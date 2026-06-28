@@ -444,17 +444,17 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[5/6] 写入输出文件..." << std::endl;
 
-    // 直接写入 rawData（已包含 stub 和加密后的 section）
+    // 写入重建后的 PE（outputData 包含签名消除的所有修改）
     FILE* outFile = fopen(outputFile.c_str(), "wb");
     if (!outFile) {
         std::cerr << "错误: 无法创建输出文件: " << outputFile << std::endl;
         return 1;
     }
-    fwrite(image->rawData, 1, image->rawSize, outFile);
+    fwrite(outputData.get(), 1, outputSize, outFile);
     fclose(outFile);
 
     std::cout << "  输出文件已保存: " << outputFile << std::endl;
-    std::cout << "  文件大小: " << image->rawSize << " 字节" << std::endl;
+    std::cout << "  文件大小: " << outputSize << " 字节" << std::endl;
 
     // ============================================================================
     // Step 6: 验证输出

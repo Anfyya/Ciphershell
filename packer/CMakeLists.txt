@@ -24,6 +24,9 @@ add_library(ciphershell_packer STATIC
     transforms/opaque_predicates.cpp
     transforms/bogus_flow.cpp
 
+    # Stub 构建器
+    transforms/stub_builder.cpp
+
     # 转译器 — Phase 4
     transforms/translator.cpp
 
@@ -39,6 +42,9 @@ add_library(ciphershell_packer STATIC
 
     # API Resolver (从 stub 引入，编译验证用)
     ../stub/stage1/api_resolver.cpp
+
+    # GUI
+    gui/console_gui.cpp
 )
 
 # 包含目录

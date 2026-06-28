@@ -16,42 +16,63 @@ static std::vector<BYTE> build_x86(const CS_STUB_PARAMS& p) {
     b(0x0F); b(0xB6); b(0x40); b(0x02); // movzx eax, byte [eax+2] (BeingDebugged)
     b(0x85); b(0xC0);            // test eax, eax
     b(0x74); uint8_t jz1 = (uint8_t)c.size(); b(0x00); // jz no_debug
-    // Debugger detected -> crash (xor eax,eax; jmp eax)
     b(0x31); b(0xC0);            // xor eax,eax
     b(0xFF); b(0xE0);            // jmp eax -> crash
-    c[jz1] = (uint8_t)(c.size() - jz1 - 1); // patch jz offset
-    // --- End Anti-Debug ---
+    c[jz1] = (uint8_t)(c.size() - jz1 - 1);
 
+    // ImageBase via PEB
     b(0x64); b(0xA1); d(0x30);   // mov eax, fs:[0x30]
     b(0x8B); b(0x40); b(0x08);   // mov eax, [eax+8] -> ImageBase
     b(0x89); b(0xC5);            // mov ebp, eax (save ImageBase)
 
+    // esi = section addr, ecx = sectionSize
     b(0x89); b(0xC6);            // mov esi, eax
-    b(0x81); b(0xC6); d(p.sectionRVA); // add esi, sectionRVA -> section addr
-    b(0xB9); d(p.sectionSize);   // mov ecx, sectionSize
-    b(0x31); b(0xD2);            // xor edx, edx -> key index
+    b(0x81); b(0xC6); d(p.sectionRVA);
+    b(0xB9); d(p.sectionSize);
+    b(0x85); b(0xC9);
+    DWORD jzPos86 = (DWORD)c.size();
+    b(0x74); uint8_t jzSkip86 = (uint8_t)c.size(); b(0x00);
 
-    // decrypt loop
-    DWORD lp = (DWORD)c.size();
-    b(0x85); b(0xC9);            // test ecx,ecx
-    b(0x74); uint8_t jzOff = (uint8_t)c.size(); b(0x00); // jz done (patch later)
+    // lea edi, [key_table] — use call/pop trick for position-independent code
+    b(0xE8); d(0);               // call $+5 (push next instr addr)
+    // key_table follows immediately after decrypt loop + jmp
 
-    b(0x8A); b(0x04); b(0x16);   // mov al, [esi+edx]
-    b(0x34); b(p.key[0]);        // xor al, keyByte
-    b(0x88); b(0x04); b(0x16);   // mov [esi+edx], al
+    // xor edx, edx (key index)
+    b(0x31); b(0xD2);
 
-    b(0x42);                     // inc edx  (only inc index, esi stays)
+    // === decrypt loop ===
+    DWORD lpx = (DWORD)c.size();
+    b(0x8A); b(0x04); b(0x17);   // mov al, [edi + edx]
+    b(0x30); b(0x06);            // xor [esi], al
+    b(0x46);                     // inc esi
+    b(0x42);                     // inc edx
+    b(0x83); b(0xFA); b(32);     // cmp edx, 32
+    b(0x72); b(0x02);            // jb no_wrap
+    b(0x31); b(0xD2);            // xor edx, edx (wrap)
     b(0x49);                     // dec ecx
+    b(0x75);
+    int jbx = (int)lpx - (int)c.size() - 1;
+    b((uint8_t)(jbx & 0xFF));    // jnz loop
 
-    int jb = (int)lp - (int)c.size() - 1;
-    b(0xEB); b((uint8_t)(jb & 0xFF)); // jmp short loop
+    c[jzSkip86] = (uint8_t)(c.size() - jzSkip86 - 1);
 
-    c[jzOff] = (uint8_t)(c.size() - jzOff - 1);
-
+    // JMP OEP
     b(0x61);                     // popad
     b(0x89); b(0xE8);            // mov eax, ebp
     b(0x05); d(p.oepRVA);        // add eax, oepRVA
     b(0xFF); b(0xE0);            // jmp eax
+
+    // === Embedded 32-byte key table ===
+    DWORD keyStart = (DWORD)c.size();
+    for (int i = 0; i < 32; i++) c.push_back(p.key[i]);
+
+    // 回填 call/pop trick: edi = &key_table
+    // call $+5 的返回地址正好是 key_table 的起始
+    // call 指令位于 (jzSkip86 patched 之后, 即 c[jzSkip86+1] 开始)
+    // 即 offset = jzPos86+2
+    // 修正：call 指令的偏移量 = keyStart - (call_insn_addr + 5)
+    DWORD callInsnAddr = jzPos86 + 2; // after jz, before "call $+5"
+    *(DWORD*)(c.data() + callInsnAddr + 1) = keyStart - (callInsnAddr + 5);
 
     return c;
 }
@@ -67,41 +88,61 @@ static std::vector<BYTE> build_x64(const CS_STUB_PARAMS& p) {
     // --- Anti-Debug: Check PEB->BeingDebugged (offset +0x02) ---
     b(0x80); b(0x78); b(0x02); b(0x00);  // cmp byte [rax+0x02], 0
     b(0x74); uint8_t jzDebug = (uint8_t)c.size(); b(0x00); // je continue (patch)
-    // Debugger detected -> exit/crash via invalid jump
     b(0x48); b(0x31); b(0xC0);           // xor rax, rax (0)
     b(0xFF); b(0xE0);                     // jmp rax -> crash
-    c[jzDebug] = (uint8_t)(c.size() - jzDebug - 1); // patch offset
-    // --- End Anti-Debug ---
+    c[jzDebug] = (uint8_t)(c.size() - jzDebug - 1);
 
-    // Note: PEB already in rax, re-load is redundant but cheap
-    // Actually we re-read gs:[0x60] to be safe after the check
-    b(0x65); b(0x48); b(0x8B); b(0x04); b(0x25); d(0x60); // mov rax, gs:[0x60]
-    b(0x48); b(0x8B); b(0x58); b(0x10); // mov rbx, [rax+0x10] -> ImageBase
+    // rbx = ImageBase (PEB+0x10)
+    b(0x65); b(0x48); b(0x8B); b(0x04); b(0x25); d(0x60);
+    b(0x48); b(0x8B); b(0x58); b(0x10); // mov rbx, [rax+0x10]
 
     // rsi = rbx + sectionRVA, ecx = sectionSize
     b(0x48); b(0x8D); b(0xB3); d(p.sectionRVA);
     b(0xB9); d(p.sectionSize);
     b(0x85); b(0xC9);
     DWORD jzPos = (DWORD)c.size();
-    b(0x0F); b(0x84); d(0);
+    b(0x0F); b(0x84); d(0);            // jz -> done (skip decrypt)
 
-    // decrypt loop
+    // lea rdi, [rip + key_table] — 32-byte key follows stub code
+    // 在 x64 上 RIP-relative 寻址: lea rdi, [rip + offset]
+    DWORD keyOffPos = (DWORD)c.size();
+    b(0x48); b(0x8D); b(0x3D); d(0);   // lea rdi, [rip + 0] (patch later)
+
+    // xor edx, edx (key index)
+    b(0x31); b(0xD2);
+
+    // === decrypt loop ===
     DWORD lp = (DWORD)c.size();
-    b(0x80); b(0x36); b(p.key[0]);
-    b(0x48); b(0xFF); b(0xC6);
-    b(0xFF); b(0xC9);
+    b(0x8A); b(0x04); b(0x17);         // mov al, [rdi + rdx]
+    b(0x30); b(0x06);                   // xor [rsi], al
+    b(0x48); b(0xFF); b(0xC6);          // inc rsi
+    b(0xFF); b(0xC2);                   // inc edx
+    b(0x83); b(0xFA); b(32);            // cmp edx, 32
+    b(0x72); b(0x02);                   // jb no_wrap
+    b(0x31); b(0xD2);                   // xor edx, edx (wrap)
+    // no_wrap:
+    b(0xFF); b(0xC9);                   // dec ecx
     b(0x75);
-    int jb = (int)lp - (int)c.size() - 1;
-    b((uint8_t)(jb & 0xFF));
+    int jb2 = (int)lp - (int)c.size() - 1;
+    b((uint8_t)(jb2 & 0xFF));           // jnz loop
 
+    // patch jz: skip decrypt if sectionSize == 0
     *(DWORD*)(c.data() + jzPos + 2) = (DWORD)(c.size() - (jzPos + 6));
 
-    // Anti-dump: 擦除 PE 签名 (e_lfanew = 0), 阻止内存 dump 工具
-    b(0xC7); b(0x43); b(0x3C); d(0); // mov dword [rbx+0x3C], 0
+    // Anti-dump: mov dword [rbx+0x3C], 0
+    b(0xC7); b(0x43); b(0x3C); d(0);
 
     // JMP OEP
-    b(0x48); b(0x8D); b(0x83); d(p.oepRVA); // lea rax,[rbx+oepRVA]
-    b(0xFF); b(0xE0);            // jmp rax
+    b(0x48); b(0x8D); b(0x83); d(p.oepRVA);
+    b(0xFF); b(0xE0);
+
+    // === Embedded 32-byte key table ===
+    // 填充 key[0..31]
+    for (int i = 0; i < 32; i++) c.push_back(p.key[i]);
+
+    // 回填 RIP-relative offset: key_table 距离 lea 指令末尾的距离
+    DWORD keyDist = (DWORD)(c.size() - 32) - (keyOffPos + 7);
+    *(DWORD*)(c.data() + keyOffPos + 3) = keyDist;
 
     return c;
 }
@@ -157,15 +198,27 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
     DWORD srv=(lve+sa-1)&~(sa-1),   svs=(ss+sa-1)&~(sa-1);
 
     DWORD ns=sfo+sfs;
+    // 保留 overlay 数据（如有）
+    DWORD overlaySize = 0;
+    if (img->rawSize > lfe) overlaySize = img->rawSize - lfe;
+    ns += overlaySize;
+
     BYTE* nd=new BYTE[ns]; memset(nd,0,ns);
     memcpy(nd,img->rawData,img->rawSize);
+    if (overlaySize) memcpy(nd + sfo + sfs, img->rawData + lfe, overlaySize);
     memcpy(nd+sfo,sd,ss); delete[] sd;
 
     DWORD po=img->dosHeader->e_lfanew;
+    // 释放旧的 rawData，避免内存泄漏
+    delete[] img->rawData;
     img->rawData=nd; img->rawSize=ns;
     img->dosHeader=(PIMAGE_DOS_HEADER)nd;
-    img->ntHeaders64=(PIMAGE_NT_HEADERS64)(nd+po);
-    img->ntHeaders32=(PIMAGE_NT_HEADERS32)(nd+po);
+    // 根据架构设置正确的 NT Headers 指针
+    if (img->is64Bit) {
+        img->ntHeaders64=(PIMAGE_NT_HEADERS64)(nd+po);
+    } else {
+        img->ntHeaders32=(PIMAGE_NT_HEADERS32)(nd+po);
+    }
 
     WORD ns2=img->numSections+1;
     PIMAGE_SECTION_HEADER secs=IMAGE_FIRST_SECTION(img->ntHeaders64);
