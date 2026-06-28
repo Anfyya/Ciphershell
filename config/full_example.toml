@@ -1,0 +1,251 @@
+# CipherShell 完整配置文件示例
+# 包含所有可用配置选项
+
+# ============================================================================
+# 全局配置
+# ============================================================================
+
+[global]
+protection_level = 3              # 全局默认保护等级 1-5
+                                  # L1: Guard (~1.05x)
+                                  # L2: Shield (~2-3x)
+                                  # L3: Armor (~5-8x)
+                                  # L4: Fortress (~15-30x)
+                                  # L5: Citadel (~50-100x+)
+
+strip_debug_info = true           # 删除所有调试信息
+strip_rich_header = true          # 删除 Rich Header（编译器指纹）
+strip_timestamps = true           # 时间戳归零
+randomize_section_names = true    # Section 名称随机化
+
+anti_debug_mode = "implicit"      # 反调试模式
+                                  # "explicit": 检测到立即退出
+                                  # "implicit": 检测到投毒，延迟崩溃
+                                  # "hybrid": 混合模式
+
+string_encryption = true          # 全局字符串加密
+import_obfuscation = true         # 导入表混淆
+resource_encryption = false       # 资源加密（可能影响兼容性）
+
+# 输入输出
+# input_file = ""                 # 输入文件（命令行指定）
+# output_file = ""                # 输出文件（命令行指定）
+
+# ============================================================================
+# 虚拟机配置
+# ============================================================================
+
+[vm]
+register_count = 24               # 虚拟寄存器数量（16-64）
+stack_size = 0x20000              # 虚拟栈大小
+opcode_width = "variable"         # "fixed_8" | "fixed_16" | "variable"
+handler_mutation = true           # Handler 代码变异
+bytecode_encryption = "rolling"   # "none" | "xor" | "rolling" | "aes_ctr"
+embed_junk_handlers = true        # 嵌入无意义的假 handler 干扰分析
+
+# Dispatch 模式混合
+dispatch_mode = "mixed"           # "table" | "computed" | "threaded" | "mixed"
+table_dispatch_ratio = 0.4        # 跳转表 dispatch 比例
+computed_dispatch_ratio = 0.3     # 计算跳转 dispatch 比例
+threaded_dispatch_ratio = 0.3     # threaded dispatch 比例
+
+# 变异选项
+opcode_randomization = true       # Opcode 编码随机化
+register_remapping = true         # 寄存器映射随机化
+handler_ast_mutation = true       # Handler AST 变形
+junk_code_injection = true        # 垃圾代码注入
+instruction_reordering = true     # 指令重排序
+
+# ============================================================================
+# 反调试配置
+# ============================================================================
+
+[anti_debug]
+# 时序检测
+timing_checks = true              # 时序检测
+timing_rdtsc = true               # RDTSC 检测
+timing_qpc = true                 # QueryPerformanceCounter 检测
+timing_gettickcount = true        # GetTickCount 检测
+timing_cross_validation = true    # 时序交叉验证
+
+# 断点检测
+hardware_bp_detection = true      # 硬件断点检测 (DR0-DR7)
+software_bp_detection = true      # INT3 / 0xCC 扫描
+memory_bp_detection = true        # 内存断点检测
+
+# 内存完整性
+memory_integrity = true           # 代码完整性校验
+memory_crc_check = true           # 代码段 CRC 校验
+handler_checksum = true           # Handler 代码校验
+
+# 环境检测
+debugger_window_scan = false      # 扫描调试器窗口类名（可选，易被绕过）
+parent_process_check = true       # 父进程检测
+module_scan = true                # 已加载模块扫描
+debugger_process_scan = true      # 调试器进程扫描
+
+# 内核调试
+thread_hiding = true              # NtSetInformationThread HideFromDebugger
+kernel_debugger_check = true      # 内核调试器检测
+debug_object_check = true         # 调试对象检测
+
+# 异常处理
+exception_chain_validation = true # 异常链验证
+single_step_detection = true      # 单步执行检测
+int3_fingerprint = true           # INT3 指纹检测
+
+# 虚拟环境检测
+vm_detection = false              # 虚拟机检测（可选）
+sandbox_detection = false         # 沙箱检测（可选）
+hypervisor_detection = true       # Hypervisor 检测
+
+# 响应配置
+implicit_response = true          # 隐式响应
+poison_delay_min = 100            # 最小投毒延迟（指令数）
+poison_delay_max = 1000           # 最大投毒延迟（指令数）
+cascade_on_redetect = true        # 重复检测时级联响应
+
+# ============================================================================
+# 反 Dump 配置
+# ============================================================================
+
+[anti_dump]
+erase_pe_header = true            # 运行时擦除 PE 头
+section_permission_guard = true   # 动态权限管理
+nanomite_patches = true           # INT3 Nanomite 技术
+guard_pages = true                # Guard Pages 保护
+api_redirection = true            # API 重定向
+
+# ============================================================================
+# 字符串加密配置
+# ============================================================================
+
+[string_encryption]
+enabled = true                    # 启用字符串加密
+mode = "chacha20"                 # "simple" | "chacha20" | "rolling"
+min_length = 4                    # 最小字符串长度
+max_length = 4096                 # 最大字符串长度
+encrypt_wide = true               # 加密宽字符字符串
+erase_after_use = false           # 使用后擦除（可能影响稳定性）
+randomize_layout = true           # 随机化布局
+detect_references = true          # 自动检测字符串引用
+
+# ============================================================================
+# 导入表混淆配置
+# ============================================================================
+
+[import_obfuscation]
+enabled = true                    # 启用导入表混淆
+strategy = "mixed"                # "hash" | "fake" | "mixed"
+preserve_critical = true          # 保留关键导入（LoadLibrary, GetProcAddress）
+fake_import_count = 10            # 假导入数量
+add_delay_imports = true          # 添加延迟导入作为干扰
+hash_algorithm = "custom"         # "crc32" | "djb2" | "custom"
+
+# ============================================================================
+# 性能配置
+# ============================================================================
+
+[performance]
+auto_hotspot_analysis = true      # 自动分析热点函数并降低其保护等级
+max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自动降级）
+startup_timeout = 5000            # 启动超时（毫秒）
+memory_limit = 0x40000000         # 内存限制（字节）
+
+# 热点分析阈值
+hotspot_threshold = 1000          # 热点函数调用次数阈值
+hotspot_loop_depth = 3            # 循环嵌套深度阈值
+hotspot_auto_downgrade = true     # 自动降低热点函数保护等级
+
+# ============================================================================
+# 签名消除配置
+# ============================================================================
+
+[signature_elimination]
+randomize_section_names = true    # 随机化 section 名称
+randomize_timestamps = true       # 随机化时间戳
+clear_rich_header = true          # 清除 Rich Header
+clear_debug_directory = true      # 清除调试目录
+clear_checksum = true             # 清除校验和
+normalize_permissions = true      # 规范化 section 权限
+add_fake_imports = true           # 添加假导入表
+
+# ============================================================================
+# 函数级精确控制
+# ============================================================================
+
+# 主函数 - 最高保护
+[[function_overrides]]
+pattern = "main"                  # 函数名匹配（支持通配符）
+pattern = "wmain"                 # 宽字符版本
+pattern = "WinMain"               # GUI 程序入口
+pattern = "wWinMain"              # 宽字符版本
+pattern = "DllMain"               # DLL 入口
+level = 5                         # 覆盖为最高保护
+vm_nesting = 2                    # 双层 VM 嵌套
+
+# 渲染相关函数 - 性能敏感
+[[function_overrides]]
+pattern = "render_*"              # 渲染相关函数
+pattern = "draw_*"                # 绘制相关函数
+pattern = "paint_*"               # 绘制相关函数
+pattern = "display_*"             # 显示相关函数
+level = 1                         # 性能敏感，仅做基础加密
+
+# 授权验证函数 - 最高保护
+[[function_overrides]]
+pattern = "license_*"             # 授权验证函数
+pattern = "auth_*"                # 认证函数
+pattern = "verify_*"              # 验证函数
+pattern = "check_license*"        # 授权检查
+pattern = "validate_*"            # 验证函数
+level = 5                         # 最高保护
+vm_nesting = 2                    # 双层 VM 嵌套
+
+# 加密函数 - 中等保护
+[[function_overrides]]
+pattern = "crypto_*"              # 已有加密函数
+pattern = "encrypt_*"             # 加密函数
+pattern = "decrypt_*"             # 解密函数
+pattern = "hash_*"                # 哈希函数
+level = 2                         # 避免过度保护影响性能
+
+# 游戏循环 - 性能敏感
+[[function_overrides]]
+pattern = "game_loop*"            # 游戏主循环
+pattern = "update*"               # 更新函数
+pattern = "tick*"                 # 帧更新
+pattern = "process_frame*"        # 帧处理
+level = 1                         # 性能敏感
+
+# 网络函数 - 中等保护
+[[function_overrides]]
+pattern = "send_*"                # 发送函数
+pattern = "recv_*"                # 接收函数
+pattern = "connect_*"             # 连接函数
+pattern = "network_*"             # 网络函数
+level = 3                         # 中等保护
+
+# 数据库函数 - 中等保护
+[[function_overrides]]
+pattern = "db_*"                  # 数据库函数
+pattern = "sql_*"                 # SQL 函数
+pattern = "query_*"               # 查询函数
+level = 3                         # 中等保护
+
+# 关键算法 - 最高保护
+[[function_overrides]]
+pattern = "algorithm_*"           # 核心算法
+pattern = "calculate_*"           # 计算函数
+pattern = "compute_*"             # 计算函数
+pattern = "process_data*"         # 数据处理
+level = 5                         # 最高保护
+vm_nesting = 1                    # 单层 VM 嵌套
+
+# 调试函数 - 最低保护
+[[function_overrides]]
+pattern = "debug_*"               # 调试函数
+pattern = "test_*"                # 测试函数
+pattern = "log_*"                 # 日志函数
+pattern = "trace_*"               # 跟踪函数
+level = 1                         # 最低保护
