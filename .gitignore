@@ -1,0 +1,55 @@
+# ============================================================================
+# CipherShell .gitignore
+# ============================================================================
+
+# 编译输出 / CMake 生成
+build/
+build_linux/
+out/
+obj/
+*.dir/
+
+# 可执行文件 / 库
+*.exe
+*.dll
+*.lib
+*.obj
+*.exp
+*.pdb
+*.ilk
+
+# IDE / 编辑器
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.filters
+CMakeUserPresets.json
+
+# 临时文件
+*.tmp
+*.log
+*.tlog
+*.lastbuildstate
+*.idb
+*.pch
+*.res
+
+# 打包输出 (测试样本)
+tests/samples/*_protected*
+tests/samples/*_L*.exe
+tests/samples/*_packed*
+tests/samples/enc.exe
+tests/samples/dec.exe
+tests/samples/orig.exe
+tests/samples/hello*.exe
+tests/samples/notepad*.exe
+tests/samples/*.obj
+tests/samples/output.txt
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
