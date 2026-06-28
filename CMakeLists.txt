@@ -80,4 +80,6 @@ endif()
 # 安装规则
 # ============================================================================
 
-install(TARGETS ciphershell RUNTIME DESTINATION bin)
+if(TARGET ciphershell)
+    install(TARGETS ciphershell RUNTIME DESTINATION bin)
+endif()

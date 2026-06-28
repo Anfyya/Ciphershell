@@ -26,6 +26,9 @@ set_target_properties(stage0_x64 PROPERTIES
 
 add_library(stage1_runtime STATIC
     stage1/api_resolver.cpp
+    stage1/anti_debug.cpp
+    stage1/anti_debug_advanced.cpp
+    stage1/implicit_response.cpp
 )
 
 # 包含目录
@@ -52,6 +55,7 @@ endif()
 # ============================================================================
 
 add_library(mirage_vm STATIC
+    vm/vm_context.c
     vm/dispatcher.c
     vm/flags_emu.c
 )

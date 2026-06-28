@@ -24,6 +24,13 @@ add_library(ciphershell_packer STATIC
     transforms/opaque_predicates.cpp
     transforms/bogus_flow.cpp
 
+    # 转译器 — Phase 4
+    transforms/translator.cpp
+
+    # 变异引擎 — Phase 4
+    mutation/bytecode_encryptor.cpp
+    mutation/mutation_engine.cpp
+
     # 配置解析
     config/config_parser.cpp
 
@@ -47,8 +54,7 @@ target_link_libraries(ciphershell_packer PRIVATE
 
 # ============================================================================
 # Packer 可执行文件
-# ============================================================================
-
+# =============================
 
 add_executable(ciphershell
     main.cpp
