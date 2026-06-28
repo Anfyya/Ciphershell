@@ -43,8 +43,11 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
             continue;
         }
 
-        // 跳过代码段中的字符串扫描（通常字符串在 .rdata）
-        // 但代码段中也可能有内联字符串
+        // 只扫描代码段中的内联字符串，跳过 .rdata（含 CRT manifest）
+        // 避免破坏运行时数据
+        if (!(section->Characteristics & IMAGE_SCN_CNT_CODE)) {
+            continue;
+        }
 
         const BYTE* sectionData = image->rawData + section->PointerToRawData;
         DWORD sectionSize = section->SizeOfRawData;

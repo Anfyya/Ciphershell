@@ -4,12 +4,13 @@ D:/vscode/CipherShell/build/CMakeFiles/ZERO_CHECK.dir
 D:/vscode/CipherShell/build/packer/CMakeFiles/ciphershell_packer.dir
 D:/vscode/CipherShell/build/packer/CMakeFiles/ciphershell.dir
 D:/vscode/CipherShell/build/packer/CMakeFiles/INSTALL.dir
-D:/vscode/CipherShell/build/stub/CMakeFiles/stage0_x86.dir
-D:/vscode/CipherShell/build/stub/CMakeFiles/stage0_x64.dir
 D:/vscode/CipherShell/build/stub/CMakeFiles/stage1_runtime.dir
 D:/vscode/CipherShell/build/stub/CMakeFiles/mirage_vm.dir
 D:/vscode/CipherShell/build/stub/CMakeFiles/INSTALL.dir
 D:/vscode/CipherShell/build/tests/CMakeFiles/test_pe_parser.dir
 D:/vscode/CipherShell/build/tests/CMakeFiles/test_vm_correctness.dir
+D:/vscode/CipherShell/build/tests/CMakeFiles/benchmark.dir
 D:/vscode/CipherShell/build/tests/CMakeFiles/hello_world_sample.dir
 D:/vscode/CipherShell/build/tests/CMakeFiles/INSTALL.dir
+D:/vscode/CipherShell/build/tools/CMakeFiles/decryptor.dir
+D:/vscode/CipherShell/build/tools/CMakeFiles/INSTALL.dir

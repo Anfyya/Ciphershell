@@ -1,24 +1,12 @@
 # CipherShell Stub CMakeLists.txt
 
 # ============================================================================
-# Stage0 汇编对象
+# Stage0 汇编对象（需要 NASM，如果不可用则跳过）
 # ============================================================================
 
-# x86 版本
-add_library(stage0_x86 OBJECT
-    stage0/stage0_x86.asm
-)
-set_target_properties(stage0_x86 PROPERTIES
-    NASM_FORMAT win32
-)
-
-# x64 版本
-add_library(stage0_x64 OBJECT
-    stage0/stage0_x64.asm
-)
-set_target_properties(stage0_x64 PROPERTIES
-    NASM_FORMAT win64
-)
+# Stage0 汇编由外部手动编译（NASM 参数与 CMake 不兼容）
+# stub/build/stage0_x86.obj
+# stub/build/stage0_x64.obj
 
 # ============================================================================
 # Stage1 运行时引擎
@@ -29,6 +17,7 @@ add_library(stage1_runtime STATIC
     stage1/anti_debug.cpp
     stage1/anti_debug_advanced.cpp
     stage1/implicit_response.cpp
+    stage1/runtime_stub.cpp
 )
 
 # 包含目录
@@ -54,10 +43,19 @@ endif()
 # VM 引擎 (Mirage)
 # ============================================================================
 
+# VM 引擎 (Mirage) - C 语言实现
 add_library(mirage_vm STATIC
     vm/vm_context.c
     vm/dispatcher.c
     vm/flags_emu.c
+)
+
+# 明确指定为 C 语言
+set_source_files_properties(
+    vm/vm_context.c
+    vm/dispatcher.c
+    vm/flags_emu.c
+    PROPERTIES LANGUAGE C
 )
 
 # 包含目录

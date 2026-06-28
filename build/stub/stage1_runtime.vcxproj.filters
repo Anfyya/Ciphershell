@@ -13,6 +13,9 @@
     <ClCompile Include="D:\vscode\CipherShell\stub\stage1\implicit_response.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\stub\stage1\runtime_stub.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="D:\vscode\CipherShell\stub\CMakeLists.txt" />

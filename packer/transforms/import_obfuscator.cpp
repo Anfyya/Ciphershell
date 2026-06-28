@@ -296,17 +296,9 @@ bool ImportObfuscator::ApplyStrategyA(
     const CS_IMPORT_OBFUSCATION_CONFIG& config,
     APIResolver* resolver)
 {
-    // 策略A：清空 IAT，只保留 LoadLibraryA 和 GetProcAddress
-    // 其余所有 API 调用改为运行时 hash resolve
-
-    // 保留关键导入
-    if (config.preserveCriticalImports) {
-        // 只保留 kernel32!LoadLibraryA 和 kernel32!GetProcAddress
-        // 其他全部清除
-    }
-
-    // 清空原始导入表
-    return ClearOriginalImports(image);
+    // 策略A: 保留 IAT 原样（stub 还不能做 runtime API resolve）
+    (void)image; (void)config; (void)resolver;
+    return true;
 }
 
 bool ImportObfuscator::ApplyStrategyB(

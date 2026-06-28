@@ -1,0 +1,828 @@
+{
+	"configurations" : 
+	[
+		{
+			"abstractTargets" : [],
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					],
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-Debug-f28f133d258ccbe0b2f9.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"build" : "packer",
+					"jsonFile" : "directory-packer-Debug-d020ad570e2820f5c218.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "packer",
+					"targetIndexes" : 
+					[
+						3,
+						4
+					]
+				},
+				{
+					"build" : "stub",
+					"jsonFile" : "directory-stub-Debug-67283c0c046ea049ea4e.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "stub",
+					"targetIndexes" : 
+					[
+						7,
+						8
+					]
+				},
+				{
+					"build" : "tests",
+					"jsonFile" : "directory-tests-Debug-74d1b11f0521a8d27dd5.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tests",
+					"targetIndexes" : 
+					[
+						2,
+						6,
+						9,
+						10
+					]
+				},
+				{
+					"build" : "tools",
+					"jsonFile" : "directory-tools-Debug-87d13f22ff1de9c90319.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tools",
+					"targetIndexes" : 
+					[
+						5
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					],
+					"name" : "CipherShell",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ALL_BUILD-Debug-8ba6808ba3cf37720f34.json",
+					"name" : "ALL_BUILD",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ZERO_CHECK::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ZERO_CHECK-Debug-305537400153d02d9767.json",
+					"name" : "ZERO_CHECK",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "benchmark::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-benchmark-Debug-10eb937207d14cbdb040.json",
+					"name" : "benchmark",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell-Debug-c6380fbd34a821a2f82d.json",
+					"name" : "ciphershell",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell_packer::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell_packer-Debug-d4e8129e5df30f23d062.json",
+					"name" : "ciphershell_packer",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 4,
+					"id" : "decryptor::@b9a00e55f22b3d77656c",
+					"jsonFile" : "target-decryptor-Debug-bf4c0f902c66d833ce50.json",
+					"name" : "decryptor",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "hello_world_sample::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-hello_world_sample-Debug-a25b5218172af2c61a11.json",
+					"name" : "hello_world_sample",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "mirage_vm::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-mirage_vm-Debug-27d8a1090f9be4c88669.json",
+					"name" : "mirage_vm",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "stage1_runtime::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-stage1_runtime-Debug-89f171705d2f1f528d2f.json",
+					"name" : "stage1_runtime",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_pe_parser::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_pe_parser-Debug-f207622c04f5e513d84b.json",
+					"name" : "test_pe_parser",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_vm_correctness::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_vm_correctness-Debug-a5b79572654b9cc8b0d8.json",
+					"name" : "test_vm_correctness",
+					"projectIndex" : 0
+				}
+			]
+		},
+		{
+			"abstractTargets" : [],
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					],
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-Release-c182645904ec84a1bc2c.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"build" : "packer",
+					"jsonFile" : "directory-packer-Release-d020ad570e2820f5c218.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "packer",
+					"targetIndexes" : 
+					[
+						3,
+						4
+					]
+				},
+				{
+					"build" : "stub",
+					"jsonFile" : "directory-stub-Release-67283c0c046ea049ea4e.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "stub",
+					"targetIndexes" : 
+					[
+						7,
+						8
+					]
+				},
+				{
+					"build" : "tests",
+					"jsonFile" : "directory-tests-Release-74d1b11f0521a8d27dd5.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tests",
+					"targetIndexes" : 
+					[
+						2,
+						6,
+						9,
+						10
+					]
+				},
+				{
+					"build" : "tools",
+					"jsonFile" : "directory-tools-Release-87d13f22ff1de9c90319.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tools",
+					"targetIndexes" : 
+					[
+						5
+					]
+				}
+			],
+			"name" : "Release",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					],
+					"name" : "CipherShell",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ALL_BUILD-Release-8ba6808ba3cf37720f34.json",
+					"name" : "ALL_BUILD",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ZERO_CHECK::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ZERO_CHECK-Release-305537400153d02d9767.json",
+					"name" : "ZERO_CHECK",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "benchmark::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-benchmark-Release-f34106409bf904bba6b6.json",
+					"name" : "benchmark",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell-Release-a867b9a9b8fe77d48682.json",
+					"name" : "ciphershell",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell_packer::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell_packer-Release-98997edb2f1c9a7eac07.json",
+					"name" : "ciphershell_packer",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 4,
+					"id" : "decryptor::@b9a00e55f22b3d77656c",
+					"jsonFile" : "target-decryptor-Release-d26988be57989b24c0cd.json",
+					"name" : "decryptor",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "hello_world_sample::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-hello_world_sample-Release-82376112ff935881a9a7.json",
+					"name" : "hello_world_sample",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "mirage_vm::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-mirage_vm-Release-bd80bb0872cf93efef23.json",
+					"name" : "mirage_vm",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "stage1_runtime::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-stage1_runtime-Release-1c1b82ddb998745053bb.json",
+					"name" : "stage1_runtime",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_pe_parser::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_pe_parser-Release-0133c906b000ff9d6d27.json",
+					"name" : "test_pe_parser",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_vm_correctness::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_vm_correctness-Release-6263c5974dbb6758261b.json",
+					"name" : "test_vm_correctness",
+					"projectIndex" : 0
+				}
+			]
+		},
+		{
+			"abstractTargets" : [],
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					],
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-MinSizeRel-8e4111b9ed1212093433.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"build" : "packer",
+					"jsonFile" : "directory-packer-MinSizeRel-d020ad570e2820f5c218.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "packer",
+					"targetIndexes" : 
+					[
+						3,
+						4
+					]
+				},
+				{
+					"build" : "stub",
+					"jsonFile" : "directory-stub-MinSizeRel-67283c0c046ea049ea4e.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "stub",
+					"targetIndexes" : 
+					[
+						7,
+						8
+					]
+				},
+				{
+					"build" : "tests",
+					"jsonFile" : "directory-tests-MinSizeRel-74d1b11f0521a8d27dd5.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tests",
+					"targetIndexes" : 
+					[
+						2,
+						6,
+						9,
+						10
+					]
+				},
+				{
+					"build" : "tools",
+					"jsonFile" : "directory-tools-MinSizeRel-87d13f22ff1de9c90319.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tools",
+					"targetIndexes" : 
+					[
+						5
+					]
+				}
+			],
+			"name" : "MinSizeRel",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					],
+					"name" : "CipherShell",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ALL_BUILD-MinSizeRel-8ba6808ba3cf37720f34.json",
+					"name" : "ALL_BUILD",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ZERO_CHECK::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ZERO_CHECK-MinSizeRel-305537400153d02d9767.json",
+					"name" : "ZERO_CHECK",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "benchmark::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-benchmark-MinSizeRel-395d5f587c9b820daf01.json",
+					"name" : "benchmark",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell-MinSizeRel-95541881198b4d109b55.json",
+					"name" : "ciphershell",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell_packer::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell_packer-MinSizeRel-04f079cd7d2509382d17.json",
+					"name" : "ciphershell_packer",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 4,
+					"id" : "decryptor::@b9a00e55f22b3d77656c",
+					"jsonFile" : "target-decryptor-MinSizeRel-1f61ab6fe3612473dd7d.json",
+					"name" : "decryptor",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "hello_world_sample::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-hello_world_sample-MinSizeRel-279823ddee73a78cea22.json",
+					"name" : "hello_world_sample",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "mirage_vm::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-mirage_vm-MinSizeRel-49f78b594df17597aa3c.json",
+					"name" : "mirage_vm",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "stage1_runtime::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-stage1_runtime-MinSizeRel-bdaf91f8eb6cfe1d0da4.json",
+					"name" : "stage1_runtime",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_pe_parser::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_pe_parser-MinSizeRel-eb0f1dd9b893a3d07b49.json",
+					"name" : "test_pe_parser",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_vm_correctness::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_vm_correctness-MinSizeRel-5d3f44c09600fa0b6a0b.json",
+					"name" : "test_vm_correctness",
+					"projectIndex" : 0
+				}
+			]
+		},
+		{
+			"abstractTargets" : [],
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4
+					],
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-RelWithDebInfo-98748f34c7dc48a8d5a5.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1
+					]
+				},
+				{
+					"build" : "packer",
+					"jsonFile" : "directory-packer-RelWithDebInfo-d020ad570e2820f5c218.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "packer",
+					"targetIndexes" : 
+					[
+						3,
+						4
+					]
+				},
+				{
+					"build" : "stub",
+					"jsonFile" : "directory-stub-RelWithDebInfo-67283c0c046ea049ea4e.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "stub",
+					"targetIndexes" : 
+					[
+						7,
+						8
+					]
+				},
+				{
+					"build" : "tests",
+					"jsonFile" : "directory-tests-RelWithDebInfo-74d1b11f0521a8d27dd5.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tests",
+					"targetIndexes" : 
+					[
+						2,
+						6,
+						9,
+						10
+					]
+				},
+				{
+					"build" : "tools",
+					"jsonFile" : "directory-tools-RelWithDebInfo-87d13f22ff1de9c90319.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.16"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 0,
+					"source" : "tools",
+					"targetIndexes" : 
+					[
+						5
+					]
+				}
+			],
+			"name" : "RelWithDebInfo",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					],
+					"name" : "CipherShell",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4,
+						5,
+						6,
+						7,
+						8,
+						9,
+						10
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ALL_BUILD::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ALL_BUILD-RelWithDebInfo-8ba6808ba3cf37720f34.json",
+					"name" : "ALL_BUILD",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ZERO_CHECK::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ZERO_CHECK-RelWithDebInfo-305537400153d02d9767.json",
+					"name" : "ZERO_CHECK",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "benchmark::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-benchmark-RelWithDebInfo-370280cc97ad64eebe73.json",
+					"name" : "benchmark",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell-RelWithDebInfo-5433d0cff84d79d8429f.json",
+					"name" : "ciphershell",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "ciphershell_packer::@45f8970fd0b3b4b5c2ca",
+					"jsonFile" : "target-ciphershell_packer-RelWithDebInfo-ddcd72a3843fedf9377e.json",
+					"name" : "ciphershell_packer",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 4,
+					"id" : "decryptor::@b9a00e55f22b3d77656c",
+					"jsonFile" : "target-decryptor-RelWithDebInfo-62ab1ed11e5b84585ed1.json",
+					"name" : "decryptor",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "hello_world_sample::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-hello_world_sample-RelWithDebInfo-e8523f8f66defc77d056.json",
+					"name" : "hello_world_sample",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "mirage_vm::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-mirage_vm-RelWithDebInfo-961fb593a6fb07d068db.json",
+					"name" : "mirage_vm",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "stage1_runtime::@31bfb7fa4c447f20d444",
+					"jsonFile" : "target-stage1_runtime-RelWithDebInfo-57c81335a13bcd0d361f.json",
+					"name" : "stage1_runtime",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_pe_parser::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_pe_parser-RelWithDebInfo-871d4cafd27c747a67ef.json",
+					"name" : "test_pe_parser",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "test_vm_correctness::@a44f0ac069e85531cdee",
+					"jsonFile" : "target-test_vm_correctness-RelWithDebInfo-b8fd56934b0602321d24.json",
+					"name" : "test_vm_correctness",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "D:/vscode/CipherShell/build",
+		"source" : "D:/vscode/CipherShell"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 9
+	}
+}

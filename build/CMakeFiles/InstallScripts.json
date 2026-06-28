@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/vscode/CipherShell/build/cmake_install.cmake",
+		"D:/vscode/CipherShell/build/packer/cmake_install.cmake",
+		"D:/vscode/CipherShell/build/stub/cmake_install.cmake",
+		"D:/vscode/CipherShell/build/tests/cmake_install.cmake",
+		"D:/vscode/CipherShell/build/tools/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

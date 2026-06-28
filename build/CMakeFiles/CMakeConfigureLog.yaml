@@ -5544,3 +5544,967 @@ events:
       -- Configuring incomplete, errors occurred!
       
 ...
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "stub/CMakeLists.txt:8 (find_program)"
+    mode: "program"
+    variable: "NASM_PROGRAM"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "nasm"
+    candidate_directories:
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/"
+      - "D:/Anaconda/"
+      - "D:/Anaconda/Scripts/"
+      - "C:/ProgramData/Oracle/Java/javapath/"
+      - "D:/vm/bin/"
+      - "C:/Windows/System32/"
+      - "C:/Windows/"
+      - "C:/Windows/System32/wbem/"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/"
+      - "C:/Windows/System32/OpenSSH/"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/"
+      - "C:/Program Files/dotnet/"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/"
+      - "C:/Program Files/nodejs/"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/"
+      - "C:/Program Files/CMake/bin/"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/"
+      - "D:/cursor/cursor/resources/app/bin/"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/"
+      - "C:/Program Files/Git/cmd/"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/"
+      - "C:/Users/yjlnq/.cargo/bin/"
+      - "D:/cursor/cursor/resources/app/codeBin/"
+      - "D:/Anaconda/Library/mingw-w64/bin/"
+      - "D:/Anaconda/Library/usr/bin/"
+      - "D:/Anaconda/Library/bin/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/"
+      - "C:/Users/yjlnq/.dotnet/tools/"
+      - "D:/vscode/Microsoft VS Code/bin/"
+      - "D:/pycharm/PyCharm 2025.3/bin/"
+      - "C:/Program Files/Git/mingw64/bin/"
+      - "C:/Users/yjlnq/.lmstudio/bin/"
+      - "C:/Program Files/bin/"
+      - "C:/Program Files/sbin/"
+      - "C:/Program Files/"
+      - "C:/Program Files (x86)/bin/"
+      - "C:/Program Files (x86)/sbin/"
+      - "C:/Program Files (x86)/"
+      - "C:/Program Files/CMake/bin/"
+      - "C:/Program Files/CMake/sbin/"
+      - "C:/Program Files/CMake/"
+      - "C:/Program Files (x86)/CipherShell/bin/"
+      - "C:/Program Files (x86)/CipherShell/sbin/"
+      - "C:/Program Files (x86)/CipherShell/"
+    searched_directories:
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/nasm"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nasm.com"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nasm.exe"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nasm"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/nasm.com"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/nasm.exe"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/nasm"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/nasm.com"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/nasm.exe"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/nasm"
+      - "D:/Anaconda/nasm.com"
+      - "D:/Anaconda/nasm.exe"
+      - "D:/Anaconda/nasm"
+      - "D:/Anaconda/Scripts/nasm.com"
+      - "D:/Anaconda/Scripts/nasm.exe"
+      - "D:/Anaconda/Scripts/nasm"
+      - "C:/ProgramData/Oracle/Java/javapath/nasm.com"
+      - "C:/ProgramData/Oracle/Java/javapath/nasm.exe"
+      - "C:/ProgramData/Oracle/Java/javapath/nasm"
+      - "D:/vm/bin/nasm.com"
+      - "D:/vm/bin/nasm.exe"
+      - "D:/vm/bin/nasm"
+      - "C:/Windows/System32/nasm.com"
+      - "C:/Windows/System32/nasm.exe"
+      - "C:/Windows/System32/nasm"
+      - "C:/Windows/nasm.com"
+      - "C:/Windows/nasm.exe"
+      - "C:/Windows/nasm"
+      - "C:/Windows/System32/wbem/nasm.com"
+      - "C:/Windows/System32/wbem/nasm.exe"
+      - "C:/Windows/System32/wbem/nasm"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/nasm.com"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/nasm.exe"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/nasm"
+      - "C:/Windows/System32/OpenSSH/nasm.com"
+      - "C:/Windows/System32/OpenSSH/nasm.exe"
+      - "C:/Windows/System32/OpenSSH/nasm"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/nasm.com"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/nasm.exe"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/nasm"
+      - "C:/Program Files/dotnet/nasm.com"
+      - "C:/Program Files/dotnet/nasm.exe"
+      - "C:/Program Files/dotnet/nasm"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/nasm.com"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/nasm.exe"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/nasm"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/nasm.com"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/nasm.exe"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/nasm"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/nasm.com"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/nasm.exe"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/nasm"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/nasm.com"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/nasm.exe"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/nasm"
+      - "C:/Program Files/nodejs/nasm.com"
+      - "C:/Program Files/nodejs/nasm.exe"
+      - "C:/Program Files/nodejs/nasm"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/nasm.com"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/nasm.exe"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/nasm"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/nasm.com"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/nasm.exe"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/nasm"
+      - "C:/Program Files/CMake/bin/nasm.com"
+      - "C:/Program Files/CMake/bin/nasm.exe"
+      - "C:/Program Files/CMake/bin/nasm"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/nasm.com"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/nasm.exe"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/nasm"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/nasm.com"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/nasm.exe"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/nasm"
+      - "D:/cursor/cursor/resources/app/bin/nasm.com"
+      - "D:/cursor/cursor/resources/app/bin/nasm.exe"
+      - "D:/cursor/cursor/resources/app/bin/nasm"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/nasm.com"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/nasm.exe"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/nasm"
+      - "C:/Program Files/Git/cmd/nasm.com"
+      - "C:/Program Files/Git/cmd/nasm.exe"
+      - "C:/Program Files/Git/cmd/nasm"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/nasm.com"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/nasm.exe"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/nasm"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/nasm.com"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/nasm.exe"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/nasm"
+      - "C:/Users/yjlnq/.cargo/bin/nasm.com"
+      - "C:/Users/yjlnq/.cargo/bin/nasm.exe"
+      - "C:/Users/yjlnq/.cargo/bin/nasm"
+      - "D:/cursor/cursor/resources/app/codeBin/nasm.com"
+      - "D:/cursor/cursor/resources/app/codeBin/nasm.exe"
+      - "D:/cursor/cursor/resources/app/codeBin/nasm"
+      - "D:/Anaconda/Library/mingw-w64/bin/nasm.com"
+      - "D:/Anaconda/Library/mingw-w64/bin/nasm.exe"
+      - "D:/Anaconda/Library/mingw-w64/bin/nasm"
+      - "D:/Anaconda/Library/usr/bin/nasm.com"
+      - "D:/Anaconda/Library/usr/bin/nasm.exe"
+      - "D:/Anaconda/Library/usr/bin/nasm"
+      - "D:/Anaconda/Library/bin/nasm.com"
+      - "D:/Anaconda/Library/bin/nasm.exe"
+      - "D:/Anaconda/Library/bin/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/nasm"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/nasm.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/nasm"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/nasm.com"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/nasm.exe"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/nasm"
+      - "C:/Users/yjlnq/.dotnet/tools/nasm.com"
+      - "C:/Users/yjlnq/.dotnet/tools/nasm.exe"
+      - "C:/Users/yjlnq/.dotnet/tools/nasm"
+      - "D:/vscode/Microsoft VS Code/bin/nasm.com"
+      - "D:/vscode/Microsoft VS Code/bin/nasm.exe"
+      - "D:/vscode/Microsoft VS Code/bin/nasm"
+      - "D:/pycharm/PyCharm 2025.3/bin/nasm.com"
+      - "D:/pycharm/PyCharm 2025.3/bin/nasm.exe"
+      - "D:/pycharm/PyCharm 2025.3/bin/nasm"
+      - "C:/Program Files/Git/mingw64/bin/nasm.com"
+      - "C:/Program Files/Git/mingw64/bin/nasm.exe"
+      - "C:/Program Files/Git/mingw64/bin/nasm"
+      - "C:/Users/yjlnq/.lmstudio/bin/nasm.com"
+      - "C:/Users/yjlnq/.lmstudio/bin/nasm.exe"
+      - "C:/Users/yjlnq/.lmstudio/bin/nasm"
+      - "C:/Program Files/bin/nasm.com"
+      - "C:/Program Files/bin/nasm.exe"
+      - "C:/Program Files/bin/nasm"
+      - "C:/Program Files/sbin/nasm.com"
+      - "C:/Program Files/sbin/nasm.exe"
+      - "C:/Program Files/sbin/nasm"
+      - "C:/Program Files/nasm.com"
+      - "C:/Program Files/nasm.exe"
+      - "C:/Program Files/nasm"
+      - "C:/Program Files (x86)/bin/nasm.com"
+      - "C:/Program Files (x86)/bin/nasm.exe"
+      - "C:/Program Files (x86)/bin/nasm"
+      - "C:/Program Files (x86)/sbin/nasm.com"
+      - "C:/Program Files (x86)/sbin/nasm.exe"
+      - "C:/Program Files (x86)/sbin/nasm"
+      - "C:/Program Files (x86)/nasm.com"
+      - "C:/Program Files (x86)/nasm.exe"
+      - "C:/Program Files (x86)/nasm"
+      - "C:/Program Files/CMake/bin/nasm.com"
+      - "C:/Program Files/CMake/bin/nasm.exe"
+      - "C:/Program Files/CMake/bin/nasm"
+      - "C:/Program Files/CMake/sbin/nasm.com"
+      - "C:/Program Files/CMake/sbin/nasm.exe"
+      - "C:/Program Files/CMake/sbin/nasm"
+      - "C:/Program Files/CMake/nasm.com"
+      - "C:/Program Files/CMake/nasm.exe"
+      - "C:/Program Files/CMake/nasm"
+      - "C:/Program Files (x86)/CipherShell/bin/nasm.com"
+      - "C:/Program Files (x86)/CipherShell/bin/nasm.exe"
+      - "C:/Program Files (x86)/CipherShell/bin/nasm"
+      - "C:/Program Files (x86)/CipherShell/sbin/nasm.com"
+      - "C:/Program Files (x86)/CipherShell/sbin/nasm.exe"
+      - "C:/Program Files (x86)/CipherShell/sbin/nasm"
+      - "C:/Program Files (x86)/CipherShell/nasm.com"
+      - "C:/Program Files (x86)/CipherShell/nasm.exe"
+      - "C:/Program Files (x86)/CipherShell/nasm"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\Scripts\\"
+        - "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin"
+        - "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\libnvvp"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts\\"
+        - "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.10.7-hotspot\\bin"
+        - "D:\\Anaconda"
+        - "D:\\Anaconda\\Scripts"
+        - "C:\\ProgramData\\Oracle\\Java\\javapath"
+        - "D:\\vm\\bin\\"
+        - "C:\\WINDOWS\\system32"
+        - "C:\\WINDOWS"
+        - "C:\\WINDOWS\\System32\\Wbem"
+        - "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\"
+        - "C:\\WINDOWS\\System32\\OpenSSH\\"
+        - "C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common"
+        - "C:\\Program Files\\dotnet\\"
+        - "C:\\Program Files\\NVIDIA Corporation\\NVIDIA app\\NvDLISR"
+        - "c:\\Program Files (x86)\\Microsoft SQL Server\\100\\Tools\\Binn\\"
+        - "c:\\Program Files\\Microsoft SQL Server\\100\\Tools\\Binn\\"
+        - "c:\\Program Files\\Microsoft SQL Server\\100\\DTS\\Binn\\"
+        - "C:\\Program Files\\nodejs\\"
+        - "C:\\Program Files\\Microsoft SQL Server\\150\\Tools\\Binn\\"
+        - "C:\\Program Files\\Microsoft SQL Server\\Client SDK\\ODBC\\170\\Tools\\Binn\\"
+        - "C:\\Program Files\\CMake\\bin"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe"
+        - "D:\\Windows Kits\\10\\Windows Performance Toolkit\\"
+        - "D:\\cursor\\cursor\\resources\\app\\bin"
+        - "C:\\Program Files\\Microsoft SQL Server\\170\\Tools\\Binn\\"
+        - "C:\\Program Files\\Git\\cmd"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
+        - "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2024.1.0\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\Scripts\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts\\"
+        - "C:\\Users\\yjlnq\\.cargo\\bin"
+        - "d:\\cursor\\cursor\\resources\\app\\codeBin"
+        - "D:\\Anaconda"
+        - "D:\\Anaconda\\Library\\mingw-w64\\bin"
+        - "D:\\Anaconda\\Library\\usr\\bin"
+        - "D:\\Anaconda\\Library\\bin"
+        - "D:\\Anaconda\\Scripts"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Launcher\\"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Microsoft\\WindowsApps"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\cs-demo-manager"
+        - "C:\\Users\\yjlnq\\AppData\\Roaming\\npm"
+        - "C:\\Users\\yjlnq\\.dotnet\\tools"
+        - "D:\\vscode\\Microsoft VS Code\\bin"
+        - "D:\\pycharm\\PyCharm 2025.3\\bin"
+        - "C:\\Program Files\\Git\\mingw64\\bin"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe"
+        - "C:\\Users\\yjlnq\\.lmstudio\\bin"
+      CMAKE_INSTALL_PREFIX: "C:/Program Files (x86)/CipherShell"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "C:/Program Files"
+        - "C:/Program Files (x86)"
+        - "C:/Program Files/CMake"
+        - "C:/Program Files (x86)/CipherShell"
+...
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is GNU using "--version" did not match "(GNU assembler)|(GCC)|(Free Software Foundation)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is AppleClang using "--version" did not match "(Apple (clang|LLVM) version)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is Clang using "--version" did not match "(clang version)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is ARMClang using "--version" did not match "armclang":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is OrangeC using "--version" did not match "occ \\(OrangeC\\) Version":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is HP using "-V" did not match "HP C":
+      nasm: error: unrecognised option `-V'
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is Intel using "--version" did not match "(ICC)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is IntelLLVM using "--version" did not match "(Intel[^
+      ]+oneAPI)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is SunPro using "-V" did not match "Sun C":
+      nasm: error: unrecognised option `-V'
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is XL using "-qversion" did not match "XL C":
+      nasm: error: unrecognised option `-q'
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is MSVC using "-?" did not match "Microsoft":
+      Usage: C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe [-@ response_file] [options...] [--] filename
+        Options:
+          -v (or --v)    print the NASM version number and exit
+          -@ file        response file; one command line option per line
+          -h             list command line options and exit (also --help)
+          -h -opt        show additional help for option "-opt"
+          -h all         show all available command line help
+          -h topics      show list of help topics (also -h list)
+          -o outfile     write output to outfile
+          --keep-all     output files will not be removed even if an error happens
+          -Xformat       specify error reporting format (see -h -X)
+          -s             redirect messages to stdout
+          -Zfile         redirect messages to file
+          --info[=lvl]   display optional informational messages
+          --debug[=lvl]  display NASM internal debugging messages
+          -M...          generate Makefile dependencies (see -h -M)
+          -f format      select output file format (see -h -f)
+          -g             generate debugging information
+          -F format      select a debugging format (see -h -F)
+          -gformat       same as -g -F format
+          -l listfile    write listing to a list file
+          -Lflags...     add information to the list file (see -h -L)
+          -Oflags...     select optimization (see -h -O)
+          -t             assemble in limited SciTech TASM compatible mode
+          -E (or -e)     preprocess only (writes output to stdout by default)
+          -a             don't preprocess (assemble only)
+          -Ipath         add a pathname to the include file path
+          -Pfile         pre-include a file (also --include)
+          -Dmacro[=str]  pre-define a macro
+          -Umacro        undefine a macro
+          -w+x           enable warning x  (see -h -w)(also -Wx)
+          -w-x           disable warning x (also -Wno-x)
+          -w[+-]error    promote all warnings to errors (also -Werror)
+          -w[+-]error=x  promote warning x to errors (also -Werror=x)
+          --pragma str   pre-executes a specific %pragma
+          --before str   add line (usually a preprocessor statement) before the input
+          --bits nn      set bits to nn (equivalent to --before "BITS nn")
+          --no-line      ignore %line directives in input
+          --gprefix str  prepend the given string to the names of all extern,
+                         common and global symbols (also --prefix)
+          --gpostfix str append the given string to the names of all extern,
+                         common and global symbols (also --postfix)
+          --lprefix str  prepend the given string to local symbols
+          --lpostfix str append the given string to local symbols
+          --reproducible attempt to produce run-to-run identical output
+          --limit-* val  set execution limit (see -h --limit)
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is TI using "-h" did not match "Texas Instruments":
+      Usage: C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe [-@ response_file] [options...] [--] filename
+        Options:
+          -v (or --v)    print the NASM version number and exit
+          -@ file        response file; one command line option per line
+          -h             list command line options and exit (also --help)
+          -h -opt        show additional help for option "-opt"
+          -h all         show all available command line help
+          -h topics      show list of help topics (also -h list)
+          -o outfile     write output to outfile
+          --keep-all     output files will not be removed even if an error happens
+          -Xformat       specify error reporting format (see -h -X)
+          -s             redirect messages to stdout
+          -Zfile         redirect messages to file
+          --info[=lvl]   display optional informational messages
+          --debug[=lvl]  display NASM internal debugging messages
+          -M...          generate Makefile dependencies (see -h -M)
+          -f format      select output file format (see -h -f)
+          -g             generate debugging information
+          -F format      select a debugging format (see -h -F)
+          -gformat       same as -g -F format
+          -l listfile    write listing to a list file
+          -Lflags...     add information to the list file (see -h -L)
+          -Oflags...     select optimization (see -h -O)
+          -t             assemble in limited SciTech TASM compatible mode
+          -E (or -e)     preprocess only (writes output to stdout by default)
+          -a             don't preprocess (assemble only)
+          -Ipath         add a pathname to the include file path
+          -Pfile         pre-include a file (also --include)
+          -Dmacro[=str]  pre-define a macro
+          -Umacro        undefine a macro
+          -w+x           enable warning x  (see -h -w)(also -Wx)
+          -w-x           disable warning x (also -Wno-x)
+          -w[+-]error    promote all warnings to errors (also -Werror)
+          -w[+-]error=x  promote warning x to errors (also -Werror=x)
+          --pragma str   pre-executes a specific %pragma
+          --before str   add line (usually a preprocessor statement) before the input
+          --bits nn      set bits to nn (equivalent to --before "BITS nn")
+          --no-line      ignore %line directives in input
+          --gprefix str  prepend the given string to the names of all extern,
+                         common and global symbols (also --prefix)
+          --gpostfix str append the given string to the names of all extern,
+                         common and global symbols (also --postfix)
+          --lprefix str  prepend the given string to local symbols
+          --lpostfix str append the given string to local symbols
+          --reproducible attempt to produce run-to-run identical output
+          --limit-* val  set execution limit (see -h --limit)
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is TIClang using "--version" did not match "(TI (.*) Clang Compiler)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is IAR using "" did not match "IAR Assembler":
+      nasm: fatal: no input file specified
+      Usage: C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe [-@ response_file] [options...] [--] filename
+         For additional help:
+             C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe -h [run|topics|all|-option]
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is Diab using "-V" did not match "Wind River Systems":
+      nasm: error: unrecognised option `-V'
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1303 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is ARMCC using "" did not match "(ARM Compiler)|(ARM Assembler)|(Arm Compiler)":
+      nasm: fatal: no input file specified
+      Usage: C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe [-@ response_file] [options...] [--] filename
+         For additional help:
+             C:/Users/yjlnq/AppData/Local/bin/NASM/nasm.exe -h [run|topics|all|-option]
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:1290 (message)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:170 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    message: |
+      Checking whether the ASM_NASM compiler is NASM using "-v" matched "(NASM version)":
+      NASM version 3.02rc12 compiled on Jun 26 2026
+  -
+    kind: "find-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeFindBinUtils.cmake:37 (find_program)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeFindBinUtils.cmake:65 (__resolve_tool_path)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeFindBinUtils.cmake:104 (__resolve_linker_path)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASMCompiler.cmake:267 (include)"
+      - "C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeDetermineASM_NASMCompiler.cmake:22 (include)"
+      - "CMakeLists.txt:44 (enable_language)"
+    mode: "program"
+    variable: "_CMAKE_TOOL_WITH_PATH"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: false
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: false
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "lld-link"
+    candidate_directories:
+      - "C:/Users/yjlnq/AppData/Local/bin/NASM/"
+      - "C:/Users/yjlnq/bin/"
+      - "C:/Program Files/Git/mingw64/bin/"
+      - "C:/Program Files/Git/usr/local/bin/"
+      - "C:/Program Files/Git/usr/bin/"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/debugCommand/"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/copilotCli/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/"
+      - "D:/Anaconda/"
+      - "D:/Anaconda/Scripts/"
+      - "C:/ProgramData/Oracle/Java/javapath/"
+      - "D:/vm/bin/"
+      - "C:/Windows/System32/"
+      - "C:/Windows/"
+      - "C:/Windows/System32/wbem/"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/"
+      - "C:/Windows/System32/OpenSSH/"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/"
+      - "C:/Program Files/dotnet/"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/"
+      - "C:/Program Files/nodejs/"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/"
+      - "C:/Program Files/CMake/bin/"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/"
+      - "D:/cursor/cursor/resources/app/bin/"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/"
+      - "C:/Program Files/Git/cmd/"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/"
+      - "C:/Users/yjlnq/.cargo/bin/"
+      - "D:/cursor/cursor/resources/app/codeBin/"
+      - "D:/Anaconda/Library/mingw-w64/bin/"
+      - "D:/Anaconda/Library/usr/bin/"
+      - "D:/Anaconda/Library/bin/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/"
+      - "C:/Users/yjlnq/.dotnet/tools/"
+      - "D:/vscode/Microsoft VS Code/bin/"
+      - "D:/pycharm/PyCharm 2025.3/bin/"
+      - "C:/Users/yjlnq/.lmstudio/bin/"
+      - "C:/Program Files/Git/usr/bin/vendor_perl/"
+      - "C:/Program Files/Git/usr/bin/core_perl/"
+      - "C:/Program Files/bin/"
+      - "C:/Program Files/sbin/"
+      - "C:/Program Files/"
+      - "C:/Program Files (x86)/bin/"
+      - "C:/Program Files (x86)/sbin/"
+      - "C:/Program Files (x86)/"
+      - "C:/Program Files/CMake/bin/"
+      - "C:/Program Files/CMake/sbin/"
+      - "C:/Program Files/CMake/"
+      - "C:/Program Files (x86)/CipherShell/bin/"
+      - "C:/Program Files (x86)/CipherShell/sbin/"
+      - "C:/Program Files (x86)/CipherShell/"
+    searched_directories:
+      - "C:/Users/yjlnq/AppData/Local/bin/NASM/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/bin/NASM/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/bin/NASM/lld-link"
+      - "C:/Users/yjlnq/bin/lld-link.com"
+      - "C:/Users/yjlnq/bin/lld-link.exe"
+      - "C:/Users/yjlnq/bin/lld-link"
+      - "C:/Program Files/Git/mingw64/bin/lld-link.com"
+      - "C:/Program Files/Git/mingw64/bin/lld-link.exe"
+      - "C:/Program Files/Git/mingw64/bin/lld-link"
+      - "C:/Program Files/Git/usr/local/bin/lld-link.com"
+      - "C:/Program Files/Git/usr/local/bin/lld-link.exe"
+      - "C:/Program Files/Git/usr/local/bin/lld-link"
+      - "C:/Program Files/Git/usr/bin/lld-link.com"
+      - "C:/Program Files/Git/usr/bin/lld-link.exe"
+      - "C:/Program Files/Git/usr/bin/lld-link"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/debugCommand/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/debugCommand/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/debugCommand/lld-link"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/copilotCli/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/copilotCli/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Roaming/Code/User/globalStorage/github.copilot-chat/copilotCli/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python312/Scripts/lld-link"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/lld-link.com"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/lld-link.exe"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/lld-link"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/lld-link.com"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/lld-link.exe"
+      - "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/libnvvp/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Python310/Scripts/lld-link"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/lld-link.com"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/lld-link.exe"
+      - "C:/Program Files/Eclipse Adoptium/jdk-21.0.10.7-hotspot/bin/lld-link"
+      - "D:/Anaconda/lld-link.com"
+      - "D:/Anaconda/lld-link.exe"
+      - "D:/Anaconda/lld-link"
+      - "D:/Anaconda/Scripts/lld-link.com"
+      - "D:/Anaconda/Scripts/lld-link.exe"
+      - "D:/Anaconda/Scripts/lld-link"
+      - "C:/ProgramData/Oracle/Java/javapath/lld-link.com"
+      - "C:/ProgramData/Oracle/Java/javapath/lld-link.exe"
+      - "C:/ProgramData/Oracle/Java/javapath/lld-link"
+      - "D:/vm/bin/lld-link.com"
+      - "D:/vm/bin/lld-link.exe"
+      - "D:/vm/bin/lld-link"
+      - "C:/Windows/System32/lld-link.com"
+      - "C:/Windows/System32/lld-link.exe"
+      - "C:/Windows/System32/lld-link"
+      - "C:/Windows/lld-link.com"
+      - "C:/Windows/lld-link.exe"
+      - "C:/Windows/lld-link"
+      - "C:/Windows/System32/wbem/lld-link.com"
+      - "C:/Windows/System32/wbem/lld-link.exe"
+      - "C:/Windows/System32/wbem/lld-link"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/lld-link.com"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/lld-link.exe"
+      - "C:/Windows/System32/WindowsPowerShell/v1.0/lld-link"
+      - "C:/Windows/System32/OpenSSH/lld-link.com"
+      - "C:/Windows/System32/OpenSSH/lld-link.exe"
+      - "C:/Windows/System32/OpenSSH/lld-link"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/lld-link.com"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/lld-link.exe"
+      - "C:/Program Files (x86)/NVIDIA Corporation/PhysX/Common/lld-link"
+      - "C:/Program Files/dotnet/lld-link.com"
+      - "C:/Program Files/dotnet/lld-link.exe"
+      - "C:/Program Files/dotnet/lld-link"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/lld-link.com"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/lld-link.exe"
+      - "C:/Program Files/NVIDIA Corporation/NVIDIA app/NvDLISR/lld-link"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/lld-link.com"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/lld-link.exe"
+      - "C:/Program Files (x86)/Microsoft SQL Server/100/Tools/Binn/lld-link"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/lld-link.com"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/lld-link.exe"
+      - "C:/Program Files/Microsoft SQL Server/100/Tools/Binn/lld-link"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/lld-link.com"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/lld-link.exe"
+      - "C:/Program Files/Microsoft SQL Server/100/DTS/Binn/lld-link"
+      - "C:/Program Files/nodejs/lld-link.com"
+      - "C:/Program Files/nodejs/lld-link.exe"
+      - "C:/Program Files/nodejs/lld-link"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/lld-link.com"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/lld-link.exe"
+      - "C:/Program Files/Microsoft SQL Server/150/Tools/Binn/lld-link"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/lld-link.com"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/lld-link.exe"
+      - "C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/170/Tools/Binn/lld-link"
+      - "C:/Program Files/CMake/bin/lld-link.com"
+      - "C:/Program Files/CMake/bin/lld-link.exe"
+      - "C:/Program Files/CMake/bin/lld-link"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/lld-link.com"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/lld-link.exe"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe/lld-link"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/lld-link.com"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/lld-link.exe"
+      - "D:/Windows Kits/10/Windows Performance Toolkit/lld-link"
+      - "D:/cursor/cursor/resources/app/bin/lld-link.com"
+      - "D:/cursor/cursor/resources/app/bin/lld-link.exe"
+      - "D:/cursor/cursor/resources/app/bin/lld-link"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/lld-link.com"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/lld-link.exe"
+      - "C:/Program Files/Microsoft SQL Server/170/Tools/Binn/lld-link"
+      - "C:/Program Files/Git/cmd/lld-link.com"
+      - "C:/Program Files/Git/cmd/lld-link.exe"
+      - "C:/Program Files/Git/cmd/lld-link"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/lld-link.com"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/lld-link.exe"
+      - "D:/vs2022/vs2022.exe/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/lld-link"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/lld-link.com"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/lld-link.exe"
+      - "C:/Program Files/NVIDIA Corporation/Nsight Compute 2024.1.0/lld-link"
+      - "C:/Users/yjlnq/.cargo/bin/lld-link.com"
+      - "C:/Users/yjlnq/.cargo/bin/lld-link.exe"
+      - "C:/Users/yjlnq/.cargo/bin/lld-link"
+      - "D:/cursor/cursor/resources/app/codeBin/lld-link.com"
+      - "D:/cursor/cursor/resources/app/codeBin/lld-link.exe"
+      - "D:/cursor/cursor/resources/app/codeBin/lld-link"
+      - "D:/Anaconda/Library/mingw-w64/bin/lld-link.com"
+      - "D:/Anaconda/Library/mingw-w64/bin/lld-link.exe"
+      - "D:/Anaconda/Library/mingw-w64/bin/lld-link"
+      - "D:/Anaconda/Library/usr/bin/lld-link.com"
+      - "D:/Anaconda/Library/usr/bin/lld-link.exe"
+      - "D:/Anaconda/Library/usr/bin/lld-link"
+      - "D:/Anaconda/Library/bin/lld-link.com"
+      - "D:/Anaconda/Library/bin/lld-link.exe"
+      - "D:/Anaconda/Library/bin/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/Python/Launcher/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Microsoft/WindowsApps/lld-link"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Local/Programs/cs-demo-manager/lld-link"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/lld-link.com"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/lld-link.exe"
+      - "C:/Users/yjlnq/AppData/Roaming/npm/lld-link"
+      - "C:/Users/yjlnq/.dotnet/tools/lld-link.com"
+      - "C:/Users/yjlnq/.dotnet/tools/lld-link.exe"
+      - "C:/Users/yjlnq/.dotnet/tools/lld-link"
+      - "D:/vscode/Microsoft VS Code/bin/lld-link.com"
+      - "D:/vscode/Microsoft VS Code/bin/lld-link.exe"
+      - "D:/vscode/Microsoft VS Code/bin/lld-link"
+      - "D:/pycharm/PyCharm 2025.3/bin/lld-link.com"
+      - "D:/pycharm/PyCharm 2025.3/bin/lld-link.exe"
+      - "D:/pycharm/PyCharm 2025.3/bin/lld-link"
+      - "C:/Users/yjlnq/.lmstudio/bin/lld-link.com"
+      - "C:/Users/yjlnq/.lmstudio/bin/lld-link.exe"
+      - "C:/Users/yjlnq/.lmstudio/bin/lld-link"
+      - "C:/Program Files/Git/usr/bin/vendor_perl/lld-link.com"
+      - "C:/Program Files/Git/usr/bin/vendor_perl/lld-link.exe"
+      - "C:/Program Files/Git/usr/bin/vendor_perl/lld-link"
+      - "C:/Program Files/Git/usr/bin/core_perl/lld-link.com"
+      - "C:/Program Files/Git/usr/bin/core_perl/lld-link.exe"
+      - "C:/Program Files/Git/usr/bin/core_perl/lld-link"
+      - "C:/Program Files/bin/lld-link.com"
+      - "C:/Program Files/bin/lld-link.exe"
+      - "C:/Program Files/bin/lld-link"
+      - "C:/Program Files/sbin/lld-link.com"
+      - "C:/Program Files/sbin/lld-link.exe"
+      - "C:/Program Files/sbin/lld-link"
+      - "C:/Program Files/lld-link.com"
+      - "C:/Program Files/lld-link.exe"
+      - "C:/Program Files/lld-link"
+      - "C:/Program Files (x86)/bin/lld-link.com"
+      - "C:/Program Files (x86)/bin/lld-link.exe"
+      - "C:/Program Files (x86)/bin/lld-link"
+      - "C:/Program Files (x86)/sbin/lld-link.com"
+      - "C:/Program Files (x86)/sbin/lld-link.exe"
+      - "C:/Program Files (x86)/sbin/lld-link"
+      - "C:/Program Files (x86)/lld-link.com"
+      - "C:/Program Files (x86)/lld-link.exe"
+      - "C:/Program Files (x86)/lld-link"
+      - "C:/Program Files/CMake/bin/lld-link.com"
+      - "C:/Program Files/CMake/bin/lld-link.exe"
+      - "C:/Program Files/CMake/bin/lld-link"
+      - "C:/Program Files/CMake/sbin/lld-link.com"
+      - "C:/Program Files/CMake/sbin/lld-link.exe"
+      - "C:/Program Files/CMake/sbin/lld-link"
+      - "C:/Program Files/CMake/lld-link.com"
+      - "C:/Program Files/CMake/lld-link.exe"
+      - "C:/Program Files/CMake/lld-link"
+      - "C:/Program Files (x86)/CipherShell/bin/lld-link.com"
+      - "C:/Program Files (x86)/CipherShell/bin/lld-link.exe"
+      - "C:/Program Files (x86)/CipherShell/bin/lld-link"
+      - "C:/Program Files (x86)/CipherShell/sbin/lld-link.com"
+      - "C:/Program Files (x86)/CipherShell/sbin/lld-link.exe"
+      - "C:/Program Files (x86)/CipherShell/sbin/lld-link"
+      - "C:/Program Files (x86)/CipherShell/lld-link.com"
+      - "C:/Program Files (x86)/CipherShell/lld-link.exe"
+      - "C:/Program Files (x86)/CipherShell/lld-link"
+    found: false
+    search_context:
+      ENV{PATH}:
+        - "C:\\Users\\yjlnq\\bin"
+        - "C:\\Program Files\\Git\\mingw64\\bin"
+        - "C:\\Program Files\\Git\\usr\\local\\bin"
+        - "C:\\Program Files\\Git\\usr\\bin"
+        - "C:\\Program Files\\Git\\usr\\bin"
+        - "C:\\Program Files\\Git\\mingw64\\bin"
+        - "C:\\Program Files\\Git\\usr\\bin"
+        - "C:\\Users\\yjlnq\\bin"
+        - "C:\\Users\\yjlnq\\AppData\\Roaming\\Code\\User\\globalStorage\\github.copilot-chat\\debugCommand"
+        - "C:\\Users\\yjlnq\\AppData\\Roaming\\Code\\User\\globalStorage\\github.copilot-chat\\copilotCli"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\Scripts"
+        - "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin"
+        - "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\libnvvp"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts"
+        - "C:\\Program Files\\Eclipse Adoptium\\jdk-21.0.10.7-hotspot\\bin"
+        - "D:\\Anaconda"
+        - "D:\\Anaconda\\Scripts"
+        - "C:\\ProgramData\\Oracle\\Java\\javapath"
+        - "D:\\vm\\bin"
+        - "C:\\WINDOWS\\system32"
+        - "C:\\WINDOWS"
+        - "C:\\WINDOWS\\System32\\Wbem"
+        - "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0"
+        - "C:\\WINDOWS\\System32\\OpenSSH"
+        - "C:\\Program Files (x86)\\NVIDIA Corporation\\PhysX\\Common"
+        - "C:\\Program Files\\dotnet"
+        - "C:\\Program Files\\NVIDIA Corporation\\NVIDIA app\\NvDLISR"
+        - "C:\\Program Files (x86)\\Microsoft SQL Server\\100\\Tools\\Binn"
+        - "C:\\Program Files\\Microsoft SQL Server\\100\\Tools\\Binn"
+        - "C:\\Program Files\\Microsoft SQL Server\\100\\DTS\\Binn"
+        - "C:\\Program Files\\nodejs"
+        - "C:\\Program Files\\Microsoft SQL Server\\150\\Tools\\Binn"
+        - "C:\\Program Files\\Microsoft SQL Server\\Client SDK\\ODBC\\170\\Tools\\Binn"
+        - "C:\\Program Files\\CMake\\bin"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe"
+        - "D:\\Windows Kits\\10\\Windows Performance Toolkit"
+        - "D:\\cursor\\cursor\\resources\\app\\bin"
+        - "C:\\Program Files\\Microsoft SQL Server\\170\\Tools\\Binn"
+        - "C:\\Program Files\\Git\\cmd"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64"
+        - "C:\\Program Files\\NVIDIA Corporation\\Nsight Compute 2024.1.0"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312\\Scripts"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python312"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts"
+        - "C:\\Users\\yjlnq\\.cargo\\bin"
+        - "D:\\cursor\\cursor\\resources\\app\\codeBin"
+        - "D:\\Anaconda"
+        - "D:\\Anaconda\\Library\\mingw-w64\\bin"
+        - "D:\\Anaconda\\Library\\usr\\bin"
+        - "D:\\Anaconda\\Library\\bin"
+        - "D:\\Anaconda\\Scripts"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310\\Scripts"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Python310"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\Python\\Launcher"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Microsoft\\WindowsApps"
+        - "C:\\Users\\yjlnq\\AppData\\Local\\Programs\\cs-demo-manager"
+        - "C:\\Users\\yjlnq\\AppData\\Roaming\\npm"
+        - "C:\\Users\\yjlnq\\.dotnet\\tools"
+        - "D:\\vscode\\Microsoft VS Code\\bin"
+        - "D:\\pycharm\\PyCharm 2025.3\\bin"
+        - "C:\\Program Files\\Git\\mingw64\\bin"
+        - "D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe"
+        - "C:\\Users\\yjlnq\\.lmstudio\\bin"
+        - "C:\\Program Files\\Git\\usr\\bin\\vendor_perl"
+        - "C:\\Program Files\\Git\\usr\\bin\\core_perl"
+      CMAKE_INSTALL_PREFIX: "C:/Program Files (x86)/CipherShell"
+      CMAKE_SYSTEM_PREFIX_PATH:
+        - "C:/Program Files"
+        - "C:/Program Files (x86)"
+        - "C:/Program Files/CMake"
+        - "C:/Program Files (x86)/CipherShell"
+...

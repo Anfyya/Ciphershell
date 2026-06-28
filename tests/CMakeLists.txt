@@ -22,6 +22,16 @@ target_link_libraries(test_vm_correctness PRIVATE
     ciphershell_packer
 )
 
+# 性能基准测试
+add_executable(benchmark
+    benchmark.cpp
+)
+
+target_link_libraries(benchmark PRIVATE
+    ciphershell_packer
+    psapi
+)
+
 # ============================================================================
 # 测试辅助程序
 # ============================================================================

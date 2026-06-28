@@ -37,10 +37,28 @@
     <ClCompile Include="D:\vscode\CipherShell\packer\transforms\translator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\transforms\stub_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="D:\vscode\CipherShell\packer\mutation\bytecode_encryptor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\vscode\CipherShell\packer\mutation\mutation_engine.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\transforms\vm_nester.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\transforms\nanomite.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\pe_parser\dll_packer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\analysis\hotspot_analyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\vscode\CipherShell\packer\gui\console_gui.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="D:\vscode\CipherShell\packer\config\config_parser.cpp">

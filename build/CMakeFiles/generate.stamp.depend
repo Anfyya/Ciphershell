@@ -1,4 +1,6 @@
 # CMake generation dependency list for this directory.
+C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeASMInformation.cmake
+C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeASM_NASMInformation.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeCXXInformation.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeCommonLanguageInclude.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/CMakeGenericSystem.cmake
@@ -11,6 +13,8 @@ C:/Program Files/CMake/share/cmake-4.2/Modules/CheckLanguage.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Compiler/CMakeCommonCompilerMacros.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Compiler/MSVC-CXX.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Compiler/MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.2/Modules/Internal/CMakeASMLinkerInformation.cmake
+C:/Program Files/CMake/share/cmake-4.2/Modules/Internal/CMakeASM_NASMLinkerInformation.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Internal/CMakeCXXLinkerInformation.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Internal/CMakeCommonLinkerInformation.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Linker/MSVC-CXX.cmake
@@ -22,7 +26,9 @@ C:/Program Files/CMake/share/cmake-4.2/Modules/Platform/Windows-MSVC-CXX.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Platform/Windows-MSVC.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Platform/Windows.cmake
 C:/Program Files/CMake/share/cmake-4.2/Modules/Platform/WindowsPaths.cmake
+C:\Program Files\CMake\share\cmake-4.2\Templates\MSBuild\nasm.props.in
 D:/vscode/CipherShell/CMakeLists.txt
+D:/vscode/CipherShell/build/CMakeFiles/4.2.1/CMakeASM_NASMCompiler.cmake
 D:/vscode/CipherShell/build/CMakeFiles/4.2.1/CMakeCXXCompiler.cmake
 D:/vscode/CipherShell/build/CMakeFiles/4.2.1/CMakeRCCompiler.cmake
 D:/vscode/CipherShell/build/CMakeFiles/4.2.1/CMakeSystem.cmake

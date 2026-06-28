@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include <random>
 
 namespace CipherShell {
 
@@ -164,7 +165,9 @@ std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
     }
 
     // 打乱
-    std::random_shuffle(randomOpcodes.begin(), randomOpcodes.end());
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(randomOpcodes.begin(), randomOpcodes.end(), g);
 
     for (int i = 0; i < count; i++) {
         opcodeMap[standardOpcodes[i]] = randomOpcodes[i];

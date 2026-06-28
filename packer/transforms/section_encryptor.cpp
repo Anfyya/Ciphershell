@@ -198,16 +198,15 @@ bool SectionEncryptor::EncryptSection(
         return false;
     }
 
-    // 初始化 ChaCha20
-    ChaCha20 cipher;
-    cipher.Init(key.key, key.nonce, key.counter);
-
-    // 加密 section 数据
+    // XOR with key[0] (single byte, matching stub implementation)
     BYTE* sectionData = image->rawData + section->PointerToRawData;
-    cipher.ProcessInPlace(sectionData, section->SizeOfRawData);
+    for (DWORD i = 0; i < section->SizeOfRawData; i++) {
+        sectionData[i] ^= key.key[0];
+    }
 
-    // 如果配置要求，移除执行权限
-    section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
+    // 给 section 加写权限，stub 需要写回解密后的数据
+    section->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    // section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
 
     return true;
 }

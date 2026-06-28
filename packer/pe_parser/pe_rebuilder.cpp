@@ -30,22 +30,8 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         return nullptr;
     }
 
-    // 计算输出大小
-    // 头大小 + 所有 section 大小 + overlay
-    DWORD headerSize = image->sections[0].PointerToRawData;
-    DWORD sectionsSize = 0;
-
-    for (WORD i = 0; i < image->numSections; i++) {
-        sectionsSize += AlignValue(image->sections[i].SizeOfRawData, config.fileAlignment);
-    }
-
-    DWORD overlaySize = 0;
-    if (config.preserveOverlay && image->hasOverlay) {
-        overlaySize = image->rawSize - image->overlayOffset;
-    }
-
-    DWORD totalSize = AlignValue(headerSize, config.fileAlignment) + sectionsSize + overlaySize;
-    totalSize = AlignValue(totalSize, config.fileAlignment) + 0x1000;  // 额外空间
+    // 简单方法：复制整个原始文件，然后修改
+    DWORD totalSize = image->rawSize + 0x10000;  // 额外空间
 
     // 分配输出缓冲区
     BYTE* output = new(std::nothrow) BYTE[totalSize];
@@ -54,30 +40,58 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
     }
     memset(output, 0, totalSize);
 
-    // 重建头部
-    if (!RebuildHeaders(output, image, config)) {
-        delete[] output;
-        return nullptr;
+    // 复制原始数据
+    memcpy(output, image->rawData, image->rawSize);
+
+    // 获取 NT Headers
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
+    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew >= image->rawSize) {
+        *outputSize = image->rawSize;
+        return output;
     }
 
-    // 重建 sections
-    if (!RebuildSections(output, image, config)) {
-        delete[] output;
-        return nullptr;
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
+
+    // 清除时间戳
+    if (config.zeroTimestamps) {
+        ntHeaders->FileHeader.TimeDateStamp = 0;
     }
 
-    // 重建 overlay
-    if (!RebuildOverlay(output, image, config)) {
-        delete[] output;
-        return nullptr;
+    // 清除调试信息
+    if (!config.preserveDebugInfo) {
+        if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)ntHeaders;
+            nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+            nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+        } else {
+            PIMAGE_NT_HEADERS32 nt32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+            nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+            nt32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+        }
     }
 
-    // 更新校验和
+    // 清除校验和
     if (!config.preserveChecksum) {
-        UpdateChecksum(output);
+        if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            ((PIMAGE_NT_HEADERS64)ntHeaders)->OptionalHeader.CheckSum = 0;
+        } else {
+            ((PIMAGE_NT_HEADERS32)ntHeaders)->OptionalHeader.CheckSum = 0;
+        }
     }
 
-    *outputSize = totalSize;
+    // 随机化 section 名称
+    if (config.randomizeSectionNames) {
+        PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
+        for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+            char name[9] = {0};
+            memcpy(name, sections[i].Name, 8);
+            if (strncmp(name, ".rsrc", 5) != 0 && strncmp(name, ".reloc", 6) != 0) {
+                GenerateRandomName((char*)sections[i].Name, 8);
+            }
+        }
+    }
+
+    *outputSize = image->rawSize;
     return output;
 }
 
@@ -121,44 +135,53 @@ bool PERebuilder::SetEntryPoint(CS_PE_IMAGE* image, DWORD newEntryPoint) {
 bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
     // 复制原始头部
     DWORD headerSize = image->sections[0].PointerToRawData;
+    if (headerSize == 0 || headerSize > image->rawSize) headerSize = 0x400;
+    if (headerSize > image->rawSize) headerSize = image->rawSize;
+    
     memcpy(output, image->rawData, headerSize);
 
-    // 获取 NT Headers 指针
+    // 获取输出缓冲区中的 NT Headers 指针
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
+    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew > headerSize) return true;
+    
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
 
     // 处理 Rich Header
-    if (!config.preserveRichHeader && image->hasRichHeader) {
-        // 清除 Rich Header
-        memset(output + sizeof(IMAGE_DOS_HEADER),
-               0,
-               image->richHeaderOffset - sizeof(IMAGE_DOS_HEADER));
+    if (!config.preserveRichHeader && image->hasRichHeader && image->richHeaderOffset > sizeof(IMAGE_DOS_HEADER)) {
+        DWORD richClearSize = image->richHeaderOffset - sizeof(IMAGE_DOS_HEADER);
+        if (richClearSize < headerSize) {
+            memset(output + sizeof(IMAGE_DOS_HEADER), 0, richClearSize);
+        }
     }
 
-    // 处理时间戳
+    // 处理时间戳（修改输出缓冲区，不是原始镜像）
     if (config.zeroTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = 0;
     } else if (config.randomizeTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = GenerateRandomDWORD();
     }
 
-    // 处理调试信息
+    // 处理调试信息（修改输出缓冲区）
     if (!config.preserveDebugInfo) {
-        if (image->is64Bit) {
-            image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
-            image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+        if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
+            ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+            ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
         } else {
-            image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
-            image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
+            PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+            ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
+            ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
         }
     }
 
     // 处理校验和
     if (!config.preserveChecksum) {
-        if (image->is64Bit) {
-            image->ntHeaders64->OptionalHeader.CheckSum = 0;
+        if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+            PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
+            ntHeaders64->OptionalHeader.CheckSum = 0;
         } else {
-            image->ntHeaders32->OptionalHeader.CheckSum = 0;
+            PIMAGE_NT_HEADERS32 ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
+            ntHeaders32->OptionalHeader.CheckSum = 0;
         }
     }
 
@@ -168,39 +191,50 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
     // 获取 NT Headers 信息
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
+    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew > 0x1000) return false;
+    
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
 
-    DWORD currentOffset = AlignValue(image->sections[0].PointerToRawData, config.fileAlignment);
+    DWORD headerSize = image->sections[0].PointerToRawData;
+    if (headerSize == 0 || headerSize > image->rawSize) headerSize = 0x200;
+    
+    DWORD currentOffset = AlignValue(headerSize, config.fileAlignment);
 
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
+        // 安全检查
+        if (section->SizeOfRawData == 0) continue;
+        if (section->PointerToRawData == 0) continue;
+        if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) continue;
+
         // 复制 section 数据
-        if (section->SizeOfRawData > 0 && section->PointerToRawData > 0) {
-            DWORD copySize = (std::min)(section->SizeOfRawData, section->Misc.VirtualSize);
+        DWORD copySize = (std::min)(section->SizeOfRawData, section->Misc.VirtualSize);
+        if (copySize > 0 && currentOffset + copySize <= config.fileAlignment * 1000) {
             memcpy(output + currentOffset,
                    image->rawData + section->PointerToRawData,
                    copySize);
         }
 
         // 更新 section 头中的偏移
-        PIMAGE_SECTION_HEADER outputSection = (PIMAGE_SECTION_HEADER)(
-            output + dosHeader->e_lfanew +
+        DWORD sectionHeaderOffset = dosHeader->e_lfanew +
             sizeof(DWORD) +  // PE signature
             sizeof(IMAGE_FILE_HEADER) +
             ntHeaders->FileHeader.SizeOfOptionalHeader +
-            i * sizeof(IMAGE_SECTION_HEADER)
-        );
+            i * sizeof(IMAGE_SECTION_HEADER);
+        
+        if (sectionHeaderOffset + sizeof(IMAGE_SECTION_HEADER) <= headerSize) {
+            PIMAGE_SECTION_HEADER outputSection = (PIMAGE_SECTION_HEADER)(output + sectionHeaderOffset);
+            outputSection->PointerToRawData = currentOffset;
+            outputSection->SizeOfRawData = AlignValue(section->SizeOfRawData, config.fileAlignment);
 
-        outputSection->PointerToRawData = currentOffset;
-        outputSection->SizeOfRawData = AlignValue(section->SizeOfRawData, config.fileAlignment);
-
-        // 随机化 section 名称
-        if (config.randomizeSectionNames) {
-            // 保留 .rsrc 和 .reloc 名称以兼容 Windows loader
-            if (strncmp((char*)section->Name, ".rsrc", 5) != 0 &&
-                strncmp((char*)section->Name, ".reloc", 6) != 0) {
-                GenerateRandomName((char*)outputSection->Name, 8);
+            // 随机化 section 名称
+            if (config.randomizeSectionNames) {
+                char name[9] = {0};
+                memcpy(name, outputSection->Name, 8);
+                if (strncmp(name, ".rsrc", 5) != 0 && strncmp(name, ".reloc", 6) != 0) {
+                    GenerateRandomName((char*)outputSection->Name, 8);
+                }
             }
         }
 

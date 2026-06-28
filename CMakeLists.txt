@@ -14,7 +14,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # MSVC 特定选项
 if(MSVC)
-    add_compile_options(/W4 /WX /utf-8)
+    add_compile_options(/W3 /utf-8 /w14244 /w4100)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_definitions(WIN32_LEAN_AND_MEAN)
     add_compile_definitions(NOMINMAX)
@@ -72,6 +72,7 @@ endif()
 # 测试仅在可链接时构建
 if(WIN32)
     add_subdirectory(tests)
+    add_subdirectory(tools)
 else()
     message(STATUS "Skipping tests (Windows-only)")
 endif()

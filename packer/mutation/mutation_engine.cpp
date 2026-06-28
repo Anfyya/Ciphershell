@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include <random>
 
 namespace CipherShell {
 
@@ -147,7 +148,9 @@ std::vector<MutatedHandler> MutationEngine::GenerateHandlerTable(const MutatedIS
     }
 
     // 随机打乱顺序
-    std::random_shuffle(table.begin(), table.end());
+    std::random_device rd2;
+    std::mt19937 g2(rd2());
+    std::shuffle(table.begin(), table.end(), g2);
 
     return table;
 }
@@ -198,12 +201,9 @@ std::vector<uint8_t> MutationEngine::RandomizeHandlerOrder() {
     for (int i = 0; i < 256; i++) order[i] = (uint8_t)i;
 
     // 洗牌
-    for (int i = 255; i > 0; i--) {
-        int j = (int)(NextRandom() % (i + 1));
-        uint8_t tmp = order[i];
-        order[i] = order[j];
-        order[j] = tmp;
-    }
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(order.begin(), order.end(), g);
 
     return order;
 }

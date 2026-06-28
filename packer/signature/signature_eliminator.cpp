@@ -318,11 +318,13 @@ bool SignatureEliminator::ClearChecksum(CS_PE_IMAGE* image) {
 
 bool SignatureEliminator::NormalizePermissions(CS_PE_IMAGE* image) {
     // 确保 section 权限看起来正常
-    // 不要设置 RWX（这会引起怀疑）
+    // 注意：保留加壳时设置的 WRITE 权限（stub 解密需要）
 
     for (WORD i = 0; i < image->numSections; i++) {
-        char name[9] = {0};
-        memcpy(name, image->sections[i].Name, 8);
+        // 只规范非加密段的权限，保留加密段已有的 WRITE 标志
+        if (image->sections[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+            continue;  // 已经有写权限，保持不变（可能是加壳设置的）
+        }
 
         // 代码段应该是 R-X
         if (image->sections[i].Characteristics & IMAGE_SCN_CNT_CODE) {

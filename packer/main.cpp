@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <windows.h>
 
 #include "pe_parser/pe_parser.h"
 #include "pe_parser/pe_rebuilder.h"
@@ -22,6 +23,8 @@
 #include "transforms/cfg_flattener.h"
 #include "transforms/opaque_predicates.h"
 #include "transforms/bogus_flow.h"
+#include "transforms/stub_builder.h"
+#include "gui/console_gui.h"
 
 namespace fs = std::filesystem;
 
@@ -60,6 +63,18 @@ CipherShell v0.1 - 自研高强度代码保护壳
 // ============================================================================
 
 int main(int argc, char* argv[]) {
+    // 设置控制台为 UTF-8 编码
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
+    // 如果没有参数，启动 GUI 模式
+    if (argc == 1) {
+        CipherShell::ConsoleGUI gui;
+        gui.Initialize();
+        gui.ShowMainMenu();
+        return 0;
+    }
+
     std::cout << "CipherShell v0.1 - 自研高强度代码保护壳" << std::endl;
     std::cout << "======================================" << std::endl;
 
@@ -191,25 +206,26 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
+    // Step 1.5: 保存原始入口点
+    // ============================================================================
+
+    DWORD originalOEP = 0;
+    if (image->is64Bit) {
+        originalOEP = image->ntHeaders64->OptionalHeader.AddressOfEntryPoint;
+    } else {
+        originalOEP = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
+    }
+    std::cout << "  原始入口点 (OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
+
+    // ============================================================================
     // Step 2: 应用保护变换
+    // 重要: 先做代码分析/变换（明文代码可反汇编），最后才做 Section 加密
     // ============================================================================
 
     std::cout << "\n[2/5] 应用保护变换 (L" << protectionLevel << ")..." << std::endl;
 
-    // L1: Section 加密
-    if (protectionLevel >= 1) {
-        std::cout << "  应用 Section 加密..." << std::endl;
-
-        CipherShell::SectionEncryptor encryptor;
-        CipherShell::CS_ENCRYPT_CONFIG encConfig;
-        CipherShell::CS_ENCRYPTION_KEY masterKey = encryptor.GenerateRandomKey();
-
-        auto encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
-        std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
-    }
-
-    // L1: 字符串加密
-    if (protectionLevel >= 1 && config.global.stringEncryption) {
+    // Phase A: 字符串加密（明文代码段中的内联字符串，L2+）
+    if (protectionLevel >= 2 && config.global.stringEncryption) {
         std::cout << "  应用字符串加密..." << std::endl;
 
         CipherShell::StringEncryptor strEncryptor;
@@ -224,8 +240,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // L1: 导入表混淆
-    if (protectionLevel >= 1 && config.global.importObfuscation) {
+    // Phase B: 导入表混淆（L2+）
+    if (protectionLevel >= 2 && config.global.importObfuscation) {
         std::cout << "  应用导入表混淆..." << std::endl;
 
         CipherShell::ImportObfuscator obfuscator;
@@ -239,14 +255,13 @@ int main(int argc, char* argv[]) {
         std::cout << "    混淆了 " << obfImports.size() << " 个导入函数" << std::endl;
     }
 
-    // L2: 控制流平坦化
-    if (protectionLevel >= 2) {
+    // Phase C: 控制流平坦化（L3+，暂禁用——GenerateFlattenedCode 需要优化）
+    if (protectionLevel >= 99) {  // FIXME: 暂时禁用，待优化
         std::cout << "  应用控制流平坦化..." << std::endl;
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
 
-        // 找到代码段
         for (WORD si = 0; si < image->numSections; si++) {
             IMAGE_SECTION_HEADER& sec = image->sections[si];
             if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
@@ -259,7 +274,11 @@ int main(int argc, char* argv[]) {
             uint64_t baseAddr = sec.VirtualAddress;
 
             auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
-            if (functions.empty()) continue;
+            if (functions.empty()) {
+                std::cout << "    代码段[" << si << "]: 未识别到函数（可能无返回指令）" << std::endl;
+                continue;
+            }
+            std::cout << "    代码段[" << si << "]: 识别到 " << functions.size() << " 个函数" << std::endl;
 
             CipherShell::CFGFlattener flattener;
             CipherShell::FlatteningConfig flatConfig;
@@ -269,18 +288,16 @@ int main(int argc, char* argv[]) {
 
             uint32_t flattenedCount = 0;
             for (const auto& func : functions) {
-                if (func.blocks.size() < 3) continue;  // 太小的函数不值得平坦化
+                if (func.blocks.size() < 2) continue;
 
                 auto flatResult = flattener.FlattenFunction(func, flatConfig);
                 DWORD codeSize = 0;
                 BYTE* flatCode = flattener.GenerateFlattenedCode(flatResult, is64, &codeSize);
                 if (flatCode && codeSize > 0) {
-                    // 将平坦化代码写回（如果大小允许）
                     DWORD funcSize = (DWORD)(func.size);
                     if (codeSize <= funcSize) {
                         DWORD funcOffset = (DWORD)(func.entryAddress - baseAddr);
                         memcpy(secData + funcOffset, flatCode, codeSize);
-                        // 剩余空间填充 INT3
                         if (codeSize < funcSize) {
                             memset(secData + funcOffset + codeSize, 0xCC, funcSize - codeSize);
                         }
@@ -293,7 +310,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // L3: 虚假控制流 + 不透明谓词
+    // Phase D: 虚假控制流（L3+，需在加密前反汇编明文代码）
     if (protectionLevel >= 3) {
         std::cout << "  应用虚假控制流..." << std::endl;
 
@@ -337,6 +354,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Phase E: Section 加密（L1+，最后执行——加密所有变换后的代码）
+    std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
+    if (protectionLevel >= 1) {
+        std::cout << "  应用 Section 加密..." << std::endl;
+
+        CipherShell::SectionEncryptor encryptor;
+        CipherShell::CS_ENCRYPT_CONFIG encConfig;
+        encConfig.encryptCodeSections = true;
+        encConfig.encryptDataSections = false;
+        encConfig.encryptResources = false;
+        CipherShell::CS_ENCRYPTION_KEY masterKey = encryptor.GenerateRandomKey();
+
+        encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
+        std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
+    }
+
     // ============================================================================
     // Step 3: 签名消除
     // ============================================================================
@@ -365,10 +398,26 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
-    // Step 4: 重建 PE
+    // Step 4: 嵌入 Stub（解密运行时）
     // ============================================================================
 
-    std::cout << "\n[4/5] 重建 PE 文件..." << std::endl;
+    std::cout << "\n[4/6] 嵌入解密 Stub..." << std::endl;
+
+    if (!encryptedSections.empty()) {
+        CipherShell::StubBuilder stubBuilder;
+        if (!stubBuilder.EmbedStub(image.get(), encryptedSections, originalOEP)) {
+            std::cerr << "  错误: Stub 嵌入失败" << std::endl;
+            return 1;
+        }
+    } else {
+        std::cout << "  跳过（无加密 section）" << std::endl;
+    }
+
+    // ============================================================================
+    // Step 5: 重建 PE
+    // ============================================================================
+
+    std::cout << "\n[5/6] 写入输出文件..." << std::endl;
 
     CipherShell::PERebuilder rebuilder;
     CipherShell::CS_REBUILD_CONFIG rebuildConfig;
@@ -393,18 +442,19 @@ int main(int argc, char* argv[]) {
     // Step 5: 写入输出文件
     // ============================================================================
 
-    std::cout << "\n[5/5] 写入输出文件..." << std::endl;
+    std::cout << "\n[5/6] 写入输出文件..." << std::endl;
 
+    // 直接写入 rawData（已包含 stub 和加密后的 section）
     FILE* outFile = fopen(outputFile.c_str(), "wb");
     if (!outFile) {
         std::cerr << "错误: 无法创建输出文件: " << outputFile << std::endl;
         return 1;
     }
-
-    fwrite(outputData.get(), 1, outputSize, outFile);
+    fwrite(image->rawData, 1, image->rawSize, outFile);
     fclose(outFile);
 
     std::cout << "  输出文件已保存: " << outputFile << std::endl;
+    std::cout << "  文件大小: " << image->rawSize << " 字节" << std::endl;
 
     // ============================================================================
     // Step 6: 验证输出

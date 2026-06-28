@@ -586,6 +586,37 @@ std::vector<Function> Disassembler::AnalyzeCode(
         functions.push_back(currentFunc);
     }
 
+    // ========================================================================
+    // 后处理：为每个函数的基本块计算后继信息
+    // ========================================================================
+    for (auto& func : functions) {
+        for (size_t bi = 0; bi < func.blocks.size(); bi++) {
+            auto& blk = func.blocks[bi];
+            if (blk.instructions.empty()) continue;
+
+            const auto& lastInstr = blk.instructions.back();
+
+            if (lastInstr.isReturn) {
+                // 返回：无后继
+                continue;
+            }
+
+            if (lastInstr.isBranch && !lastInstr.isConditional) {
+                // 无条件跳转：后继 = 目标地址
+                blk.successors.push_back(lastInstr.targetAddress);
+            } else if (lastInstr.isBranch && lastInstr.isConditional) {
+                // 条件跳转：两个后继（fallthrough + target）
+                blk.successors.push_back(lastInstr.address + lastInstr.length); // fallthrough
+                blk.successors.push_back(lastInstr.targetAddress);               // target
+            } else {
+                // 一般指令（含 call）：后继 = 下一块的起始地址（fallthrough）
+                if (bi + 1 < func.blocks.size()) {
+                    blk.successors.push_back(func.blocks[bi + 1].startAddress);
+                }
+            }
+        }
+    }
+
     return functions;
 }
 
