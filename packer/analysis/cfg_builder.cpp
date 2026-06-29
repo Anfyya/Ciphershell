@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <stack>
 #include <set>
+#include <functional>
 
 namespace CipherShell {
 
@@ -90,61 +91,113 @@ ControlFlowGraph CFGBuilder::Build(const std::vector<BasicBlock>& blocks) {
 }
 
 void CFGBuilder::ComputeDominatorTree(ControlFlowGraph& cfg) {
+    // BUG 5 修复：实现正确的 Cooper-Harvey-Kennedy 迭代支配树算法
+    // 原算法只做一遍且 Intersect 在 BFS 深度上比较（不正确），
+    // 需要使用 postorder 编号并循环直到不动点。
+
     if (cfg.nodes.empty()) return;
 
     size_t n = cfg.nodes.size();
 
-    // 初始化
-    std::unordered_map<uint64_t, uint64_t> idom;  // 直接支配者
-    std::unordered_map<uint64_t, uint32_t> depth;  // 节点深度
+    // 第一步：计算逆后序（reverse postorder）
+    std::vector<uint64_t> postOrder;
+    std::unordered_set<uint64_t> dfsVisited;
 
-    // 计算深度（通过 BFS）
-    std::queue<uint64_t> queue;
-    std::unordered_set<uint64_t> visited;
+    // DFS 计算后序
+    std::function<void(uint64_t)> dfs = [&](uint64_t nodeId) {
+        dfsVisited.insert(nodeId);
+        for (uint64_t succ : GetSuccessors(cfg, nodeId)) {
+            if (dfsVisited.find(succ) == dfsVisited.end()) {
+                dfs(succ);
+            }
+        }
+        postOrder.push_back(nodeId);
+    };
+    dfs(cfg.entryNodeId);
 
-    queue.push(cfg.entryNodeId);
-    depth[cfg.entryNodeId] = 0;
-    visited.insert(cfg.entryNodeId);
+    // postOrder[i] 的后序编号 = i
+    // 逆后序 = postOrder 反转
+    std::unordered_map<uint64_t, uint32_t> postOrderNum;
+    for (size_t i = 0; i < postOrder.size(); i++) {
+        postOrderNum[postOrder[i]] = (uint32_t)i;
+    }
+    std::vector<uint64_t> rpo(postOrder.rbegin(), postOrder.rend());
 
-    while (!queue.empty()) {
-        uint64_t current = queue.front();
-        queue.pop();
+    // 第二步：初始化 idom
+    std::unordered_map<uint64_t, uint64_t> idom;
+    const uint64_t UNDEFINED = (uint64_t)-1;
 
-        for (uint64_t successor : GetSuccessors(cfg, current)) {
-            if (visited.find(successor) == visited.end()) {
-                depth[successor] = depth[current] + 1;
-                visited.insert(successor);
-                queue.push(successor);
+    for (auto& node : cfg.nodes) {
+        idom[node.id] = UNDEFINED;
+        node.dominatorId = UNDEFINED;
+    }
+    idom[cfg.entryNodeId] = cfg.entryNodeId;  // 入口节点支配自身
+
+    // 第三步：Intersect 函数（在 postorder 编号上比较）
+    auto intersectFn = [&](uint64_t b1, uint64_t b2) -> uint64_t {
+        uint64_t finger1 = b1;
+        uint64_t finger2 = b2;
+        while (finger1 != finger2) {
+            // postorder 编号越小意味着在逆后序中越靠后
+            while (postOrderNum[finger1] < postOrderNum[finger2]) {
+                finger1 = idom[finger1];
+                if (finger1 == UNDEFINED) return finger2;
+            }
+            while (postOrderNum[finger2] < postOrderNum[finger1]) {
+                finger2 = idom[finger2];
+                if (finger2 == UNDEFINED) return finger1;
+            }
+        }
+        return finger1;
+    };
+
+    // 第四步：迭代直到不动点
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        // 按逆后序遍历（跳过入口节点）
+        for (uint64_t nodeId : rpo) {
+            if (nodeId == cfg.entryNodeId) continue;
+
+            auto preds = GetPredecessors(cfg, nodeId);
+            if (preds.empty()) continue;
+
+            // 找到第一个已处理的前驱
+            uint64_t newIdom = UNDEFINED;
+            for (uint64_t pred : preds) {
+                if (idom[pred] != UNDEFINED) {
+                    newIdom = pred;
+                    break;
+                }
+            }
+            if (newIdom == UNDEFINED) continue;
+
+            // 与其余已处理的前驱求交
+            for (uint64_t pred : preds) {
+                if (pred == newIdom) continue;
+                if (idom[pred] != UNDEFINED) {
+                    newIdom = intersectFn(pred, newIdom);
+                }
+            }
+
+            if (idom[nodeId] != newIdom) {
+                idom[nodeId] = newIdom;
+                changed = true;
             }
         }
     }
 
-    // 简化的支配树计算
-    // 对于每个节点，找到共同支配者
+    // 第五步：将结果写入 CFG 节点
     for (auto& node : cfg.nodes) {
         if (node.id == cfg.entryNodeId) {
-            node.dominatorId = (uint64_t)-1;  // 入口节点没有支配者
-            continue;
-        }
-
-        auto predecessors = GetPredecessors(cfg, node.id);
-        if (predecessors.empty()) {
-            node.dominatorId = (uint64_t)-1;
-            continue;
-        }
-
-        // 找到所有前驱的共同支配者
-        uint64_t commonDom = predecessors[0];
-        for (size_t i = 1; i < predecessors.size(); i++) {
-            commonDom = Intersect(commonDom, predecessors[i], depth, idom);
-        }
-
-        idom[node.id] = commonDom;
-        node.dominatorId = commonDom;
-
-        // 添加到支配者的被支配列表
-        if (commonDom < cfg.nodes.size()) {
-            cfg.nodes[commonDom].dominated.push_back(node.id);
+            node.dominatorId = UNDEFINED;  // 入口节点没有支配者
+        } else {
+            node.dominatorId = idom[node.id];
+            // 添加到支配者的被支配列表
+            uint64_t domId = idom[node.id];
+            if (domId != UNDEFINED && domId < cfg.nodes.size()) {
+                cfg.nodes[domId].dominated.push_back(node.id);
+            }
         }
     }
 }

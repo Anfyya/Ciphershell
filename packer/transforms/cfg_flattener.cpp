@@ -75,10 +75,12 @@ FlatteningResult CFGFlattener::Flatten(const ControlFlowGraph& cfg, const Flatte
             flatBlock.nextStateIdFalse = stateMap[succIds[0]];
         } else {
             // 多后继（条件分支）
+            // BUG 9 修复：后继列表中 succIds[0] 是 fallthrough（false 分支），
+            // succIds[1] 是条件跳转目标（true/taken 分支），之前赋值反了。
             flatBlock.isConditional = true;
-            flatBlock.nextStateIdTrue = stateMap[succIds[0]];
-            flatBlock.nextStateIdFalse = stateMap[succIds[1]];
-            flatBlock.nextStateId = stateMap[succIds[0]];  // 默认
+            flatBlock.nextStateIdTrue = stateMap[succIds[1]];   // taken 分支 = 跳转目标
+            flatBlock.nextStateIdFalse = stateMap[succIds[0]];  // fallthrough = false 分支
+            flatBlock.nextStateId = stateMap[succIds[0]];       // 默认 = fallthrough
         }
 
         result.blocks.push_back(flatBlock);
@@ -236,8 +238,15 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
         labelOffsets[LABEL_BLOCK_BASE + (int)i] = off;
         const auto& blk = result.blocks[i];
 
-        // 写入原始指令字节
-        for (const auto& instr : blk.originalBlock.instructions) {
+        // BUG 8 修复：写入原始指令字节时，剔除末尾的跳转指令
+        // 因为平坦化后原始跳转目标地址已失效，由 dispatcher 跳转替代
+        size_t instrCount = blk.originalBlock.instructions.size();
+        for (size_t j = 0; j < instrCount; j++) {
+            const auto& instr = blk.originalBlock.instructions[j];
+            // 跳过末尾的分支指令（条件跳转、无条件跳转），保留 call 和 ret
+            if (j == instrCount - 1 && instr.isBranch) {
+                continue;  // 剔除原始跳转，由下方 dispatcher 跳转替代
+            }
             for (size_t b = 0; b < instr.length; b++) {
                 code[off++] = instr.bytes[b];
             }
@@ -245,10 +254,26 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
 
         // 尾部跳转
         if (blk.isConditional) {
-            // 条件块：保留原始 Jcc 的条件码
-            // je trueTarget (0F 84 rel32)
+            // BUG 7 修复：保留原始条件类型，而不是全部硬编码为 JE (0F 84)
+            // 从原始块末尾的条件跳转指令中提取条件码
+            uint8_t condCode = 0x84;  // 默认 JE
+            if (!blk.originalBlock.instructions.empty()) {
+                const auto& lastInstr = blk.originalBlock.instructions.back();
+                if (lastInstr.isBranch && lastInstr.isConditional) {
+                    uint8_t firstByte = lastInstr.bytes[0];
+                    if (firstByte >= 0x70 && firstByte <= 0x7F) {
+                        // 短条件跳转 0x7X -> 近条件跳转 0x0F 0x8X
+                        condCode = 0x80 + (firstByte - 0x70);
+                    } else if (firstByte == 0x0F && lastInstr.length >= 2) {
+                        // 已经是近条件跳转 0F 8X，直接使用第二字节
+                        condCode = lastInstr.bytes[1];
+                    }
+                }
+            }
+
+            // Jcc trueTarget (0F XX rel32) — 使用原始条件码
             code[off++] = 0x0F;
-            code[off++] = 0x84;
+            code[off++] = condCode;
             patchList.push_back({off, LABEL_TRUE_BASE + (int)i});
             write32(0);
 
@@ -318,45 +343,62 @@ BYTE* CFGFlattener::GenerateDispatcher(const FlatteningResult& result, bool is64
 // ============================================================================
 
 BYTE* CFGFlattener::GenerateTableDispatcher(const FlatteningResult& result, bool is64Bit, DWORD* size) {
-    // 构建状态 ID → 表索引的映射
-    std::unordered_map<uint32_t, uint32_t> stateToIndex;
-    uint32_t idx = 0;
-    for (const auto& blk : result.blocks) {
-        stateToIndex[blk.stateId] = idx++;
-    }
+    // BUG 6 修复：原来所有 JE 短跳转偏移 = 0x00，从未回填。
+    // 现改为使用 JE rel32 (0F 84) 并在布局完成后回填实际偏移。
 
     uint32_t tableSize = (uint32_t)result.blocks.size();
-    // 代码布局：
-    //   sub eax, minStateId     ; 标准化索引（如果状态不连续则需要不同方案）
-    //   cmp eax, tableSize      ; 范围检查
-    //   jae exit                ; 越界则退出
-    //   jmp [eax*4 + table]     ; 跳转表
-    //   table: dd offset0, offset1, ...
 
-    // 简化实现：用线性搜索模拟跳转表
-    DWORD codeLen = 32 + tableSize * 12;
+    // 每个条目：cmp eax,imm32 (5字节) + je rel32 (6字节) = 11 字节
+    // 末尾 ret (1字节)
+    // 块体区：每块留出 NOP 占位（此处 dispatcher 仅做跳转，不含块体）
+    DWORD dispatchLen = tableSize * 11 + 1;
+    DWORD codeLen = dispatchLen + tableSize * 4 + 64;
     BYTE* code = new(std::nothrow) BYTE[codeLen];
     if (!code) { *size = 0; return nullptr; }
     memset(code, 0xCC, codeLen);
 
     DWORD off = 0;
 
-    // 对每个状态生成 cmp/je
-    for (const auto& blk : result.blocks) {
-        // cmp eax, stateId
-        code[off++] = 0x3D;
-        code[off++] = (BYTE)(blk.stateId & 0xFF);
-        code[off++] = (BYTE)((blk.stateId >> 8) & 0xFF);
-        code[off++] = (BYTE)((blk.stateId >> 16) & 0xFF);
-        code[off++] = (BYTE)((blk.stateId >> 24) & 0xFF);
+    // 记录每个 JE 的 rel32 偏移位置和对应的块索引
+    struct JePatch { DWORD relOff; uint32_t blockIdx; };
+    std::vector<JePatch> patches;
 
-        // je +0 (占位，需后续修补)
-        code[off++] = 0x74;
-        code[off++] = 0x00;  // short jump placeholder
+    // dispatcher: 对每个状态生成 cmp/je
+    for (uint32_t i = 0; i < tableSize; i++) {
+        // cmp eax, stateId (3D imm32)
+        code[off++] = 0x3D;
+        code[off++] = (BYTE)(result.blocks[i].stateId & 0xFF);
+        code[off++] = (BYTE)((result.blocks[i].stateId >> 8) & 0xFF);
+        code[off++] = (BYTE)((result.blocks[i].stateId >> 16) & 0xFF);
+        code[off++] = (BYTE)((result.blocks[i].stateId >> 24) & 0xFF);
+
+        // je rel32 (0F 84 xx xx xx xx)
+        code[off++] = 0x0F;
+        code[off++] = 0x84;
+        patches.push_back({off, i});
+        off += 4;  // rel32 占位
     }
 
     // ret (default exit)
     code[off++] = 0xC3;
+
+    // 块目标区：每块放一条 ret 作为占位（实际使用时由调用方拼接块体）
+    std::vector<DWORD> blockOffsets(tableSize);
+    for (uint32_t i = 0; i < tableSize; i++) {
+        blockOffsets[i] = off;
+        code[off++] = 0xC3;  // 占位 ret
+    }
+
+    // 回填所有 JE 的 rel32
+    for (const auto& p : patches) {
+        DWORD target = blockOffsets[p.blockIdx];
+        DWORD source = p.relOff + 4;  // rel32 基址 = rel32 字段末尾
+        int32_t rel = (int32_t)(target - source);
+        code[p.relOff + 0] = (BYTE)(rel & 0xFF);
+        code[p.relOff + 1] = (BYTE)((rel >> 8) & 0xFF);
+        code[p.relOff + 2] = (BYTE)((rel >> 16) & 0xFF);
+        code[p.relOff + 3] = (BYTE)((rel >> 24) & 0xFF);
+    }
 
     *size = off;
     return code;
@@ -367,7 +409,9 @@ BYTE* CFGFlattener::GenerateTableDispatcher(const FlatteningResult& result, bool
 // ============================================================================
 
 BYTE* CFGFlattener::GenerateComputedDispatcher(const FlatteningResult& result, bool is64Bit, DWORD* size) {
-    DWORD codeLen = 64 + (DWORD)result.blocks.size() * 16;
+    // BUG 6 修复：使用 JE rel32 (0F 84) 替代短跳转并回填偏移
+    uint32_t blockCount = (uint32_t)result.blocks.size();
+    DWORD codeLen = 64 + blockCount * 20 + blockCount * 4;
     BYTE* code = new(std::nothrow) BYTE[codeLen];
     if (!code) { *size = 0; return nullptr; }
     memset(code, 0xCC, codeLen);
@@ -382,11 +426,15 @@ BYTE* CFGFlattener::GenerateComputedDispatcher(const FlatteningResult& result, b
     code[off++] = (BYTE)((result.stateEncryptionKey >> 16) & 0xFF);
     code[off++] = (BYTE)((result.stateEncryptionKey >> 24) & 0xFF);
 
-    // 然后做线性匹配
-    for (const auto& blk : result.blocks) {
-        uint32_t decryptedState = blk.stateId ^ result.stateEncryptionKey;
+    // 记录 JE rel32 的修补位置
+    struct JePatch { DWORD relOff; uint32_t blockIdx; };
+    std::vector<JePatch> patches;
 
-        // cmp eax, decryptedState
+    // 然后做线性匹配
+    for (uint32_t i = 0; i < blockCount; i++) {
+        uint32_t decryptedState = result.blocks[i].stateId ^ result.stateEncryptionKey;
+
+        // cmp eax, decryptedState (81 F8 imm32)
         code[off++] = 0x81;
         code[off++] = 0xF8;
         code[off++] = (BYTE)(decryptedState & 0xFF);
@@ -394,9 +442,11 @@ BYTE* CFGFlattener::GenerateComputedDispatcher(const FlatteningResult& result, b
         code[off++] = (BYTE)((decryptedState >> 16) & 0xFF);
         code[off++] = (BYTE)((decryptedState >> 24) & 0xFF);
 
-        // je +0 (占位)
-        code[off++] = 0x74;
-        code[off++] = 0x00;
+        // je rel32 (0F 84 xx xx xx xx)
+        code[off++] = 0x0F;
+        code[off++] = 0x84;
+        patches.push_back({off, i});
+        off += 4;  // rel32 占位
     }
 
     // 加密回去 (xor eax, key) 然后 ret
@@ -408,6 +458,24 @@ BYTE* CFGFlattener::GenerateComputedDispatcher(const FlatteningResult& result, b
 
     code[off++] = 0xC3;  // ret
 
+    // 块目标区占位
+    std::vector<DWORD> blockOffsets(blockCount);
+    for (uint32_t i = 0; i < blockCount; i++) {
+        blockOffsets[i] = off;
+        code[off++] = 0xC3;  // 占位 ret
+    }
+
+    // 回填所有 JE 的 rel32
+    for (const auto& p : patches) {
+        DWORD target = blockOffsets[p.blockIdx];
+        DWORD source = p.relOff + 4;
+        int32_t rel = (int32_t)(target - source);
+        code[p.relOff + 0] = (BYTE)(rel & 0xFF);
+        code[p.relOff + 1] = (BYTE)((rel >> 8) & 0xFF);
+        code[p.relOff + 2] = (BYTE)((rel >> 16) & 0xFF);
+        code[p.relOff + 3] = (BYTE)((rel >> 24) & 0xFF);
+    }
+
     *size = off;
     return code;
 }
@@ -417,14 +485,18 @@ BYTE* CFGFlattener::GenerateComputedDispatcher(const FlatteningResult& result, b
 // ============================================================================
 
 BYTE* CFGFlattener::GenerateMixedDispatcher(const FlatteningResult& result, bool is64Bit, DWORD* size) {
-    // 混合方案：前半用 XOR 加密，后半用直接比较，两者之间插入垃圾指令
-    DWORD codeLen = 128 + (DWORD)result.blocks.size() * 20;
+    // BUG 6 修复：混合方案使用 JE rel32 (0F 84) 并回填偏移
+    uint32_t blockCount = (uint32_t)result.blocks.size();
+    DWORD codeLen = 128 + blockCount * 24 + blockCount * 4;
     BYTE* code = new(std::nothrow) BYTE[codeLen];
     if (!code) { *size = 0; return nullptr; }
     memset(code, 0xCC, codeLen);
 
     DWORD off = 0;
     size_t half = result.blocks.size() / 2;
+
+    struct JePatch { DWORD relOff; uint32_t blockIdx; };
+    std::vector<JePatch> patches;
 
     // 保存 eax
     code[off++] = 0x50;  // push eax
@@ -443,8 +515,11 @@ BYTE* CFGFlattener::GenerateMixedDispatcher(const FlatteningResult& result, bool
         code[off++] = (BYTE)((decState >> 8) & 0xFF);
         code[off++] = (BYTE)((decState >> 16) & 0xFF);
         code[off++] = (BYTE)((decState >> 24) & 0xFF);
-        code[off++] = 0x74;  // je short
-        code[off++] = 0x00;
+        // je rel32 (0F 84 xx xx xx xx)
+        code[off++] = 0x0F;
+        code[off++] = 0x84;
+        patches.push_back({off, (uint32_t)i});
+        off += 4;  // rel32 占位
     }
 
     // 垃圾指令分隔
@@ -461,11 +536,32 @@ BYTE* CFGFlattener::GenerateMixedDispatcher(const FlatteningResult& result, bool
         code[off++] = (BYTE)((result.blocks[i].stateId >> 8) & 0xFF);
         code[off++] = (BYTE)((result.blocks[i].stateId >> 16) & 0xFF);
         code[off++] = (BYTE)((result.blocks[i].stateId >> 24) & 0xFF);
-        code[off++] = 0x74;  // je short
-        code[off++] = 0x00;
+        // je rel32 (0F 84 xx xx xx xx)
+        code[off++] = 0x0F;
+        code[off++] = 0x84;
+        patches.push_back({off, (uint32_t)i});
+        off += 4;  // rel32 占位
     }
 
     code[off++] = 0xC3;  // ret
+
+    // 块目标区占位
+    std::vector<DWORD> blockOffsets(blockCount);
+    for (uint32_t i = 0; i < blockCount; i++) {
+        blockOffsets[i] = off;
+        code[off++] = 0xC3;  // 占位 ret
+    }
+
+    // 回填所有 JE 的 rel32
+    for (const auto& p : patches) {
+        DWORD target = blockOffsets[p.blockIdx];
+        DWORD source = p.relOff + 4;
+        int32_t rel = (int32_t)(target - source);
+        code[p.relOff + 0] = (BYTE)(rel & 0xFF);
+        code[p.relOff + 1] = (BYTE)((rel >> 8) & 0xFF);
+        code[p.relOff + 2] = (BYTE)((rel >> 16) & 0xFF);
+        code[p.relOff + 3] = (BYTE)((rel >> 24) & 0xFF);
+    }
 
     *size = off;
     return code;

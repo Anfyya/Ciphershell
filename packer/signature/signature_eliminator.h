@@ -103,7 +103,29 @@ private:
     DWORD GenerateRandomDWORD();
     void GenerateRandomName(char* name, DWORD length);
 
-    // 已知壳的特征模式
+    // BUG 17 修复：支持从外部配置文件加载签名数据库
+public:
+    /**
+     * 从外部文件加载签名数据库
+     * 文件格式：每行一个签名，格式为 "名称:十六进制字节"
+     * 例如：VMProtect:2E766D7030
+     * @param filePath 签名数据库文件路径
+     * @return 加载的签名数量
+     */
+    uint32_t LoadSignatureDatabase(const std::string& filePath);
+
+private:
+    // BUG 18 修复：生成随机内容后自检，确保不匹配已知签名
+    bool VerifyNoSignatureMatch(const BYTE* data, DWORD size);
+
+    // 外部加载的签名数据库
+    struct ExternalSignature {
+        std::string name;
+        std::vector<BYTE> pattern;
+    };
+    std::vector<ExternalSignature> m_externalSignatures;
+
+    // 已知壳的特征模式（内置默认，可被外部数据库补充）
     static const BYTE s_vmpPattern[];
     static const BYTE s_themidaPattern[];
     static const BYTE s_upxPattern[];

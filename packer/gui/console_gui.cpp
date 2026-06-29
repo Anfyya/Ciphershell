@@ -5,7 +5,11 @@
 #include "console_gui.h"
 #include <iostream>
 #include <iomanip>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "windows_compat.h"
+#endif
 
 namespace CipherShell {
 
@@ -20,28 +24,66 @@ ConsoleGUI::~ConsoleGUI() {}
 // 公共接口
 // ============================================================================
 
+// BUG 14 修复辅助：使用 Win32 API 清屏，替代不安全的 system("cls")
+static void ClearConsole() {
+#ifdef _WIN32
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    DWORD written;
+    DWORD consoleSize;
+
+    if (!GetConsoleScreenBufferInfo(hConsole, &csbi)) return;
+
+    consoleSize = csbi.dwSize.X * csbi.dwSize.Y;
+    COORD topLeft = { 0, 0 };
+
+    // 填充空格清除屏幕内容
+    FillConsoleOutputCharacterA(hConsole, ' ', consoleSize, topLeft, &written);
+    // 重置属性
+    FillConsoleOutputAttribute(hConsole, csbi.wAttributes, consoleSize, topLeft, &written);
+    // 光标移到左上角
+    SetConsoleCursorPosition(hConsole, topLeft);
+#else
+    // 非 Windows 平台使用 ANSI escape codes
+    std::cout << "\033[2J\033[H" << std::flush;
+#endif
+}
+
 void ConsoleGUI::Initialize() {
     // 设置控制台标题
+#ifdef _WIN32
     SetConsoleTitleA("CipherShell Protector v0.1");
 
-    // 设置控制台大小
-    system("mode con cols=80 lines=50");
+    // BUG 14 修复：使用 Win32 API 设置控制台大小，替代 system("mode con")
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SMALL_RECT windowSize = { 0, 0, 79, 49 }; // 80 列 x 50 行
+    COORD bufferSize = { 80, 50 };
+    SetConsoleScreenBufferSize(hConsole, bufferSize);
+    SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
+#endif
 
     m_initialized = true;
 }
 
 void ConsoleGUI::ShowMainMenu() {
-    PrintBanner();
+    // BUG 13 修复：改为循环结构，避免 ShowMenu -> action -> ShowMainMenu -> ShowMenu 的递归
+    // 每次选择菜单项后回到循环重新显示菜单，而不是递归调用
+    while (true) {
+        PrintBanner();
 
-    std::vector<MenuItem> items = {
-        {"1", "保护 EXE/DLL", [this]() { ShowProtectionWizard(); }},
-        {"2", "配置编辑器", [this]() { ShowConfigEditor(); }},
-        {"3", "帮助", [this]() { ShowHelp(); }},
-        {"4", "关于", [this]() { ShowAbout(); }},
-        {"0", "退出", nullptr}
-    };
+        std::vector<MenuItem> items = {
+            {"1", "保护 EXE/DLL", [this]() { ShowProtectionWizard(); }},
+            {"2", "配置编辑器", [this]() { ShowConfigEditor(); }},
+            {"3", "帮助", [this]() { ShowHelp(); }},
+            {"4", "关于", [this]() { ShowAbout(); }},
+            {"0", "退出", nullptr}
+        };
 
-    ShowMenu("主菜单", items);
+        // ShowMenu 返回 false 表示用户选择了退出
+        if (!ShowMenu("主菜单", items)) {
+            break;
+        }
+    }
 }
 
 void ConsoleGUI::ShowProtectionWizard() {
@@ -219,7 +261,8 @@ void ConsoleGUI::ShowAbout() {
 // ============================================================================
 
 void ConsoleGUI::PrintBanner() {
-    system("cls");
+    // BUG 14 修复：使用安全的 Win32 API 清屏替代 system("cls")
+    ClearConsole();
     SetColor(ConsoleColor::Cyan);
     std::cout << R"(
   ╔═══════════════════════════════════════════════════════════════╗
@@ -338,7 +381,9 @@ bool ConsoleGUI::ReadYesNo(const std::string& prompt) {
     }
 }
 
-void ConsoleGUI::ShowMenu(const std::string& title, const std::vector<MenuItem>& items) {
+// BUG 13 修复：ShowMenu 改为返回 bool（true=继续循环, false=退出）
+// 不再在 action 完成后递归调用 ShowMainMenu，由外层循环负责重新显示菜单
+bool ConsoleGUI::ShowMenu(const std::string& title, const std::vector<MenuItem>& items) {
     SetColor(ConsoleColor::Cyan);
     std::cout << "  " << title << std::endl;
     ResetColor();
@@ -360,12 +405,11 @@ void ConsoleGUI::ShowMenu(const std::string& title, const std::vector<MenuItem>&
             if (choice == item.key) {
                 if (item.action) {
                     item.action();
-                    // 返回主菜单
-                    ShowMainMenu();
-                    return;
+                    // 返回 true 让外层循环重新显示菜单
+                    return true;
                 } else {
-                    // Exit
-                    return;
+                    // 用户选择退出
+                    return false;
                 }
             }
         }

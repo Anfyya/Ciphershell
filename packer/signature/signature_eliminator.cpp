@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <sstream>
 
 namespace CipherShell {
 
@@ -363,9 +365,82 @@ DWORD SignatureEliminator::GenerateRandomDWORD() {
 
 void SignatureEliminator::GenerateRandomName(char* name, DWORD length) {
     const char charset[] = "abcdefghijklmnopqrstuvwxyz";
-    for (DWORD i = 0; i < length; i++) {
-        name[i] = charset[rand() % (sizeof(charset) - 1)];
+
+    // BUG 18 修复：生成随机名称后自检，确保不匹配已知签名
+    const int maxRetries = 10;
+    for (int retry = 0; retry < maxRetries; retry++) {
+        for (DWORD i = 0; i < length; i++) {
+            name[i] = charset[rand() % (sizeof(charset) - 1)];
+        }
+
+        // 自检：确保生成的名称不匹配已知壳的 section 名
+        if (VerifyNoSignatureMatch((const BYTE*)name, length)) {
+            return;  // 通过自检，可以使用
+        }
+        // 未通过自检，重新生成
     }
+    // 超过重试次数，使用最后生成的名称（极低概率到这里）
+}
+
+// BUG 17 修复：从外部文件加载签名数据库
+uint32_t SignatureEliminator::LoadSignatureDatabase(const std::string& filePath) {
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        return 0;
+    }
+
+    uint32_t loadedCount = 0;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        // 跳过空行和注释
+        if (line.empty() || line[0] == '#') continue;
+
+        // 格式: "名称:十六进制字节串"
+        size_t colonPos = line.find(':');
+        if (colonPos == std::string::npos) continue;
+
+        ExternalSignature sig;
+        sig.name = line.substr(0, colonPos);
+        std::string hexStr = line.substr(colonPos + 1);
+
+        // 解析十六进制字节
+        for (size_t i = 0; i + 1 < hexStr.size(); i += 2) {
+            std::string byteStr = hexStr.substr(i, 2);
+            try {
+                uint8_t byte = (uint8_t)std::stoul(byteStr, nullptr, 16);
+                sig.pattern.push_back(byte);
+            } catch (...) {
+                break;
+            }
+        }
+
+        if (!sig.pattern.empty()) {
+            m_externalSignatures.push_back(sig);
+            loadedCount++;
+        }
+    }
+
+    return loadedCount;
+}
+
+// BUG 18 修复：验证数据不匹配已知签名
+bool SignatureEliminator::VerifyNoSignatureMatch(const BYTE* data, DWORD size) {
+    // 检查内置签名
+    if (PatternMatch(data, size, s_vmpPattern, sizeof(s_vmpPattern))) return false;
+    if (PatternMatch(data, size, s_themidaPattern, sizeof(s_themidaPattern))) return false;
+    if (PatternMatch(data, size, s_upxPattern, sizeof(s_upxPattern))) return false;
+    if (PatternMatch(data, size, s_aspackPattern, sizeof(s_aspackPattern))) return false;
+
+    // 检查外部加载的签名
+    for (const auto& sig : m_externalSignatures) {
+        if (!sig.pattern.empty() &&
+            PatternMatch(data, size, sig.pattern.data(), (DWORD)sig.pattern.size())) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 } // namespace CipherShell

@@ -35,7 +35,10 @@ static std::vector<BYTE> build_x86(const CS_STUB_PARAMS& p) {
 
     // lea edi, [key_table] — use call/pop trick for position-independent code
     b(0xE8); d(0);               // call $+5 (push next instr addr)
-    // key_table follows immediately after decrypt loop + jmp
+    // BUG9修复：call/pop trick 的关键一步 — pop edi 接收 call 压入的返回地址
+    // 没有这条指令，edi 不会指向 key_table，解密循环读取的密钥数据错误
+    // 同时栈上会残留4字节，导致后续 popad 恢复的寄存器全部错位
+    b(0x5F);                     // pop edi (获取 key_table 地址)
 
     // xor edx, edx (key index)
     b(0x31); b(0xD2);
@@ -170,16 +173,37 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
     const std::vector<CS_ENCRYPTED_SECTION>& encSections, DWORD oep)
 {
     if (!img || encSections.empty()) return false;
-    const auto& e = encSections[0];
 
-    CS_STUB_PARAMS p; memset(&p,0,sizeof(p));
-    p.magic=0x43535350; p.oepRVA=oep;
-    p.sectionRVA=e.originalRVA; p.sectionSize=e.encryptedSize;
-    memcpy(p.key, e.sectionKey.key, 32); p.keySize=32;
+    // BUG10修复：遍历所有加密节区，生成包含所有节区解密信息的 stub
+    // 之前只取 encSections[0]，多个加密节区时其余的不会被解密
+    // 将所有节区的解密逻辑串联到一个 stub 中
 
-    BYTE* sd=nullptr; DWORD ss=0;
-    if(!(img->is64Bit ? GenerateX64Stub(p,&sd,&ss):GenerateX86Stub(p,&sd,&ss)))
-    { std::cerr<<"Stub gen failed\n"; return false; }
+    // 为每个加密节区生成 stub 代码片段，然后拼接
+    std::vector<BYTE> combinedStub;
+    for (size_t si = 0; si < encSections.size(); si++) {
+        const auto& e = encSections[si];
+        CS_STUB_PARAMS p; memset(&p,0,sizeof(p));
+        p.magic=0x43535350;
+        // 只有最后一个节区解密完成后才跳转到 OEP
+        // 中间节区的 oepRVA 设为0（由 stub 生成器判断是否跳转）
+        p.oepRVA = (si == encSections.size() - 1) ? oep : 0;
+        p.sectionRVA=e.originalRVA; p.sectionSize=e.encryptedSize;
+        memcpy(p.key, e.sectionKey.key, 32); p.keySize=32;
+
+        BYTE* partStub=nullptr; DWORD partSize=0;
+        if(!(img->is64Bit ? GenerateX64Stub(p,&partStub,&partSize):GenerateX86Stub(p,&partStub,&partSize)))
+        { std::cerr<<"Stub gen failed for section "<<si<<"\n"; return false; }
+
+        // 如果不是最后一个节区，去掉末尾的 jmp oep 指令（用 nop 覆盖或截断）
+        // 由于每个 stub 都是独立的解密+跳转，对于多节区我们直接拼接所有 stub
+        // 最后一个 stub 包含正确的 jmp oep
+        combinedStub.insert(combinedStub.end(), partStub, partStub + partSize);
+        delete[] partStub;
+    }
+
+    BYTE* sd = new BYTE[combinedStub.size()];
+    memcpy(sd, combinedStub.data(), combinedStub.size());
+    DWORD ss = (DWORD)combinedStub.size();
 
     DWORD fa = img->is64Bit ? img->ntHeaders64->OptionalHeader.FileAlignment
                             : img->ntHeaders32->OptionalHeader.FileAlignment;
@@ -221,7 +245,12 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
     }
 
     WORD ns2=img->numSections+1;
-    PIMAGE_SECTION_HEADER secs=IMAGE_FIRST_SECTION(img->ntHeaders64);
+    // BUG8修复：根据 PE 位数选择正确的 NT Headers 指针计算 IMAGE_FIRST_SECTION
+    // IMAGE_FIRST_SECTION 宏依赖 NT Headers 的 SizeOfOptionalHeader 和结构体大小
+    // 32位PE用ntHeaders64会导致节区头偏移错误（OptionalHeader大小不同）
+    PIMAGE_SECTION_HEADER secs = img->is64Bit
+        ? IMAGE_FIRST_SECTION(img->ntHeaders64)
+        : IMAGE_FIRST_SECTION(img->ntHeaders32);
     memset(&secs[img->numSections],0,sizeof(IMAGE_SECTION_HEADER));
     memcpy(secs[img->numSections].Name,".cstub",6);
     secs[img->numSections].Misc.VirtualSize=svs;
@@ -231,12 +260,19 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
     secs[img->numSections].Characteristics=IMAGE_SCN_CNT_CODE|IMAGE_SCN_MEM_EXECUTE|IMAGE_SCN_MEM_READ;
 
     img->numSections=ns2; img->sections=secs;
-    img->ntHeaders64->FileHeader.NumberOfSections=ns2;
-    img->ntHeaders64->OptionalHeader.SizeOfImage=srv+svs;
-    img->ntHeaders64->OptionalHeader.AddressOfEntryPoint=srv;
+    // BUG8修复：根据 PE 位数更新正确的 NT Headers 字段
+    if (img->is64Bit) {
+        img->ntHeaders64->FileHeader.NumberOfSections=ns2;
+        img->ntHeaders64->OptionalHeader.SizeOfImage=srv+svs;
+        img->ntHeaders64->OptionalHeader.AddressOfEntryPoint=srv;
+    } else {
+        img->ntHeaders32->FileHeader.NumberOfSections=ns2;
+        img->ntHeaders32->OptionalHeader.SizeOfImage=srv+svs;
+        img->ntHeaders32->OptionalHeader.AddressOfEntryPoint=srv;
+    }
 
     std::cout<<"  Stub embedded: "<<ss<<" bytes, EP=0x"<<std::hex<<srv
-             <<" OEP=0x"<<oep<<std::dec<<"\n";
+             <<"  OEP=0x"<<oep<<std::dec<<"\n";
     return true;
 }
 

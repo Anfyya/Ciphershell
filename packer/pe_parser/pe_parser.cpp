@@ -148,8 +148,10 @@ bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
     } else if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_I386) {
         image->is64Bit = FALSE;
         image->ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
-        // 同时设置64位指针以便统一访问
-        image->ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
+        // BUG1修复：32位PE不能设置ntHeaders64指针，两者结构体布局不同
+        // IMAGE_NT_HEADERS32.OptionalHeader 与 IMAGE_NT_HEADERS64.OptionalHeader 字段偏移不同
+        // 用ntHeaders64读取32位PE会导致ImageBase、SizeOfImage、EntryPoint等字段错位
+        image->ntHeaders64 = nullptr;
     } else {
         SetError(image, "Unsupported machine type");
         return false;
@@ -839,7 +841,10 @@ bool PEParser::IsValidPE(CS_PE_IMAGE* image) {
 }
 
 bool PEParser::CheckBounds(CS_PE_IMAGE* image, DWORD offset, DWORD size) {
-    return (offset + size <= image->rawSize);
+    // BUG2修复：防止 offset+size 整数溢出绕过边界检查
+    // 例如 offset=0xFFFFFFF0, size=0x20 时, offset+size=0x10 会错误地通过检查
+    // 安全写法：先检查 offset 是否越界，再用减法检查 size
+    return (offset <= image->rawSize && size <= image->rawSize - offset);
 }
 
 void PEParser::SetError(CS_PE_IMAGE* image, const std::string& message) {

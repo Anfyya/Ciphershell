@@ -9,6 +9,41 @@
 namespace CipherShell {
 
 // ============================================================================
+// RVA 到文件偏移转换
+// ============================================================================
+
+// RVA（相对虚拟地址）是 PE 映射到内存后的偏移，与文件中的偏移不同
+// 节区在文件中按 FileAlignment 对齐，内存中按 SectionAlignment 对齐
+static DWORD RvaToFileOffset(BYTE* fileBase, DWORD rva) {
+    if (rva == 0) return 0;
+
+    PIMAGE_DOS_HEADER dosHdr = (PIMAGE_DOS_HEADER)fileBase;
+    PIMAGE_NT_HEADERS ntHdr = (PIMAGE_NT_HEADERS)(fileBase + dosHdr->e_lfanew);
+
+    PIMAGE_SECTION_HEADER sections;
+    WORD numSections = ntHdr->FileHeader.NumberOfSections;
+    if (ntHdr->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+        sections = IMAGE_FIRST_SECTION((PIMAGE_NT_HEADERS64)ntHdr);
+    } else {
+        sections = IMAGE_FIRST_SECTION((PIMAGE_NT_HEADERS32)ntHdr);
+    }
+
+    for (WORD i = 0; i < numSections; i++) {
+        DWORD secStart = sections[i].VirtualAddress;
+        DWORD secEnd = secStart + sections[i].SizeOfRawData;
+        if (rva >= secStart && rva < secEnd) {
+            return rva - secStart + sections[i].PointerToRawData;
+        }
+    }
+
+    if (numSections > 0 && rva < sections[0].VirtualAddress) {
+        return rva;
+    }
+
+    return 0;
+}
+
+// ============================================================================
 // 构造/析构
 // ============================================================================
 
@@ -126,7 +161,14 @@ bool RelocFixer::ApplyRelocations(
     }
 
     for (const auto& reloc : relocs) {
-        BYTE* address = imageBase + reloc.fullRVA;
+        // BUG11修复：将 RVA 转换为文件偏移后再访问数据
+        // fullRVA 是内存中的相对虚拟地址，不能直接作为文件缓冲区的偏移
+        DWORD fileOffset = RvaToFileOffset(imageBase, reloc.fullRVA);
+        if (fileOffset == 0 && reloc.fullRVA != 0) {
+            // RVA 转换失败，跳过此条目
+            continue;
+        }
+        BYTE* address = imageBase + fileOffset;
 
         // 根据重定位类型应用修复
         switch (reloc.type) {
@@ -199,10 +241,16 @@ std::vector<CS_RELOC_ENTRY> RelocFixer::ExtractRelocations(
         return relocs;
     }
 
+    // BUG11修复：将重定位表 RVA 转换为文件偏移
+    DWORD relocFileOffset = RvaToFileOffset(imageBase, relocRVA);
+    if (relocFileOffset == 0) {
+        return relocs;
+    }
+
     // 遍历重定位块
     DWORD offset = 0;
     while (offset < relocSize) {
-        PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)(imageBase + relocRVA + offset);
+        PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)(imageBase + relocFileOffset + offset);
 
         if (block->VirtualAddress == 0 || block->SizeOfBlock == 0) {
             break;

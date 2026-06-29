@@ -3,9 +3,13 @@
  */
 
 #include "api_resolver.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <winternl.h>
 #include <intrin.h>
+#else
+#include "windows_compat.h"
+#endif
 #include <cstring>
 
 namespace CipherShell {
@@ -250,9 +254,112 @@ FARPROC APIResolver::GetFunctionByHash(HMODULE hModule, uint32_t funcHash) {
 }
 
 HMODULE APIResolver::FindInPEB(uint32_t dllHash) {
-    // 简化实现：使用 GetModuleHandle 尝试常用 DLL
-    // 实际的 PEB 遍历在 stub 中实现（汇编版本）
+    // BUG 19 修复：在 Windows 平台实现真正的 PEB 遍历，
+    // 通过 TEB -> PEB -> Ldr -> InMemoryOrderModuleList 遍历已加载模块，
+    // 不依赖 GetModuleHandleA（GetModuleHandleA 本身需要导入表解析）。
+    // 非 Windows 平台保持 stub 实现。
 
+#ifdef _WIN32
+    // 通过 NtCurrentTeb() 获取 PEB 地址
+    // PEB 结构中 Ldr 字段偏移：x64 为 +0x18，x86 为 +0x0C
+    // PEB_LDR_DATA 中 InMemoryOrderModuleList 偏移：x64 为 +0x20，x86 为 +0x14
+
+#ifdef _WIN64
+    // x64: 通过 GS 段寄存器获取 TEB，TEB+0x60 = PEB
+    BYTE* pPEB = nullptr;
+    __try {
+        pPEB = (BYTE*)NtCurrentTeb()->ProcessEnvironmentBlock;
+    } __except(1) {
+        return nullptr;
+    }
+    if (!pPEB) return nullptr;
+
+    // PEB+0x18 = Ldr (PEB_LDR_DATA*)
+    BYTE* pLdr = *(BYTE**)(pPEB + 0x18);
+    if (!pLdr) return nullptr;
+
+    // PEB_LDR_DATA+0x20 = InMemoryOrderModuleList (LIST_ENTRY)
+    LIST_ENTRY* pListHead = (LIST_ENTRY*)(pLdr + 0x20);
+    LIST_ENTRY* pEntry = pListHead->Flink;
+
+    while (pEntry != pListHead) {
+        // LDR_DATA_TABLE_ENTRY 中 InMemoryOrderLinks 后的结构：
+        // +0x00 = InMemoryOrderLinks (LIST_ENTRY)
+        // +0x10 (x64) / +0x08 (x86) = 从 InMemoryOrderLinks 开始的偏移
+        // 对于 InMemoryOrderModuleList，DllBase 在 entry 基址 +0x20 (x64)
+        // BaseDllName (UNICODE_STRING) 在 entry 基址 +0x48 (x64)
+
+        // 获取 LDR_DATA_TABLE_ENTRY 基址
+        // InMemoryOrderLinks 是 LDR_DATA_TABLE_ENTRY 的第二个 LIST_ENTRY
+        // 所以 entry_base = pEntry - offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)
+        // 在 x64 上，InMemoryOrderLinks offset = 0x10
+        BYTE* entryBase = (BYTE*)pEntry - 0x10;
+
+        // DllBase 在 LDR_DATA_TABLE_ENTRY+0x30 (x64)
+        HMODULE dllBase = *(HMODULE*)(entryBase + 0x30);
+
+        // BaseDllName (UNICODE_STRING) 在 LDR_DATA_TABLE_ENTRY+0x58 (x64)
+        // UNICODE_STRING: Length(USHORT) + MaxLength(USHORT) + padding + Buffer(PWSTR)
+        USHORT nameLen = *(USHORT*)(entryBase + 0x58);
+        wchar_t* nameBuffer = *(wchar_t**)(entryBase + 0x60);
+
+        if (nameBuffer && nameLen > 0 && dllBase) {
+            // 计算 DLL 名称的哈希值
+            uint32_t hash = HashStringW(nameBuffer);
+            if (hash == dllHash) {
+                return dllBase;
+            }
+        }
+
+        pEntry = pEntry->Flink;
+    }
+
+    return nullptr;
+
+#else  // x86
+    // x86: 通过 FS 段寄存器获取 TEB，TEB+0x30 = PEB
+    BYTE* pPEB = nullptr;
+    __try {
+        pPEB = (BYTE*)NtCurrentTeb()->ProcessEnvironmentBlock;
+    } __except(1) {
+        return nullptr;
+    }
+    if (!pPEB) return nullptr;
+
+    // PEB+0x0C = Ldr (PEB_LDR_DATA*)
+    BYTE* pLdr = *(BYTE**)(pPEB + 0x0C);
+    if (!pLdr) return nullptr;
+
+    // PEB_LDR_DATA+0x14 = InMemoryOrderModuleList (LIST_ENTRY)
+    LIST_ENTRY* pListHead = (LIST_ENTRY*)(pLdr + 0x14);
+    LIST_ENTRY* pEntry = pListHead->Flink;
+
+    while (pEntry != pListHead) {
+        // x86 下 InMemoryOrderLinks offset = 0x08
+        BYTE* entryBase = (BYTE*)pEntry - 0x08;
+
+        // DllBase 在 LDR_DATA_TABLE_ENTRY+0x18 (x86)
+        HMODULE dllBase = *(HMODULE*)(entryBase + 0x18);
+
+        // BaseDllName (UNICODE_STRING) 在 LDR_DATA_TABLE_ENTRY+0x2C (x86)
+        USHORT nameLen = *(USHORT*)(entryBase + 0x2C);
+        wchar_t* nameBuffer = *(wchar_t**)(entryBase + 0x30);
+
+        if (nameBuffer && nameLen > 0 && dllBase) {
+            uint32_t hash = HashStringW(nameBuffer);
+            if (hash == dllHash) {
+                return dllBase;
+            }
+        }
+
+        pEntry = pEntry->Flink;
+    }
+
+    return nullptr;
+#endif // _WIN64
+
+#else  // 非 Windows 平台：保持 stub 实现
+    // 非 Windows 平台没有 PEB，使用回退列表
     const char* commonDLLs[] = {
         "kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll",
         "gdi32.dll", "shell32.dll", "ole32.dll", "msvcrt.dll",
@@ -268,6 +375,7 @@ HMODULE APIResolver::FindInPEB(uint32_t dllHash) {
     }
 
     return nullptr;
+#endif // _WIN32
 }
 
 // ============================================================================

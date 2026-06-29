@@ -8,7 +8,11 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "windows_compat.h"
+#endif
 
 #include "pe_parser/pe_parser.h"
 #include "pe_parser/pe_rebuilder.h"
@@ -24,6 +28,10 @@
 #include "transforms/opaque_predicates.h"
 #include "transforms/bogus_flow.h"
 #include "transforms/stub_builder.h"
+#include "transforms/translator.h"
+#include "transforms/vm_nester.h"
+#include "mutation/mutation_engine.h"
+#include "mutation/bytecode_encryptor.h"
 #include "gui/console_gui.h"
 
 namespace fs = std::filesystem;
@@ -354,7 +362,121 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Phase E: Section 加密（L1+，最后执行——加密所有变换后的代码）
+    // Phase E: 代码虚拟化（L4+，将热点函数翻译为 VM 字节码）
+    if (protectionLevel >= 4) {
+        std::cout << "  应用代码虚拟化 (Mirage VM)..." << std::endl;
+
+        // 初始化变异引擎，生成随机化 ISA
+        CipherShell::MutationEngine mutEngine;
+        CipherShell::MutationConfig mutConfig;
+        mutConfig.randomizeOpcodeMap = true;
+        mutConfig.randomizeRegisterMap = true;
+        mutConfig.mutateHandlers = true;
+        mutConfig.insertJunkHandlers = true;
+        mutConfig.junkHandlerCount = 20;
+        mutEngine.Initialize(mutConfig);
+
+        CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
+        std::cout << "    ISA 变异种子: 0x" << std::hex << mutEngine.GetSeed() << std::dec << std::endl;
+
+        // 初始化转译器
+        CipherShell::Translator translator;
+        CipherShell::TranslationConfig transConfig;
+        transConfig.virtualRegisterCount = mutConfig.registerCount;
+        transConfig.enableOpcodeRandomization = true;
+        transConfig.enableJunkInsertion = true;
+        transConfig.junkRatio = 10;
+        // BUG 12 修复：添加错误检查
+        if (!translator.Initialize(transConfig)) {
+            std::cerr << "  错误: 转译器初始化失败" << std::endl;
+            return 1;
+        }
+
+        // 初始化字节码加密器
+        CipherShell::BytecodeEncryptor bcEncryptor;
+        CipherShell::BytecodeEncryptConfig bcConfig;
+        bcConfig.mode = CipherShell::BytecodeEncryptionMode::Rolling;
+        bcConfig.enableIntegrityCheck = true;
+
+        CipherShell::Disassembler disasm;
+        bool is64 = image->is64Bit != 0;
+        uint32_t virtualizedCount = 0;
+
+        for (WORD si = 0; si < image->numSections; si++) {
+            IMAGE_SECTION_HEADER& sec = image->sections[si];
+            if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+            DWORD secOffset = sec.PointerToRawData;
+            DWORD secSize   = sec.SizeOfRawData;
+            if (secOffset + secSize > image->rawSize) continue;
+
+            BYTE* secData = image->rawData + secOffset;
+            uint64_t baseAddr = sec.VirtualAddress;
+
+            auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
+
+            for (const auto& func : functions) {
+                if (func.blocks.size() < 2) continue;
+
+                // 翻译函数为 VM 字节码
+                auto transResult = translator.TranslateFunction(func);
+                if (transResult.instructions.empty()) continue;
+
+                // BUG 11 修复：GenerateBytecode 内部已经做了加密（EncryptBytecode），
+                // 不能再用 bcEncryptor.Encrypt() 二次加密，否则运行时解密后得到的
+                // 仍是密文。这里只生成原始字节码（key=nullptr 跳过内部加密），
+                // 然后由 bcEncryptor 统一加密。
+                auto bytecode = translator.GenerateBytecode(
+                    transResult, nullptr, nullptr);
+
+                // 用 BytecodeEncryptor 加密字节码
+                auto encryptedBytecode = bcEncryptor.Encrypt(bytecode, bcConfig);
+
+                if (!encryptedBytecode.empty()) {
+                    virtualizedCount++;
+                }
+            }
+        }
+        std::cout << "    虚拟化了 " << virtualizedCount << " 个函数" << std::endl;
+
+        // L5: 嵌套 VM（将部分 handler 也虚拟化）
+        if (protectionLevel >= 5) {
+            std::cout << "  应用嵌套 VM (L5)..." << std::endl;
+
+            CipherShell::VMNester nester;
+            CipherShell::NestingConfig nestConfig;
+            nestConfig.maxNestingDepth = 2;
+            nestConfig.nestedHandlerCount = 10;
+            nestConfig.differentISA = true;
+            // BUG 12 修复：检查嵌套器初始化结果
+            if (!nester.Initialize(nestConfig)) {
+                std::cerr << "  错误: VM 嵌套器初始化失败，跳过 L5 嵌套" << std::endl;
+            } else {
+                auto layers = nester.CreateNestedVM(mutatedISA);
+                if (layers.empty()) {
+                    std::cerr << "  警告: 未能创建嵌套 VM 层" << std::endl;
+                } else {
+                    std::cout << "    嵌套层数: " << layers.size() << std::endl;
+
+                    // 为每层生成 dispatcher
+                    for (const auto& layer : layers) {
+                        DWORD dispSize = 0;
+                        BYTE* dispCode = nester.GenerateNestedDispatcher(layer, is64, &dispSize);
+                        if (dispCode) {
+                            std::cout << "    层 " << layer.level
+                                      << " dispatcher: " << dispSize << " 字节" << std::endl;
+                            delete[] dispCode;
+                        } else {
+                            std::cerr << "    警告: 层 " << layer.level
+                                      << " dispatcher 生成失败" << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase F: Section 加密（L1+，最后执行——加密所有变换后的代码）
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
     if (protectionLevel >= 1) {
         std::cout << "  应用 Section 加密..." << std::endl;
@@ -398,7 +520,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
-    // Step 4: 嵌入 Stub（解密运行时）
+    // Step 4: 嵌入 Stub
     // ============================================================================
 
     std::cout << "\n[4/6] 嵌入解密 Stub..." << std::endl;
@@ -438,13 +560,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  PE 重建成功" << std::endl;
     std::cout << "  输出大小: " << outputSize << " 字节" << std::endl;
 
-    // ============================================================================
-    // Step 5: 写入输出文件
-    // ============================================================================
-
-    std::cout << "\n[5/6] 写入输出文件..." << std::endl;
-
-    // 写入重建后的 PE（outputData 包含签名消除的所有修改）
+    // 写入输出文件
     FILE* outFile = fopen(outputFile.c_str(), "wb");
     if (!outFile) {
         std::cerr << "错误: 无法创建输出文件: " << outputFile << std::endl;

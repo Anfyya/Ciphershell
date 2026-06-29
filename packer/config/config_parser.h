@@ -166,6 +166,19 @@ public:
      */
     bool GenerateDefaultConfig(const std::string& filePath);
 
+    // BUG 16 修复：添加错误查询接口，调用方可据此决定行为
+    /**
+     * 检查上次操作是否有错误
+     * @return 是否有错误
+     */
+    bool HasError() const { return !m_lastError.empty(); }
+
+    /**
+     * 获取上次错误信息
+     * @return 错误描述字符串
+     */
+    const std::string& GetLastError() const { return m_lastError; }
+
 private:
     // 解析各个配置段
     void ParseGlobalSection(const std::string& content, GlobalConfig& config);
@@ -182,6 +195,9 @@ private:
     int ParseInt(const std::string& value);
     double ParseDouble(const std::string& value);
     std::string ParseString(const std::string& value);
+
+    // BUG 16 修复：错误状态
+    std::string m_lastError;
 };
 
 } // namespace CipherShell

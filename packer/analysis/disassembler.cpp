@@ -86,8 +86,9 @@ std::vector<Instruction> Disassembler::Disassemble(
     uint32_t offset = 0;
 
     while (offset < size) {
-        Instruction instr;
-        memset(&instr, 0, sizeof(instr));
+        // BUG 2 修复：Instruction 包含 std::string 成员，不能用 memset 清零，
+        // 否则会破坏 string 的内部状态。使用值初始化代替。
+        Instruction instr{};
 
         if (!DecodeInstruction(code + offset, size - offset, address, instr)) {
             // 无法解码，跳过这个字节
@@ -97,7 +98,8 @@ std::vector<Instruction> Disassembler::Disassemble(
         }
 
         instr.address = address;
-        instr.length = GetInstructionLength(code + offset, size - offset);
+        // BUG 1 修复：GetInstructionLength 与 DecodeInstruction 各自独立解码指令长度，
+        // 可能返回不同结果。直接使用 DecodeInstruction 已经计算好的 length。
         if (instr.length == 0) instr.length = 1;  // 最小 1 字节
 
         memcpy(instr.bytes, code + offset, std::min((uint32_t)15, instr.length));
@@ -306,15 +308,138 @@ std::string Disassembler::FormatInstruction(const Instruction& instr) {
 bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_t address, Instruction& instr) {
     if (size == 0) return false;
 
-    uint8_t opcode = code[0];
-    instr.length = 1;
+    uint32_t pos = 0;
+
+    // BUG 3 修复：处理 REX prefix (0x40-0x4F)，仅在 64 位模式下有效
+    uint8_t rex = 0;
+    if (m_is64Bit && pos < size && (code[pos] & 0xF0) == 0x40) {
+        rex = code[pos];
+        pos++;
+        if (pos >= size) {
+            instr.length = pos;
+            return true;
+        }
+    }
+
+    uint8_t opcode = code[pos];
+    pos++;
+
+    // BUG 4 修复：处理 0x0F 双字节操作码（如条件跳转 0F 80-0F 8F、MOVZX 0F B6 等）
+    if (opcode == 0x0F) {
+        if (pos >= size) {
+            instr.length = pos;
+            instr.mnemonic = "???";
+            return true;
+        }
+        uint8_t opcode2 = code[pos];
+        pos++;
+
+        // 0F 80 - 0F 8F: 条件跳转 rel32（近跳转）
+        if (opcode2 >= 0x80 && opcode2 <= 0x8F) {
+            if (pos + 4 <= size) {
+                const char* condNames[] = {
+                    "jo", "jno", "jb", "jnb", "jz", "jnz", "jbe", "ja",
+                    "js", "jns", "jp", "jnp", "jl", "jnl", "jle", "jg"
+                };
+                instr.mnemonic = condNames[opcode2 - 0x80];
+                instr.isBranch = true;
+                instr.isConditional = true;
+                instr.hasTarget = true;
+                int32_t rel = *(int32_t*)(code + pos);
+                pos += 4;
+                instr.targetAddress = address + pos + rel;
+                instr.length = pos;
+                return true;
+            }
+        }
+        // 0F B6: MOVZX r32, r/m8
+        // 0F B7: MOVZX r32, r/m16
+        // 0F BE: MOVSX r32, r/m8
+        // 0F BF: MOVSX r32, r/m16
+        else if (opcode2 == 0xB6 || opcode2 == 0xB7 || opcode2 == 0xBE || opcode2 == 0xBF) {
+            if (pos < size) {
+                uint8_t modrm = code[pos];
+                pos++;
+                uint8_t mod = (modrm >> 6) & 3;
+                uint8_t rm = modrm & 7;
+                if (mod == 0 && rm == 5) pos += 4;       // disp32
+                else if (mod == 0 && rm == 4) {           // SIB
+                    pos++;
+                }
+                else if (mod == 1) {
+                    if (rm == 4) pos++;  // SIB
+                    pos++;               // disp8
+                }
+                else if (mod == 2) {
+                    if (rm == 4) pos++;  // SIB
+                    pos += 4;            // disp32
+                }
+                instr.mnemonic = (opcode2 == 0xB6 || opcode2 == 0xB7) ? "movzx" : "movsx";
+                instr.length = pos;
+                return true;
+            }
+        }
+        // 0F 94 - 0F 9F: SETcc r/m8
+        else if (opcode2 >= 0x90 && opcode2 <= 0x9F) {
+            if (pos < size) {
+                pos++;  // ModR/M 字节
+                instr.mnemonic = "setcc";
+                instr.length = pos;
+                return true;
+            }
+        }
+        // 0F AF: IMUL r, r/m
+        else if (opcode2 == 0xAF) {
+            if (pos < size) {
+                uint8_t modrm = code[pos];
+                pos++;
+                uint8_t mod = (modrm >> 6) & 3;
+                uint8_t rm = modrm & 7;
+                if (mod == 0 && rm == 5) pos += 4;
+                else if (mod == 0 && rm == 4) pos++;
+                else if (mod == 1) { if (rm == 4) pos++; pos++; }
+                else if (mod == 2) { if (rm == 4) pos++; pos += 4; }
+                instr.mnemonic = "imul";
+                instr.length = pos;
+                return true;
+            }
+        }
+        // 其他 0F 开头的双字节操作码：默认 2 字节 + 可能的 ModR/M
+        else {
+            // 保守处理：假设带 ModR/M
+            if (pos < size) {
+                uint8_t modrm = code[pos];
+                pos++;
+                uint8_t mod = (modrm >> 6) & 3;
+                uint8_t rm = modrm & 7;
+                if (mod == 0 && rm == 5) pos += 4;
+                else if (mod == 0 && rm == 4) pos++;
+                else if (mod == 1) { if (rm == 4) pos++; pos++; }
+                else if (mod == 2) { if (rm == 4) pos++; pos += 4; }
+            }
+            instr.mnemonic = "???";
+            instr.length = pos;
+            return true;
+        }
+
+        instr.mnemonic = "???";
+        instr.length = pos;
+        return true;
+    }
+
+    // 如果有 REX.W 前缀，调整 MOV reg, imm 的长度（imm64 而非 imm32）
+    bool rexW = (rex & 0x08) != 0;
+
+    instr.length = pos;  // 至少包含前缀 + 操作码
 
     // 简化的指令解码
+    // 注意：pos 已经包含了 REX prefix 的偏移（pos = rex ? 2 : 1）
     switch (opcode) {
         // NOP
         case 0x90:
             instr.mnemonic = "nop";
             instr.isNop = true;
+            // instr.length = pos (已设置)
             break;
 
         // INT3
@@ -331,48 +456,48 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
 
         // RET imm16
         case 0xC2:
-            if (size >= 3) {
+            if (pos + 2 <= size) {
                 instr.mnemonic = "ret";
-                instr.length = 3;
+                instr.length = pos + 2;  // 操作码 + 2字节立即数
                 instr.isReturn = true;
             }
             break;
 
         // JMP rel8
         case 0xEB:
-            if (size >= 2) {
+            if (pos + 1 <= size) {
                 instr.mnemonic = "jmp";
                 instr.isBranch = true;
                 instr.isConditional = false;
                 instr.hasTarget = true;
-                int8_t rel = (int8_t)code[1];
-                instr.targetAddress = address + 2 + rel;
-                instr.length = 2;
+                int8_t rel = (int8_t)code[pos];
+                instr.length = pos + 1;
+                instr.targetAddress = address + instr.length + rel;
             }
             break;
 
         // JMP rel32
         case 0xE9:
-            if (size >= 5) {
+            if (pos + 4 <= size) {
                 instr.mnemonic = "jmp";
                 instr.isBranch = true;
                 instr.isConditional = false;
                 instr.hasTarget = true;
-                int32_t rel = *(int32_t*)(code + 1);
-                instr.targetAddress = address + 5 + rel;
-                instr.length = 5;
+                int32_t rel = *(int32_t*)(code + pos);
+                instr.length = pos + 4;
+                instr.targetAddress = address + instr.length + rel;
             }
             break;
 
         // CALL rel32
         case 0xE8:
-            if (size >= 5) {
+            if (pos + 4 <= size) {
                 instr.mnemonic = "call";
                 instr.isCall = true;
                 instr.hasTarget = true;
-                int32_t rel = *(int32_t*)(code + 1);
-                instr.targetAddress = address + 5 + rel;
-                instr.length = 5;
+                int32_t rel = *(int32_t*)(code + pos);
+                instr.length = pos + 4;
+                instr.targetAddress = address + instr.length + rel;
             }
             break;
 
@@ -388,20 +513,24 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
             instr.mnemonic = "pop";
             break;
 
-        // MOV reg, imm32 (0xB8-0xBF)
+        // MOV reg, imm32/imm64 (0xB8-0xBF)
         case 0xB8: case 0xB9: case 0xBA: case 0xBB:
         case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-            if (size >= 5) {
+        {
+            // BUG 3 修复：REX.W 时立即数为 8 字节（imm64），否则 4 字节
+            uint32_t immSize = (rexW) ? 8 : 4;
+            if (pos + immSize <= size) {
                 instr.mnemonic = "mov";
-                instr.length = 5;
+                instr.length = pos + immSize;
             }
             break;
+        }
 
         // PUSH imm32
         case 0x68:
-            if (size >= 5) {
+            if (pos + 4 <= size) {
                 instr.mnemonic = "push";
-                instr.length = 5;
+                instr.length = pos + 4;
             }
             break;
 
@@ -410,7 +539,7 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
         case 0x74: case 0x75: case 0x76: case 0x77:
         case 0x78: case 0x79: case 0x7A: case 0x7B:
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
-            if (size >= 2) {
+            if (pos + 1 <= size) {
                 const char* condNames[] = {
                     "jo", "jno", "jb", "jnb", "jz", "jnz", "jbe", "ja",
                     "js", "jns", "jp", "jnp", "jl", "jnl", "jle", "jg"
@@ -419,16 +548,16 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
                 instr.isBranch = true;
                 instr.isConditional = true;
                 instr.hasTarget = true;
-                int8_t rel = (int8_t)code[1];
-                instr.targetAddress = address + 2 + rel;
-                instr.length = 2;
+                int8_t rel = (int8_t)code[pos];
+                instr.length = pos + 1;
+                instr.targetAddress = address + instr.length + rel;
             }
             break;
 
         // 默认处理
         default:
             instr.mnemonic = "???";
-            instr.length = 1;
+            // instr.length = pos (已设置)
             break;
     }
 
@@ -441,6 +570,7 @@ bool Disassembler::AnalyzeBranch(Instruction& instr) {
 }
 
 bool Disassembler::IsConditionalBranch(uint8_t opcode) {
+    // 短条件跳转 0x70-0x7F; 近条件跳转需要双字节 0x0F 80-8F，在此只检查单字节
     return (opcode >= 0x70 && opcode <= 0x7F);
 }
 
@@ -487,27 +617,13 @@ bool Disassembler::IsEpilogue(const uint8_t* code, uint32_t size) {
 uint32_t Disassembler::GetInstructionLength(const uint8_t* code, uint32_t maxSize) {
     if (maxSize == 0) return 0;
 
-    // 简化的指令长度计算
-    uint8_t opcode = code[0];
-    
-    // 特殊指令
-    switch (opcode) {
-        case 0xC2: return 3;  // ret imm16
-        case 0x68: return 5;  // push imm32
-        case 0xE8: return 5;  // call rel32
-        case 0xE9: return 5;  // jmp rel32
-        case 0xEB: return 2;  // jmp rel8
-        case 0xB8: case 0xB9: case 0xBA: case 0xBB:
-        case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-            return 5;  // mov reg, imm32
+    // BUG 1 修复：统一使用 DecodeInstruction 计算长度，
+    // 避免两套独立解码逻辑返回不同结果。
+    Instruction tempInstr{};
+    if (DecodeInstruction(code, maxSize, 0, tempInstr)) {
+        return tempInstr.length > 0 ? tempInstr.length : 1;
     }
-
-    // 条件跳转
-    if (opcode >= 0x70 && opcode <= 0x7F) return 2;
-
-    // 使用查找表
-    int len = SINGLE_BYTE_LENGTHS[opcode];
-    return (len > 0) ? len : 1;
+    return 1;
 }
 
 
@@ -586,7 +702,7 @@ std::vector<Function> Disassembler::AnalyzeCode(
         functions.push_back(currentFunc);
     }
 
-    // ========================================================================
+    // ============================================================================================
     // 后处理：为每个函数的基本块计算后继信息
     // ========================================================================
     for (auto& func : functions) {

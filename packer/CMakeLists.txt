@@ -29,6 +29,7 @@ add_library(ciphershell_packer STATIC
 
     # 转译器 — Phase 4
     transforms/translator.cpp
+    transforms/vm_nester.cpp
 
     # 变异引擎 — Phase 4
     mutation/bytecode_encryptor.cpp

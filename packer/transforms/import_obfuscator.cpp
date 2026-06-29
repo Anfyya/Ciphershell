@@ -137,19 +137,21 @@ std::vector<CS_OBFUSCATED_IMPORT> ImportObfuscator::ObfuscateImports(
 
     // 收集混淆后的导入信息
     // 遍历原始导入表，为每个函数生成哈希
+    // BUG 13 修复：使用 std::string 拷贝代替 c_str() 裸指针，
+    // 避免源 string 销毁或 vector 重分配后指针悬空。
     for (const auto& dll : image->imports.dlls) {
         for (const auto& func : dll.functions) {
             CS_OBFUSCATED_IMPORT obfImport;
             obfImport.dllHash = APIResolver::HashString(dll.dllName.c_str());
-            obfImport.dllName = dll.dllName.c_str();
+            obfImport.dllName = dll.dllName;  // std::string 拷贝
 
             if (func.isOrdinal) {
                 // 按序号导入：使用序号作为哈希
                 obfImport.funcHash = func.ordinal;
-                obfImport.funcName = nullptr;
+                obfImport.funcName = "";
             } else {
                 obfImport.funcHash = APIResolver::HashString(func.name.c_str());
-                obfImport.funcName = func.name.c_str();
+                obfImport.funcName = func.name;  // std::string 拷贝
             }
 
             obfImport.originalRVA = func.thunkRVA;

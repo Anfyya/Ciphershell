@@ -29,11 +29,15 @@ OpaquePredicateGenerator::~OpaquePredicateGenerator() {}
 // ============================================================================
 
 OpaquePredicate OpaquePredicateGenerator::Generate(OpaquePredicateType type, bool expectedResult) {
+    // BUG 10 修复：根据 expectedResult 选择生成 always-true 或 always-false 的谓词，
+    // 而不是忽略该参数。
     switch (type) {
         case OpaquePredicateType::AlwaysTrue:
-            return GenerateAlwaysTrue();
+            // 尊重 expectedResult：如果期望 false，则生成 AlwaysFalse
+            return expectedResult ? GenerateAlwaysTrue() : GenerateAlwaysFalse();
         case OpaquePredicateType::AlwaysFalse:
-            return GenerateAlwaysFalse();
+            // 尊重 expectedResult：如果期望 true，则生成 AlwaysTrue
+            return expectedResult ? GenerateAlwaysTrue() : GenerateAlwaysFalse();
         case OpaquePredicateType::MathIdentity:
             return GenerateMathPredicate(expectedResult);
         case OpaquePredicateType::PointerAlias:
@@ -89,44 +93,60 @@ OpaquePredicate OpaquePredicateGenerator::GenerateMathPredicate(bool expectedRes
     pred.type = OpaquePredicateType::MathIdentity;
     pred.id = m_nextId++;
     pred.expectedResult = expectedResult;
-    
-    // 选择一个数学恒等式
-    uint32_t choice = rand() % 4;
-    
-    switch (choice) {
-        case 0:
-            // x^2 mod 4 ∈ {0, 1}（永远为真）
-            pred.operand1 = rand() % 1000;
-            pred.magicValue = (pred.operand1 * pred.operand1) % 4;
-            pred.description = "x^2 mod 4 ∈ {0, 1}";
-            pred.expectedResult = true;  // 这个永远为真
-            break;
-            
-        case 1:
-            // x * (x + 1) 是偶数（永远为真）
-            pred.operand1 = rand() % 1000;
-            pred.magicValue = pred.operand1 * (pred.operand1 + 1);
-            pred.description = "x * (x + 1) is even";
-            pred.expectedResult = true;
-            break;
-            
-        case 2:
-            // x^3 - x 能被 6 整除（对于 x >= 1，永远为真）
-            pred.operand1 = rand() % 100 + 1;
-            pred.magicValue = pred.operand1 * pred.operand1 * pred.operand1 - pred.operand1;
-            pred.description = "x^3 - x divisible by 6";
-            pred.expectedResult = true;
-            break;
-            
-        case 3:
-            // 选择一个完全平方数
-            pred.operand1 = rand() % 100;
-            pred.magicValue = pred.operand1 * pred.operand1;
-            pred.description = "Is perfect square check";
-            pred.expectedResult = expectedResult;
-            break;
+    pred.code = nullptr;
+    pred.codeSize = 0;
+
+    // BUG 10 修复：根据 expectedResult 选择恒真或恒假的数学谓词，
+    // 而不是所有 case 都强制覆盖为 true。
+    if (expectedResult) {
+        // 生成恒真谓词
+        uint32_t choice = rand() % 3;
+        switch (choice) {
+            case 0:
+                // x^2 mod 4 ∈ {0, 1}（永远为真）
+                pred.operand1 = rand() % 1000;
+                pred.magicValue = (pred.operand1 * pred.operand1) % 4;
+                pred.description = "x^2 mod 4 in {0, 1} (always true)";
+                break;
+            case 1:
+                // x * (x + 1) 是偶数（永远为真）
+                pred.operand1 = rand() % 1000;
+                pred.magicValue = pred.operand1 * (pred.operand1 + 1);
+                pred.description = "x * (x + 1) is even (always true)";
+                break;
+            case 2:
+                // x^3 - x 能被 6 整除（永远为真）
+                pred.operand1 = rand() % 100 + 1;
+                pred.magicValue = pred.operand1 * pred.operand1 * pred.operand1 - pred.operand1;
+                pred.description = "x^3 - x divisible by 6 (always true)";
+                break;
+        }
+    } else {
+        // 生成恒假谓词
+        uint32_t choice = rand() % 3;
+        switch (choice) {
+            case 0:
+                // x^2 < 0（对无符号数永远为假）
+                pred.operand1 = rand() % 1000;
+                pred.magicValue = 0;
+                pred.description = "x^2 < 0 (always false for unsigned)";
+                break;
+            case 1:
+                // x != x（永远为假）
+                pred.operand1 = rand() % 1000;
+                pred.operand2 = pred.operand1;
+                pred.magicValue = 1;  // 期望不等，但实际相等
+                pred.description = "x != x (always false)";
+                break;
+            case 2:
+                // (x & 0) != 0（永远为假）
+                pred.operand1 = rand() % 1000;
+                pred.magicValue = 0;
+                pred.description = "(x & 0) != 0 (always false)";
+                break;
+        }
     }
-    
+
     return pred;
 }
 

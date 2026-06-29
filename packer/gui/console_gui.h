@@ -100,8 +100,8 @@ private:
     int ReadChoice(const std::string& prompt, int min, int max);
     bool ReadYesNo(const std::string& prompt);
 
-    // 菜单显示
-    void ShowMenu(const std::string& title, const std::vector<MenuItem>& items);
+    // 菜单显示（返回 true 表示继续循环，false 表示退出）
+    bool ShowMenu(const std::string& title, const std::vector<MenuItem>& items);
 
     // 成员变量
     bool m_initialized;

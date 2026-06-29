@@ -169,6 +169,9 @@ private:
     uint8_t GetOpcodeForInstruction(const std::string& mnemonic);
     bool IsJumpInstruction(const std::string& mnemonic);
 
+    // BUG 1 修复：计算指令编码后的实际字节长度（用于两遍偏移量计算）
+    uint32_t CalculateEncodedSize(const BytecodeInstr& instr);
+
     // 成员变量
     TranslationConfig m_config;
     std::unordered_map<uint8_t, uint8_t> m_registerMap;  // x86 reg -> VM reg

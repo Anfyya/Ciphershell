@@ -186,13 +186,14 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
     deadBlock.startAddress = GenerateBlockId() * 0x100;
     deadBlock.instructionCount = 0;
 
-    // 随机选择一种死代码模式（看起来像真实计算但永远不会执行）
-    uint32_t pattern = rand() % 5;
+    // BUG 14 修复：增加虚假块的多样性，使用更多种类的指令组合
+    // （多种 NOP sled 变体、算术运算、内存操作、位操作等）
+    // BUG 2 同类修复：Instruction 包含 std::string，不能用 memset
+    uint32_t pattern = rand() % 10;  // 扩展到 10 种模式
     uint64_t addr = deadBlock.startAddress;
 
     auto addInstr = [&](const char* mnem, std::initializer_list<uint8_t> bytes) {
-        Instruction instr;
-        memset(&instr, 0, sizeof(instr));
+        Instruction instr{};  // 值初始化，替代 memset
         instr.address = addr;
         instr.length = (uint8_t)bytes.size();
         int i = 0;
@@ -205,7 +206,7 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
 
     switch (pattern) {
         case 0:
-            // 模拟循环计数器：mov ecx, N; dec ecx; jnz -2（但不跳）
+            // 模拟循环计数器
             addInstr("push", {0x51});                          // push ecx
             addInstr("mov",  {0xB9, 0x0A, 0x00, 0x00, 0x00}); // mov ecx, 10
             addInstr("dec",  {0x49});                          // dec ecx
@@ -216,7 +217,7 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
             break;
 
         case 1:
-            // 模拟内存操作：push/pop 序列
+            // 模拟内存操作：push/pop + 运算
             addInstr("push", {0x50});                          // push eax
             addInstr("push", {0x53});                          // push ebx
             addInstr("mov",  {0xB8, 0xFF, 0x00, 0x00, 0x00}); // mov eax, 0xFF
@@ -262,6 +263,74 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
             addInstr("pop",  {0x58});                          // pop eax
             break;
 
+        case 5:
+            // 多字节 NOP sled 变体（反模式识别）
+            addInstr("nop",    {0x90});                                     // 1字节 NOP
+            addInstr("xchg",   {0x66, 0x90});                              // 2字节 NOP (66 90)
+            addInstr("nop",    {0x0F, 0x1F, 0x00});                        // 3字节 NOP (0F 1F /0)
+            addInstr("nop",    {0x0F, 0x1F, 0x40, 0x00});                  // 4字节 NOP
+            addInstr("nop",    {0x0F, 0x1F, 0x44, 0x00, 0x00});            // 5字节 NOP
+            addInstr("lea",    {0x8D, 0x76, 0x00});                        // lea esi,[esi+0] (等效NOP)
+            break;
+
+        case 6:
+            // 模拟字符串长度计算
+            addInstr("push",  {0x50});                          // push eax
+            addInstr("push",  {0x51});                          // push ecx
+            addInstr("push",  {0x52});                          // push edx
+            addInstr("xor",   {0x31, 0xC9});                    // xor ecx, ecx
+            addInstr("mov",   {0xB8, 0x48, 0x65, 0x6C, 0x6C}); // mov eax, 'lleH'
+            addInstr("not",   {0xF7, 0xD0});                    // not eax
+            addInstr("bswap", {0x0F, 0xC8});                    // bswap eax
+            addInstr("and",   {0x83, 0xE0, 0x0F});              // and eax, 0xF
+            addInstr("pop",   {0x5A});                          // pop edx
+            addInstr("pop",   {0x59});                          // pop ecx
+            addInstr("pop",   {0x58});                          // pop eax
+            break;
+
+        case 7:
+            // 模拟 CRC 步骤：移位 + 异或
+            addInstr("push", {0x50});                          // push eax
+            addInstr("push", {0x52});                          // push edx
+            addInstr("mov",  {0xB8, 0x04, 0xC1, 0x1D, 0xB7}); // mov eax, 0xB71DC104 (CRC多项式)
+            addInstr("mov",  {0xBA, 0xFF, 0xFF, 0xFF, 0xFF}); // mov edx, 0xFFFFFFFF
+            addInstr("shr",  {0xC1, 0xEA, 0x01});              // shr edx, 1
+            addInstr("xor",  {0x31, 0xC2});                    // xor edx, eax
+            addInstr("shr",  {0xC1, 0xEA, 0x01});              // shr edx, 1
+            addInstr("xor",  {0x31, 0xC2});                    // xor edx, eax
+            addInstr("not",  {0xF7, 0xD2});                    // not edx
+            addInstr("pop",  {0x5A});                          // pop edx
+            addInstr("pop",  {0x58});                          // pop eax
+            break;
+
+        case 8:
+            // 浮点运算模拟（FPU 指令序列）
+            addInstr("push",  {0x50});                          // push eax
+            addInstr("sub",   {0x83, 0xEC, 0x08});              // sub esp, 8
+            addInstr("mov",   {0xB8, 0x00, 0x00, 0x80, 0x3F}); // mov eax, 0x3F800000 (1.0f)
+            addInstr("mov",   {0x89, 0x04, 0x24});              // mov [esp], eax
+            addInstr("mov",   {0xB8, 0x00, 0x00, 0x00, 0x40}); // mov eax, 0x40000000 (2.0f)
+            addInstr("mov",   {0x89, 0x44, 0x24, 0x04});        // mov [esp+4], eax
+            addInstr("add",   {0x83, 0xC4, 0x08});              // add esp, 8
+            addInstr("pop",   {0x58});                          // pop eax
+            break;
+
+        case 9:
+            // 模拟查表跳转准备（间接跳转前的地址计算）
+            addInstr("push", {0x50});                          // push eax
+            addInstr("push", {0x53});                          // push ebx
+            addInstr("push", {0x51});                          // push ecx
+            addInstr("mov",  {0xB8, 0x03, 0x00, 0x00, 0x00}); // mov eax, 3
+            addInstr("mov",  {0xB9, 0x04, 0x00, 0x00, 0x00}); // mov ecx, 4
+            addInstr("imul", {0x0F, 0xAF, 0xC1});              // imul eax, ecx
+            addInstr("cdq",  {0x99});                           // cdq
+            addInstr("idiv", {0xF7, 0xF9});                    // idiv ecx
+            addInstr("mov",  {0x89, 0xC3});                    // mov ebx, eax
+            addInstr("pop",  {0x59});                          // pop ecx
+            addInstr("pop",  {0x5B});                          // pop ebx
+            addInstr("pop",  {0x58});                          // pop eax
+            break;
+
         default:
             // 默认: NOP 滑梯
             for (int i = 0; i < 4; i++) {
@@ -282,8 +351,7 @@ BasicBlock BogusFlowInjector::MutateBlock(const BasicBlock& block) {
 
     // 在指令序列中插入 NOP
     if (!mutated.instructions.empty()) {
-        Instruction nop;
-        memset(&nop, 0, sizeof(nop));
+        Instruction nop{};  // 值初始化，不用 memset（Instruction 含 std::string）
         nop.address = mutated.startAddress;
         nop.length = 1;
         nop.bytes[0] = 0x90;
@@ -325,8 +393,7 @@ void BogusFlowInjector::RearrangeInstructions(BasicBlock& block) {
     // 在不改变语义的前提下重排
     // 简化版：在开头插入 XCHG EAX,EAX (等效 NOP)
     if (!block.instructions.empty()) {
-        Instruction xchg;
-        memset(&xchg, 0, sizeof(xchg));
+        Instruction xchg{};  // 值初始化，不用 memset（Instruction 含 std::string）
         xchg.address = block.startAddress;
         xchg.length = 2;
         xchg.bytes[0] = 0x87;

@@ -179,6 +179,91 @@ MutatedISA VMNester::MutateISA(const MutatedISA& baseISA, uint32_t level) {
     return mutated;
 }
 
+// BUG 7 修复辅助函数：根据操作码确定操作数长度（字节）
+// 必须与 Translator::EncodeInstruction 中的编码规则一致
+static uint32_t GetOpcodeOperandSize(uint8_t opcode) {
+    switch (opcode) {
+        // 无操作数
+        case VM_NOP:
+        case VM_PUSHAD:
+        case VM_POPAD:
+        case VM_PUSHF:
+        case VM_POPF:
+        case VM_RET_VM:
+        case VM_VMEXIT:
+        case VM_INT3:
+            return 0;
+
+        // 双寄存器：regDst + regSrc (2 字节)
+        case VM_MOV_RR:
+        case VM_ADD_RR:
+        case VM_SUB_RR:
+        case VM_AND_RR:
+        case VM_OR_RR:
+        case VM_XOR_RR:
+        case VM_CMP_RR:
+        case VM_TEST_RR:
+        case VM_SHL_RR:
+        case VM_SHR_RR:
+        case VM_SAR_RR:
+        case VM_ADC_RR:
+        case VM_SBB_RR:
+        case VM_XCHG:
+            return 2;
+
+        // 寄存器 + 立即数64：reg + imm64 (9 字节)
+        case VM_MOV_RC:
+        case VM_ADD_RC:
+        case VM_SUB_RC:
+        case VM_AND_RC:
+        case VM_OR_RC:
+        case VM_XOR_RC:
+        case VM_CMP_RC:
+        case VM_TEST_RC:
+        case VM_PUSH_C:
+            return 9;
+
+        // 单寄存器：reg (1 字节)
+        case VM_PUSH_R:
+        case VM_POP_R:
+        case VM_INC_R:
+        case VM_DEC_R:
+        case VM_NEG_R:
+        case VM_NOT_R:
+            return 1;
+
+        // 内存操作：regDst + regSrc + imm64 (10 字节)
+        case VM_MOV_RM:
+        case VM_MOV_MR:
+        case VM_LEA:
+            return 10;
+
+        // 跳转/调用（立即数32）：imm32 (4 字节)
+        case VM_JMP:
+        case VM_JZ:
+        case VM_JNZ:
+        case VM_JA:
+        case VM_JB:
+        case VM_JG:
+        case VM_JL:
+        case VM_JGE:
+        case VM_JLE:
+        case VM_JO:
+        case VM_JNO:
+        case VM_JS:
+        case VM_JNS:
+        case VM_CALL_VM:
+            return 4;
+
+        // CALL_NATIVE：dllHash(imm32) + funcHash(imm32) (8 字节)
+        case VM_CALL_NATIVE:
+            return 8;
+
+        default:
+            return 0;  // 未知操作码视为无操作数
+    }
+}
+
 std::vector<uint8_t> VMNester::TranslateToNestedBytecode(
     const uint8_t* code,
     uint32_t size,
@@ -187,22 +272,35 @@ std::vector<uint8_t> VMNester::TranslateToNestedBytecode(
 {
     std::vector<uint8_t> result;
 
-    // 简化实现：将原始字节码中的 opcode 映射到内层 ISA
-    for (uint32_t i = 0; i < size; i++) {
+    // BUG 7 修复：正确解析字节码流——先读操作码确定操作数长度，
+    // 只映射操作码，操作数原样保留
+    uint32_t i = 0;
+    while (i < size) {
         uint8_t originalOp = code[i];
-        uint8_t mappedOp = originalOp;
 
-        // 查找内层 ISA 的 opcode 映射
+        // 映射操作码到内层 ISA
+        uint8_t mappedOp = originalOp;
         auto it = toISA.opcodeMap.find(originalOp);
         if (it != toISA.opcodeMap.end()) {
             mappedOp = it->second;
         }
-
         result.push_back(mappedOp);
+        i++;
+
+        // 计算此操作码的操作数长度，操作数原样复制
+        uint32_t operandSize = GetOpcodeOperandSize(originalOp);
+        for (uint32_t j = 0; j < operandSize && i < size; j++, i++) {
+            result.push_back(code[i]);
+        }
     }
 
-    // 添加内层 VMEXIT 指令
-    result.push_back(VM_VMEXIT);
+    // BUG 8 修复：VMEXIT 操作码也需要通过内层 ISA 映射
+    uint8_t vmexitMapped = VM_VMEXIT;
+    auto exitIt = toISA.opcodeMap.find(VM_VMEXIT);
+    if (exitIt != toISA.opcodeMap.end()) {
+        vmexitMapped = exitIt->second;
+    }
+    result.push_back(vmexitMapped);
 
     return result;
 }

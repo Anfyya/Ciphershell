@@ -96,7 +96,18 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
 }
 
 void PERebuilder::AddSection(std::vector<CS_SECTION_CONFIG>& sections, const CS_SECTION_CONFIG& section) {
-    sections.push_back(section);
+    CS_SECTION_CONFIG fixedSection = section;
+
+    // BUG4修复：VirtualSize=0 会导致节区在内存中被映射为零大小，节区数据丢失
+    // Windows PE 加载器在 VirtualSize=0 时可能不分配内存页，导致运行时访问违例
+    // 至少应等于 SizeOfRawData（即 dataSize），确保数据能完整映射到内存
+    if (fixedSection.virtualSize == 0 && fixedSection.dataSize > 0) {
+        DWORD align = fixedSection.alignment > 0 ? fixedSection.alignment : 0x1000;
+        // 按 SectionAlignment 对齐
+        fixedSection.virtualSize = (fixedSection.dataSize + align - 1) & ~(align - 1);
+    }
+
+    sections.push_back(fixedSection);
 }
 
 char* PERebuilder::GenerateRandomSectionName() {
@@ -316,13 +327,14 @@ DWORD PERebuilder::CalculateChecksum(BYTE* data, DWORD size) {
     return checksum + size;
 }
 
-bool PERebuilder::UpdateChecksum(BYTE* peData) {
+bool PERebuilder::UpdateChecksum(BYTE* peData, DWORD actualFileSize) {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)peData;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peData + dosHeader->e_lfanew);
 
-    // 计算新校验和
-    DWORD fileSize = ntHeaders->OptionalHeader.SizeOfImage;
-    DWORD checksum = CalculateChecksum(peData, fileSize);
+    // BUG3修复：使用实际文件缓冲区大小而非 SizeOfImage（内存映像大小）
+    // SizeOfImage 是 PE 映射到内存后的大小（按 SectionAlignment 对齐），通常远大于文件大小
+    // 用 SizeOfImage 计算校验和会读取超出文件数据范围的内存，导致校验和错误
+    DWORD checksum = CalculateChecksum(peData, actualFileSize);
 
     // 更新校验和
     if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {

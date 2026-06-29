@@ -6,7 +6,11 @@
 #ifndef CS_VM_NESTER_H
 #define CS_VM_NESTER_H
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "windows_compat.h"
+#endif
 #include "../../stub/vm/vm_context.h"
 #include "../mutation/mutation_engine.h"
 #include <cstdint>

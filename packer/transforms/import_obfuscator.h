@@ -31,8 +31,10 @@ struct CS_OBFUSCATED_IMPORT {
     uint32_t    dllHash;        // DLL 名称哈希
     uint32_t    funcHash;       // 函数名称哈希
     DWORD       originalRVA;    // 原始 IAT 位置 RVA
-    const char* dllName;        // 原始 DLL 名称
-    const char* funcName;       // 原始函数名称
+    // BUG 13 修复：使用 std::string 代替 const char*，
+    // 避免临时 string 对象销毁后 c_str() 悬空指针
+    std::string dllName;        // 原始 DLL 名称
+    std::string funcName;       // 原始函数名称
     bool        isFake;         // 是否为假导入
 };
 

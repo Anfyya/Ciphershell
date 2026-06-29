@@ -169,20 +169,32 @@ std::vector<CS_STRING_REF> StringEncryptor::FindStringReferences(
         const BYTE* codeData = image->rawData + section->PointerToRawData;
         DWORD codeSize = section->SizeOfRawData;
 
+        // BUG 11 修复：push imm32 / mov reg,imm32 中的立即数是 VA（含 ImageBase），
+        // 需要减去 ImageBase 转换为 RVA 后再与 rvaToIndex 匹配。
+        ULONGLONG imageBase = 0;
+        if (image->is64Bit && image->ntHeaders64) {
+            imageBase = image->ntHeaders64->OptionalHeader.ImageBase;
+        } else if (image->ntHeaders32) {
+            imageBase = image->ntHeaders32->OptionalHeader.ImageBase;
+        }
+
         // 简化扫描：查找直接引用（push offset / mov reg, offset 模式）
         for (DWORD offset = 0; offset < codeSize - 5; offset++) {
             // 检查 push imm32 (0x68) 或 mov reg, imm32 (0xB8-0xBF)
-            if (codeData[offset] == 0x68 || 
+            if (codeData[offset] == 0x68 ||
                 (codeData[offset] >= 0xB8 && codeData[offset] <= 0xBF)) {
-                // 获取立即数
+                // 获取立即数（VA）
                 DWORD imm32 = *(DWORD*)(codeData + offset + 1);
 
+                // BUG 11 修复：将 VA 转换为 RVA 后再查找
+                DWORD stringRVA = imm32 - (DWORD)imageBase;
+
                 // 检查是否是字符串 RVA
-                if (rvaToIndex.find(imm32) != rvaToIndex.end()) {
+                if (rvaToIndex.find(stringRVA) != rvaToIndex.end()) {
                     CS_STRING_REF ref;
                     ref.codeRVA = section->VirtualAddress + offset;
                     ref.codeOffset = section->PointerToRawData + offset;
-                    ref.stringRVA = imm32;
+                    ref.stringRVA = stringRVA;
                     ref.instrLength = 5;
                     ref.isDirectPush = (codeData[offset] == 0x68);
 
@@ -192,21 +204,30 @@ std::vector<CS_STRING_REF> StringEncryptor::FindStringReferences(
 
             // lea reg, [rip+offset] (x64)
             if (image->is64Bit && offset < codeSize - 7) {
-                // 检查 lea 指令 (48 8D xx xx xx xx xx)
+                // BUG 12 修复：检查 LEA 指令时需要正确解析 ModR/M 字节
+                // LEA 格式：REX.W (0x48) + 0x8D + ModR/M
+                // RIP-relative 寻址：ModR/M 的 mod=00, rm=101 (0bXX_rrr_101)
                 if (codeData[offset] == 0x48 && codeData[offset + 1] == 0x8D) {
-                    // 计算 RIP 相对地址
-                    int32_t rel32 = *(int32_t*)(codeData + offset + 3);
-                    DWORD targetRVA = section->VirtualAddress + offset + 7 + rel32;
+                    uint8_t modrm = codeData[offset + 2];
+                    uint8_t mod = (modrm >> 6) & 3;
+                    uint8_t rm = modrm & 7;
 
-                    if (rvaToIndex.find(targetRVA) != rvaToIndex.end()) {
-                        CS_STRING_REF ref;
-                        ref.codeRVA = section->VirtualAddress + offset;
-                        ref.codeOffset = section->PointerToRawData + offset;
-                        ref.stringRVA = targetRVA;
-                        ref.instrLength = 7;
-                        ref.isDirectPush = false;
+                    // 只处理 RIP-relative 寻址 (mod=00, rm=101)
+                    if (mod == 0x00 && rm == 0x05) {
+                        // 计算 RIP 相对地址
+                        int32_t rel32 = *(int32_t*)(codeData + offset + 3);
+                        DWORD targetRVA = section->VirtualAddress + offset + 7 + rel32;
 
-                        result.push_back(ref);
+                        if (rvaToIndex.find(targetRVA) != rvaToIndex.end()) {
+                            CS_STRING_REF ref;
+                            ref.codeRVA = section->VirtualAddress + offset;
+                            ref.codeOffset = section->PointerToRawData + offset;
+                            ref.stringRVA = targetRVA;
+                            ref.instrLength = 7;
+                            ref.isDirectPush = false;
+
+                            result.push_back(ref);
+                        }
                     }
                 }
             }

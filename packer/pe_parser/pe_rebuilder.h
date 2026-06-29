@@ -120,7 +120,7 @@ private:
     DWORD AlignValue(DWORD value, DWORD alignment);
     void GenerateRandomName(char* name, DWORD length);
     DWORD CalculateChecksum(BYTE* data, DWORD size);
-    bool UpdateChecksum(BYTE* peData);
+    bool UpdateChecksum(BYTE* peData, DWORD actualFileSize);
 
     // 随机数生成
     DWORD GenerateRandomDWORD();

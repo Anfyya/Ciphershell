@@ -7,6 +7,16 @@
 #include <cstdlib>
 #include <ctime>
 
+// BUG6修复：使用密码学安全的随机数生成器替代 rand()
+// rand() 的输出可预测（种子空间小、线性同余算法），攻击者可暴力破解密钥
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <random>
+#endif
+
 namespace CipherShell {
 
 // ============================================================================
@@ -14,7 +24,7 @@ namespace CipherShell {
 // ============================================================================
 
 SectionEncryptor::SectionEncryptor() {
-    srand((unsigned int)time(nullptr));
+    // BUG6修复：不再使用 srand/rand，密钥生成已改用 CSPRNG
 }
 
 SectionEncryptor::~SectionEncryptor() {}
@@ -88,17 +98,33 @@ bool SectionEncryptor::DecryptSections(
 CS_ENCRYPTION_KEY SectionEncryptor::GenerateRandomKey() {
     CS_ENCRYPTION_KEY key;
 
+    // BUG6修复：使用密码学安全的随机数生成器
+    // rand() 种子空间仅 32 位，且输出序列可预测，不适用于密钥生成
+#ifdef _WIN32
+    // Windows 平台：使用 BCryptGenRandom（CNG API），提供 CSPRNG
+    BCryptGenRandom(NULL, key.key, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    BCryptGenRandom(NULL, key.nonce, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    BCryptGenRandom(NULL, (PUCHAR)&key.counter, sizeof(key.counter), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+#else
+    // 跨平台：使用 std::random_device 获取硬件熵源
+    std::random_device rd;
     // 生成随机密钥
-    for (int i = 0; i < 32; i++) {
-        key.key[i] = (uint8_t)(rand() % 256);
+    for (int i = 0; i < 32; i += 4) {
+        uint32_t val = rd();
+        int remaining = 32 - i;
+        int copyLen = remaining < 4 ? remaining : 4;
+        memcpy(key.key + i, &val, copyLen);
     }
-
     // 生成随机 nonce
-    for (int i = 0; i < 12; i++) {
-        key.nonce[i] = (uint8_t)(rand() % 256);
+    for (int i = 0; i < 12; i += 4) {
+        uint32_t val = rd();
+        int remaining = 12 - i;
+        int copyLen = remaining < 4 ? remaining : 4;
+        memcpy(key.nonce + i, &val, copyLen);
     }
-
-    key.counter = (uint32_t)rand();
+    uint32_t counterVal = rd();
+    key.counter = counterVal;
+#endif
 
     return key;
 }
@@ -232,13 +258,14 @@ bool SectionEncryptor::DecryptSection(
         return false;
     }
 
-    // 初始化 ChaCha20
-    ChaCha20 cipher;
-    cipher.Init(key.key, key.nonce, key.counter);
-
-    // 解密 section 数据
+    // BUG5修复：解密必须与加密使用相同算法
+    // EncryptSection 使用 XOR key[0] 加密，XOR 是对称操作（加密 = 解密）
+    // 之前错误地使用 ChaCha20 解密，导致解密后数据损坏
+    // stub 中同样使用 XOR 解密，这里保持一致
     BYTE* sectionData = image->rawData + section->PointerToRawData;
-    cipher.ProcessInPlace(sectionData, section->SizeOfRawData);
+    for (DWORD i = 0; i < section->SizeOfRawData; i++) {
+        sectionData[i] ^= key.key[0];
+    }
 
     // 恢复执行权限
     section->Characteristics |= IMAGE_SCN_MEM_EXECUTE;

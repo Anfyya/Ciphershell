@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <regex>
+#include <iostream>
 
 namespace CipherShell {
 
@@ -24,9 +25,13 @@ ConfigParser::~ConfigParser() {}
 
 CipherShellConfig ConfigParser::LoadFromFile(const std::string& filePath) {
     CipherShellConfig config;
+    m_lastError.clear();  // BUG 16 修复：清除之前的错误状态
 
     std::ifstream file(filePath);
     if (!file.is_open()) {
+        // BUG 16 修复：设置错误信息而非仅打印到 stderr，调用方可检查 HasError()
+        m_lastError = "无法打开配置文件: " + filePath;
+        std::cerr << "[ConfigParser] " << m_lastError << std::endl;
         return config;
     }
 
@@ -34,11 +39,18 @@ CipherShellConfig ConfigParser::LoadFromFile(const std::string& filePath) {
     ss << file.rdbuf();
     std::string content = ss.str();
 
+    if (content.empty()) {
+        m_lastError = "配置文件为空: " + filePath;
+        std::cerr << "[ConfigParser] " << m_lastError << std::endl;
+        return config;
+    }
+
     return LoadFromString(content);
 }
 
 CipherShellConfig ConfigParser::LoadFromString(const std::string& content) {
     CipherShellConfig config;
+    m_lastError.clear();  // BUG 16 修复：清除之前的错误状态
 
     // 解析各个配置段
     ParseGlobalSection(content, config.global);
@@ -303,7 +315,31 @@ double ConfigParser::ParseDouble(const std::string& value) {
 std::string ConfigParser::ParseString(const std::string& value) {
     // 去掉引号
     if (value.length() >= 2 && value.front() == '"' && value.back() == '"') {
-        return value.substr(1, value.length() - 2);
+        std::string raw = value.substr(1, value.length() - 2);
+
+        // BUG 15 修复：处理 TOML 字符串中的转义字符
+        std::string result;
+        result.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); i++) {
+            if (raw[i] == '\\' && i + 1 < raw.size()) {
+                switch (raw[i + 1]) {
+                    case 'n':  result += '\n'; i++; break;
+                    case 't':  result += '\t'; i++; break;
+                    case 'r':  result += '\r'; i++; break;
+                    case '\\': result += '\\'; i++; break;
+                    case '"':  result += '"';  i++; break;
+                    case 'b':  result += '\b'; i++; break;
+                    case 'f':  result += '\f'; i++; break;
+                    default:
+                        // 未知转义序列，原样保留
+                        result += raw[i];
+                        break;
+                }
+            } else {
+                result += raw[i];
+            }
+        }
+        return result;
     }
     return value;
 }

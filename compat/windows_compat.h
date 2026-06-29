@@ -638,7 +638,18 @@ inline void strcpy_s(char (&dest)[N], const char* src) {
     strcpy_s(dest, N, src);
 }
 
+// Console API 存根
+#define STD_OUTPUT_HANDLE ((DWORD)-11)
+#define STD_INPUT_HANDLE  ((DWORD)-10)
+inline HANDLE GetStdHandle(DWORD) { return nullptr; }
+inline BOOL SetConsoleTextAttribute(HANDLE, WORD) { return FALSE; }
+inline BOOL SetConsoleTitleA(LPCSTR) { return FALSE; }
+inline BOOL SetConsoleOutputCP(UINT) { return FALSE; }
+inline BOOL SetConsoleCP(UINT) { return FALSE; }
+inline BOOL GetConsoleScreenBufferInfo(HANDLE, void*) { return FALSE; }
+
+// NtQueryInformationProcess stub
+inline NTSTATUS NtQueryInformationProcess(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG) { return -1; }
+
 #endif // !_WIN32
 #endif // CS_WINDOWS_COMPAT_H
-
-// Remove the closing guards, we'll re-add them

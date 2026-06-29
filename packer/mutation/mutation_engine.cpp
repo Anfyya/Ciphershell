@@ -220,36 +220,81 @@ void MutationEngine::MutateCode(std::vector<uint8_t>& code) {
 }
 
 void MutationEngine::InsertJunkInstructions(std::vector<uint8_t>& code) {
-    // 在代码中随机位置插入无害的垃圾指令
-    std::vector<uint8_t> junkPatterns = {
-        0x90,                               // nop
-        0x48, 0x89, 0xC0,                   // mov rax, rax
-        0x48, 0x83, 0xC0, 0x00,             // add rax, 0
-        0x48, 0x83, 0xE8, 0x00,             // sub rax, 0
-        0x48, 0x21, 0xC0,                   // and rax, rax
-        0x48, 0x09, 0xC0,                   // or rax, rax
+    // BUG 10 修复：先识别指令边界，只在指令边界处插入垃圾指令
+    // 不能在多字节指令中间插入，否则会破坏原有指令编码
+
+    // 安全的垃圾指令模板（完整的 x86-64 指令）
+    struct JunkPattern {
+        const uint8_t* data;
+        size_t size;
     };
+    static const uint8_t nop1[] = { 0x90 };                           // nop
+    static const uint8_t nop2[] = { 0x66, 0x90 };                     // 66 nop (2字节 nop)
+    static const uint8_t nop3[] = { 0x0F, 0x1F, 0x00 };               // nop dword [rax] (3字节 nop)
+    static const uint8_t nop4[] = { 0x0F, 0x1F, 0x40, 0x00 };         // nop dword [rax+0] (4字节 nop)
 
-    // 在随机位置插入 1-3 条垃圾指令
-    int insertCount = 1 + (NextRandom() % 3);
+    JunkPattern patterns[] = {
+        { nop1, sizeof(nop1) },
+        { nop2, sizeof(nop2) },
+        { nop3, sizeof(nop3) },
+        { nop4, sizeof(nop4) },
+    };
+    int patternCount = sizeof(patterns) / sizeof(patterns[0]);
+
+    // 识别指令边界（简化实现：扫描已知前缀识别指令长度）
+    // 由于这是 handler 代码变异，handler 通常较短，使用保守策略：
+    // 只在 code 的开头和末尾（ret 之前）插入 NOP 序列，避免在中间破坏指令
+    if (code.empty()) return;
+
+    int insertCount = 1 + (NextRandom() % 2);
     for (int i = 0; i < insertCount; i++) {
-        size_t pos = NextRandom() % code.size();
-        int patternIdx = (NextRandom() % (junkPatterns.size() / 3)) * 3;
+        int patIdx = NextRandom() % patternCount;
+        const JunkPattern& pat = patterns[patIdx];
 
-        // 插入 nop
-        code.insert(code.begin() + pos, 0x90);
+        // 在代码开头插入（安全的指令边界位置）
+        code.insert(code.begin(), pat.data, pat.data + pat.size);
     }
 }
 
 void MutationEngine::RemapRegisters(std::vector<uint8_t>& code) {
-    // 简化：在某些指令中替换寄存器编码
+    // BUG 9 修复：寄存器重映射必须确保生成的指令合法
+    // 之前直接修改字节可能产生非法编码
+    // 修复策略：只对已知安全的编码模式进行寄存器替换
+
     for (size_t i = 0; i < code.size(); i++) {
-        // 检测 MOV reg, imm 指令 (B8-BF)
+        // 检测 REX 前缀（48h-4Fh），跳过以避免破坏 REX.B/R/X 位
+        if (code[i] >= 0x48 && code[i] <= 0x4F) {
+            // 这是 REX 前缀，下一字节才是操作码，跳过 REX
+            i++;
+            if (i >= code.size()) break;
+
+            // REX + MOV reg, imm64 (B8-BF)：
+            // REX.B 控制寄存器扩展，只能在 REX.B=0 时安全替换低3位
+            if (code[i] >= 0xB8 && code[i] <= 0xBF) {
+                uint8_t rexByte = code[i - 1];
+                // 只在 REX.B == 0 时替换（否则寄存器编号受 REX.B 影响）
+                if ((rexByte & 0x01) == 0) {
+                    uint8_t newReg = (uint8_t)(NextRandom() % 8);
+                    code[i] = 0xB8 + newReg;
+                }
+                // 跳过 imm64 操作数 (8 字节)
+                i += 8;
+            }
+            // REX + 双字节指令带 ModR/M（如 89/8B 等）：
+            // 不做修改，避免生成非法 ModR/M 组合
+            continue;
+        }
+
+        // 非 REX 的 MOV reg, imm32 (B8-BF)
         if (code[i] >= 0xB8 && code[i] <= 0xBF) {
-            // 随机选择一个不同的寄存器
             uint8_t newReg = (uint8_t)(NextRandom() % 8);
             code[i] = 0xB8 + newReg;
+            // 跳过 imm32 操作数 (4 字节)
+            i += 4;
+            continue;
         }
+
+        // 其它指令编码不做修改，避免生成非法指令
     }
 }
 
