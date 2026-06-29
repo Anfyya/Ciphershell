@@ -31,6 +31,7 @@ Translator::~Translator() {}
 
 bool Translator::Initialize(const TranslationConfig& config) {
     m_config = config;
+    m_lastFailures.clear();
 
     // 初始化寄存器映射
     for (uint8_t i = 0; i < 16; i++) {
@@ -50,36 +51,45 @@ bool Translator::Initialize(const TranslationConfig& config) {
 }
 
 TranslationResult Translator::TranslateFunction(const Function& func) {
-    TranslationResult result;
+    TranslationResult result{};
     result.totalSize = 0;
     result.registerCount = m_config.virtualRegisterCount;
+    result.success = false;
+    m_lastFailures.clear();
 
-    if (!m_initialized) return result;
+    if (!m_initialized) {
+        TranslationFailure failure{};
+        failure.address = func.entryAddress;
+        failure.mnemonic = "<translator>";
+        failure.reason = "translator not initialized";
+        m_lastFailures.push_back(failure);
+        result.failures = m_lastFailures;
+        return result;
+    }
 
-    // BUG 1 修复：使用两遍策略计算正确的跳转偏移
-    // 第一遍：生成所有 VM 指令并记录每条指令在字节码流中的实际偏移
+    result.success = true;
     uint32_t currentOffset = 0;
-    std::vector<uint32_t> instrOffsets; // 每条 VM 指令的字节码偏移
+    std::vector<uint32_t> instrOffsets;
 
     for (const auto& block : func.blocks) {
-        // 记录基本块起始地址到字节码偏移的映射
         result.addrMap[block.startAddress] = currentOffset;
 
         for (const auto& instr : block.instructions) {
-            // 记录原始指令地址的映射
             result.addrMap[instr.address] = currentOffset;
 
-            BytecodeInstr vmInstr;
-            memset(&vmInstr, 0, sizeof(vmInstr));
-
-            if (TranslateInstruction(instr, vmInstr)) {
-                instrOffsets.push_back(currentOffset);
-                result.instructions.push_back(vmInstr);
-                // 使用实际编码大小而非固定估算值
-                currentOffset += CalculateEncodedSize(vmInstr);
+            BytecodeInstr vmInstr{};
+            if (!TranslateInstruction(instr, vmInstr)) {
+                result.success = false;
+                result.failures = m_lastFailures;
+                result.instructions.clear();
+                result.totalSize = 0;
+                return result;
             }
 
-            // 插入垃圾指令
+            instrOffsets.push_back(currentOffset);
+            result.instructions.push_back(vmInstr);
+            currentOffset += CalculateEncodedSize(vmInstr);
+
             if (m_config.enableJunkInsertion && (rand() % 100) < (int)m_config.junkRatio) {
                 BytecodeInstr junk = GenerateJunkInstruction();
                 instrOffsets.push_back(currentOffset);
@@ -89,55 +99,64 @@ TranslationResult Translator::TranslateFunction(const Function& func) {
         }
     }
 
-    // 第二遍：回填跳转目标偏移
-    // 跳转指令的 immediate 字段存储的是相对于 x86 原始指令的偏移
-    // 需要将其转换为 VM 字节码中的绝对偏移
     for (size_t i = 0; i < result.instructions.size(); i++) {
         BytecodeInstr& vmInstr = result.instructions[i];
         if (vmInstr.isJump) {
-            // immediate 中是 x86 相对偏移，jumpTarget 可存储 VM 字节码绝对偏移
-            // 由于原始地址映射已建立，可以在 GenerateBytecode 阶段做最终解析
-            // 这里将当前 VM 字节码偏移记录到 jumpTarget 中，供后续使用
             vmInstr.jumpTarget = instrOffsets[i];
         }
     }
 
     result.totalSize = currentOffset;
+    result.failures = m_lastFailures;
     return result;
 }
-
 TranslationResult Translator::TranslateBlock(const BasicBlock& block, uint32_t baseOffset) {
-    TranslationResult result;
+    TranslationResult result{};
     result.totalSize = baseOffset;
     result.registerCount = m_config.virtualRegisterCount;
+    result.success = false;
+    m_lastFailures.clear();
 
-    if (!m_initialized) return result;
+    if (!m_initialized) {
+        TranslationFailure failure{};
+        failure.address = block.startAddress;
+        failure.mnemonic = "<translator>";
+        failure.reason = "translator not initialized";
+        m_lastFailures.push_back(failure);
+        result.failures = m_lastFailures;
+        return result;
+    }
 
+    result.success = true;
     uint32_t currentOffset = baseOffset;
 
     for (const auto& instr : block.instructions) {
         result.addrMap[instr.address] = currentOffset;
 
-        BytecodeInstr vmInstr;
-        memset(&vmInstr, 0, sizeof(vmInstr));
-
-        if (TranslateInstruction(instr, vmInstr)) {
-            result.instructions.push_back(vmInstr);
-            // BUG 1 修复：使用实际编码大小而非固定 11 字节
-            currentOffset += CalculateEncodedSize(vmInstr);
+        BytecodeInstr vmInstr{};
+        if (!TranslateInstruction(instr, vmInstr)) {
+            result.success = false;
+            result.failures = m_lastFailures;
+            result.instructions.clear();
+            result.totalSize = 0;
+            return result;
         }
+
+        result.instructions.push_back(vmInstr);
+        currentOffset += CalculateEncodedSize(vmInstr);
     }
 
     result.totalSize = currentOffset - baseOffset;
+    result.failures = m_lastFailures;
     return result;
 }
-
 std::vector<uint8_t> Translator::GenerateBytecode(
     const TranslationResult& result,
     const uint8_t* key,
     const uint8_t* nonce)
 {
     std::vector<uint8_t> bytecode;
+    if (!result.success) return bytecode;
 
     // 编码每条指令
     for (const auto& instr : result.instructions) {
@@ -156,6 +175,12 @@ std::unordered_map<uint8_t, uint8_t> Translator::GetRegisterMap() const {
     return m_registerMap;
 }
 
+const std::vector<TranslationFailure>& Translator::GetLastFailures() const {
+    return m_lastFailures;
+}
+std::unordered_map<uint8_t, uint8_t> Translator::GetOpcodeMap() const {
+    return m_opcodeMap;
+}
 std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
     std::unordered_map<uint8_t, uint8_t> opcodeMap;
 
@@ -195,9 +220,8 @@ std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
 // ============================================================================
 
 bool Translator::TranslateInstruction(const Instruction& instr, BytecodeInstr& outInstr) {
-    if (instr.mnemonic.empty()) return false;
+    if (instr.mnemonic.empty()) return FailInstruction(instr, "empty or undecoded instruction");
 
-    // 根据助记符选择翻译函数
     if (instr.mnemonic == "mov") return TranslateMov(instr, outInstr);
     if (instr.mnemonic == "add") return TranslateAdd(instr, outInstr);
     if (instr.mnemonic == "sub") return TranslateSub(instr, outInstr);
@@ -207,49 +231,38 @@ bool Translator::TranslateInstruction(const Instruction& instr, BytecodeInstr& o
     if (instr.mnemonic == "call") return TranslateCall(instr, outInstr);
     if (instr.mnemonic == "ret") return TranslateRet(instr, outInstr);
     if (instr.mnemonic == "nop") return TranslateNop(instr, outInstr);
-    // BUG 2 修复：XOR 指令需要从 ModR/M 字节正确提取源/目标寄存器，
-    // 而非硬编码寄存器 0
+
     if (instr.mnemonic == "xor") {
         if (instr.bytes[0] == 0x31 || instr.bytes[0] == 0x33) {
-            // 0x31: XOR r/m, reg  (reg 字段是源)
-            // 0x33: XOR reg, r/m  (reg 字段是目标)
             outInstr.opcode = VM_XOR_RR;
             outInstr.regDst = MapRegister((instr.bytes[1] >> 3) & 7);
             outInstr.regSrc = MapRegister(instr.bytes[1] & 7);
-            // 0x31 编码下 reg 是源，rm 是目标，需要交换
             if (instr.bytes[0] == 0x31) {
-                uint8_t tmp = outInstr.regDst;
                 outInstr.regDst = MapRegister(instr.bytes[1] & 7);
                 outInstr.regSrc = MapRegister((instr.bytes[1] >> 3) & 7);
             }
-        } else if (instr.bytes[0] == 0x83 && ((instr.bytes[1] >> 3) & 7) == 6) {
-            // 0x83 /6: XOR r/m, imm8 — reg 字段 (/6) 是操作码扩展
+            return true;
+        }
+        if (instr.bytes[0] == 0x83 && ((instr.bytes[1] >> 3) & 7) == 6) {
             outInstr.opcode = VM_XOR_RC;
             outInstr.regDst = MapRegister(instr.bytes[1] & 7);
             outInstr.immediate = (int64_t)(int8_t)instr.bytes[2];
-        } else {
-            // 其它 XOR 编码，回退到通用处理
-            outInstr.opcode = VM_XOR_RR;
-            outInstr.regDst = MapRegister(0);
-            outInstr.regSrc = MapRegister(0);
+            return true;
         }
-        return true;
+        return FailInstruction(instr, "unsupported XOR encoding");
     }
+
     if (instr.mnemonic == "int3") {
         outInstr.opcode = VM_INT3;
         return true;
     }
 
-    // 跳转指令
     if (IsJumpInstruction(instr.mnemonic)) {
         return TranslateJump(instr, outInstr);
     }
 
-    // 默认：翻译为 NOP
-    outInstr.opcode = VM_NOP;
-    return true;
+    return FailInstruction(instr, "unsupported instruction mnemonic");
 }
-
 bool Translator::TranslateMov(const Instruction& instr, BytecodeInstr& outInstr) {
     // MOV reg, imm32
     if (instr.bytes[0] >= 0xB8 && instr.bytes[0] <= 0xBF) {
@@ -266,10 +279,7 @@ bool Translator::TranslateMov(const Instruction& instr, BytecodeInstr& outInstr)
         return true;
     }
 
-    outInstr.opcode = VM_MOV_RR;
-    outInstr.regDst = MapRegister(0);
-    outInstr.regSrc = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported MOV encoding");
 }
 
 bool Translator::TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -291,10 +301,7 @@ bool Translator::TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr)
         return true;
     }
 
-    outInstr.opcode = VM_ADD_RR;
-    outInstr.regDst = MapRegister(0);
-    outInstr.regSrc = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported ADD encoding");
 }
 
 bool Translator::TranslateSub(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -314,10 +321,7 @@ bool Translator::TranslateSub(const Instruction& instr, BytecodeInstr& outInstr)
         return true;
     }
 
-    outInstr.opcode = VM_SUB_RR;
-    outInstr.regDst = MapRegister(0);
-    outInstr.regSrc = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported SUB encoding");
 }
 
 bool Translator::TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -347,10 +351,7 @@ bool Translator::TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr)
         return true;
     }
 
-    outInstr.opcode = VM_CMP_RR;
-    outInstr.regDst = MapRegister(0);
-    outInstr.regSrc = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported CMP encoding");
 }
 
 bool Translator::TranslatePush(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -375,9 +376,7 @@ bool Translator::TranslatePush(const Instruction& instr, BytecodeInstr& outInstr
         return true;
     }
 
-    outInstr.opcode = VM_PUSH_R;
-    outInstr.regDst = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported PUSH encoding");
 }
 
 bool Translator::TranslatePop(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -388,65 +387,44 @@ bool Translator::TranslatePop(const Instruction& instr, BytecodeInstr& outInstr)
         return true;
     }
 
-    outInstr.opcode = VM_POP_R;
-    outInstr.regDst = MapRegister(0);
-    return true;
+    return FailInstruction(instr, "unsupported POP encoding");
 }
 
 bool Translator::TranslateJump(const Instruction& instr, BytecodeInstr& outInstr) {
-    // 无条件跳转
-    if (instr.bytes[0] == 0xEB) {  // JMP rel8
+    if (instr.bytes[0] == 0xEB) {
         outInstr.opcode = VM_JMP;
         outInstr.immediate = (int64_t)(int8_t)instr.bytes[1];
         outInstr.isJump = true;
         return true;
     }
-    if (instr.bytes[0] == 0xE9) {  // JMP rel32
+    if (instr.bytes[0] == 0xE9) {
         outInstr.opcode = VM_JMP;
         outInstr.immediate = (int64_t)(int32_t)(*(uint32_t*)(instr.bytes + 1));
         outInstr.isJump = true;
         return true;
     }
 
-    // 条件跳转
     if (instr.bytes[0] >= 0x70 && instr.bytes[0] <= 0x7F) {
         uint8_t cond = instr.bytes[0] - 0x70;
         int8_t rel8 = (int8_t)instr.bytes[1];
 
-        // BUG 4 修复：JNB (0x73, >=) 应映射为 VM_JGE（无符号 >=），
-        //   JBE (0x76, <=) 应映射为 VM_JLE（无符号 <=）
-        // 注意：VM ISA 中没有独立的 VM_JAE/VM_JBE，使用最接近的语义：
-        //   JNB/JAE (CF=0) → VM_JGE，JBE (CF=1||ZF=1) → VM_JLE
-        //   JA (CF=0&&ZF=0) → VM_JA，见 case 0x7
-        // BUG 5 修复：JP (0x7A) / JNP (0x7B) 不能静默降级为无条件 JMP，
-        //   报告不支持并生成 VM_NOP（保持程序流不变，而非错误跳转）
         switch (cond) {
-            case 0x0: outInstr.opcode = VM_JO;  break;       // JO
-            case 0x1: outInstr.opcode = VM_JNO; break;       // JNO
-            case 0x2: outInstr.opcode = VM_JB;  break;       // JB / JNAE / JC
-            case 0x3: outInstr.opcode = VM_JGE; break;       // JNB / JAE / JNC (无符号 >=)
-            case 0x4: outInstr.opcode = VM_JZ;  break;       // JZ / JE
-            case 0x5: outInstr.opcode = VM_JNZ; break;       // JNZ / JNE
-            case 0x6: outInstr.opcode = VM_JLE; break;       // JBE / JNA (无符号 <=)
-            case 0x7: outInstr.opcode = VM_JA;  break;       // JA / JNBE (无符号 >)
-            case 0x8: outInstr.opcode = VM_JS;  break;       // JS
-            case 0x9: outInstr.opcode = VM_JNS; break;       // JNS
-            case 0xA:                                         // JP / JPE
-                // VM ISA 不支持 JP/JNP，不能降级为无条件 JMP
-                // 生成 NOP 并标记为非跳转，避免错误的无条件跳转语义
-                outInstr.opcode = VM_NOP;
-                outInstr.isJump = false;
-                // TODO: 实现 PF 标志检测等价序列
-                return true;
-            case 0xB:                                         // JNP / JPO
-                outInstr.opcode = VM_NOP;
-                outInstr.isJump = false;
-                // TODO: 实现 PF 标志检测等价序列
-                return true;
-            case 0xC: outInstr.opcode = VM_JL;  break;       // JL / JNGE
-            case 0xD: outInstr.opcode = VM_JGE; break;       // JGE / JNL
-            case 0xE: outInstr.opcode = VM_JLE; break;       // JLE / JNG
-            case 0xF: outInstr.opcode = VM_JG;  break;       // JG / JNLE
+            case 0x0: outInstr.opcode = VM_JO;  break;
+            case 0x1: outInstr.opcode = VM_JNO; break;
+            case 0x2: outInstr.opcode = VM_JB;  break;
+            case 0x3: outInstr.opcode = VM_JGE; break;
+            case 0x4: outInstr.opcode = VM_JZ;  break;
+            case 0x5: outInstr.opcode = VM_JNZ; break;
+            case 0x6: outInstr.opcode = VM_JLE; break;
+            case 0x7: outInstr.opcode = VM_JA;  break;
+            case 0x8: outInstr.opcode = VM_JS;  break;
+            case 0x9: outInstr.opcode = VM_JNS; break;
+            case 0xA: return FailInstruction(instr, "JP/JPE requires parity flag bridge that is not implemented");
+            case 0xB: return FailInstruction(instr, "JNP/JPO requires parity flag bridge that is not implemented");
+            case 0xC: outInstr.opcode = VM_JL;  break;
+            case 0xD: outInstr.opcode = VM_JGE; break;
+            case 0xE: outInstr.opcode = VM_JLE; break;
+            case 0xF: outInstr.opcode = VM_JG;  break;
         }
 
         outInstr.immediate = (int64_t)rel8;
@@ -454,12 +432,9 @@ bool Translator::TranslateJump(const Instruction& instr, BytecodeInstr& outInstr
         return true;
     }
 
-    outInstr.opcode = VM_NOP;
-    return true;
+    return FailInstruction(instr, "unsupported jump encoding");
 }
-
 bool Translator::TranslateCall(const Instruction& instr, BytecodeInstr& outInstr) {
-    // CALL rel32
     if (instr.bytes[0] == 0xE8) {
         outInstr.opcode = VM_CALL_VM;
         outInstr.immediate = (int64_t)(int32_t)(*(uint32_t*)(instr.bytes + 1));
@@ -467,10 +442,8 @@ bool Translator::TranslateCall(const Instruction& instr, BytecodeInstr& outInstr
         return true;
     }
 
-    outInstr.opcode = VM_NOP;
-    return true;
+    return FailInstruction(instr, "unsupported CALL encoding or missing native bridge");
 }
-
 bool Translator::TranslateRet(const Instruction& instr, BytecodeInstr& outInstr) {
     // RET
     if (instr.bytes[0] == 0xC3) {
@@ -680,6 +653,14 @@ BytecodeInstr Translator::GenerateJunkInstruction() {
     return junk;
 }
 
+bool Translator::FailInstruction(const Instruction& instr, const std::string& reason) {
+    TranslationFailure failure{};
+    failure.address = instr.address;
+    failure.mnemonic = instr.mnemonic.empty() ? "<unknown>" : instr.mnemonic;
+    failure.reason = reason;
+    m_lastFailures.push_back(failure);
+    return false;
+}
 uint8_t Translator::GetOpcodeForInstruction(const std::string& mnemonic) {
     if (mnemonic == "mov") return VM_MOV_RR;
     if (mnemonic == "add") return VM_ADD_RR;
@@ -694,7 +675,7 @@ uint8_t Translator::GetOpcodeForInstruction(const std::string& mnemonic) {
     if (mnemonic == "ret") return VM_RET_VM;
     if (mnemonic == "nop") return VM_NOP;
     if (mnemonic == "int3") return VM_INT3;
-    return VM_NOP;
+    return 0xFF;
 }
 
 bool Translator::IsJumpInstruction(const std::string& mnemonic) {

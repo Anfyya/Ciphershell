@@ -30,6 +30,7 @@
 #include "transforms/bogus_flow.h"
 #include "transforms/stub_builder.h"
 #include "transforms/translator.h"
+#include "transforms/vm_section_emitter.h"
 #include "transforms/vm_nester.h"
 #include "mutation/mutation_engine.h"
 #include "mutation/bytecode_encryptor.h"
@@ -385,11 +386,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Phase E: 代码虚拟化（L4+，将热点函数翻译为 VM 字节码）
+    // Phase E: 函数级 VM 保护。这里只允许完整落盘的数据进入下一步，失败必须明确诊断。
     if (protectionLevel >= 4) {
         std::cout << "  应用代码虚拟化 (Mirage VM)..." << std::endl;
 
-        // 初始化变异引擎，生成随机化 ISA
         CipherShell::MutationEngine mutEngine;
         CipherShell::MutationConfig mutConfig;
         mutConfig.randomizeOpcodeMap = true;
@@ -402,20 +402,17 @@ int main(int argc, char* argv[]) {
         CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
         std::cout << "    ISA 变异种子: 0x" << std::hex << mutEngine.GetSeed() << std::dec << std::endl;
 
-        // 初始化转译器
         CipherShell::Translator translator;
         CipherShell::TranslationConfig transConfig;
         transConfig.virtualRegisterCount = mutConfig.registerCount;
         transConfig.enableOpcodeRandomization = true;
         transConfig.enableJunkInsertion = true;
         transConfig.junkRatio = 10;
-        // BUG 12 修复：添加错误检查
         if (!translator.Initialize(transConfig)) {
-            std::cerr << "  错误: 转译器初始化失败" << std::endl;
+            std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed" << std::endl;
             return 1;
         }
 
-        // 初始化字节码加密器
         CipherShell::BytecodeEncryptor bcEncryptor;
         CipherShell::BytecodeEncryptConfig bcConfig;
         bcConfig.mode = CipherShell::BytecodeEncryptionMode::Rolling;
@@ -424,6 +421,9 @@ int main(int argc, char* argv[]) {
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
         uint32_t virtualizedCount = 0;
+        uint32_t rejectedCount = 0;
+        std::vector<uint8_t> vmBytecodeBlob;
+        std::vector<CipherShell::VMFunctionRecord> vmRecords;
 
         for (WORD si = 0; si < image->numSections; si++) {
             IMAGE_SECTION_HEADER& sec = image->sections[si];
@@ -435,70 +435,82 @@ int main(int argc, char* argv[]) {
 
             BYTE* secData = image->rawData + secOffset;
             uint64_t baseAddr = sec.VirtualAddress;
-
             auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
 
             for (const auto& func : functions) {
-                if (func.blocks.size() < 2) continue;
-
-                // 翻译函数为 VM 字节码
-                auto transResult = translator.TranslateFunction(func);
-                if (transResult.instructions.empty()) continue;
-
-                // BUG 11 修复：GenerateBytecode 内部已经做了加密（EncryptBytecode），
-                // 不能再用 bcEncryptor.Encrypt() 二次加密，否则运行时解密后得到的
-                // 仍是密文。这里只生成原始字节码（key=nullptr 跳过内部加密），
-                // 然后由 bcEncryptor 统一加密。
-                auto bytecode = translator.GenerateBytecode(
-                    transResult, nullptr, nullptr);
-
-                // 用 BytecodeEncryptor 加密字节码
-                auto encryptedBytecode = bcEncryptor.Encrypt(bytecode, bcConfig);
-
-                if (!encryptedBytecode.empty()) {
-                    virtualizedCount++;
+                if (func.blocks.size() < 2 || func.size < 5) continue;
+                if (func.entryAddress > 0xFFFFFFFFULL || func.size > 0xFFFFFFFFULL) {
+                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
+                              << std::dec << " reason=function_range_too_large" << std::endl;
+                    rejectedCount++;
+                    continue;
                 }
+
+                auto transResult = translator.TranslateFunction(func);
+                if (!transResult.success || transResult.instructions.empty()) {
+                    rejectedCount++;
+                    if (!transResult.failures.empty()) {
+                        const auto& failure = transResult.failures.front();
+                        std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
+                                  << func.entryAddress << " instr_rva=0x" << failure.address << std::dec
+                                  << " mnemonic=" << failure.mnemonic
+                                  << " reason=" << failure.reason << std::endl;
+                    } else {
+                        std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
+                                  << func.entryAddress << std::dec
+                                  << " reason=no_vm_instructions" << std::endl;
+                    }
+                    continue;
+                }
+
+                auto plainBytecode = translator.GenerateBytecode(transResult, nullptr, nullptr);
+                auto encryptedBytecode = bcEncryptor.Encrypt(plainBytecode, bcConfig);
+                if (encryptedBytecode.empty()) {
+                    std::cerr << "VM_BYTECODE_FAIL module=BytecodeEncryptor function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec << " reason=empty_encrypted_bytecode" << std::endl;
+                    rejectedCount++;
+                    continue;
+                }
+
+                CipherShell::VMFunctionRecord record{};
+                record.functionRVA = static_cast<uint32_t>(func.entryAddress);
+                record.functionSize = static_cast<uint32_t>(func.size);
+                record.bytecodeOffset = static_cast<uint32_t>(vmBytecodeBlob.size());
+                record.bytecodeSize = static_cast<uint32_t>(encryptedBytecode.size());
+                record.opcodeMapOffset = 0;
+                record.registerMapOffset = 0;
+                record.flags = is64 ? 1u : 0u;
+                vmRecords.push_back(record);
+                vmBytecodeBlob.insert(vmBytecodeBlob.end(), encryptedBytecode.begin(), encryptedBytecode.end());
+                virtualizedCount++;
             }
         }
-        std::cout << "    虚拟化了 " << virtualizedCount << " 个函数" << std::endl;
 
-        // L5: 嵌套 VM（将部分 handler 也虚拟化）
-        if (protectionLevel >= 5) {
-            std::cout << "  应用嵌套 VM (L5)..." << std::endl;
-
-            CipherShell::VMNester nester;
-            CipherShell::NestingConfig nestConfig;
-            nestConfig.maxNestingDepth = 2;
-            nestConfig.nestedHandlerCount = 10;
-            nestConfig.differentISA = true;
-            // BUG 12 修复：检查嵌套器初始化结果
-            if (!nester.Initialize(nestConfig)) {
-                std::cerr << "  错误: VM 嵌套器初始化失败，跳过 L5 嵌套" << std::endl;
-            } else {
-                auto layers = nester.CreateNestedVM(mutatedISA);
-                if (layers.empty()) {
-                    std::cerr << "  警告: 未能创建嵌套 VM 层" << std::endl;
-                } else {
-                    std::cout << "    嵌套层数: " << layers.size() << std::endl;
-
-                    // 为每层生成 dispatcher
-                    for (const auto& layer : layers) {
-                        DWORD dispSize = 0;
-                        BYTE* dispCode = nester.GenerateNestedDispatcher(layer, is64, &dispSize);
-                        if (dispCode) {
-                            std::cout << "    层 " << layer.level
-                                      << " dispatcher: " << dispSize << " 字节" << std::endl;
-                            delete[] dispCode;
-                        } else {
-                            std::cerr << "    警告: 层 " << layer.level
-                                      << " dispatcher 生成失败" << std::endl;
-                        }
-                    }
-                }
+        if (!vmRecords.empty()) {
+            CipherShell::VMSectionEmitter vmEmitter;
+            auto emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
+                translator.GetOpcodeMap(), translator.GetRegisterMap());
+            if (!emitResult.success) {
+                std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
+                return 1;
             }
+            std::cout << "    VM section: rva=0x" << std::hex << emitResult.sectionRVA
+                      << " metadata=0x" << emitResult.metadataRVA
+                      << " bytecode=0x" << emitResult.bytecodeRVA << std::dec << std::endl;
+        }
+
+        std::cout << "    VM bytecode 写入函数数: " << virtualizedCount
+                  << "，拒绝函数数: " << rejectedCount << std::endl;
+
+        if (!vmRecords.empty()) {
+            std::cerr << "VM_LINK_FAIL module=VMRuntimeBridge reason=vmenter_runtime_and_function_trampoline_not_linked" << std::endl;
+            return 1;
+        }
+
+        if (protectionLevel >= 5) {
+            std::cout << "  跳过嵌套 VM：没有已链接的一级 VM runtime" << std::endl;
         }
     }
-
     // Phase F: Section 加密（L1+，最后执行——加密所有变换后的代码）
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
     if (protectionLevel >= 1) {
