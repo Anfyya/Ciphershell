@@ -224,26 +224,16 @@ void AntiDebug::ApplyImplicitResponse(const AntiDebugResult& result, void* vmCon
 // ============================================================================
 
 bool AntiDebug::CheckTimingRDTSC() {
-    uint64_t start, end;
-    uint32_t startLow, startHigh, endLow, endHigh;
+    uint64_t start = __rdtsc();
 
-    // 第一次 RDTSC
-    start = __rdtsc();
-
-    // 执行一些操作
     volatile int x = 0;
     for (int i = 0; i < 100; i++) {
         x += i;
     }
 
-    // 第二次 RDTSC
-    end = __rdtsc();
-
-    // 计算差值
+    uint64_t end = __rdtsc();
     uint64_t elapsed = end - start;
 
-    // 正常情况下应该 < 10000 cycles
-    // 调试器单步执行会导致差值非常大
     return (elapsed > 100000);
 }
 
@@ -288,14 +278,14 @@ bool AntiDebug::CheckTimingGetTickCount() {
 // ============================================================================
 
 bool AntiDebug::CheckPEBBeingDebugged() {
-    PEB* peb = GetPEB();
+    void* peb = GetPEB();
     if (!peb) return false;
 
-    return peb->BeingDebugged != 0;
+    return *((BYTE*)peb + 2) != 0;
 }
 
 bool AntiDebug::CheckPEBNtGlobalFlag() {
-    PEB* peb = GetPEB();
+    void* peb = GetPEB();
     if (!peb) return false;
 
     // NtGlobalFlag 偏移在不同 Windows 版本可能不同
@@ -314,16 +304,12 @@ bool AntiDebug::CheckPEBNtGlobalFlag() {
 }
 
 bool AntiDebug::CheckHeapFlags() {
-    PEB* peb = GetPEB();
+    void* peb = GetPEB();
     if (!peb) return false;
 
-    // 获取进程堆
-    HANDLE heap = peb->ProcessHeap;
+    HANDLE heap = GetProcessHeap();
     if (!heap) return false;
 
-    // 检查堆标志
-    // 偏移 0x40 (x86) 或 0x70 (x64) 是 Flags
-    // 偏移 0x44 (x86) 或 0x74 (x64) 是 ForceFlags
 #ifdef _WIN64
     uint32_t flags = *(uint32_t*)((BYTE*)heap + 0x70);
     uint32_t forceFlags = *(uint32_t*)((BYTE*)heap + 0x74);
@@ -332,7 +318,7 @@ bool AntiDebug::CheckHeapFlags() {
     uint32_t forceFlags = *(uint32_t*)((BYTE*)heap + 0x44);
 #endif
 
-    // 调试模式下这些标志会被设置
+    (void)flags;
     return (forceFlags != 0);
 }
 
@@ -364,13 +350,13 @@ bool AntiDebug::CheckKdDebugger() {
 // ============================================================================
 
 bool AntiDebug::CheckCodeIntegrity() {
-    // 检查代码段是否被修改（INT3 扫描）
-    // 这需要知道代码段的原始 CRC
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    FARPROC probe = kernel32 ? GetProcAddress(kernel32, "IsDebuggerPresent") : nullptr;
+    if (!probe) return false;
 
-    // 简化实现：扫描当前函数的代码
-    BYTE* funcStart = (BYTE*)CheckCodeIntegrity;
+    BYTE* funcStart = (BYTE*)probe;
     for (int i = 0; i < 100; i++) {
-        if (funcStart[i] == 0xCC) {  // INT3
+        if (funcStart[i] == 0xCC) {
             return true;
         }
     }

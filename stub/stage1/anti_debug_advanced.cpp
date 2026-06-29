@@ -5,7 +5,9 @@
 #include "anti_debug_advanced.h"
 #include <intrin.h>
 #include <iphlpapi.h>
+#include <shlobj.h>
 #include <cmath>
+#include <string>
 
 #pragma comment(lib, "iphlpapi.lib")
 

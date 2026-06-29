@@ -323,7 +323,7 @@ void ConsoleGUI::PrintProgress(int current, int total, const std::string& label)
 
 void ConsoleGUI::SetColor(ConsoleColor foreground, ConsoleColor background) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE),
-        (int)foreground | ((int)background << 4));
+        static_cast<WORD>(static_cast<int>(foreground) | (static_cast<int>(background) << 4)));
 }
 
 void ConsoleGUI::ResetColor() {

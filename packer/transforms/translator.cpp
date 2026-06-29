@@ -33,12 +33,12 @@ bool Translator::Initialize(const TranslationConfig& config) {
     m_config = config;
 
     // 初始化寄存器映射
-    for (int i = 0; i < 16; i++) {
+    for (uint8_t i = 0; i < 16; i++) {
         if (config.enableRegisterRemapping) {
             // 随机映射
-            m_registerMap[i] = (uint8_t)(i % config.virtualRegisterCount);
+            m_registerMap[i] = static_cast<uint8_t>(i % config.virtualRegisterCount);
         } else {
-            m_registerMap[i] = (uint8_t)i;
+            m_registerMap[i] = i;
         }
     }
 

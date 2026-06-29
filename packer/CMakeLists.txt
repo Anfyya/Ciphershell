@@ -8,16 +8,19 @@ add_library(ciphershell_packer STATIC
     # PE 解析器
     pe_parser/pe_parser.cpp
     pe_parser/pe_rebuilder.cpp
+    pe_parser/dll_packer.cpp
 
     # 变换引擎 — Phase 1
     transforms/section_encryptor.cpp
     transforms/string_encryptor.cpp
+    transforms/string_encryptor_advanced.cpp
     transforms/import_obfuscator.cpp
     transforms/reloc_fixer.cpp
 
     # 分析引擎 — Phase 3
     analysis/disassembler.cpp
     analysis/cfg_builder.cpp
+    analysis/hotspot_analyzer.cpp
 
     # 变换引擎 — Phase 3
     transforms/cfg_flattener.cpp
@@ -55,6 +58,12 @@ target_include_directories(ciphershell_packer PUBLIC
 )
 
 # 链接依赖
+if(WIN32)
+    target_sources(ciphershell_packer PRIVATE
+        transforms/nanomite.cpp
+    )
+endif()
+
 target_link_libraries(ciphershell_packer PRIVATE
     # Windows API
 )

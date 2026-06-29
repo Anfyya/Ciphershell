@@ -14,7 +14,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # MSVC 特定选项
 if(MSVC)
-    add_compile_options(/W3 /utf-8 /w14244 /w4100)
+    add_compile_options(/W3 /utf-8 /w14244 /wd4100)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_definitions(WIN32_LEAN_AND_MEAN)
     add_compile_definitions(NOMINMAX)

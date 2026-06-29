@@ -11,6 +11,7 @@
 #include <functional>
 #include <windows.h>
 #include <intrin.h>
+#include <psapi.h>
 
 // ============================================================================
 // 基准测试结果

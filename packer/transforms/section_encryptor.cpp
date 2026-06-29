@@ -224,10 +224,10 @@ bool SectionEncryptor::EncryptSection(
         return false;
     }
 
-    // XOR with key[0] (single byte, matching stub implementation)
+    // 与启动 stub 保持一致：32 字节循环 XOR。
     BYTE* sectionData = image->rawData + section->PointerToRawData;
     for (DWORD i = 0; i < section->SizeOfRawData; i++) {
-        sectionData[i] ^= key.key[0];
+        sectionData[i] ^= key.key[i & 31];
     }
 
     // 给 section 加写权限，stub 需要写回解密后的数据
@@ -258,13 +258,13 @@ bool SectionEncryptor::DecryptSection(
         return false;
     }
 
-    // BUG5修复：解密必须与加密使用相同算法
-    // EncryptSection 使用 XOR key[0] 加密，XOR 是对称操作（加密 = 解密）
-    // 之前错误地使用 ChaCha20 解密，导致解密后数据损坏
-    // stub 中同样使用 XOR 解密，这里保持一致
+    // 解密必须与 EncryptSection 和启动 stub 完全一致。
+    // XOR 是对称操作（加密 = 解密）。
+    // 保留现有轻量 XOR 方案，但必须使用完整 32 字节密钥循环。
+    // stub 中同样使用 XOR 解密，这里保持一致。
     BYTE* sectionData = image->rawData + section->PointerToRawData;
     for (DWORD i = 0; i < section->SizeOfRawData; i++) {
-        sectionData[i] ^= key.key[0];
+        sectionData[i] ^= key.key[i & 31];
     }
 
     // 恢复执行权限

@@ -264,7 +264,7 @@ std::vector<Function> Disassembler::DetectFunctions(
             // 收集函数内的所有块
             // 简化实现：只添加入口块
             func.blocks.push_back(block);
-            func.size = block.endAddress - block.startAddress;
+            func.size = static_cast<uint32_t>((std::min)(block.endAddress - block.startAddress, static_cast<uint64_t>(UINT32_MAX)));
 
             // 检查是否是叶子函数
             for (const auto& instr : block.instructions) {
@@ -288,14 +288,14 @@ std::string Disassembler::FormatInstruction(const Instruction& instr) {
     if (!instr.mnemonic.empty()) {
         if (!instr.operands.empty()) {
             snprintf(buffer, sizeof(buffer), "%08llx: %-8s %s", 
-                     instr.address, instr.mnemonic.c_str(), instr.operands.c_str());
+                     static_cast<unsigned long long>(instr.address), instr.mnemonic.c_str(), instr.operands.c_str());
         } else {
             snprintf(buffer, sizeof(buffer), "%08llx: %s", 
-                     instr.address, instr.mnemonic.c_str());
+                     static_cast<unsigned long long>(instr.address), instr.mnemonic.c_str());
         }
     } else {
         snprintf(buffer, sizeof(buffer), "%08llx: db %02X", 
-                 instr.address, instr.bytes[0]);
+                 static_cast<unsigned long long>(instr.address), instr.bytes[0]);
     }
 
     return std::string(buffer);

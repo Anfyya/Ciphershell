@@ -142,9 +142,9 @@ private:
     bool ValidateExceptionChain();
 
     // 辅助函数
-    PEB* GetPEB();
+    void* GetPEB();
     uint64_t GetTimestamp();
-    uint32_t HashFunction(const void* data, DWORD size);
+    uint32_t HashFunction(const char* name);
 
     // 成员变量
     AntiDebugConfig m_config;

@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <cstring>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -207,7 +208,15 @@ int main(int argc, char* argv[]) {
     if (!configFile.empty()) {
         std::cout << "\n[1.5] 加载配置文件: " << configFile << std::endl;
         config = configParser.LoadFromFile(configFile);
+        if (configParser.HasError()) {
+            std::cerr << "错误: " << configParser.GetLastError() << std::endl;
+            return 1;
+        }
         protectionLevel = config.global.protectionLevel;
+        if (protectionLevel < 1 || protectionLevel > 5) {
+            std::cerr << "错误: 配置中的保护等级必须在 1-5 之间" << std::endl;
+            return 1;
+        }
     } else {
         // 使用默认配置
         config.global.protectionLevel = protectionLevel;
@@ -232,6 +241,8 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[2/5] 应用保护变换 (L" << protectionLevel << ")..." << std::endl;
 
+    std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
+
     // Phase A: 字符串加密（明文代码段中的内联字符串，L2+）
     if (protectionLevel >= 2 && config.global.stringEncryption) {
         std::cout << "  应用字符串加密..." << std::endl;
@@ -244,7 +255,19 @@ int main(int argc, char* argv[]) {
 
         if (!strings.empty()) {
             strEncryptor.EncryptStrings(image.get(), strings);
-            std::cout << "    已加密所有字符串" << std::endl;
+            encryptedStringRegions.reserve(encryptedStringRegions.size() + strings.size());
+            for (const auto& s : strings) {
+                CipherShell::CS_ENCRYPTED_SECTION region{};
+                region.sectionIndex = 0xFFFF;
+                region.originalRVA = s.rva;
+                region.originalSize = s.length;
+                region.encryptedSize = s.length;
+                memcpy(region.sectionKey.key, s.key, 32);
+                memcpy(region.sectionKey.nonce, s.nonce, 12);
+                region.sectionKey.counter = 0;
+                encryptedStringRegions.push_back(region);
+            }
+            std::cout << "    已加密所有字符串，并登记运行时解密任务" << std::endl;
         }
     }
 
@@ -485,11 +508,18 @@ int main(int argc, char* argv[]) {
         CipherShell::CS_ENCRYPT_CONFIG encConfig;
         encConfig.encryptCodeSections = true;
         encConfig.encryptDataSections = false;
-        encConfig.encryptResources = false;
+        encConfig.encryptResources = config.global.resourceEncryption;
         CipherShell::CS_ENCRYPTION_KEY masterKey = encryptor.GenerateRandomKey();
 
         encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
         std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
+    }
+
+    if (!encryptedStringRegions.empty()) {
+        encryptedSections.insert(encryptedSections.end(),
+            encryptedStringRegions.begin(), encryptedStringRegions.end());
+        std::cout << "    已追加 " << encryptedStringRegions.size()
+                  << " 个字符串运行时解密任务" << std::endl;
     }
 
     // ============================================================================
@@ -544,10 +574,10 @@ int main(int argc, char* argv[]) {
     CipherShell::PERebuilder rebuilder;
     CipherShell::CS_REBUILD_CONFIG rebuildConfig;
 
-    rebuildConfig.randomizeSectionNames = true;
-    rebuildConfig.zeroTimestamps = true;
-    rebuildConfig.preserveRichHeader = false;
-    rebuildConfig.preserveDebugInfo = false;
+    rebuildConfig.randomizeSectionNames = config.global.randomizeSections;
+    rebuildConfig.zeroTimestamps = config.global.stripTimestamps;
+    rebuildConfig.preserveRichHeader = !config.global.stripRichHeader;
+    rebuildConfig.preserveDebugInfo = !config.global.stripDebugInfo;
 
     DWORD outputSize = 0;
     std::unique_ptr<BYTE[]> outputData(rebuilder.RebuildImage(image.get(), rebuildConfig, &outputSize));

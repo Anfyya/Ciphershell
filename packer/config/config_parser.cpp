@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <regex>
 #include <iostream>
 
@@ -235,18 +236,23 @@ void ConfigParser::ParsePerformanceSection(const std::string& content, Performan
 }
 
 void ConfigParser::ParseFunctionOverrides(const std::string& content, std::vector<FunctionOverride>& overrides) {
-    // 查找所有 [[function_overrides]] 段
-    std::regex regex_block(R"(\[\[function_overrides\]\]\s*\n(.*?)(?=\[\[|$))");
+    const std::string marker = "[[function_overrides]]";
     std::regex regex_pattern(R"RE(pattern\s*=\s*"([^"]+)")RE");
     std::regex regex_level(R"(level\s*=\s*(\d+))");
     std::regex regex_nesting(R"(vm_nesting\s*=\s*(\d+))");
 
-    std::sregex_iterator it(content.begin(), content.end(), regex_block);
-    std::sregex_iterator end;
+    size_t pos = 0;
+    while ((pos = content.find(marker, pos)) != std::string::npos) {
+        size_t blockStart = pos + marker.length();
+        size_t blockEnd = content.find("\n[", blockStart);
+        if (blockEnd == std::string::npos) {
+            blockEnd = content.length();
+        }
 
-    for (; it != end; ++it) {
-        std::string block = (*it)[1];
-        FunctionOverride override;
+        std::string block = content.substr(blockStart, blockEnd - blockStart);
+        FunctionOverride override{};
+        override.level = 0;
+        override.vmNesting = 0;
 
         std::smatch match;
         if (std::regex_search(block, match, regex_pattern)) override.pattern = match[1];
@@ -254,11 +260,14 @@ void ConfigParser::ParseFunctionOverrides(const std::string& content, std::vecto
         if (std::regex_search(block, match, regex_nesting)) override.vmNesting = ParseInt(match[1]);
 
         if (!override.pattern.empty()) {
+            if (override.level < 1) override.level = 1;
+            if (override.level > 5) override.level = 5;
             overrides.push_back(override);
         }
+
+        pos = blockEnd;
     }
 }
-
 // ============================================================================
 // 辅助函数
 // ============================================================================
@@ -289,7 +298,7 @@ std::string ConfigParser::ExtractSection(const std::string& content, const std::
 
 bool ConfigParser::ParseBool(const std::string& value) {
     std::string lower = value;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return (lower == "true" || lower == "1" || lower == "yes");
 }
 

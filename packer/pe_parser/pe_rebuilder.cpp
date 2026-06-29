@@ -45,12 +45,12 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
 
     // 获取 NT Headers
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
-    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew >= image->rawSize) {
+    if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) >= image->rawSize) {
         *outputSize = image->rawSize;
         return output;
     }
 
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
     // 清除时间戳
     if (config.zeroTimestamps) {
@@ -153,13 +153,13 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 
     // 获取输出缓冲区中的 NT Headers 指针
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
-    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew > headerSize) return true;
+    if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) > headerSize) return true;
     
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
     // 处理 Rich Header
-    if (!config.preserveRichHeader && image->hasRichHeader && image->richHeaderOffset > sizeof(IMAGE_DOS_HEADER)) {
-        DWORD richClearSize = image->richHeaderOffset - sizeof(IMAGE_DOS_HEADER);
+    if (!config.preserveRichHeader && image->hasRichHeader && image->richHeaderOffset > static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER))) {
+        DWORD richClearSize = image->richHeaderOffset - static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER));
         if (richClearSize < headerSize) {
             memset(output + sizeof(IMAGE_DOS_HEADER), 0, richClearSize);
         }
@@ -202,9 +202,9 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
     // 获取 NT Headers 信息
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
-    if (dosHeader->e_lfanew == 0 || dosHeader->e_lfanew > 0x1000) return false;
+    if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) > 0x1000) return false;
     
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + dosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
     DWORD headerSize = image->sections[0].PointerToRawData;
     if (headerSize == 0 || headerSize > image->rawSize) headerSize = 0x200;
@@ -329,7 +329,7 @@ DWORD PERebuilder::CalculateChecksum(BYTE* data, DWORD size) {
 
 bool PERebuilder::UpdateChecksum(BYTE* peData, DWORD actualFileSize) {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)peData;
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peData + dosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peData + static_cast<DWORD>(dosHeader->e_lfanew));
 
     // BUG3修复：使用实际文件缓冲区大小而非 SizeOfImage（内存映像大小）
     // SizeOfImage 是 PE 映射到内存后的大小（按 SectionAlignment 对齐），通常远大于文件大小

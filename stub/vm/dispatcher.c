@@ -7,6 +7,9 @@
 #include "vm_context.h"
 #include "flags_emu.h"
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 // ============================================================================
 // 辅助宏
@@ -35,6 +38,52 @@
     (ctx)->regs.sp += 4; \
 } while(0)
 
+static uint64_t mul_u64_get_high(uint64_t a, uint64_t b, uint64_t* high)
+{
+#if defined(_MSC_VER) && defined(_M_X64)
+    return _umul128(a, b, high);
+#elif defined(__SIZEOF_INT128__)
+    unsigned __int128 result128 = (unsigned __int128)a * (unsigned __int128)b;
+    *high = (uint64_t)(result128 >> 64);
+    return (uint64_t)result128;
+#else
+    uint64_t a_lo = (uint32_t)a;
+    uint64_t a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b;
+    uint64_t b_hi = b >> 32;
+    uint64_t p0 = a_lo * b_lo;
+    uint64_t p1 = a_lo * b_hi;
+    uint64_t p2 = a_hi * b_lo;
+    uint64_t p3 = a_hi * b_hi;
+    uint64_t middle = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
+    *high = p3 + (p1 >> 32) + (p2 >> 32) + (middle >> 32);
+    return (middle << 32) | (uint32_t)p0;
+#endif
+}
+
+static uint64_t mul_i64_get_high(int64_t a, int64_t b, int64_t* high)
+{
+#if defined(_MSC_VER) && defined(_M_X64)
+    return (uint64_t)_mul128(a, b, high);
+#elif defined(__SIZEOF_INT128__)
+    __int128 result128 = (__int128)a * (__int128)b;
+    *high = (int64_t)(result128 >> 64);
+    return (uint64_t)result128;
+#else
+    uint64_t sign_a = (uint64_t)(a < 0);
+    uint64_t sign_b = (uint64_t)(b < 0);
+    uint64_t ua = ((uint64_t)a ^ (0 - sign_a)) + sign_a;
+    uint64_t ub = ((uint64_t)b ^ (0 - sign_b)) + sign_b;
+    uint64_t unsigned_high = 0;
+    uint64_t low = mul_u64_get_high(ua, ub, &unsigned_high);
+    if (sign_a ^ sign_b) {
+        unsigned_high = ~unsigned_high + (low == 0 ? 1 : 0);
+        low = ~low + 1;
+    }
+    *high = (int64_t)unsigned_high;
+    return low;
+#endif
+}
 // ============================================================================
 // Bytecode 解密
 // ============================================================================
@@ -604,11 +653,10 @@ static void handler_mul_rr(VM_CONTEXT* ctx)
 
     uint64_t a = ctx->regs.r[dst];
     uint64_t b = ctx->regs.r[src];
-    ctx->regs.r[dst] = a * b;
+    uint64_t high = 0;
+    ctx->regs.r[dst] = mul_u64_get_high(a, b, &high);
 
     // MUL: CF=OF=0 if high half is 0, else 1
-    __uint128_t result128 = (__uint128_t)a * (__uint128_t)b;
-    uint64_t high = (uint64_t)(result128 >> 64);
     ctx->regs.vflags.CF = (high != 0) ? 1 : 0;
     ctx->regs.vflags.OF = ctx->regs.vflags.CF;
 }
@@ -620,12 +668,13 @@ static void handler_imul_rr(VM_CONTEXT* ctx)
 
     int64_t a = (int64_t)ctx->regs.r[dst];
     int64_t b = (int64_t)ctx->regs.r[src];
-    ctx->regs.r[dst] = (uint64_t)(a * b);
+    int64_t high = 0;
+    uint64_t low = mul_i64_get_high(a, b, &high);
+    int64_t sign_extension = ((int64_t)low < 0) ? -1 : 0;
+    ctx->regs.r[dst] = low;
 
     // IMUL: CF=OF=1 if result truncated
-    __int128_t result128 = (__int128_t)a * (__int128_t)b;
-    int64_t high = (int64_t)(result128 >> 64);
-    ctx->regs.vflags.CF = (high != 0 && high != -1) ? 1 : 0;
+    ctx->regs.vflags.CF = (high != sign_extension) ? 1 : 0;
     ctx->regs.vflags.OF = ctx->regs.vflags.CF;
 }
 

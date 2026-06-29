@@ -14,7 +14,7 @@ namespace CipherShell {
 
 // RVA（相对虚拟地址）是 PE 映射到内存后的偏移，与文件中的偏移不同
 // 节区在文件中按 FileAlignment 对齐，内存中按 SectionAlignment 对齐
-static DWORD RvaToFileOffset(BYTE* fileBase, DWORD rva) {
+static DWORD RvaToFileOffset(BYTE* fileBase, DWORD64 rva) {
     if (rva == 0) return 0;
 
     PIMAGE_DOS_HEADER dosHdr = (PIMAGE_DOS_HEADER)fileBase;
@@ -29,15 +29,15 @@ static DWORD RvaToFileOffset(BYTE* fileBase, DWORD rva) {
     }
 
     for (WORD i = 0; i < numSections; i++) {
-        DWORD secStart = sections[i].VirtualAddress;
-        DWORD secEnd = secStart + sections[i].SizeOfRawData;
+        DWORD64 secStart = sections[i].VirtualAddress;
+        DWORD64 secEnd = secStart + sections[i].SizeOfRawData;
         if (rva >= secStart && rva < secEnd) {
-            return rva - secStart + sections[i].PointerToRawData;
+            return static_cast<DWORD>(rva - secStart + sections[i].PointerToRawData);
         }
     }
 
-    if (numSections > 0 && rva < sections[0].VirtualAddress) {
-        return rva;
+    if (numSections > 0 && rva < sections[0].VirtualAddress && rva <= 0xFFFFFFFFULL) {
+        return static_cast<DWORD>(rva);
     }
 
     return 0;
@@ -64,37 +64,36 @@ bool RelocFixer::FixRelocations(
         return false;
     }
 
-    // 获取原始基址
     DWORD64 originalBase = 0;
     if (image->is64Bit) {
         originalBase = image->ntHeaders64->OptionalHeader.ImageBase;
     } else {
         originalBase = image->ntHeaders32->OptionalHeader.ImageBase;
+        if (newImageBase > 0xFFFFFFFFULL) {
+            return false;
+        }
     }
 
-    // 计算基址差值
-    int64_t delta = (int64_t)(newImageBase - originalBase);
+    int64_t delta = (newImageBase >= originalBase)
+        ? static_cast<int64_t>(newImageBase - originalBase)
+        : -static_cast<int64_t>(originalBase - newImageBase);
 
-    // 如果没有差值，不需要修复
     if (delta == 0) {
         return true;
     }
 
-    // 应用重定位
     if (!ApplyRelocations(image->rawData, image->relocs.entries, delta)) {
         return false;
     }
 
-    // 更新映像基址
     if (image->is64Bit) {
         image->ntHeaders64->OptionalHeader.ImageBase = newImageBase;
     } else {
-        image->ntHeaders32->OptionalHeader.ImageBase = newImageBase;
+        image->ntHeaders32->OptionalHeader.ImageBase = static_cast<DWORD>(newImageBase);
     }
 
     return true;
 }
-
 bool RelocFixer::RebuildRelocations(
     CS_PE_IMAGE* image,
     const std::vector<CS_RELOC_ENTRY>& newRelocs)

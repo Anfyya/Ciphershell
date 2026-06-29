@@ -5,6 +5,8 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <cstdint>
+#include <cstddef>
 
 // ============================================================================
 // 类型定义
@@ -15,43 +17,82 @@ typedef FARPROC (WINAPI *pGetProcAddress)(HMODULE, LPCSTR);
 typedef LPVOID  (WINAPI *pVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
 typedef BOOL    (WINAPI *pVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef BOOL    (WINAPI *pFlushInstructionCache)(HANDLE, LPCVOID, SIZE_T);
+typedef struct _CS_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} CS_UNICODE_STRING;
+
+typedef struct _CS_PEB_LDR_DATA {
+    ULONG Length;
+    BOOLEAN Initialized;
+    PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+} CS_PEB_LDR_DATA;
+
+typedef struct _CS_LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    CS_UNICODE_STRING FullDllName;
+    CS_UNICODE_STRING BaseDllName;
+} CS_LDR_DATA_TABLE_ENTRY;
+
+typedef struct _CS_PEB {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    PVOID Reserved3[2];
+    CS_PEB_LDR_DATA* Ldr;
+} CS_PEB;
+
+static bool EqualsKernel32Name(const wchar_t* name, USHORT byteLength) {
+    static const wchar_t expected[] = L"kernel32.dll";
+    const size_t expectedLen = (sizeof(expected) / sizeof(expected[0])) - 1;
+    size_t charLength = byteLength / sizeof(wchar_t);
+    if (!name || charLength != expectedLen) return false;
+
+    for (size_t i = 0; i < expectedLen; i++) {
+        wchar_t c = name[i];
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c + (L'a' - L'A'));
+        if (c != expected[i]) return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // PEB 遍历获取 kernel32 基址
 // ============================================================================
 
 static HMODULE GetKernel32Base() {
-    // 通过 PEB 获取 kernel32.dll 基址
-    PEB* peb = nullptr;
+    CS_PEB* peb = nullptr;
 #ifdef _WIN64
-    peb = (PEB*)__readgsqword(0x60);
+    peb = (CS_PEB*)__readgsqword(0x60);
 #else
-    peb = (PEB*)__readfsdword(0x30);
+    peb = (CS_PEB*)__readfsdword(0x30);
 #endif
 
     if (!peb || !peb->Ldr) return nullptr;
 
-    // 遍历已加载模块
-    PEB_LDR_DATA* ldr = peb->Ldr;
+    CS_PEB_LDR_DATA* ldr = peb->Ldr;
     LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
     LIST_ENTRY* current = head->Flink;
 
-    while (current != head) {
-        // 获取模块基址
-        // LDR_DATA_TABLE_ENTRY 结构偏移
-        BYTE* entry = (BYTE*)current - sizeof(LIST_ENTRY);  // 回到结构开头
-        HMODULE base = *(HMODULE*)(entry + 0x30);  // DllBase 偏移
+    while (current && current != head) {
+        CS_LDR_DATA_TABLE_ENTRY* entry =
+            (CS_LDR_DATA_TABLE_ENTRY*)((BYTE*)current - offsetof(CS_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks));
+        HMODULE base = (HMODULE)entry->DllBase;
 
-        // 检查是否是 kernel32 (通过检查 PE 头)
-        if (base) {
+        if (base && EqualsKernel32Name(entry->BaseDllName.Buffer, entry->BaseDllName.Length)) {
             IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
             if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
                 IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)base + dos->e_lfanew);
                 if (nt->Signature == IMAGE_NT_SIGNATURE) {
-                    // 简单检查：kernel32 通常在低地址
-                    if ((uintptr_t)base < 0x10000000) {
-                        return base;
-                    }
+                    return base;
                 }
             }
         }

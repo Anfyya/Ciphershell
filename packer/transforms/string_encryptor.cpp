@@ -254,10 +254,10 @@ bool StringEncryptor::EncryptStrings(
         // 获取字符串数据
         BYTE* data = image->rawData + entry.offset;
 
-        // 加密
-        ChaCha20 cipher;
-        cipher.Init(entry.key, entry.nonce, 0);
-        cipher.ProcessInPlace(data, entry.length);
+        // 与启动 stub / GenerateDecryptFunction 保持一致：32 字节循环 XOR。
+        for (DWORD i = 0; i < entry.length; i++) {
+            data[i] ^= entry.key[i & 31];
+        }
 
         // 更新加密后大小
         entry.encryptedSize = entry.length;
