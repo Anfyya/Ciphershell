@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell 配置解析器 - 实现
  * 简化的 TOML 解析实现
  */
@@ -27,6 +27,7 @@ ConfigParser::~ConfigParser() {}
 CipherShellConfig ConfigParser::LoadFromFile(const std::string& filePath) {
     CipherShellConfig config;
     m_lastError.clear();  // BUG 16 修复：清除之前的错误状态
+    m_warnings.clear();
 
     std::ifstream file(filePath);
     if (!file.is_open()) {
@@ -52,12 +53,14 @@ CipherShellConfig ConfigParser::LoadFromFile(const std::string& filePath) {
 CipherShellConfig ConfigParser::LoadFromString(const std::string& content) {
     CipherShellConfig config;
     m_lastError.clear();  // BUG 16 修复：清除之前的错误状态
+    m_warnings.clear();
 
     // 解析各个配置段
     ParseGlobalSection(content, config.global);
     ParseVMSection(content, config.vm);
     ParseStringEncryptionSection(content, config.stringEncryption);
     ParseImportProtectionSection(content, config.importProtection);
+    ParseSectionEncryptionSection(content, config.sectionEncryption);
     ParseControlFlowSection(content, config.controlFlow);
     ParseAntiDebugSection(content, config.antiDebug);
     ParseAntiDumpSection(content, config.antiDump);
@@ -163,9 +166,18 @@ void ConfigParser::ParseGlobalSection(const std::string& content, GlobalConfig& 
     if (std::regex_search(section, match, regex_timestamps)) config.stripTimestamps = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_sections)) config.randomizeSections = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_antidebug)) config.antiDebugMode = match[1];
-    if (std::regex_search(section, match, regex_strings)) config.stringEncryption = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_imports)) config.importObfuscation = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_resources)) config.resourceEncryption = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_strings)) {
+        config.stringEncryption = ParseBool(match[1]);
+        m_warnings.push_back("[global].string_encryption is deprecated; use [string_encryption].enabled instead");
+    }
+    if (std::regex_search(section, match, regex_imports)) {
+        config.importObfuscation = ParseBool(match[1]);
+        m_warnings.push_back("[global].import_obfuscation is deprecated; use [import_protection].enabled instead");
+    }
+    if (std::regex_search(section, match, regex_resources)) {
+        config.resourceEncryption = ParseBool(match[1]);
+        m_warnings.push_back("[global].resource_encryption is deprecated; use [section_encryption].resources when available");
+    }
 }
 
 void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) {
@@ -218,6 +230,11 @@ void ConfigParser::ParseStringEncryptionSection(const std::string& content, Stri
 
 void ConfigParser::ParseImportProtectionSection(const std::string& content, ImportProtectionConfig& config) {
     std::string section = ExtractSection(content, "import_protection");
+    std::string legacySection = ExtractSection(content, "import_obfuscation");
+    if (section.empty() && !legacySection.empty()) {
+        section = legacySection;
+        m_warnings.push_back("[import_obfuscation] is deprecated; use [import_protection] instead");
+    }
     if (section.empty()) return;
 
     std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
@@ -227,6 +244,18 @@ void ConfigParser::ParseImportProtectionSection(const std::string& content, Impo
     if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
 }
 
+void ConfigParser::ParseSectionEncryptionSection(const std::string& content, SectionEncryptionConfig& config) {
+    std::string section = ExtractSection(content, "section_encryption");
+    if (section.empty()) return;
+
+    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
+    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
+    std::regex regex_mode(R"RE(mode\s*=\s*"([^"]+)")RE");
+    std::smatch match;
+    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
+    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+    if (std::regex_search(section, match, regex_mode)) config.mode = match[1];
+}
 void ConfigParser::ParseControlFlowSection(const std::string& content, ControlFlowConfigFile& config) {
     std::string section = ExtractSection(content, "control_flow");
     std::string flattening = ExtractSection(content, "control_flow.flattening");

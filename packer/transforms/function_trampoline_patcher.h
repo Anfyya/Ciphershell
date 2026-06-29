@@ -1,4 +1,4 @@
-﻿#ifndef CS_FUNCTION_TRAMPOLINE_PATCHER_H
+#ifndef CS_FUNCTION_TRAMPOLINE_PATCHER_H
 #define CS_FUNCTION_TRAMPOLINE_PATCHER_H
 
 #include "vm_runtime_builder.h"
@@ -9,11 +9,19 @@
 
 namespace CipherShell {
 
+enum class FunctionPatchKind {
+    None,
+    NearRel32,
+    X64AbsoluteR11
+};
+
 struct FunctionPatchResult {
     bool success = false;
     uint32_t functionRVA = 0;
     uint32_t trampolineRVA = 0;
     uint32_t patchedBytes = 0;
+    FunctionPatchKind patchKind = FunctionPatchKind::None;
+    bool verified = false;
     std::string error;
 };
 
@@ -26,7 +34,23 @@ public:
         bool destroyNativeBody);
 
 private:
-    static std::vector<uint8_t> BuildNearJump(uint32_t sourceRVA, uint32_t targetRVA);
+    static bool BuildEntryPatch(
+        const CS_PE_IMAGE* image,
+        uint32_t sourceRVA,
+        uint32_t targetRVA,
+        uint32_t availableSize,
+        std::vector<uint8_t>& patch,
+        FunctionPatchKind& kind,
+        std::string& error);
+    static bool BuildNearJump(uint32_t sourceRVA, uint32_t targetRVA, std::vector<uint8_t>& patch);
+    static std::vector<uint8_t> BuildX64AbsoluteJump(uint64_t targetVA);
+    static bool VerifyPatch(
+        const CS_PE_IMAGE* image,
+        uint32_t functionRVA,
+        uint32_t trampolineRVA,
+        FunctionPatchKind kind,
+        const std::vector<uint8_t>& patch,
+        std::string& error);
 };
 
 } // namespace CipherShell

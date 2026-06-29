@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell x86/x64 → Mirage Bytecode 转译器 - 实现
  */
 
@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include <iomanip>
 #include <random>
+#include <sstream>
 
 namespace CipherShell {
 
@@ -30,6 +32,15 @@ struct DecodedModRM {
     uint32_t immOffset = 0;
 };
 
+static std::string FormatInstructionBytes(const Instruction& instr) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (uint32_t i = 0; i < instr.length; i++) {
+        if (i) oss << ' ';
+        oss << std::setw(2) << static_cast<unsigned>(instr.bytes[i]);
+    }
+    return oss.str();
+}
 static DecodedModRM DecodeModRMInstr(const Instruction& instr) {
     DecodedModRM d;
     uint32_t pos = 0;
@@ -270,7 +281,7 @@ std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
         VM_ADD_RR, VM_ADD_RC, VM_SUB_RR, VM_SUB_RC,
         VM_AND_RR, VM_AND_RC, VM_OR_RR, VM_OR_RC, VM_XOR_RR, VM_XOR_RC, VM_NOT_R,
         VM_CMP_RR, VM_CMP_RC, VM_TEST_RR, VM_TEST_RC,
-        VM_JMP, VM_JZ, VM_JNZ, VM_JA, VM_JB, VM_JG, VM_JL,
+        VM_JMP, VM_JZ, VM_JNZ, VM_JA, VM_JB, VM_JAE, VM_JBE, VM_JG, VM_JL,
         VM_CALL_VM, VM_RET_VM, VM_CALL_NATIVE, VM_VMEXIT
     };
 
@@ -590,10 +601,10 @@ bool Translator::TranslateJump(const Instruction& instr, BytecodeInstr& outInstr
             case 0x0: outInstr.opcode = VM_JO;  break;
             case 0x1: outInstr.opcode = VM_JNO; break;
             case 0x2: outInstr.opcode = VM_JB;  break;
-            case 0x3: outInstr.opcode = VM_JGE; break;
+            case 0x3: outInstr.opcode = VM_JAE; break;
             case 0x4: outInstr.opcode = VM_JZ;  break;
             case 0x5: outInstr.opcode = VM_JNZ; break;
-            case 0x6: outInstr.opcode = VM_JLE; break;
+            case 0x6: outInstr.opcode = VM_JBE; break;
             case 0x7: outInstr.opcode = VM_JA;  break;
             case 0x8: outInstr.opcode = VM_JS;  break;
             case 0x9: outInstr.opcode = VM_JNS; break;
@@ -726,6 +737,8 @@ void Translator::EncodeInstruction(const BytecodeInstr& instr, std::vector<uint8
         case VM_JNZ:
         case VM_JA:
         case VM_JB:
+        case VM_JAE:
+        case VM_JBE:
         case VM_JG:
         case VM_JL:
         case VM_JGE:
@@ -900,6 +913,8 @@ uint32_t Translator::CalculateEncodedSize(const BytecodeInstr& instr) {
         case VM_JNZ:
         case VM_JA:
         case VM_JB:
+        case VM_JAE:
+        case VM_JBE:
         case VM_JG:
         case VM_JL:
         case VM_JGE:

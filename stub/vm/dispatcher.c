@@ -210,6 +210,8 @@ static void handler_jz(VM_CONTEXT* ctx);
 static void handler_jnz(VM_CONTEXT* ctx);
 static void handler_ja(VM_CONTEXT* ctx);
 static void handler_jb(VM_CONTEXT* ctx);
+static void handler_jae(VM_CONTEXT* ctx);
+static void handler_jbe(VM_CONTEXT* ctx);
 static void handler_jg(VM_CONTEXT* ctx);
 static void handler_jl(VM_CONTEXT* ctx);
 static void handler_jge(VM_CONTEXT* ctx);
@@ -314,9 +316,10 @@ static VM_HANDLER_FUNC default_handler_table[VM_MAX_OPCODE] = {
     /* 0x71 VM_VMENTER   */ handler_nop,
     /* 0x72 VM_VMEXIT    */ handler_vmexit,
     /* 0x73 VM_SYSCALL   */ handler_nop,
-    /* 0x74-0x7F         */ handler_nop, handler_nop, handler_nop, handler_nop, handler_nop,
+    /* 0x74 VM_JAE       */ handler_jae,
+    /* 0x75 VM_JBE       */ handler_jbe,
+    /* 0x76-0x7F         */ handler_nop, handler_nop, handler_nop, handler_nop, handler_nop,
                            handler_nop, handler_nop, handler_nop, handler_nop, handler_nop,
-                           handler_nop, handler_nop,
     /* 0x80 VM_ANTI_DEBUG */ handler_anti_debug,
 };
 
@@ -909,95 +912,114 @@ static void handler_test_rc(VM_CONTEXT* ctx)
 
 // ---- 控制流 ----
 
+static void vm_jump_absolute(VM_CONTEXT* ctx, uint32_t target)
+{
+    if (target > ctx->bytecodeSize) {
+        ctx->running = 0;
+        ctx->exitReason = VM_EXIT_ERROR;
+        ctx->errorCode = 2;
+        return;
+    }
+    ctx->regs.ip = target;
+}
+
 static void handler_jmp(VM_CONTEXT* ctx)
 {
-    // JMP: 读取 32 位偏移，跳转到 bytecode 内位置
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
-    ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+    uint32_t target = dispatch_fetch_imm32(ctx);
+    vm_jump_absolute(ctx, target);
 }
 
 static void handler_jz(VM_CONTEXT* ctx)
 {
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (ctx->regs.vflags.ZF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jnz(VM_CONTEXT* ctx)
 {
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (!ctx->regs.vflags.ZF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_ja(VM_CONTEXT* ctx)
 {
-    // JA: CF=0 且 ZF=0
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (!ctx->regs.vflags.CF && !ctx->regs.vflags.ZF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jb(VM_CONTEXT* ctx)
 {
-    // JB: CF=1
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (ctx->regs.vflags.CF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
+    }
+}
+
+static void handler_jae(VM_CONTEXT* ctx)
+{
+    uint32_t target = dispatch_fetch_imm32(ctx);
+    if (!ctx->regs.vflags.CF) {
+        vm_jump_absolute(ctx, target);
+    }
+}
+
+static void handler_jbe(VM_CONTEXT* ctx)
+{
+    uint32_t target = dispatch_fetch_imm32(ctx);
+    if (ctx->regs.vflags.CF || ctx->regs.vflags.ZF) {
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jg(VM_CONTEXT* ctx)
 {
-    // JG: ZF=0 且 SF=OF
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (!ctx->regs.vflags.ZF && ctx->regs.vflags.SF == ctx->regs.vflags.OF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jl(VM_CONTEXT* ctx)
 {
-    // JL: SF!=OF
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (ctx->regs.vflags.SF != ctx->regs.vflags.OF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jge(VM_CONTEXT* ctx)
 {
-    // JGE: SF=OF
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (ctx->regs.vflags.SF == ctx->regs.vflags.OF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
 
 static void handler_jle(VM_CONTEXT* ctx)
 {
-    // JLE: ZF=1 或 SF!=OF
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
     if (ctx->regs.vflags.ZF || ctx->regs.vflags.SF != ctx->regs.vflags.OF) {
-        ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+        vm_jump_absolute(ctx, target);
     }
 }
-
 // ---- VM 调用/返回 ----
 
 static void handler_call_vm(VM_CONTEXT* ctx)
 {
     // VM 内部函数调用：push return offset, jmp target
-    int32_t offset = (int32_t)dispatch_fetch_imm32(ctx);
+    uint32_t target = dispatch_fetch_imm32(ctx);
 
     // 保存返回地址
     VM_STACK_PUSH64(ctx, ctx->regs.ip);
 
     // 跳转
-    ctx->regs.ip = (uint64_t)((int64_t)ctx->regs.ip + offset);
+    vm_jump_absolute(ctx, target);
 }
 
 static void handler_ret_vm(VM_CONTEXT* ctx)

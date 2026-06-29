@@ -1,4 +1,4 @@
-﻿#include "vm_runtime_builder.h"
+#include "vm_runtime_builder.h"
 #include "../pe_parser/pe_emitter.h"
 #include <cstring>
 
@@ -28,8 +28,8 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeSkeleton(uint32_t metadata
     std::vector<uint8_t> c;
     c.reserve(96);
 
-    // Strict ABI-preserving shell. The interpreter body is intentionally marked by
-    // a stable internal status byte and is checked by CapabilityChecker before L4 output.
+    // Strict ABI-preserving shell. This is still marked non-execution-ready by
+    // Build(); it must never be treated as a working interpreter by the main pipeline.
     Emit8(c, 0x9C);                                      // pushfq
     Emit8(c, 0x50);                                      // push rax
     Emit8(c, 0x51);                                      // push rcx
@@ -48,11 +48,13 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeSkeleton(uint32_t metadata
     Emit8(c, 0x41); Emit8(c, 0x57);                      // push r15
     Emit8(c, 0x48); Emit8(c, 0x83); Emit8(c, 0xEC); Emit8(c, 0x28); // shadow space + align
 
-    // mov r10d, metadataRVA. This gives the runtime a concrete metadata binding.
-    Emit8(c, 0x41); Emit8(c, 0xBA); Emit32(c, metadataRVA);
+    // mov r11d, metadataRVA. The actual trampoline also passes metadata in r11d;
+    // this immediate binding is kept for static validation while the runtime is fail-closed.
+    Emit8(c, 0x41); Emit8(c, 0xBB); Emit32(c, metadataRVA);
 
-    // ud2 marks incomplete interpreter execution. Main refuses to use this for strict VM output.
-    Emit8(c, 0x0F); Emit8(c, 0x0B);
+    // No crash sentinel is emitted on the normal path. The packer refuses
+    // to write an L4 output until a real interpreter replaces this no-op body.
+    Emit8(c, 0x90);
 
     Emit8(c, 0x48); Emit8(c, 0x83); Emit8(c, 0xC4); Emit8(c, 0x28);
     Emit8(c, 0x41); Emit8(c, 0x5F);
@@ -78,8 +80,8 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeSkeleton(uint32_t metadata
 std::vector<uint8_t> VMRuntimeBuilder::BuildX64Trampoline(uint32_t functionRVA, uint32_t metadataRVA) {
     std::vector<uint8_t> c;
     c.reserve(32);
-    Emit8(c, 0xB9); Emit32(c, functionRVA);              // mov ecx, functionRVA
-    Emit8(c, 0xBA); Emit32(c, metadataRVA);              // mov edx, metadataRVA
+    Emit8(c, 0x41); Emit8(c, 0xBA); Emit32(c, functionRVA); // mov r10d, functionRVA
+    Emit8(c, 0x41); Emit8(c, 0xBB); Emit32(c, metadataRVA); // mov r11d, metadataRVA
     Emit8(c, 0xE9); Emit32(c, 0);                        // jmp runtime, patched after layout
     return c;
 }
@@ -138,10 +140,10 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
         VMTrampolineRecord tr;
         tr.functionRVA = records[i].functionRVA;
         tr.trampolineRVA = append.rva + trampolineOffsets[i];
-        tr.trampolineSize = 14;
+        tr.trampolineSize = 17;
         result.trampolines.push_back(tr);
     }
-    result.error = "VM interpreter body is not execution-ready; refusing strict L4 output";
+    result.error = "VM interpreter body is not execution-ready; generated runtime is a non-crashing fail-closed shell";
     return result;
 }
 

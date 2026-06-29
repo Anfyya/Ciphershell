@@ -116,6 +116,8 @@ extern "C" {
 #define VM_VMENTER          0x71    // native -> VM
 #define VM_VMEXIT           0x72    // VM -> native
 #define VM_SYSCALL          0x73    // 直接syscall
+#define VM_JAE              0x74    // CF=0, unsigned >= / not below
+#define VM_JBE              0x75    // CF=1 or ZF=1, unsigned <= / not above
 
 // 特殊
 #define VM_ANTI_DEBUG       0x80    // 内联反调试

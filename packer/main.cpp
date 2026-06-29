@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell 主程序入口
  * 命令行界面
  */
@@ -72,6 +72,13 @@ CipherShell v0.1 - 自研高强度代码保护壳
 )" << std::endl;
 }
 
+static void PrintFeatureStatus(const std::string& name, const std::string& status, const std::string& reason = std::string()) {
+    std::cout << "FEATURE_STATUS name=" << name << " status=" << status;
+    if (!reason.empty()) {
+        std::cout << " reason=" << reason;
+    }
+    std::cout << std::endl;
+}
 // ============================================================================
 // 主函数
 // ============================================================================
@@ -230,6 +237,10 @@ int main(int argc, char* argv[]) {
     CipherShell::ProtectionBuildContext buildCtx =
         CipherShell::ProtectionBuildContext::FromConfig(config, protectionLevel, verbose);
 
+    for (const auto& warning : configParser.GetWarnings()) {
+        std::cerr << "CONFIG_WARN module=ConfigParser reason=" << warning << std::endl;
+    }
+
     CipherShell::CapabilityChecker capabilityChecker;
     auto capabilityReport = capabilityChecker.CheckImage(image.get(), buildCtx);
     for (const auto& issue : capabilityReport.issues) {
@@ -291,7 +302,12 @@ int main(int argc, char* argv[]) {
                 encryptedStringRegions.push_back(region);
             }
             std::cout << "    已加密所有字符串，并登记运行时解密任务" << std::endl;
+            PrintFeatureStatus("string_encryption", "applied", "mode=" + buildCtx.stringEncryption.mode);
+        } else {
+            PrintFeatureStatus("string_encryption", "skipped", "no_strings_found");
         }
+    } else {
+        PrintFeatureStatus("string_encryption", "skipped", "disabled");
     }
 
     // Phase B: 导入表混淆（L2+）
@@ -307,6 +323,9 @@ int main(int argc, char* argv[]) {
 
         auto obfImports = obfuscator.ObfuscateImports(image.get(), obfConfig, &resolver);
         std::cout << "    混淆了 " << obfImports.size() << " 个导入函数" << std::endl;
+            PrintFeatureStatus("import_protection", "partial", "runtime_resolver_callsite_rewrite_not_closed");
+    } else {
+        PrintFeatureStatus("import_protection", "skipped", "disabled");
     }
 
     // Phase C: 控制流平坦化（L3+，暂禁用——GenerateFlattenedCode 需要优化）
@@ -500,8 +519,9 @@ int main(int argc, char* argv[]) {
                         const auto& failure = transResult.failures.front();
                         std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
                                   << func.entryAddress << " instr_rva=0x" << failure.address << std::dec
-                                  << " mnemonic=" << failure.mnemonic
-                                  << " reason=" << failure.reason << std::endl;
+                                  << " mnemonic=" << failure.mnemonic;
+                        if (!failure.bytes.empty()) std::cerr << " bytes=" << failure.bytes;
+                        std::cerr << " reason=" << failure.reason << std::endl;
                     } else {
                         std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
                                   << func.entryAddress << std::dec
@@ -539,6 +559,7 @@ int main(int argc, char* argv[]) {
                 buildCtx.opcodeMap, buildCtx.registerMap, 0, buildCtx.vmSectionName);
             if (!emitResult.success) {
                 std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
+                                PrintFeatureStatus("vm", "failed", emitResult.error);
                 return 1;
             }
 
@@ -547,6 +568,7 @@ int main(int argc, char* argv[]) {
                 emitResult.metadataRVA, buildCtx.vmRuntimeSectionName);
             if (!runtimeResult.success) {
                 std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
+                                PrintFeatureStatus("vm", "failed", runtimeResult.error);
                 return 1;
             }
 
@@ -554,11 +576,13 @@ int main(int argc, char* argv[]) {
             if (!vmEmitter.PatchRuntimeEntry(image.get(), emitResult.metadataRVA,
                     runtimeResult.runtimeEntryRVA, &patchError)) {
                 std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
+                                PrintFeatureStatus("vm", "failed", patchError);
                 return 1;
             }
 
             if (!runtimeResult.executionReady) {
                 std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
+                                PrintFeatureStatus("vm", "failed", runtimeResult.error);
                 return 1;
             }
 
@@ -569,6 +593,7 @@ int main(int argc, char* argv[]) {
                     std::cerr << "VM_PATCH_FAIL module=FunctionTrampolinePatcher function_rva=0x"
                               << std::hex << patch.functionRVA << std::dec
                               << " reason=" << patch.error << std::endl;
+                                        PrintFeatureStatus("vm", "failed", patch.error);
                     return 1;
                 }
             }
@@ -577,6 +602,9 @@ int main(int argc, char* argv[]) {
                       << " metadata=0x" << emitResult.metadataRVA
                       << " bytecode=0x" << emitResult.bytecodeRVA
                       << " runtime=0x" << runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+            PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
+        } else {
+            PrintFeatureStatus("vm", "skipped", "no_supported_functions");
         }
 
         std::cout << "    VM bytecode 写入函数数: " << virtualizedCount
@@ -600,6 +628,9 @@ int main(int argc, char* argv[]) {
 
         encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
         std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
+            PrintFeatureStatus("section_encryption", encryptedSections.empty() ? "skipped" : "applied", encryptedSections.empty() ? "no_encryptable_sections" : "mode=" + buildCtx.sectionEncryption.mode);
+    } else {
+        PrintFeatureStatus("section_encryption", "skipped", "disabled");
     }
 
     if (!encryptedStringRegions.empty()) {

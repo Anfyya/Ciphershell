@@ -1,4 +1,4 @@
-﻿#include "protection_build_context.h"
+#include "protection_build_context.h"
 #include <ctime>
 
 namespace CipherShell {

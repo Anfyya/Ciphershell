@@ -1,4 +1,4 @@
-﻿#ifndef CS_TRANSLATOR_H
+#ifndef CS_TRANSLATOR_H
 #define CS_TRANSLATOR_H
 
 #include "../analysis/disassembler.h"
@@ -35,6 +35,7 @@ struct BytecodeInstr {
 struct TranslationFailure {
     uint64_t    address;
     std::string mnemonic;
+    std::string bytes;
     std::string reason;
 };
 
