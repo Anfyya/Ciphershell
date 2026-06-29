@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 配置解析器
  * 解析 TOML 格式的保护配置文件
  */
@@ -54,6 +54,10 @@ struct GlobalConfig {
 // ============================================================================
 
 struct VMConfig {
+    bool            enabled;
+    bool            enabledSet;
+    int             strength;
+    std::vector<std::string> targetFunctions;
     int             registerCount;      // 虚拟寄存器数量 (16-64)
     int             stackSize;          // 虚拟栈大小
     std::string     opcodeWidth;        // "fixed_8" | "fixed_16" | "variable"
@@ -62,6 +66,9 @@ struct VMConfig {
     bool            embedJunkHandlers;  // 嵌入假 handler
 
     VMConfig() :
+        enabled(false),
+        enabledSet(false),
+        strength(0),
         registerCount(24),
         stackSize(0x20000),
         opcodeWidth("variable"),
@@ -71,6 +78,65 @@ struct VMConfig {
 };
 
 // ============================================================================
+// ============================================================================
+// 模块化保护配置
+// ============================================================================
+
+struct StringEncryptionConfig {
+    bool            enabled;
+    bool            enabledSet;
+    int             strength;
+    std::string     mode;
+    bool            ascii;
+    bool            utf16;
+    bool            resources;
+    bool            clearAfterUse;
+
+    StringEncryptionConfig() :
+        enabled(false),
+        enabledSet(false),
+        strength(0),
+        mode(""),
+        ascii(true),
+        utf16(true),
+        resources(false),
+        clearAfterUse(false) {}
+};
+
+struct ImportProtectionConfig {
+    bool            enabled;
+    bool            enabledSet;
+    int             strength;
+
+    ImportProtectionConfig() :
+        enabled(false),
+        enabledSet(false),
+        strength(0) {}
+};
+
+struct ControlFlowConfigFile {
+    bool            enabled;
+    bool            enabledSet;
+    int             strength;
+    bool            flatteningEnabled;
+    bool            flatteningEnabledSet;
+    int             flatteningStrength;
+    std::vector<std::string> flatteningTargets;
+    bool            bogusEnabled;
+    bool            bogusEnabledSet;
+    int             bogusStrength;
+
+    ControlFlowConfigFile() :
+        enabled(false),
+        enabledSet(false),
+        strength(0),
+        flatteningEnabled(false),
+        flatteningEnabledSet(false),
+        flatteningStrength(0),
+        bogusEnabled(false),
+        bogusEnabledSet(false),
+        bogusStrength(0) {}
+};
 // 反调试配置
 // ============================================================================
 
@@ -130,6 +196,9 @@ struct PerformanceConfig {
 struct CipherShellConfig {
     GlobalConfig                global;
     VMConfig                    vm;
+    StringEncryptionConfig      stringEncryption;
+    ImportProtectionConfig      importProtection;
+    ControlFlowConfigFile       controlFlow;
     AntiDebugConfigFile         antiDebug;
     AntiDumpConfig              antiDump;
     PerformanceConfig           performance;
@@ -183,6 +252,9 @@ private:
     // 解析各个配置段
     void ParseGlobalSection(const std::string& content, GlobalConfig& config);
     void ParseVMSection(const std::string& content, VMConfig& config);
+    void ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config);
+    void ParseImportProtectionSection(const std::string& content, ImportProtectionConfig& config);
+    void ParseControlFlowSection(const std::string& content, ControlFlowConfigFile& config);
     void ParseAntiDebugSection(const std::string& content, AntiDebugConfigFile& config);
     void ParseAntiDumpSection(const std::string& content, AntiDumpConfig& config);
     void ParsePerformanceSection(const std::string& content, PerformanceConfig& config);
@@ -195,6 +267,7 @@ private:
     int ParseInt(const std::string& value);
     double ParseDouble(const std::string& value);
     std::string ParseString(const std::string& value);
+    std::vector<std::string> ParseStringArray(const std::string& value);
 
     // BUG 16 修复：错误状态
     std::string m_lastError;

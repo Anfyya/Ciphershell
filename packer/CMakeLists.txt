@@ -1,4 +1,4 @@
-# CipherShell Packer CMakeLists.txt
+﻿# CipherShell Packer CMakeLists.txt
 
 # ============================================================================
 # Packer 库
@@ -7,6 +7,7 @@
 add_library(ciphershell_packer STATIC
     # PE 解析器
     pe_parser/pe_parser.cpp
+    pe_parser/pe_emitter.cpp
     pe_parser/pe_rebuilder.cpp
     pe_parser/dll_packer.cpp
 
@@ -20,6 +21,7 @@ add_library(ciphershell_packer STATIC
     # 分析引擎 — Phase 3
     analysis/disassembler.cpp
     analysis/cfg_builder.cpp
+    analysis/capability_checker.cpp
     analysis/hotspot_analyzer.cpp
 
     # 变换引擎 — Phase 3
@@ -33,6 +35,8 @@ add_library(ciphershell_packer STATIC
     # 转译器 — Phase 4
     transforms/translator.cpp
     transforms/vm_section_emitter.cpp
+    transforms/vm_runtime_builder.cpp
+    transforms/function_trampoline_patcher.cpp
     transforms/vm_nester.cpp
 
     # 变异引擎 — Phase 4
@@ -41,6 +45,7 @@ add_library(ciphershell_packer STATIC
 
     # 配置解析
     config/config_parser.cpp
+    config/protection_build_context.cpp
 
     # 签名消除
     signature/signature_eliminator.cpp

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 主程序入口
  * 命令行界面
  */
@@ -35,6 +35,10 @@
 #include "mutation/mutation_engine.h"
 #include "mutation/bytecode_encryptor.h"
 #include "gui/console_gui.h"
+#include "transforms/function_trampoline_patcher.h"
+#include "transforms/vm_runtime_builder.h"
+#include "analysis/capability_checker.h"
+#include "config/protection_build_context.h"
 
 namespace fs = std::filesystem;
 
@@ -223,6 +227,20 @@ int main(int argc, char* argv[]) {
         config.global.protectionLevel = protectionLevel;
     }
 
+    CipherShell::ProtectionBuildContext buildCtx =
+        CipherShell::ProtectionBuildContext::FromConfig(config, protectionLevel, verbose);
+
+    CipherShell::CapabilityChecker capabilityChecker;
+    auto capabilityReport = capabilityChecker.CheckImage(image.get(), buildCtx);
+    for (const auto& issue : capabilityReport.issues) {
+        std::cerr << "CAPABILITY_" << (issue.fatal ? "FAIL" : "WARN")
+                  << " module=" << issue.module
+                  << " rva=0x" << std::hex << issue.rva << std::dec
+                  << " reason=" << issue.reason << std::endl;
+    }
+    if (!capabilityReport.ok) {
+        return 1;
+    }
     // ============================================================================
     // Step 1.5: 保存原始入口点
     // ============================================================================
@@ -245,11 +263,15 @@ int main(int argc, char* argv[]) {
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
 
     // Phase A: 字符串加密（明文代码段中的内联字符串，L2+）
-    if (protectionLevel >= 2 && config.global.stringEncryption) {
+    if (buildCtx.stringEncryption.enabled) {
         std::cout << "  应用字符串加密..." << std::endl;
 
         CipherShell::StringEncryptor strEncryptor;
         CipherShell::CS_STRING_CONFIG strConfig;
+        strConfig.encryptAnsiStrings = buildCtx.stringAscii;
+        strConfig.encryptWideStrings = buildCtx.stringUtf16;
+        strConfig.scanResources = buildCtx.stringResources;
+        strConfig.scanReadableSections = true;
 
         auto strings = strEncryptor.ScanStrings(image.get(), strConfig);
         std::cout << "    发现 " << strings.size() << " 个字符串" << std::endl;
@@ -273,7 +295,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Phase B: 导入表混淆（L2+）
-    if (protectionLevel >= 2 && config.global.importObfuscation) {
+    if (buildCtx.importProtection.enabled) {
         std::cout << "  应用导入表混淆..." << std::endl;
 
         CipherShell::ImportObfuscator obfuscator;
@@ -288,7 +310,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Phase C: 控制流平坦化（L3+，暂禁用——GenerateFlattenedCode 需要优化）
-    if (protectionLevel >= 99) {  // FIXME: 暂时禁用，待优化
+    if (buildCtx.flattening.enabled) {  // FIXME: 暂时禁用，待优化
         std::cout << "  应用控制流平坦化..." << std::endl;
 
         CipherShell::Disassembler disasm;
@@ -343,7 +365,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Phase D: 虚假控制流（L3+，需在加密前反汇编明文代码）
-    if (protectionLevel >= 3) {
+    if (buildCtx.bogusFlow.enabled) {
         std::cout << "  应用虚假控制流..." << std::endl;
 
         CipherShell::BogusFlowInjector bogusInjector;
@@ -377,7 +399,19 @@ int main(int argc, char* argv[]) {
                 DWORD codeSize = 0;
                 BYTE* bogusCode = bogusInjector.GenerateBogusCode(bogusResult, is64, &codeSize);
                 if (bogusCode && codeSize > 0) {
-                    injectedCount++;
+                    DWORD funcSize = static_cast<DWORD>(func.size);
+                    DWORD funcOffset = static_cast<DWORD>(func.entryAddress - sec.VirtualAddress);
+                    if (codeSize <= funcSize && funcOffset + funcSize <= secSize) {
+                        memcpy(image->rawData + secOffset + funcOffset, bogusCode, codeSize);
+                        if (codeSize < funcSize) {
+                            memset(image->rawData + secOffset + funcOffset + codeSize, 0x90, funcSize - codeSize);
+                        }
+                        injectedCount++;
+                    } else {
+                        std::cerr << "CFG_BOGUS_SKIP module=BogusFlow function_rva=0x" << std::hex
+                                  << func.entryAddress << std::dec
+                                  << " reason=generated_code_does_not_fit_original_function" << std::endl;
+                    }
                     delete[] bogusCode;
                 }
                 bogusInjector.Cleanup(bogusResult);
@@ -387,7 +421,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Phase E: 函数级 VM 保护。这里只允许完整落盘的数据进入下一步，失败必须明确诊断。
-    if (protectionLevel >= 4) {
+    if (buildCtx.vm.enabled) {
         std::cout << "  应用代码虚拟化 (Mirage VM)..." << std::endl;
 
         CipherShell::MutationEngine mutEngine;
@@ -397,9 +431,12 @@ int main(int argc, char* argv[]) {
         mutConfig.mutateHandlers = true;
         mutConfig.insertJunkHandlers = true;
         mutConfig.junkHandlerCount = 20;
+        mutConfig.seed = buildCtx.isaSeed;
         mutEngine.Initialize(mutConfig);
 
         CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
+        buildCtx.opcodeMap = mutatedISA.opcodeMap;
+        buildCtx.registerMap = mutatedISA.registerMap;
         std::cout << "    ISA 变异种子: 0x" << std::hex << mutEngine.GetSeed() << std::dec << std::endl;
 
         CipherShell::Translator translator;
@@ -412,6 +449,8 @@ int main(int argc, char* argv[]) {
             std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed" << std::endl;
             return 1;
         }
+        translator.SetOpcodeMap(buildCtx.opcodeMap);
+        translator.SetRegisterMap(buildCtx.registerMap);
 
         CipherShell::BytecodeEncryptor bcEncryptor;
         CipherShell::BytecodeEncryptConfig bcConfig;
@@ -442,6 +481,14 @@ int main(int argc, char* argv[]) {
                 if (func.entryAddress > 0xFFFFFFFFULL || func.size > 0xFFFFFFFFULL) {
                     std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
                               << std::dec << " reason=function_range_too_large" << std::endl;
+                    rejectedCount++;
+                    continue;
+                }
+
+                std::string vmSafetyReason;
+                if (!capabilityChecker.IsFunctionVmSafe(image.get(), func, vmSafetyReason)) {
+                    std::cerr << "VM_REJECT module=CapabilityChecker rva=0x" << std::hex << func.entryAddress
+                              << std::dec << " reason=" << vmSafetyReason << std::endl;
                     rejectedCount++;
                     continue;
                 }
@@ -489,31 +536,59 @@ int main(int argc, char* argv[]) {
         if (!vmRecords.empty()) {
             CipherShell::VMSectionEmitter vmEmitter;
             auto emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
-                translator.GetOpcodeMap(), translator.GetRegisterMap());
+                buildCtx.opcodeMap, buildCtx.registerMap, 0, buildCtx.vmSectionName);
             if (!emitResult.success) {
                 std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
                 return 1;
             }
+
+            CipherShell::VMRuntimeBuilder runtimeBuilder;
+            auto runtimeResult = runtimeBuilder.Build(image.get(), vmRecords,
+                emitResult.metadataRVA, buildCtx.vmRuntimeSectionName);
+            if (!runtimeResult.success) {
+                std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
+                return 1;
+            }
+
+            std::string patchError;
+            if (!vmEmitter.PatchRuntimeEntry(image.get(), emitResult.metadataRVA,
+                    runtimeResult.runtimeEntryRVA, &patchError)) {
+                std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
+                return 1;
+            }
+
+            if (!runtimeResult.executionReady) {
+                std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
+                return 1;
+            }
+
+            CipherShell::FunctionTrampolinePatcher patcher;
+            auto patchResults = patcher.PatchFunctions(image.get(), runtimeResult.trampolines, vmRecords, true);
+            for (const auto& patch : patchResults) {
+                if (!patch.success) {
+                    std::cerr << "VM_PATCH_FAIL module=FunctionTrampolinePatcher function_rva=0x"
+                              << std::hex << patch.functionRVA << std::dec
+                              << " reason=" << patch.error << std::endl;
+                    return 1;
+                }
+            }
+
             std::cout << "    VM section: rva=0x" << std::hex << emitResult.sectionRVA
                       << " metadata=0x" << emitResult.metadataRVA
-                      << " bytecode=0x" << emitResult.bytecodeRVA << std::dec << std::endl;
+                      << " bytecode=0x" << emitResult.bytecodeRVA
+                      << " runtime=0x" << runtimeResult.runtimeEntryRVA << std::dec << std::endl;
         }
 
         std::cout << "    VM bytecode 写入函数数: " << virtualizedCount
                   << "，拒绝函数数: " << rejectedCount << std::endl;
 
-        if (!vmRecords.empty()) {
-            std::cerr << "VM_LINK_FAIL module=VMRuntimeBridge reason=vmenter_runtime_and_function_trampoline_not_linked" << std::endl;
-            return 1;
-        }
-
-        if (protectionLevel >= 5) {
-            std::cout << "  跳过嵌套 VM：没有已链接的一级 VM runtime" << std::endl;
+        if (buildCtx.quickLevel >= 5) {
+            std::cout << "  嵌套 VM 等待一级 VM runtime 执行器 ready 后启用" << std::endl;
         }
     }
     // Phase F: Section 加密（L1+，最后执行——加密所有变换后的代码）
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
-    if (protectionLevel >= 1) {
+    if (buildCtx.sectionEncryption.enabled) {
         std::cout << "  应用 Section 加密..." << std::endl;
 
         CipherShell::SectionEncryptor encryptor;

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 字符串加密器
  * 扫描并加密 PE 中的字符串引用
  */
@@ -51,13 +51,17 @@ struct CS_STRING_CONFIG {
     bool        encryptWideStrings; // 加宽字符字符串
     bool        encryptAnsiStrings; // 加密 ANSI 字符串
     bool        insertDecryptionStub; // 是否插入解密桩
+    bool        scanReadableSections; // 扫描可读 section（.rdata/.data 等）
+    bool        scanResources;        // 扫描资源字符串表
 
     CS_STRING_CONFIG() :
         minLength(4),
         maxLength(4096),
         encryptWideStrings(true),
         encryptAnsiStrings(true),
-        insertDecryptionStub(true) {}
+        insertDecryptionStub(true),
+        scanReadableSections(true),
+        scanResources(false) {}
 };
 
 // ============================================================================

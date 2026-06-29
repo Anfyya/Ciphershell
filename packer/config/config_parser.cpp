@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 配置解析器 - 实现
  * 简化的 TOML 解析实现
  */
@@ -56,6 +56,9 @@ CipherShellConfig ConfigParser::LoadFromString(const std::string& content) {
     // 解析各个配置段
     ParseGlobalSection(content, config.global);
     ParseVMSection(content, config.vm);
+    ParseStringEncryptionSection(content, config.stringEncryption);
+    ParseImportProtectionSection(content, config.importProtection);
+    ParseControlFlowSection(content, config.controlFlow);
     ParseAntiDebugSection(content, config.antiDebug);
     ParseAntiDumpSection(content, config.antiDump);
     ParsePerformanceSection(content, config.performance);
@@ -175,6 +178,9 @@ void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) 
     std::regex regex_mutation(R"(handler_mutation\s*=\s*(true|false))");
     std::regex regex_encrypt(R"RE(bytecode_encryption\s*=\s*"([^"]+)")RE");
     std::regex regex_junk(R"(embed_junk_handlers\s*=\s*(true|false))");
+    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
+    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
+    std::regex regex_targets(R"RE(target_functions\s*=\s*(\[[^\]]*\]))RE");
 
     std::smatch match;
     if (std::regex_search(section, match, regex_reg)) config.registerCount = ParseInt(match[1]);
@@ -183,8 +189,68 @@ void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) 
     if (std::regex_search(section, match, regex_mutation)) config.handlerMutation = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_encrypt)) config.bytecodeEncryption = match[1];
     if (std::regex_search(section, match, regex_junk)) config.embedJunkHandlers = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
+    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+    if (std::regex_search(section, match, regex_targets)) config.targetFunctions = ParseStringArray(match[1]);
 }
 
+void ConfigParser::ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config) {
+    std::string section = ExtractSection(content, "string_encryption");
+    if (section.empty()) return;
+
+    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
+    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
+    std::regex regex_mode(R"RE(mode\s*=\s*"([^"]+)")RE");
+    std::regex regex_ascii(R"(ascii\s*=\s*(true|false))");
+    std::regex regex_utf16(R"(utf16\s*=\s*(true|false))");
+    std::regex regex_resources(R"(resources\s*=\s*(true|false))");
+    std::regex regex_clear(R"(clear_after_use\s*=\s*(true|false))");
+
+    std::smatch match;
+    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
+    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+    if (std::regex_search(section, match, regex_mode)) config.mode = match[1];
+    if (std::regex_search(section, match, regex_ascii)) config.ascii = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_utf16)) config.utf16 = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_resources)) config.resources = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_clear)) config.clearAfterUse = ParseBool(match[1]);
+}
+
+void ConfigParser::ParseImportProtectionSection(const std::string& content, ImportProtectionConfig& config) {
+    std::string section = ExtractSection(content, "import_protection");
+    if (section.empty()) return;
+
+    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
+    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
+    std::smatch match;
+    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
+    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+}
+
+void ConfigParser::ParseControlFlowSection(const std::string& content, ControlFlowConfigFile& config) {
+    std::string section = ExtractSection(content, "control_flow");
+    std::string flattening = ExtractSection(content, "control_flow.flattening");
+    std::string bogus = ExtractSection(content, "control_flow.bogus");
+
+    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
+    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
+    std::regex regex_targets(R"RE(target_functions\s*=\s*(\[[^\]]*\]))RE");
+    std::smatch match;
+
+    if (!section.empty()) {
+        if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
+        if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+    }
+    if (!flattening.empty()) {
+        if (std::regex_search(flattening, match, regex_enabled)) { config.flatteningEnabled = ParseBool(match[1]); config.flatteningEnabledSet = true; }
+        if (std::regex_search(flattening, match, regex_strength)) config.flatteningStrength = ParseInt(match[1]);
+        if (std::regex_search(flattening, match, regex_targets)) config.flatteningTargets = ParseStringArray(match[1]);
+    }
+    if (!bogus.empty()) {
+        if (std::regex_search(bogus, match, regex_enabled)) { config.bogusEnabled = ParseBool(match[1]); config.bogusEnabledSet = true; }
+        if (std::regex_search(bogus, match, regex_strength)) config.bogusStrength = ParseInt(match[1]);
+    }
+}
 void ConfigParser::ParseAntiDebugSection(const std::string& content, AntiDebugConfigFile& config) {
     std::string section = ExtractSection(content, "anti_debug");
     if (section.empty()) return;
@@ -353,4 +419,23 @@ std::string ConfigParser::ParseString(const std::string& value) {
     return value;
 }
 
+std::vector<std::string> ConfigParser::ParseStringArray(const std::string& value) {
+    std::vector<std::string> result;
+    size_t begin = value.find('[');
+    size_t end = value.rfind(']');
+    if (begin == std::string::npos || end == std::string::npos || end <= begin) return result;
+
+    std::string body = value.substr(begin + 1, end - begin - 1);
+    size_t pos = 0;
+    while (pos < body.size()) {
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == ',')) pos++;
+        if (pos >= body.size()) break;
+        if (body[pos] != '"') break;
+        size_t close = body.find('"', pos + 1);
+        if (close == std::string::npos) break;
+        result.push_back(body.substr(pos + 1, close - pos - 1));
+        pos = close + 1;
+    }
+    return result;
+}
 } // namespace CipherShell

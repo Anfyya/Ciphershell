@@ -1,4 +1,4 @@
-#ifndef CS_TRANSLATOR_H
+﻿#ifndef CS_TRANSLATOR_H
 #define CS_TRANSLATOR_H
 
 #include "../analysis/disassembler.h"
@@ -25,6 +25,7 @@ struct BytecodeInstr {
     uint8_t     regDst;
     uint8_t     regSrc;
     uint8_t     regExtra;
+    uint8_t     scale;
     uint64_t    immediate;
     uint32_t    jumpTarget;
     bool        isJump;
@@ -82,6 +83,8 @@ public:
 
     std::unordered_map<uint8_t, uint8_t> GetRegisterMap() const;
     std::unordered_map<uint8_t, uint8_t> GetOpcodeMap() const;
+    void SetOpcodeMap(const std::unordered_map<uint8_t, uint8_t>& opcodeMap);
+    void SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& registerMap);
     std::unordered_map<uint8_t, uint8_t> GenerateOpcodeMap();
     const std::vector<TranslationFailure>& GetLastFailures() const;
 
@@ -92,6 +95,10 @@ private:
     bool TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr);
     bool TranslateSub(const Instruction& instr, BytecodeInstr& outInstr);
     bool TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr);
+    bool TranslateAnd(const Instruction& instr, BytecodeInstr& outInstr);
+    bool TranslateOr(const Instruction& instr, BytecodeInstr& outInstr);
+    bool TranslateTest(const Instruction& instr, BytecodeInstr& outInstr);
+    bool TranslateLea(const Instruction& instr, BytecodeInstr& outInstr);
     bool TranslatePush(const Instruction& instr, BytecodeInstr& outInstr);
     bool TranslatePop(const Instruction& instr, BytecodeInstr& outInstr);
     bool TranslateJump(const Instruction& instr, BytecodeInstr& outInstr);

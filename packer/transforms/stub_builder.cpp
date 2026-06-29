@@ -1,4 +1,5 @@
-#include "stub_builder.h"
+﻿#include "stub_builder.h"
+#include "../pe_parser/pe_emitter.h"
 #include <cstring>
 #include <iostream>
 #include <new>
@@ -244,86 +245,21 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
                                           : build_x86_multi(tasks, oep);
     if (stub.empty()) return false;
 
-    DWORD ss = (DWORD)stub.size();
-    DWORD fa = img->is64Bit ? img->ntHeaders64->OptionalHeader.FileAlignment
-                            : img->ntHeaders32->OptionalHeader.FileAlignment;
-    DWORD sa = img->is64Bit ? img->ntHeaders64->OptionalHeader.SectionAlignment
-                            : img->ntHeaders32->OptionalHeader.SectionAlignment;
-    if (fa < 0x200) fa = 0x200;
-    if (sa < 0x1000) sa = 0x1000;
-
-    DWORD lfe = 0, lve = 0;
-    for (WORD i = 0; i < img->numSections; i++) {
-        DWORD fe = img->sections[i].PointerToRawData + img->sections[i].SizeOfRawData;
-        DWORD ve = img->sections[i].VirtualAddress +
-            ((img->sections[i].Misc.VirtualSize + sa - 1) & ~(sa - 1));
-        if (fe > lfe) lfe = fe;
-        if (ve > lve) lve = ve;
-    }
-
-    DWORD sfo = (lfe + fa - 1) & ~(fa - 1);
-    DWORD sfs = (ss + fa - 1) & ~(fa - 1);
-    DWORD srv = (lve + sa - 1) & ~(sa - 1);
-    DWORD svs = (ss + sa - 1) & ~(sa - 1);
-
-    DWORD newSectionHeaderEnd = (DWORD)((BYTE*)&img->sections[img->numSections + 1] - img->rawData);
-    DWORD firstRaw = img->sections[0].PointerToRawData;
-    if (firstRaw != 0 && newSectionHeaderEnd > firstRaw) {
-        std::cerr << "  错误: PE 头部没有足够空间添加 stub section" << std::endl;
+    PEEmitter emitter(img);
+    char name[8] = {'.','c','s','t','u','b',0,0};
+    auto append = emitter.AppendSection(
+        name,
+        stub,
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    if (!append.success) {
+        std::cerr << "  错误: Stub section 写入失败: " << append.error << std::endl;
         return false;
     }
 
-    DWORD overlaySize = 0;
-    if (img->rawSize > lfe) overlaySize = img->rawSize - lfe;
-    DWORD ns = sfo + sfs + overlaySize;
+    emitter.SetEntryPoint(append.rva);
 
-    BYTE* nd = new(std::nothrow) BYTE[ns];
-    if (!nd) return false;
-    memset(nd, 0, ns);
-    DWORD copyPrefix = (img->rawSize < lfe) ? img->rawSize : lfe;
-    memcpy(nd, img->rawData, copyPrefix);
-    memcpy(nd + sfo, stub.data(), ss);
-    if (overlaySize) memcpy(nd + sfo + sfs, img->rawData + lfe, overlaySize);
-
-    DWORD po = img->dosHeader->e_lfanew;
-    delete[] img->rawData;
-    img->rawData = nd;
-    img->rawSize = ns;
-    img->dosHeader = (PIMAGE_DOS_HEADER)nd;
-    if (img->is64Bit) {
-        img->ntHeaders64 = (PIMAGE_NT_HEADERS64)(nd + po);
-    } else {
-        img->ntHeaders32 = (PIMAGE_NT_HEADERS32)(nd + po);
-    }
-
-    WORD ns2 = img->numSections + 1;
-    PIMAGE_SECTION_HEADER secs = img->is64Bit
-        ? IMAGE_FIRST_SECTION(img->ntHeaders64)
-        : IMAGE_FIRST_SECTION(img->ntHeaders32);
-
-
-    memset(&secs[img->numSections], 0, sizeof(IMAGE_SECTION_HEADER));
-    memcpy(secs[img->numSections].Name, ".cstub", 6);
-    secs[img->numSections].Misc.VirtualSize = svs;
-    secs[img->numSections].VirtualAddress = srv;
-    secs[img->numSections].SizeOfRawData = sfs;
-    secs[img->numSections].PointerToRawData = sfo;
-    secs[img->numSections].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
-
-    img->numSections = ns2;
-    img->sections = secs;
-    if (img->is64Bit) {
-        img->ntHeaders64->FileHeader.NumberOfSections = ns2;
-        img->ntHeaders64->OptionalHeader.SizeOfImage = srv + svs;
-        img->ntHeaders64->OptionalHeader.AddressOfEntryPoint = srv;
-    } else {
-        img->ntHeaders32->FileHeader.NumberOfSections = ns2;
-        img->ntHeaders32->OptionalHeader.SizeOfImage = srv + svs;
-        img->ntHeaders32->OptionalHeader.AddressOfEntryPoint = srv;
-    }
-
-    std::cout << "  Stub embedded: " << ss << " bytes, tasks=" << tasks.size()
-              << ", EP=0x" << std::hex << srv << "  OEP=0x" << oep << std::dec << "\n";
+    std::cout << "  Stub embedded: " << stub.size() << " bytes, tasks=" << tasks.size()
+              << ", EP=0x" << std::hex << append.rva << "  OEP=0x" << oep << std::dec << "\n";
     return true;
 }
 

@@ -1,4 +1,4 @@
-# CipherShell Tests CMakeLists.txt
+﻿# CipherShell Tests CMakeLists.txt
 
 # ============================================================================
 # 测试程序
@@ -44,4 +44,12 @@ add_executable(hello_world_sample
 # 设置测试样本输出目录
 set_target_properties(hello_world_sample PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
+add_executable(test_e2e_packaging
+    test_e2e_packaging.cpp
+)
+
+target_link_libraries(test_e2e_packaging PRIVATE
+    ciphershell_packer
 )

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 字符串加密器 - 实现
  */
 
@@ -43,9 +43,10 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
             continue;
         }
 
-        // 只扫描代码段中的内联字符串，跳过 .rdata（含 CRT manifest）
-        // 避免破坏运行时数据
-        if (!(section->Characteristics & IMAGE_SCN_CNT_CODE)) {
+        bool readable = (section->Characteristics & IMAGE_SCN_MEM_READ) != 0;
+        bool code = (section->Characteristics & IMAGE_SCN_CNT_CODE) != 0;
+        bool initializedData = (section->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+        if (!code && (!config.scanReadableSections || !readable || !initializedData)) {
             continue;
         }
 

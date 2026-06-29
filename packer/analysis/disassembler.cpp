@@ -1,4 +1,4 @@
-/**
+﻿/**
  * CipherShell 反汇编引擎 - 实现
  * 简化的 x86/x64 反汇编器（不依赖 Zydis）
  */
@@ -53,6 +53,32 @@ static const int SINGLE_BYTE_LENGTHS[256] = {
 // 构造/析构
 // ============================================================================
 
+static uint32_t ConsumeModRMBytes(const uint8_t* code, uint32_t size, uint32_t pos) {
+    if (pos >= size) return 0;
+    uint8_t modrm = code[pos++];
+    uint8_t mod = (modrm >> 6) & 3;
+    uint8_t rm = modrm & 7;
+    if (mod != 3 && rm == 4) {
+        if (pos >= size) return 0;
+        uint8_t sib = code[pos++];
+        uint8_t base = sib & 7;
+        if (mod == 0 && base == 5) {
+            if (pos + 4 > size) return 0;
+            pos += 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        if (pos + 4 > size) return 0;
+        pos += 4;
+    }
+    if (mod == 1) {
+        if (pos + 1 > size) return 0;
+        pos += 1;
+    } else if (mod == 2) {
+        if (pos + 4 > size) return 0;
+        pos += 4;
+    }
+    return pos;
+}
 Disassembler::Disassembler() 
     : m_initialized(false)
     , m_is64Bit(false)
@@ -442,6 +468,50 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
             // instr.length = pos (已设置)
             break;
 
+        // Common ModR/M register, memory and ALU instructions
+        case 0x8B: case 0x89: case 0x8D:
+        case 0x03: case 0x2B: case 0x3B:
+        case 0x21: case 0x23: case 0x09: case 0x0B:
+        case 0x31: case 0x33: case 0x85: case 0x84:
+        {
+            uint32_t end = ConsumeModRMBytes(code, size, pos);
+            if (end == 0) break;
+            switch (opcode) {
+                case 0x8B: case 0x89: instr.mnemonic = "mov"; break;
+                case 0x8D: instr.mnemonic = "lea"; break;
+                case 0x03: instr.mnemonic = "add"; break;
+                case 0x2B: instr.mnemonic = "sub"; break;
+                case 0x3B: instr.mnemonic = "cmp"; break;
+                case 0x21: case 0x23: instr.mnemonic = "and"; break;
+                case 0x09: case 0x0B: instr.mnemonic = "or"; break;
+                case 0x31: case 0x33: instr.mnemonic = "xor"; break;
+                case 0x84: case 0x85: instr.mnemonic = "test"; break;
+            }
+            uint8_t mod = (code[pos] >> 6) & 3;
+            instr.readsMemory = (mod != 3) && (opcode != 0x89);
+            instr.writesMemory = (mod != 3) && (opcode == 0x89);
+            instr.length = end;
+            break;
+        }
+
+        case 0x83: case 0x81:
+        {
+            uint32_t end = ConsumeModRMBytes(code, size, pos);
+            if (end == 0) break;
+            uint8_t ext = (code[pos] >> 3) & 7;
+            uint32_t immSize = (opcode == 0x83) ? 1 : 4;
+            if (end + immSize > size) break;
+            switch (ext) {
+                case 0: instr.mnemonic = "add"; break;
+                case 4: instr.mnemonic = "and"; break;
+                case 5: instr.mnemonic = "sub"; break;
+                case 6: instr.mnemonic = "xor"; break;
+                case 7: instr.mnemonic = "cmp"; break;
+                default: instr.mnemonic = "???"; break;
+            }
+            instr.length = end + immSize;
+            break;
+        }
         // INT3
         case 0xCC:
             instr.mnemonic = "int3";
