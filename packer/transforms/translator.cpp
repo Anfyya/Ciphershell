@@ -385,7 +385,8 @@ bool Translator::TranslateInstruction(const Instruction& instr, BytecodeInstr& o
 
     if (instr.mnemonic == "xor") {
         DecodedModRM m = DecodeModRMInstr(instr);
-        if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "XOR memory form requires native bridge");
+        if (!m.ok) return FailInstruction(instr, "invalid XOR ModRM");
+        if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: XOR memory form requires native bridge");
         if (m.opcode == 0x31 || m.opcode == 0x33) {
             if ((m.opcode == 0x31 && m.rm == 4) || (m.opcode == 0x33 && m.reg == 4)) return FailInstruction(instr, "XOR into RSP requires VM/native stack mapping");
             outInstr.opcode = VM_XOR_RR;
@@ -494,7 +495,8 @@ bool Translator::TranslateMov(const Instruction& instr, BytecodeInstr& outInstr)
 bool Translator::TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr) {
     uint32_t opPos = ((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0;
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "ADD memory form requires native bridge");
+    if (!m.ok) return FailInstruction(instr, "invalid ADD ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: ADD memory form requires native bridge");
 
     uint8_t opcode = instr.bytes[opPos];
     if (opcode == 0x03) {
@@ -517,7 +519,8 @@ bool Translator::TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr)
 bool Translator::TranslateSub(const Instruction& instr, BytecodeInstr& outInstr) {
     uint32_t opPos = ((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0;
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "SUB memory form requires native bridge");
+    if (!m.ok) return FailInstruction(instr, "invalid SUB ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: SUB memory form requires native bridge");
 
     uint8_t opcode = instr.bytes[opPos];
     if (opcode == 0x2B) {
@@ -540,7 +543,8 @@ bool Translator::TranslateSub(const Instruction& instr, BytecodeInstr& outInstr)
 bool Translator::TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr) {
     uint32_t opPos = ((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0;
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "CMP memory form requires native bridge");
+    if (!m.ok) return FailInstruction(instr, "invalid CMP ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: CMP memory form requires native bridge");
 
     uint8_t opcode = instr.bytes[opPos];
     if (opcode == 0x3B) {
@@ -563,7 +567,8 @@ bool Translator::TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr)
 bool Translator::TranslateAnd(const Instruction& instr, BytecodeInstr& outInstr) {
     uint32_t opPos = ((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0;
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "AND memory form requires native bridge");
+    if (!m.ok) return FailInstruction(instr, "invalid AND ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: AND memory form requires native bridge");
     uint8_t opcode = instr.bytes[opPos];
     if (opcode == 0x23) {
         if (m.reg == 4) return FailInstruction(instr, "AND into RSP requires VM/native stack mapping");
@@ -585,7 +590,8 @@ bool Translator::TranslateAnd(const Instruction& instr, BytecodeInstr& outInstr)
 bool Translator::TranslateOr(const Instruction& instr, BytecodeInstr& outInstr) {
     uint32_t opPos = ((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0;
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "OR memory form requires native bridge");
+    if (!m.ok) return FailInstruction(instr, "invalid OR ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: OR memory form requires native bridge");
     uint8_t opcode = instr.bytes[opPos];
     if (opcode == 0x0B) {
         if (m.reg == 4) return FailInstruction(instr, "OR into RSP requires VM/native stack mapping");
@@ -605,12 +611,71 @@ bool Translator::TranslateOr(const Instruction& instr, BytecodeInstr& outInstr) 
 }
 
 bool Translator::TranslateTest(const Instruction& instr, BytecodeInstr& outInstr) {
+    uint32_t opPos = 0;
+    bool operand16 = false;
+    while (opPos < instr.length) {
+        uint8_t b = instr.bytes[opPos];
+        if (b == 0x66) {
+            operand16 = true;
+            opPos++;
+            continue;
+        }
+        if ((b & 0xF0) == 0x40) {
+            opPos++;
+            continue;
+        }
+        break;
+    }
+    if (opPos >= instr.length) return FailInstruction(instr, "empty_instruction_bytes");
+
+    uint8_t opcode = instr.bytes[opPos];
+    if (opcode == 0xA8) {
+        if (opPos + 2 > instr.length) return FailInstruction(instr, "truncated TEST imm8");
+        outInstr.opcode = VM_TEST_RC;
+        outInstr.regDst = MapRegister(0);
+        outInstr.immediate = instr.bytes[opPos + 1];
+        return true;
+    }
+    if (opcode == 0xA9) {
+        uint32_t immSize = operand16 ? 2u : 4u;
+        if (opPos + 1 + immSize > instr.length) return FailInstruction(instr, "truncated TEST imm32");
+        outInstr.opcode = VM_TEST_RC;
+        outInstr.regDst = MapRegister(0);
+        outInstr.immediate = (immSize == 2)
+            ? static_cast<uint64_t>(*reinterpret_cast<const uint16_t*>(instr.bytes + opPos + 1))
+            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + opPos + 1));
+        return true;
+    }
+
     DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || m.memory || m.ripRelative) return FailInstruction(instr, "TEST memory form requires native bridge");
-    outInstr.opcode = VM_TEST_RR;
-    outInstr.regDst = MapRegister(m.reg);
-    outInstr.regSrc = MapRegister(m.rm);
-    return true;
+    if (!m.ok) return FailInstruction(instr, "invalid TEST ModRM");
+    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: TEST memory form requires native bridge");
+
+    if (m.opcode == 0x85) {
+        outInstr.opcode = VM_TEST_RR;
+        outInstr.regDst = MapRegister(m.reg);
+        outInstr.regSrc = MapRegister(m.rm);
+        return true;
+    }
+
+    if ((m.opcode == 0xF6 || m.opcode == 0xF7) && ((m.reg & 7u) == 0u)) {
+        uint32_t immSize = (m.opcode == 0xF6) ? 1u : (m.operand16 ? 2u : 4u);
+        if (m.immOffset + immSize > instr.length) return FailInstruction(instr, "truncated TEST immediate");
+        outInstr.opcode = VM_TEST_RC;
+        outInstr.regDst = MapRegister(m.rm);
+        if (immSize == 1) {
+            outInstr.immediate = instr.bytes[m.immOffset];
+        } else if (immSize == 2) {
+            outInstr.immediate = static_cast<uint64_t>(*reinterpret_cast<const uint16_t*>(instr.bytes + m.immOffset));
+        } else {
+            outInstr.immediate = m.rexW
+                ? static_cast<uint64_t>(static_cast<int64_t>(*reinterpret_cast<const int32_t*>(instr.bytes + m.immOffset)))
+                : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
+        }
+        return true;
+    }
+
+    return FailInstruction(instr, "unsupported TEST encoding");
 }
 
 bool Translator::TranslateLea(const Instruction& instr, BytecodeInstr& outInstr) {
@@ -886,11 +951,17 @@ bool Translator::FailInstruction(const Instruction& instr, const std::string& re
     TranslationFailure failure{};
     failure.address = instr.address;
     failure.mnemonic = instr.mnemonic.empty() ? "<unknown>" : instr.mnemonic;
-    failure.reason = reason;
+    failure.bytes = FormatInstructionBytes(instr);
+    if (instr.length == 0) {
+        failure.reason = (reason == "empty_instruction_bytes")
+            ? "empty_instruction_bytes"
+            : "empty_instruction_bytes: " + reason;
+    } else {
+        failure.reason = reason;
+    }
     m_lastFailures.push_back(failure);
     return false;
-}
-uint8_t Translator::GetOpcodeForInstruction(const std::string& mnemonic) {
+}uint8_t Translator::GetOpcodeForInstruction(const std::string& mnemonic) {
     if (mnemonic == "mov") return VM_MOV_RR;
     if (mnemonic == "add") return VM_ADD_RR;
     if (mnemonic == "sub") return VM_SUB_RR;

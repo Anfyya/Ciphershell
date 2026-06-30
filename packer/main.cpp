@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <cstring>
 #include <unordered_map>
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -18,6 +21,7 @@
 
 #include "pe_parser/pe_parser.h"
 #include "pe_parser/pe_rebuilder.h"
+#include "pe_parser/pe_emitter.h"
 #include "transforms/section_encryptor.h"
 #include "transforms/string_encryptor.h"
 #include "transforms/import_obfuscator.h"
@@ -150,6 +154,312 @@ static void PrintVMRegisterMapReport(const std::unordered_map<uint8_t, uint8_t>&
     }
 }
 
+static uint32_t ReadLe32(const std::vector<uint8_t>& data, size_t pos) {
+    return static_cast<uint32_t>(data[pos]) |
+        (static_cast<uint32_t>(data[pos + 1]) << 8) |
+        (static_cast<uint32_t>(data[pos + 2]) << 16) |
+        (static_cast<uint32_t>(data[pos + 3]) << 24);
+}
+
+static uint64_t ReadLe64(const std::vector<uint8_t>& data, size_t pos) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++) {
+        value |= static_cast<uint64_t>(data[pos + i]) << (i * 8);
+    }
+    return value;
+}
+
+static std::string HexValue(uint64_t value) {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << value;
+    return oss.str();
+}
+
+static bool IsValidVMRegisterId(uint8_t reg, uint32_t registerCount) {
+    return reg == CipherShell::VM_REG_INVALID || reg < registerCount;
+}
+
+static bool IsVmJumpOpcode(uint8_t opcode) {
+    switch (opcode) {
+        case VM_JMP:
+        case VM_JZ:
+        case VM_JNZ:
+        case VM_JA:
+        case VM_JAE:
+        case VM_JB:
+        case VM_JBE:
+        case VM_JG:
+        case VM_JGE:
+        case VM_JL:
+        case VM_JLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsVmConditionalJumpOpcode(uint8_t opcode) {
+    return IsVmJumpOpcode(opcode) && opcode != VM_JMP;
+}
+
+struct VMStaticDecodedInstr {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    uint8_t opcode = 0;
+    bool hasTarget = false;
+    uint32_t target = 0;
+    bool terminal = false;
+};
+
+static bool DecodeAndValidateVMRecordBytecode(
+    const CipherShell::VMFunctionRecord& record,
+    const std::vector<uint8_t>& bytecode,
+    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+    uint32_t registerCount,
+    uint32_t& opcodeCount,
+    std::string& reason)
+{
+    opcodeCount = 0;
+    if (registerCount == 0 || registerCount > 32) {
+        reason = "invalid_register_count";
+        return false;
+    }
+    if (record.bytecodeOffset > bytecode.size() ||
+        record.bytecodeSize > bytecode.size() - record.bytecodeOffset) {
+        reason = "record_bytecode_range_outside_blob";
+        return false;
+    }
+
+    uint8_t reverseOpcode[256];
+    for (uint32_t i = 0; i < 256; i++) reverseOpcode[i] = static_cast<uint8_t>(i);
+    for (const auto& kv : opcodeMap) reverseOpcode[kv.second] = kv.first;
+
+    const size_t begin = record.bytecodeOffset;
+    const size_t end = begin + record.bytecodeSize;
+    size_t ip = begin;
+    bool hasRet = false;
+    std::vector<VMStaticDecodedInstr> decoded;
+
+    auto failAt = [&](const std::string& what, size_t at) {
+        reason = what + " function_rva=" + HexValue(record.functionRVA) +
+            " bytecode_offset=" + HexValue(static_cast<uint64_t>(at - begin));
+        return false;
+    };
+    auto requireBytes = [&](size_t count, size_t at, const std::string& what) {
+        if (at + count > end) {
+            reason = what + " function_rva=" + HexValue(record.functionRVA) +
+                " bytecode_offset=" + HexValue(static_cast<uint64_t>(at - begin));
+            return false;
+        }
+        return true;
+    };
+
+    while (ip < end) {
+        VMStaticDecodedInstr instr{};
+        instr.offset = static_cast<uint32_t>(ip - begin);
+        uint8_t encodedOpcode = bytecode[ip++];
+        instr.opcode = reverseOpcode[encodedOpcode];
+
+        if (!IsMinimalVMInterpreterOpcode(instr.opcode)) {
+            reason = "unsupported_runtime_opcode function_rva=" + HexValue(record.functionRVA) +
+                " bytecode_offset=" + HexValue(instr.offset) +
+                " encoded=" + HexValue(encodedOpcode) +
+                " opcode=" + HexValue(instr.opcode);
+            return false;
+        }
+
+        switch (instr.opcode) {
+            case VM_NOP:
+                break;
+
+            case VM_RET_VM:
+                instr.terminal = true;
+                hasRet = true;
+                break;
+
+            case VM_MOV_RR:
+            case VM_ADD_RR:
+            case VM_SUB_RR:
+            case VM_AND_RR:
+            case VM_OR_RR:
+            case VM_XOR_RR:
+            case VM_CMP_RR:
+            case VM_TEST_RR: {
+                if (!requireBytes(2, ip, "rr_operand_oob")) return false;
+                uint8_t dst = bytecode[ip++];
+                uint8_t src = bytecode[ip++];
+                if (!IsValidVMRegisterId(dst, registerCount) || !IsValidVMRegisterId(src, registerCount)) {
+                    return failAt("invalid_register_id", ip - 2);
+                }
+                break;
+            }
+
+            case VM_MOV_RC:
+            case VM_ADD_RC:
+            case VM_SUB_RC:
+            case VM_AND_RC:
+            case VM_OR_RC:
+            case VM_XOR_RC:
+            case VM_CMP_RC:
+            case VM_TEST_RC: {
+                if (!requireBytes(9, ip, "rc_operand_oob")) return false;
+                uint8_t dst = bytecode[ip++];
+                if (!IsValidVMRegisterId(dst, registerCount)) return failAt("invalid_register_id", ip - 1);
+                ip += 8;
+                break;
+            }
+
+            case VM_MOV_RM:
+            case VM_MOV_MR:
+            case VM_LEA: {
+                if (!requireBytes(15, ip, "memory_operand_oob")) return false;
+                uint8_t dst = bytecode[ip++];
+                uint8_t src = bytecode[ip++];
+                uint8_t base = bytecode[ip++];
+                uint8_t index = bytecode[ip++];
+                uint8_t scale = bytecode[ip++];
+                uint8_t width = bytecode[ip++];
+                uint8_t kind = bytecode[ip++];
+                (void)ReadLe64(bytecode, ip);
+                ip += 8;
+                if (!IsValidVMRegisterId(dst, registerCount) ||
+                    !IsValidVMRegisterId(src, registerCount) ||
+                    !IsValidVMRegisterId(base, registerCount) ||
+                    !IsValidVMRegisterId(index, registerCount)) {
+                    return failAt("invalid_register_id", ip - 15);
+                }
+                if (!(scale == 1 || scale == 2 || scale == 4 || scale == 8)) {
+                    return failAt("invalid_memory_scale", ip - 11);
+                }
+                if (!(width == 1 || width == 2 || width == 4 || width == 8)) {
+                    return failAt("invalid_memory_width", ip - 10);
+                }
+                if (kind > 1) return failAt("invalid_memory_kind", ip - 9);
+                break;
+            }
+
+            case VM_JMP:
+            case VM_JZ:
+            case VM_JNZ:
+            case VM_JA:
+            case VM_JAE:
+            case VM_JB:
+            case VM_JBE:
+            case VM_JG:
+            case VM_JGE:
+            case VM_JL:
+            case VM_JLE: {
+                if (!requireBytes(4, ip, "jump_operand_oob")) return false;
+                instr.hasTarget = true;
+                instr.target = ReadLe32(bytecode, ip);
+                ip += 4;
+                if (instr.target >= record.bytecodeSize) {
+                    return failAt("jump_target_outside_record", begin + instr.target);
+                }
+                break;
+            }
+
+            default:
+                return failAt("unsupported_static_decoder_opcode", ip - 1);
+        }
+
+        instr.size = static_cast<uint32_t>((ip - begin) - instr.offset);
+        decoded.push_back(instr);
+        opcodeCount++;
+    }
+
+    if (decoded.empty()) {
+        reason = "empty_decoded_bytecode function_rva=" + HexValue(record.functionRVA);
+        return false;
+    }
+    if (!hasRet) {
+        reason = "ret_missing function_rva=" + HexValue(record.functionRVA);
+        return false;
+    }
+
+    auto findIndexByOffset = [&](uint32_t offset, size_t& index) {
+        for (size_t i = 0; i < decoded.size(); i++) {
+            if (decoded[i].offset == offset) {
+                index = i;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<uint8_t> visited(decoded.size(), 0);
+    std::vector<size_t> stack;
+    stack.push_back(0);
+    bool reachableRet = false;
+
+    auto pushOffset = [&](uint32_t offset, const std::string& edgeName) {
+        size_t idx = 0;
+        if (!findIndexByOffset(offset, idx)) {
+            reason = edgeName + "_not_instruction_boundary function_rva=" + HexValue(record.functionRVA) +
+                " target=" + HexValue(offset);
+            return false;
+        }
+        if (!visited[idx]) stack.push_back(idx);
+        return true;
+    };
+
+    while (!stack.empty()) {
+        size_t idx = stack.back();
+        stack.pop_back();
+        if (idx >= decoded.size() || visited[idx]) continue;
+        visited[idx] = 1;
+        const auto& instr = decoded[idx];
+        uint32_t next = instr.offset + instr.size;
+
+        if (instr.terminal) {
+            reachableRet = true;
+            continue;
+        }
+        if (instr.hasTarget) {
+            if (!pushOffset(instr.target, "jump_target")) return false;
+            if (IsVmConditionalJumpOpcode(instr.opcode) && next < record.bytecodeSize) {
+                if (!pushOffset(next, "fallthrough")) return false;
+            }
+            continue;
+        }
+        if (next < record.bytecodeSize) {
+            if (!pushOffset(next, "fallthrough")) return false;
+        } else {
+            reason = "control_flow_falls_off_without_ret function_rva=" + HexValue(record.functionRVA);
+            return false;
+        }
+    }
+
+    if (!reachableRet) {
+        reason = "ret_not_reachable function_rva=" + HexValue(record.functionRVA);
+        return false;
+    }
+    return true;
+}
+
+static const char* PatchKindName(CipherShell::FunctionPatchKind kind) {
+    switch (kind) {
+        case CipherShell::FunctionPatchKind::NearRel32: return "rel32";
+        case CipherShell::FunctionPatchKind::X64AbsoluteR11: return "abs64";
+        default: return "none";
+    }
+}
+
+static std::string FormatImageBytesAtRva(CipherShell::CS_PE_IMAGE* image, uint32_t rva, uint32_t count) {
+    CipherShell::PEEmitter emitter(image);
+    uint32_t offset = emitter.RvaToOffset(rva);
+    if (offset == 0 || offset >= image->rawSize) return "<unavailable>";
+    uint32_t available = image->rawSize - offset;
+    uint32_t n = std::min(count, available);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (uint32_t i = 0; i < n; i++) {
+        if (i) oss << ' ';
+        oss << std::setw(2) << static_cast<unsigned>(image->rawData[offset + i]);
+    }
+    return oss.str();
+}
+
 static bool ValidateVMStaticLink(
     const std::vector<CipherShell::VMFunctionRecord>& records,
     const std::vector<uint8_t>& bytecode,
@@ -158,11 +468,22 @@ static bool ValidateVMStaticLink(
     const std::vector<CipherShell::FunctionPatchResult>& patchResults,
     const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     const std::unordered_map<uint8_t, uint8_t>& registerMap,
+    uint32_t registerCount,
+    std::unordered_map<uint32_t, uint32_t>& opcodeCounts,
     std::string& reason)
 {
+    opcodeCounts.clear();
     if (!runtimeResult.executionReady) { reason = "runtime_not_execution_ready"; return false; }
-    if (!emitResult.success || emitResult.metadataRVA == 0 || emitResult.bytecodeRVA == 0) { reason = "metadata_or_bytecode_not_linked"; return false; }
-    if (runtimeResult.runtimeEntryRVA == 0 || runtimeResult.trampolines.empty()) { reason = "runtime_or_trampoline_missing"; return false; }
+    if (!emitResult.success || emitResult.sectionRVA == 0 || emitResult.sectionRawOffset == 0 ||
+        emitResult.sectionSize == 0 || emitResult.metadataRVA == 0 || emitResult.bytecodeRVA == 0) {
+        reason = "metadata_or_bytecode_not_linked";
+        return false;
+    }
+    if (runtimeResult.sectionRVA == 0 || runtimeResult.sectionRawOffset == 0 || runtimeResult.sectionSize == 0 ||
+        runtimeResult.runtimeEntryRVA == 0 || runtimeResult.trampolines.empty()) {
+        reason = "runtime_or_trampoline_missing";
+        return false;
+    }
     if (records.empty() || bytecode.empty()) { reason = "records_or_bytecode_empty"; return false; }
     if (opcodeMap.empty() || registerMap.empty()) { reason = "opcode_or_register_map_missing"; return false; }
     if (runtimeResult.trampolines.size() != records.size()) { reason = "trampoline_count_mismatch"; return false; }
@@ -199,6 +520,14 @@ static bool ValidateVMStaticLink(
             reason = "record_without_verified_function_patch";
             return false;
         }
+
+        uint32_t opcodeCount = 0;
+        std::string decodeReason;
+        if (!DecodeAndValidateVMRecordBytecode(record, bytecode, opcodeMap, registerCount, opcodeCount, decodeReason)) {
+            reason = "bytecode_decoder_check_failed: " + decodeReason;
+            return false;
+        }
+        opcodeCounts[record.functionRVA] = opcodeCount;
     }
     return true;
 }
@@ -590,7 +919,7 @@ int main(int argc, char* argv[]) {
         translator.SetOpcodeMap(buildCtx.opcodeMap);
         translator.SetRegisterMap(buildCtx.registerMap);
         PrintVMRegisterMapReport(buildCtx.registerMap);
-        std::cout << "VM_MEMORY_SUPPORT addressing=base_disp,index_scale,rip_relative_image_rva widths=1,2,4,8 stack_policy=rsp_mutation_rejected" << std::endl;
+        std::cout << "VM_MEMORY_SUPPORT load_store=MOV_RM,MOV_MR address_calc=LEA memory_arithmetic=false addressing=base_disp,index_scale,rip_relative_image_rva widths=1,2,4,8 stack_policy=rsp_mutation_rejected" << std::endl;
         std::cout << "VM_CALL_STACK_POLICY call=reject push=reject pop=reject native_bridge=not_implemented" << std::endl;
 
 
@@ -637,9 +966,9 @@ int main(int argc, char* argv[]) {
                         const auto& failure = transResult.failures.front();
                         std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
                                   << func.entryAddress << " instr_rva=0x" << failure.address << std::dec
-                                  << " mnemonic=" << failure.mnemonic;
-                        if (!failure.bytes.empty()) std::cerr << " bytes=" << failure.bytes;
-                        std::cerr << " reason=" << failure.reason << std::endl;
+                                  << " mnemonic=" << failure.mnemonic
+                                  << " bytes=" << (failure.bytes.empty() ? "<empty>" : failure.bytes)
+                                  << " reason=" << failure.reason << std::endl;
                     } else {
                         std::cerr << "VM_TRANSLATE_FAIL module=Translator function_rva=0x" << std::hex
                                   << func.entryAddress << std::dec
@@ -725,8 +1054,10 @@ int main(int argc, char* argv[]) {
             }
 
             std::string staticCheckReason;
+            std::unordered_map<uint32_t, uint32_t> vmOpcodeCounts;
             if (!ValidateVMStaticLink(vmRecords, vmBytecodeBlob, emitResult, runtimeResult,
-                    patchResults, buildCtx.opcodeMap, buildCtx.registerMap, staticCheckReason)) {
+                    patchResults, buildCtx.opcodeMap, buildCtx.registerMap,
+                    transConfig.virtualRegisterCount, vmOpcodeCounts, staticCheckReason)) {
                 std::cerr << "VM_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
                           << staticCheckReason << std::endl;
                 PrintFeatureStatus("vm", "failed", staticCheckReason);
@@ -734,10 +1065,47 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "VM_STATIC_CHECK_PASS module=VMStaticLinkChecker records="
                       << vmRecords.size() << std::endl;
-            std::cout << "    VM section: rva=0x" << std::hex << emitResult.sectionRVA
+            std::cout << "VM_RUNTIME_SECTION rva=0x" << std::hex << runtimeResult.sectionRVA
+                      << " raw=0x" << runtimeResult.sectionRawOffset
+                      << " size=0x" << runtimeResult.sectionSize
+                      << " entry=0x" << runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+            std::cout << "VM_METADATA_SECTION rva=0x" << std::hex << emitResult.sectionRVA
+                      << " raw=0x" << emitResult.sectionRawOffset
+                      << " size=0x" << emitResult.sectionSize
                       << " metadata=0x" << emitResult.metadataRVA
-                      << " bytecode=0x" << emitResult.bytecodeRVA
-                      << " runtime=0x" << runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+                      << " bytecode=0x" << emitResult.bytecodeRVA << std::dec << std::endl;
+            std::cout << "VM_DEBUG_TRACE_LAYOUT runtime_version_off=32 runtime_flags_off=36 enter_count_off=40"
+                      << " last_function_rva_off=44 last_opcode_off=48 last_error_code_off=52"
+                      << " last_bytecode_offset_off=56 last_ret_value_low32_off=60 fail_policy=int3_ud2" << std::endl;
+            std::cout << "VM_MEMORY_SUPPORT load_store=MOV_RM,MOV_MR address_calc=LEA memory_arithmetic=false widths=1,2,4,8" << std::endl;
+
+            for (const auto& record : vmRecords) {
+                const CipherShell::VMTrampolineRecord* trampoline = nullptr;
+                const CipherShell::FunctionPatchResult* patch = nullptr;
+                for (const auto& tr : runtimeResult.trampolines) {
+                    if (tr.functionRVA == record.functionRVA) { trampoline = &tr; break; }
+                }
+                for (const auto& pr : patchResults) {
+                    if (pr.functionRVA == record.functionRVA) { patch = &pr; break; }
+                }
+                uint32_t opcodeCount = 0;
+                auto countIt = vmOpcodeCounts.find(record.functionRVA);
+                if (countIt != vmOpcodeCounts.end()) opcodeCount = countIt->second;
+                std::cout << "VM_RECORD function_rva=0x" << std::hex << record.functionRVA
+                          << " original_size=0x" << record.functionSize
+                          << " trampoline_rva=0x" << (trampoline ? trampoline->trampolineRVA : 0)
+                          << " trampoline_size=0x" << (trampoline ? trampoline->trampolineSize : 0)
+                          << " patch_type=" << (patch ? PatchKindName(patch->patchKind) : "none")
+                          << " bytecode_offset=0x" << record.bytecodeOffset
+                          << " bytecode_size=0x" << record.bytecodeSize
+                          << " opcode_count=" << std::dec << opcodeCount
+                          << " patched_first16=" << FormatImageBytesAtRva(image.get(), record.functionRVA, 16)
+                          << " trampoline_first16=" << FormatImageBytesAtRva(image.get(), trampoline ? trampoline->trampolineRVA : 0, 16)
+                          << std::endl;
+            }
+            std::cout << "VM_MANUAL_TEST_COMMAND compile=\"D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x86\\cl.exe /nologo /EHsc /O2 /Fe:tests\\samples\\vm_manual_x64_sample.exe tests\\samples\\vm_manual_x64_sample.cpp\"" << std::endl;
+            std::cout << "VM_MANUAL_TEST_COMMAND pack=\"ciphershell tests\\samples\\vm_manual_x64_sample.exe -o tests\\samples\\vm_manual_x64_sample.vm.exe -l 4 -v\"" << std::endl;
+            std::cout << "VM_MANUAL_DEBUG_HINT first_check=metadata_trace_slots,last_error_code,runtime_section,trampoline_patch,bytecode_offset" << std::endl;
             PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
         } else {
             PrintFeatureStatus("vm", "skipped", "no_supported_functions");

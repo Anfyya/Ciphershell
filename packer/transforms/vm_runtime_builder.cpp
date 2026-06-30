@@ -39,9 +39,28 @@ constexpr uint32_t kMemWidth = 0x105;
 constexpr uint32_t kMemKind = 0x106;
 constexpr uint32_t kMemIndexRaw = 0x107;
 constexpr uint32_t kBytecodeSize = 0x108;
+constexpr uint32_t kMetadataVa = 0x110;
+constexpr uint32_t kTraceEnterCount = 40;
+constexpr uint32_t kTraceLastFunctionRva = 44;
+constexpr uint32_t kTraceLastOpcode = 48;
+constexpr uint32_t kTraceLastErrorCode = 52;
+constexpr uint32_t kTraceLastBytecodeOffset = 56;
+constexpr uint32_t kTraceLastRetValueLow32 = 60;
+constexpr uint32_t kVMRuntimeVersion = 0x00010004u;
 constexpr uint32_t kSaveBase = kLocalSize;
 constexpr uint32_t kSavedRflags = kLocalSize + 120;
 constexpr uint32_t kOrigRsp = kLocalSize + 0x80;
+
+enum VMRuntimeError : uint32_t {
+    VM_ERR_METADATA_INVALID = 1,
+    VM_ERR_RECORD_NOT_FOUND = 2,
+    VM_ERR_BYTECODE_RANGE = 3,
+    VM_ERR_OPCODE_UNSUPPORTED = 4,
+    VM_ERR_REGISTER_MAP_INVALID = 5,
+    VM_ERR_MEMORY_ADDR_INVALID = 6,
+    VM_ERR_HANDLER_BUG = 7,
+    VM_ERR_RET_WITHOUT_CONTEXT = 8
+};
 
 struct Label {
     size_t pos = static_cast<size_t>(-1);
@@ -90,21 +109,21 @@ private:
 
 uint32_t SaveSlotForNativeReg(uint8_t reg) {
     switch (reg) {
-        case 0:  return kSaveBase + 112;
-        case 1:  return kSaveBase + 104;
-        case 2:  return kSaveBase + 96;
-        case 3:  return kSaveBase + 88;
-        case 5:  return kSaveBase + 80;
-        case 6:  return kSaveBase + 72;
-        case 7:  return kSaveBase + 64;
-        case 8:  return kSaveBase + 56;
-        case 9:  return kSaveBase + 48;
-        case 10: return kSaveBase + 40;
-        case 11: return kSaveBase + 32;
-        case 12: return kSaveBase + 24;
-        case 13: return kSaveBase + 16;
-        case 14: return kSaveBase + 8;
-        case 15: return kSaveBase + 0;
+        case 0:  return kSaveBase + 112; // RAX: return value slot.
+        case 1:  return kSaveBase + 104; // RCX: first integer argument slot.
+        case 2:  return kSaveBase + 96;  // RDX: second integer argument slot.
+        case 3:  return kSaveBase + 88;  // RBX: non-volatile user context slot.
+        case 5:  return kSaveBase + 80;  // RBP: non-volatile frame pointer slot.
+        case 6:  return kSaveBase + 72;  // RSI: non-volatile source index slot.
+        case 7:  return kSaveBase + 64;  // RDI: non-volatile destination index slot.
+        case 8:  return kSaveBase + 56;  // R8: third integer argument slot.
+        case 9:  return kSaveBase + 48;  // R9: fourth integer argument slot.
+        case 10: return kSaveBase + 40;  // R10: trampoline functionRVA carrier slot.
+        case 11: return kSaveBase + 32;  // R11: volatile scratch slot.
+        case 12: return kSaveBase + 24;  // R12: non-volatile context slot.
+        case 13: return kSaveBase + 16;  // R13: non-volatile context slot.
+        case 14: return kSaveBase + 8;   // R14: non-volatile context slot.
+        case 15: return kSaveBase + 0;   // R15: non-volatile context slot.
         default: return 0;
     }
 }
@@ -228,7 +247,9 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     X64Emitter e;
     e.code.reserve(4096);
 
-    Label fail, restore, writeback, dispatch, foundRecord, recordLoop;
+    Label runtimeFail, failMetadataInvalid, failRecordNotFound, failBytecodeRange, failOpcodeUnsupported;
+    Label failRegisterMapInvalid, failMemoryAddrInvalid, failHandlerBug, failRetWithoutContext;
+    Label restore, writeback, dispatch, foundRecord, recordLoop;
     Label fetchByte, fetchReg, fetchImm32, fetchImm64, fetchOpcode, fetchMemAddress;
     Label memNoBase, memNoIndex, memScaleCheck4, memScaleCheck8, memScaleDone, memNoImageBase;
     Label opNop, opMovRR, opMovRC, opMovRM, opMovMR, opLea;
@@ -238,6 +259,11 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     Label movRmW2, movRmW4, movRmW8, movRmStore;
     Label movMrW2, movMrW4, movMrW8, movMrDone;
     Label jccSkip1, jccSkip2, jccTake1, jccTake2, jccSkip3, jccSkip4, jccSkip5, jccSkip6;
+
+    auto emitRuntimeFailCode = [&](VMRuntimeError code) {
+        e.U8(0xBF); e.U32(static_cast<uint32_t>(code));
+        e.Jmp(runtimeFail);
+    };
 
     e.Bytes({0x9C, 0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57});
     e.Bytes({0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});
@@ -250,8 +276,14 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     e.Bytes({0x41, 0x8B, 0xC3});
     e.Bytes({0x48, 0x01, 0xD8});
     e.Bytes({0x49, 0x89, 0xC4});
+    e.Bytes({0x4C, 0x89, 0xA5}); e.U32(kMetadataVa);
+    e.Bytes({0x41, 0xFF, 0x44, 0x24}); e.U8(static_cast<uint8_t>(kTraceEnterCount));
+    e.Bytes({0x45, 0x89, 0x54, 0x24}); e.U8(static_cast<uint8_t>(kTraceLastFunctionRva));
+    e.Bytes({0x41, 0xC7, 0x44, 0x24}); e.U8(static_cast<uint8_t>(kTraceLastErrorCode)); e.U32(0);
 
     e.Bytes({0x41, 0x8B, 0x04, 0x24});
+    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x05, 0x41, 0x33, 0x54, 0x24, 0x20});
+    e.Bytes({0x81, 0xFA}); e.U32(kVMRuntimeVersion); e.Jcc(0x5, failMetadataInvalid);
     e.Bytes({0x41, 0x8B, 0x4C, 0x24, 0x04});
     e.Bytes({0x31, 0xC1});
 
@@ -265,7 +297,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     e.Bytes({0x4D, 0x89, 0xE6, 0x49, 0x01, 0xD6});
 
     e.Bind(recordLoop);
-    e.Bytes({0x85, 0xC9}); e.Jcc(0x4, fail);
+    e.Bytes({0x85, 0xC9}); e.Jcc(0x4, failRecordNotFound);
     e.Bytes({0x41, 0x8B, 0x55, 0x00});
     e.Bytes({0x31, 0xC2});
     e.Bytes({0x44, 0x39, 0xD2});
@@ -299,7 +331,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
 
     e.Bind(fetchByte);
     e.Bytes({0x48, 0x3B, 0xB5}); e.U32(kBytecodeSize);
-    e.Jcc(0x3, fail);
+    e.Jcc(0x3, failBytecodeRange);
     e.Bytes({0x41, 0x0F, 0xB6, 0x04, 0x36});
     e.Bytes({0x8B, 0xCE, 0x83, 0xE1, 0x03});
     e.Bytes({0x44, 0x89, 0xDA});
@@ -312,7 +344,8 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
 
     e.Bind(fetchReg);
     e.Call(fetchByte);
-    e.Bytes({0x0F, 0xB6, 0xC8, 0x83, 0xE1, 0x1F});
+    e.Bytes({0x0F, 0xB6, 0xC8});
+    e.Bytes({0x83, 0xF9, 0x1F}); e.Jcc(0x7, failRegisterMapInvalid);
     e.U8(0xC3);
 
     e.Bind(fetchImm32);
@@ -377,6 +410,10 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
 
     e.Bind(dispatch);
     e.Call(fetchOpcode);
+    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
+    e.Bytes({0x41, 0x89, 0x45}); e.U8(static_cast<uint8_t>(kTraceLastOpcode));
+    e.Bytes({0x8B, 0xD6, 0x83, 0xEA, 0x01});
+    e.Bytes({0x41, 0x89, 0x55}); e.U8(static_cast<uint8_t>(kTraceLastBytecodeOffset));
     const std::pair<uint8_t, Label*> opcodeTargets[] = {
         {static_cast<uint8_t>(VM_NOP), &opNop}, {static_cast<uint8_t>(VM_MOV_RR), &opMovRR}, {static_cast<uint8_t>(VM_MOV_RC), &opMovRC},
         {static_cast<uint8_t>(VM_MOV_RM), &opMovRM}, {static_cast<uint8_t>(VM_MOV_MR), &opMovMR}, {static_cast<uint8_t>(VM_LEA), &opLea},
@@ -393,7 +430,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
         e.Bytes({0x3C, pair.first});
         e.Jcc(0x4, *pair.second);
     }
-    e.Jmp(fail);
+    e.Jmp(failOpcodeUnsupported);
 
     e.Bind(opNop); e.Jmp(dispatch);
 
@@ -418,7 +455,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x04); e.Jcc(0x5, movRmW8);
     e.Bytes({0x8B, 0x10}); e.Jmp(movRmStore);
     e.Bind(movRmW8);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, fail);
+    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, failMemoryAddrInvalid);
     e.Bytes({0x48, 0x8B, 0x10});
     e.Bind(movRmStore);
     EmitStoreVmRegFromRdxToEbx(e); e.Jmp(dispatch);
@@ -437,7 +474,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x04); e.Jcc(0x5, movMrW8);
     e.Bytes({0x89, 0x10}); e.Jmp(movMrDone);
     e.Bind(movMrW8);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, fail);
+    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, failMemoryAddrInvalid);
     e.Bytes({0x48, 0x89, 0x10});
     e.Bind(movMrDone); e.Jmp(dispatch);
 
@@ -531,13 +568,31 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     e.Jmp(writeback);
 
     e.Bind(writeback);
+    EmitReadRegMapToEcx(e, 0);
+    EmitLoadVmRegToRdxFromEcx(e);
+    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
+    e.Bytes({0x41, 0x89, 0x55}); e.U8(static_cast<uint8_t>(kTraceLastRetValueLow32));
     EmitCommitFlagsToSavedRflags(e);
     const uint8_t nativeRegsWriteback[] = {0,1,2,3,5,6,7,8,9,10,11,12,13,14,15};
     for (uint8_t r : nativeRegsWriteback) EmitWriteBackNativeReg(e, r);
     e.Jmp(restore);
 
-    e.Bind(fail);
-    e.Jmp(restore);
+    e.Bind(failRecordNotFound);
+    emitRuntimeFailCode(VM_ERR_RECORD_NOT_FOUND);
+    e.Bind(failBytecodeRange);
+    emitRuntimeFailCode(VM_ERR_BYTECODE_RANGE);
+    e.Bind(failOpcodeUnsupported);
+    emitRuntimeFailCode(VM_ERR_OPCODE_UNSUPPORTED);
+    e.Bind(failMemoryAddrInvalid);
+    emitRuntimeFailCode(VM_ERR_MEMORY_ADDR_INVALID);
+    e.Bind(failHandlerBug);
+    emitRuntimeFailCode(VM_ERR_HANDLER_BUG);
+
+    e.Bind(runtimeFail);
+    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
+    e.Bytes({0x41, 0x89, 0x7D}); e.U8(static_cast<uint8_t>(kTraceLastErrorCode));
+    e.U8(0xCC);
+    e.Bytes({0x0F, 0x0B});
 
     e.Bind(restore);
     e.Bytes({0x48, 0x81, 0xC4}); e.U32(kLocalSize);
@@ -610,6 +665,8 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.success = true;
     result.executionReady = true;
     result.sectionRVA = append.rva;
+    result.sectionRawOffset = append.rawOffset;
+    result.sectionSize = append.rawSize;
     result.runtimeEntryRVA = append.rva + runtimeOffset;
     for (size_t i = 0; i < records.size(); i++) {
         VMTrampolineRecord tr;

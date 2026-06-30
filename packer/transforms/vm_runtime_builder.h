@@ -19,6 +19,8 @@ struct VMRuntimeBuildResult {
     bool success = false;
     bool executionReady = false;
     uint32_t sectionRVA = 0;
+    uint32_t sectionRawOffset = 0;
+    uint32_t sectionSize = 0;
     uint32_t runtimeEntryRVA = 0;
     std::vector<VMTrampolineRecord> trampolines;
     std::string error;

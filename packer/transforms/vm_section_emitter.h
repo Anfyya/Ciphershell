@@ -1,4 +1,4 @@
-﻿#ifndef CS_VM_SECTION_EMITTER_H
+#ifndef CS_VM_SECTION_EMITTER_H
 #define CS_VM_SECTION_EMITTER_H
 
 #include "../pe_parser/pe_parser.h"
@@ -24,6 +24,7 @@ struct VMEmitResult {
     bool success;
     uint32_t sectionRVA;
     uint32_t sectionRawOffset;
+    uint32_t sectionSize;
     uint32_t metadataRVA;
     uint32_t bytecodeRVA;
     uint32_t trampolineRVA;

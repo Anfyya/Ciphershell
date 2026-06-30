@@ -15,6 +15,8 @@ uint32_t RotL32(uint32_t v, unsigned c) {
     c &= 31;
     return (v << c) | (v >> ((32 - c) & 31));
 }
+constexpr uint32_t kVMRuntimeVersion = 0x00010004u;
+constexpr uint32_t kVMRuntimeFlagsDebugTrace = 0x00000001u;
 }
 
 uint32_t VMSectionEmitter::AlignUp(uint32_t value, uint32_t alignment) {
@@ -56,7 +58,7 @@ VMEmitResult VMSectionEmitter::Emit(
     std::vector<uint8_t> section;
     section.reserve(0x100 + records.size() * 32 + bytecode.size());
 
-    const uint32_t headerSize = 40;
+    const uint32_t headerSize = 72;
     const uint32_t recordOffset = headerSize;
     const uint32_t recordSize = 28;
     const uint32_t opcodeMapOffset = recordOffset + static_cast<uint32_t>(records.size() * recordSize);
@@ -86,9 +88,16 @@ VMEmitResult VMSectionEmitter::Emit(
     AppendU32(section, bytecodeOffset ^ RotL32(cookie, 17));
     AppendU32(section, static_cast<uint32_t>(bytecode.size()) ^ RotL32(cookie, 19));
     AppendU32(section, runtimeEntryRVA ^ RotL32(cookie, 23));
-    AppendU32(section, 0u ^ RotL32(cookie, 5));
-    AppendU32(section, 0u ^ RotL32(cookie, 13));
-
+    AppendU32(section, kVMRuntimeVersion ^ RotL32(cookie, 5));
+    AppendU32(section, kVMRuntimeFlagsDebugTrace ^ RotL32(cookie, 13));
+    AppendU32(section, 0u); // enter_count
+    AppendU32(section, 0u); // last_function_rva
+    AppendU32(section, 0u); // last_opcode
+    AppendU32(section, 0u); // last_error_code
+    AppendU32(section, 0u); // last_bytecode_offset
+    AppendU32(section, 0u); // last_ret_value_low32
+    AppendU32(section, 0u); // reserved_trace0
+    AppendU32(section, 0u); // reserved_trace1
     for (const auto& record : records) {
         AppendU32(section, record.functionRVA ^ cookie);
         AppendU32(section, record.functionSize ^ RotL32(cookie, 1));
@@ -116,7 +125,7 @@ VMEmitResult VMSectionEmitter::Emit(
     if (sectionName) memcpy(name, sectionName, 8);
 
     PEEmitter emitter(image);
-    auto append = emitter.AppendSection(name, section, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+    auto append = emitter.AppendSection(name, section, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
     if (!append.success) {
         result.error = "VM_EMIT: " + append.error;
         return result;
@@ -124,6 +133,7 @@ VMEmitResult VMSectionEmitter::Emit(
 
     result.sectionRVA = append.rva;
     result.sectionRawOffset = append.rawOffset;
+    result.sectionSize = append.rawSize;
     result.metadataRVA = append.rva;
     result.bytecodeRVA = append.rva + bytecodeOffset;
     result.trampolineRVA = runtimeEntryRVA;
