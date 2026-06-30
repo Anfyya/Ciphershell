@@ -20,12 +20,21 @@ enum class X86Register : uint8_t {
     UNKNOWN = 0xFF
 };
 
+static constexpr uint8_t VM_REG_INVALID = 0xFF;
+
 struct BytecodeInstr {
     uint8_t     opcode;
     uint8_t     regDst;
     uint8_t     regSrc;
     uint8_t     regExtra;
     uint8_t     scale;
+    uint8_t     memBaseReg;
+    uint8_t     memIndexReg;
+    uint8_t     memScale;
+    uint8_t     memWidth;
+    uint8_t     memoryKind;
+    bool        isRipRelative;
+    int64_t     memDisp;
     uint64_t    immediate;
     uint32_t    jumpTarget;
     bool        isJump;

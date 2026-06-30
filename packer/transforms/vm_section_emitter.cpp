@@ -1,4 +1,4 @@
-﻿#include "vm_section_emitter.h"
+#include "vm_section_emitter.h"
 #include "../pe_parser/pe_emitter.h"
 #include <algorithm>
 #include <cstring>
@@ -7,6 +7,10 @@
 namespace CipherShell {
 
 namespace {
+uint8_t BytecodeMask(uint32_t cookie, uint32_t offset) {
+    uint8_t cookieByte = static_cast<uint8_t>(cookie >> ((offset & 3u) * 8u));
+    return static_cast<uint8_t>(cookieByte ^ static_cast<uint8_t>((offset * 131u) & 0xFFu));
+}
 uint32_t RotL32(uint32_t v, unsigned c) {
     c &= 31;
     return (v << c) | (v >> ((32 - c) & 31));
@@ -61,6 +65,19 @@ VMEmitResult VMSectionEmitter::Emit(
     const uint32_t registerMapSize = 32;
     const uint32_t bytecodeOffset = registerMapOffset + registerMapSize;
 
+    std::vector<uint8_t> encodedBytecode = bytecode;
+    for (const auto& record : records) {
+        if (record.bytecodeOffset > encodedBytecode.size() ||
+            record.bytecodeSize > encodedBytecode.size() - record.bytecodeOffset) {
+            result.error = "VM_EMIT: function bytecode range is outside bytecode blob";
+            return result;
+        }
+        for (uint32_t i = 0; i < record.bytecodeSize; i++) {
+            uint32_t pos = record.bytecodeOffset + i;
+            encodedBytecode[pos] ^= BytecodeMask(cookie, i);
+        }
+    }
+
     AppendU32(section, cookie);
     AppendU32(section, static_cast<uint32_t>(records.size()) ^ cookie);
     AppendU32(section, recordOffset ^ RotL32(cookie, 3));
@@ -93,7 +110,7 @@ VMEmitResult VMSectionEmitter::Emit(
         if (kv.first < 32) regMap[kv.first] = kv.second;
     }
     section.insert(section.end(), regMap, regMap + 32);
-    section.insert(section.end(), bytecode.begin(), bytecode.end());
+    section.insert(section.end(), encodedBytecode.begin(), encodedBytecode.end());
 
     char name[8] = {'.','c','s','v','m',0,0,0};
     if (sectionName) memcpy(name, sectionName, 8);

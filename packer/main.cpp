@@ -9,6 +9,7 @@
 #include <memory>
 #include <filesystem>
 #include <cstring>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -33,7 +34,6 @@
 #include "transforms/vm_section_emitter.h"
 #include "transforms/vm_nester.h"
 #include "mutation/mutation_engine.h"
-#include "mutation/bytecode_encryptor.h"
 #include "gui/console_gui.h"
 #include "transforms/function_trampoline_patcher.h"
 #include "transforms/vm_runtime_builder.h"
@@ -83,6 +83,125 @@ static void PrintFeatureStatus(const std::string& name, const std::string& statu
 // 主函数
 // ============================================================================
 
+
+static bool IsMinimalVMInterpreterOpcode(uint8_t opcode) {
+    switch (opcode) {
+        case VM_NOP:
+        case VM_MOV_RR:
+        case VM_MOV_RC:
+        case VM_MOV_RM:
+        case VM_MOV_MR:
+        case VM_LEA:
+        case VM_ADD_RR:
+        case VM_ADD_RC:
+        case VM_SUB_RR:
+        case VM_SUB_RC:
+        case VM_AND_RR:
+        case VM_AND_RC:
+        case VM_OR_RR:
+        case VM_OR_RC:
+        case VM_XOR_RR:
+        case VM_XOR_RC:
+        case VM_CMP_RR:
+        case VM_CMP_RC:
+        case VM_TEST_RR:
+        case VM_TEST_RC:
+        case VM_JMP:
+        case VM_JZ:
+        case VM_JNZ:
+        case VM_JA:
+        case VM_JAE:
+        case VM_JB:
+        case VM_JBE:
+        case VM_JG:
+        case VM_JGE:
+        case VM_JL:
+        case VM_JLE:
+        case VM_RET_VM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsMinimalVMInterpreterProgram(
+    const std::vector<CipherShell::BytecodeInstr>& instructions,
+    std::string& reason)
+{
+    for (const auto& instr : instructions) {
+        if (!IsMinimalVMInterpreterOpcode(instr.opcode)) {
+            reason = "unsupported_minimal_interpreter_opcode_" +
+                std::to_string(static_cast<unsigned>(instr.opcode));
+            return false;
+        }
+    }
+    return true;
+}
+static void PrintVMRegisterMapReport(const std::unordered_map<uint8_t, uint8_t>& registerMap) {
+    static const char* kNativeNames[16] = {
+        "RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI",
+        "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15"
+    };
+    for (uint8_t i = 0; i < 16; i++) {
+        auto it = registerMap.find(i);
+        uint8_t vmReg = (it != registerMap.end()) ? it->second : i;
+        std::cout << "VM_REG_MAP native=" << kNativeNames[i]
+                  << " vm=" << static_cast<unsigned>(vmReg) << std::endl;
+    }
+}
+
+static bool ValidateVMStaticLink(
+    const std::vector<CipherShell::VMFunctionRecord>& records,
+    const std::vector<uint8_t>& bytecode,
+    const CipherShell::VMEmitResult& emitResult,
+    const CipherShell::VMRuntimeBuildResult& runtimeResult,
+    const std::vector<CipherShell::FunctionPatchResult>& patchResults,
+    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+    const std::unordered_map<uint8_t, uint8_t>& registerMap,
+    std::string& reason)
+{
+    if (!runtimeResult.executionReady) { reason = "runtime_not_execution_ready"; return false; }
+    if (!emitResult.success || emitResult.metadataRVA == 0 || emitResult.bytecodeRVA == 0) { reason = "metadata_or_bytecode_not_linked"; return false; }
+    if (runtimeResult.runtimeEntryRVA == 0 || runtimeResult.trampolines.empty()) { reason = "runtime_or_trampoline_missing"; return false; }
+    if (records.empty() || bytecode.empty()) { reason = "records_or_bytecode_empty"; return false; }
+    if (opcodeMap.empty() || registerMap.empty()) { reason = "opcode_or_register_map_missing"; return false; }
+    if (runtimeResult.trampolines.size() != records.size()) { reason = "trampoline_count_mismatch"; return false; }
+    if (patchResults.size() != records.size()) { reason = "patch_result_count_mismatch"; return false; }
+
+    for (const auto& record : records) {
+        if (record.functionRVA == 0 || record.functionSize == 0 || record.bytecodeSize == 0) {
+            reason = "invalid_function_record";
+            return false;
+        }
+        if (record.bytecodeOffset > bytecode.size() || record.bytecodeSize > bytecode.size() - record.bytecodeOffset) {
+            reason = "record_bytecode_range_outside_blob";
+            return false;
+        }
+        bool hasTrampoline = false;
+        for (const auto& tr : runtimeResult.trampolines) {
+            if (tr.functionRVA == record.functionRVA && tr.trampolineRVA != 0 && tr.trampolineSize != 0) {
+                hasTrampoline = true;
+                break;
+            }
+        }
+        if (!hasTrampoline) {
+            reason = "record_without_trampoline";
+            return false;
+        }
+        bool hasVerifiedPatch = false;
+        for (const auto& patch : patchResults) {
+            if (patch.functionRVA == record.functionRVA && patch.success && patch.verified && patch.trampolineRVA != 0) {
+                hasVerifiedPatch = true;
+                break;
+            }
+        }
+        if (!hasVerifiedPatch) {
+            reason = "record_without_verified_function_patch";
+            return false;
+        }
+    }
+    return true;
+}
 int main(int argc, char* argv[]) {
     // 设置控制台为 UTF-8 编码
     SetConsoleOutputCP(65001);
@@ -470,11 +589,10 @@ int main(int argc, char* argv[]) {
         }
         translator.SetOpcodeMap(buildCtx.opcodeMap);
         translator.SetRegisterMap(buildCtx.registerMap);
+        PrintVMRegisterMapReport(buildCtx.registerMap);
+        std::cout << "VM_MEMORY_SUPPORT addressing=base_disp,index_scale,rip_relative_image_rva widths=1,2,4,8 stack_policy=rsp_mutation_rejected" << std::endl;
+        std::cout << "VM_CALL_STACK_POLICY call=reject push=reject pop=reject native_bridge=not_implemented" << std::endl;
 
-        CipherShell::BytecodeEncryptor bcEncryptor;
-        CipherShell::BytecodeEncryptConfig bcConfig;
-        bcConfig.mode = CipherShell::BytecodeEncryptionMode::Rolling;
-        bcConfig.enableIntegrityCheck = true;
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
@@ -530,11 +648,19 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                auto plainBytecode = translator.GenerateBytecode(transResult, nullptr, nullptr);
-                auto encryptedBytecode = bcEncryptor.Encrypt(plainBytecode, bcConfig);
-                if (encryptedBytecode.empty()) {
-                    std::cerr << "VM_BYTECODE_FAIL module=BytecodeEncryptor function_rva=0x" << std::hex
-                              << func.entryAddress << std::dec << " reason=empty_encrypted_bytecode" << std::endl;
+                std::string interpreterRejectReason;
+                if (!IsMinimalVMInterpreterProgram(transResult.instructions, interpreterRejectReason)) {
+                    std::cerr << "VM_REJECT module=VMRuntimeBuilder function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " reason=" << interpreterRejectReason << std::endl;
+                    rejectedCount++;
+                    continue;
+                }
+
+                auto vmBytecode = translator.GenerateBytecode(transResult, nullptr, nullptr);
+                if (vmBytecode.empty()) {
+                    std::cerr << "VM_BYTECODE_FAIL module=TranslatorBytecode function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec << " reason=empty_bytecode" << std::endl;
                     rejectedCount++;
                     continue;
                 }
@@ -543,12 +669,12 @@ int main(int argc, char* argv[]) {
                 record.functionRVA = static_cast<uint32_t>(func.entryAddress);
                 record.functionSize = static_cast<uint32_t>(func.size);
                 record.bytecodeOffset = static_cast<uint32_t>(vmBytecodeBlob.size());
-                record.bytecodeSize = static_cast<uint32_t>(encryptedBytecode.size());
+                record.bytecodeSize = static_cast<uint32_t>(vmBytecode.size());
                 record.opcodeMapOffset = 0;
                 record.registerMapOffset = 0;
                 record.flags = is64 ? 1u : 0u;
                 vmRecords.push_back(record);
-                vmBytecodeBlob.insert(vmBytecodeBlob.end(), encryptedBytecode.begin(), encryptedBytecode.end());
+                vmBytecodeBlob.insert(vmBytecodeBlob.end(), vmBytecode.begin(), vmBytecode.end());
                 virtualizedCount++;
             }
         }
@@ -598,6 +724,16 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            std::string staticCheckReason;
+            if (!ValidateVMStaticLink(vmRecords, vmBytecodeBlob, emitResult, runtimeResult,
+                    patchResults, buildCtx.opcodeMap, buildCtx.registerMap, staticCheckReason)) {
+                std::cerr << "VM_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
+                          << staticCheckReason << std::endl;
+                PrintFeatureStatus("vm", "failed", staticCheckReason);
+                return 1;
+            }
+            std::cout << "VM_STATIC_CHECK_PASS module=VMStaticLinkChecker records="
+                      << vmRecords.size() << std::endl;
             std::cout << "    VM section: rva=0x" << std::hex << emitResult.sectionRVA
                       << " metadata=0x" << emitResult.metadataRVA
                       << " bytecode=0x" << emitResult.bytecodeRVA

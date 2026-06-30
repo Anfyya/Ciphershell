@@ -1,4 +1,4 @@
-﻿#ifndef CS_VM_RUNTIME_BUILDER_H
+#ifndef CS_VM_RUNTIME_BUILDER_H
 #define CS_VM_RUNTIME_BUILDER_H
 
 #include "vm_section_emitter.h"
@@ -38,7 +38,7 @@ private:
     static size_t Emit32Placeholder(std::vector<uint8_t>& out);
     static void Patch32(std::vector<uint8_t>& out, size_t pos, uint32_t value);
     static void PatchRel32(std::vector<uint8_t>& out, size_t immPos, size_t target);
-    static std::vector<uint8_t> BuildX64RuntimeSkeleton(uint32_t metadataRVA);
+    static std::vector<uint8_t> BuildX64RuntimeInterpreter(uint32_t metadataRVA);
     static std::vector<uint8_t> BuildX64Trampoline(uint32_t functionRVA, uint32_t metadataRVA);
 };
 
