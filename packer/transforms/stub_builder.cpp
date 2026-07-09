@@ -151,12 +151,18 @@ static std::vector<BYTE> build_x64_multi(const std::vector<CS_STUB_PARAMS>& task
     emit8(c, 0x48); emit8(c, 0x8D); emit8(c, 0x34); emit8(c, 0x33); // lea rsi, [rbx+rsi]
     emit8(c, 0x49); emit8(c, 0x8D); emit8(c, 0x78); emit8(c, 0x08); // lea rdi, [r8+8]
     emit8(c, 0x45); emit8(c, 0x31); emit8(c, 0xC9);                 // xor r9d, r9d
+    emit8(c, 0x44); emit8(c, 0x8B); emit8(c, 0x17);                 // mov r10d, [rdi] ; rolling state
 
     size_t inner = c.size();
     emit8(c, 0x85); emit8(c, 0xD2);                                 // test edx, edx
     emit8(c, 0x74); size_t nextJz = c.size(); emit8(c, 0);
+    emit8(c, 0x44); emit8(c, 0x8A); emit8(c, 0x1E);                 // mov r11b, [rsi] ; ciphertext feedback
     emit8(c, 0x42); emit8(c, 0x8A); emit8(c, 0x04); emit8(c, 0x0F); // mov al, [rdi+r9]
+    emit8(c, 0x44); emit8(c, 0x30); emit8(c, 0xD0);                 // xor al, r10b
     emit8(c, 0x30); emit8(c, 0x06);                                 // xor [rsi], al
+    emit8(c, 0x41); emit8(c, 0xC1); emit8(c, 0xCA); emit8(c, 0x08); // ror r10d, 8
+    emit8(c, 0x45); emit8(c, 0x0F); emit8(c, 0xB6); emit8(c, 0xDB); // movzx r11d, r11b
+    emit8(c, 0x45); emit8(c, 0x31); emit8(c, 0xDA);                 // xor r10d, r11d
     emit8(c, 0x48); emit8(c, 0xFF); emit8(c, 0xC6);                 // inc rsi
     emit8(c, 0x41); emit8(c, 0xFF); emit8(c, 0xC1);                 // inc r9d
     emit8(c, 0x41); emit8(c, 0x83); emit8(c, 0xF9); emit8(c, 32);   // cmp r9d, 32
@@ -264,3 +270,5 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
 }
 
 } // namespace CipherShell
+
+

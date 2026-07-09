@@ -1,4 +1,4 @@
-#ifndef CS_TRANSLATOR_H
+﻿#ifndef CS_TRANSLATOR_H
 #define CS_TRANSLATOR_H
 
 #include "../analysis/disassembler.h"
@@ -33,6 +33,7 @@ struct BytecodeInstr {
     uint8_t     memScale;
     uint8_t     memWidth;
     uint8_t     memoryKind;
+    uint8_t     operandWidth;
     bool        isRipRelative;
     int64_t     memDisp;
     uint64_t    immediate;
@@ -143,3 +144,4 @@ private:
 } // namespace CipherShell
 
 #endif // CS_TRANSLATOR_H
+

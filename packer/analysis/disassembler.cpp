@@ -336,15 +336,19 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
 
     uint32_t pos = 0;
 
-    // BUG 3 修复：处理 REX prefix (0x40-0x4F)，仅在 64 位模式下有效
+    // 统一消费常见前缀；长度计算必须包含前缀，否则下游 CFG/VM 会错位。
     uint8_t rex = 0;
-    if (m_is64Bit && pos < size && (code[pos] & 0xF0) == 0x40) {
-        rex = code[pos];
-        pos++;
-        if (pos >= size) {
-            instr.length = pos;
-            return true;
-        }
+    bool operand16 = false;
+    while (pos < size) {
+        uint8_t p = code[pos];
+        if (p == 0x66) { operand16 = true; pos++; continue; }
+        if (p == 0x67 || p == 0xF2 || p == 0xF3) { pos++; continue; }
+        if (m_is64Bit && (p & 0xF0) == 0x40) { rex = p; pos++; continue; }
+        break;
+    }
+    if (pos >= size) {
+        instr.length = pos;
+        return true;
     }
 
     uint8_t opcode = code[pos];
@@ -469,27 +473,27 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
             break;
 
         // Common ModR/M register, memory and ALU instructions
-        case 0x8B: case 0x89: case 0x8D:
-        case 0x03: case 0x2B: case 0x3B:
+        case 0x8B: case 0x89: case 0x8A: case 0x88: case 0x8D:
+        case 0x03: case 0x01: case 0x2B: case 0x29: case 0x3B: case 0x39:
         case 0x21: case 0x23: case 0x09: case 0x0B:
         case 0x31: case 0x33: case 0x85: case 0x84:
         {
             uint32_t end = ConsumeModRMBytes(code, size, pos);
             if (end == 0) break;
             switch (opcode) {
-                case 0x8B: case 0x89: instr.mnemonic = "mov"; break;
+                case 0x8B: case 0x89: case 0x8A: case 0x88: instr.mnemonic = "mov"; break;
                 case 0x8D: instr.mnemonic = "lea"; break;
-                case 0x03: instr.mnemonic = "add"; break;
-                case 0x2B: instr.mnemonic = "sub"; break;
-                case 0x3B: instr.mnemonic = "cmp"; break;
+                case 0x03: case 0x01: instr.mnemonic = "add"; break;
+                case 0x2B: case 0x29: instr.mnemonic = "sub"; break;
+                case 0x3B: case 0x39: instr.mnemonic = "cmp"; break;
                 case 0x21: case 0x23: instr.mnemonic = "and"; break;
                 case 0x09: case 0x0B: instr.mnemonic = "or"; break;
                 case 0x31: case 0x33: instr.mnemonic = "xor"; break;
                 case 0x84: case 0x85: instr.mnemonic = "test"; break;
             }
             uint8_t mod = (code[pos] >> 6) & 3;
-            instr.readsMemory = (mod != 3) && (opcode != 0x89);
-            instr.writesMemory = (mod != 3) && (opcode == 0x89);
+            instr.readsMemory = (mod != 3) && (opcode != 0x89 && opcode != 0x88);
+            instr.writesMemory = (mod != 3) && (opcode == 0x89 || opcode == 0x88);
             instr.length = end;
             break;
         }
@@ -603,6 +607,28 @@ bool Disassembler::DecodeInstruction(const uint8_t* code, uint32_t size, uint64_
                 instr.length = pos + 4;
             }
             break;
+
+        // PUSH imm8
+        case 0x6A:
+            if (pos + 1 <= size) {
+                instr.mnemonic = "push";
+                instr.length = pos + 1;
+            }
+            break;
+
+                // FF /2 call r/m, /4 jmp r/m, /6 push r/m
+        case 0xFF:
+        {
+            uint32_t end = ConsumeModRMBytes(code, size, pos);
+            if (end == 0) break;
+            uint8_t ext = (code[pos] >> 3) & 7;
+            if (ext == 2) { instr.mnemonic = "call"; instr.isCall = true; instr.isIndirect = true; }
+            else if (ext == 4) { instr.mnemonic = "jmp"; instr.isBranch = true; instr.isIndirect = true; }
+            else if (ext == 6) { instr.mnemonic = "push"; }
+            else { instr.mnemonic = "???"; }
+            instr.length = end;
+            break;
+        }
 
         // 条件跳转 (0x70-0x7F)
         case 0x70: case 0x71: case 0x72: case 0x73:
@@ -807,3 +833,4 @@ std::vector<Function> Disassembler::AnalyzeCode(
 }
 
 } // namespace CipherShell
+

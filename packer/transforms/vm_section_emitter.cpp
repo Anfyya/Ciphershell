@@ -1,4 +1,4 @@
-#include "vm_section_emitter.h"
+﻿#include "vm_section_emitter.h"
 #include "../pe_parser/pe_emitter.h"
 #include <algorithm>
 #include <cstring>
@@ -15,7 +15,7 @@ uint32_t RotL32(uint32_t v, unsigned c) {
     c &= 31;
     return (v << c) | (v >> ((32 - c) & 31));
 }
-constexpr uint32_t kVMRuntimeVersion = 0x00010004u;
+constexpr uint32_t kVMRuntimeVersion = 0x00010005u;
 constexpr uint32_t kVMRuntimeFlagsDebugTrace = 0x00000001u;
 }
 
@@ -159,3 +159,4 @@ bool VMSectionEmitter::PatchRuntimeEntry(CS_PE_IMAGE* image, uint32_t metadataRV
     return emitter.PatchBytes(metadataRVA + 28, patch, error);
 }
 } // namespace CipherShell
+

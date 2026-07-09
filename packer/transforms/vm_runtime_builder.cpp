@@ -1,4 +1,4 @@
-#include "vm_runtime_builder.h"
+﻿#include "vm_runtime_builder.h"
 #include "../pe_parser/pe_emitter.h"
 #include <cstring>
 #include <limits>
@@ -28,7 +28,6 @@ void VMRuntimeBuilder::PatchRel32(std::vector<uint8_t>& out, size_t immPos, size
 }
 
 namespace {
-constexpr uint32_t kLocalSize = 0x180;
 constexpr uint32_t kVmRegs = 0x000;
 constexpr uint32_t kFlagZF = 0x100;
 constexpr uint32_t kFlagSF = 0x101;
@@ -38,15 +37,19 @@ constexpr uint32_t kMemScale = 0x104;
 constexpr uint32_t kMemWidth = 0x105;
 constexpr uint32_t kMemKind = 0x106;
 constexpr uint32_t kMemIndexRaw = 0x107;
-constexpr uint32_t kBytecodeSize = 0x108;
-constexpr uint32_t kMetadataVa = 0x110;
+constexpr uint32_t kOperandWidth = 0x108;
+constexpr uint32_t kBytecodeSize = 0x110;
+constexpr uint32_t kMetadataVa = 0x118;
+constexpr uint32_t kVmStack = 0x180;
+constexpr uint32_t kVmStackSize = 0x400;
+constexpr uint32_t kLocalSize = 0x600;
 constexpr uint32_t kTraceEnterCount = 40;
 constexpr uint32_t kTraceLastFunctionRva = 44;
 constexpr uint32_t kTraceLastOpcode = 48;
 constexpr uint32_t kTraceLastErrorCode = 52;
 constexpr uint32_t kTraceLastBytecodeOffset = 56;
 constexpr uint32_t kTraceLastRetValueLow32 = 60;
-constexpr uint32_t kVMRuntimeVersion = 0x00010004u;
+constexpr uint32_t kVMRuntimeVersion = 0x00010005u;
 constexpr uint32_t kSaveBase = kLocalSize;
 constexpr uint32_t kSavedRflags = kLocalSize + 120;
 constexpr uint32_t kOrigRsp = kLocalSize + 0x80;
@@ -177,9 +180,13 @@ void EmitFetchDstToEbx(X64Emitter& e, Label& fetchReg) {
     e.Bytes({0x8B, 0xD9});
 }
 
+void EmitFetchOperandWidth(X64Emitter& e, Label& fetchByte);
+void EmitMaskRaxByOperandWidth(X64Emitter& e);
+void EmitMaskRdxByOperandWidth(X64Emitter& e);
+
 void EmitInitNativeReg(X64Emitter& e, uint8_t nativeReg) {
     EmitReadRegMapToEcx(e, nativeReg);
-    if (nativeReg == 4) e.LeaRdxFrame(kOrigRsp);
+    if (nativeReg == 4) e.LeaRdxFrame(kVmStack + kVmStackSize);
     else e.MovRdxFromFrame(SaveSlotForNativeReg(nativeReg));
     EmitStoreVmRegFromRdxToEcx(e);
 }
@@ -210,21 +217,29 @@ void EmitCommitFlagsToSavedRflags(X64Emitter& e) {
     e.MovFrameFromRdx(kSavedRflags);
 }
 
-void EmitBinaryRR(X64Emitter& e, Label& fetchReg, uint8_t op1, uint8_t op2, bool logicFlags) {
+void EmitBinaryRR(X64Emitter& e, Label& fetchReg, Label& fetchByte, uint8_t op1, uint8_t op2, bool logicFlags) {
     EmitFetchDstToEbx(e, fetchReg);
     e.Call(fetchReg);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRaxFromEbx(e);
     EmitLoadVmRegToRdxFromEcx(e);
+    EmitMaskRaxByOperandWidth(e);
+    EmitMaskRdxByOperandWidth(e);
     e.Bytes({0x48, op1, op2});
+    EmitMaskRaxByOperandWidth(e);
     EmitStoreVmRegFromRaxToEbx(e);
     if (logicFlags) EmitSetLogicFlags(e); else EmitSetArithmeticFlags(e);
 }
 
-void EmitBinaryRC(X64Emitter& e, Label& fetchReg, Label& fetchImm64, uint8_t op1, uint8_t op2, bool logicFlags) {
+void EmitBinaryRC(X64Emitter& e, Label& fetchReg, Label& fetchImm64, Label& fetchByte, uint8_t op1, uint8_t op2, bool logicFlags) {
     EmitFetchDstToEbx(e, fetchReg);
     e.Call(fetchImm64);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRdxFromEbx(e);
+    EmitMaskRdxByOperandWidth(e);
+    EmitMaskRaxByOperandWidth(e);
     e.Bytes({0x48, op1, op2});
+    EmitMaskRdxByOperandWidth(e);
     EmitStoreVmRegFromRdxToEbx(e);
     if (logicFlags) EmitSetLogicFlags(e); else EmitSetArithmeticFlags(e);
 }
@@ -240,6 +255,35 @@ void EmitConditionalJumpByFlag(X64Emitter& e, Label& fetchImm32, uint32_t flagDi
     e.Bind(skip);
     e.Jmp(dispatch);
 }
+void EmitFetchOperandWidth(X64Emitter& e, Label& fetchByte) {
+    e.Call(fetchByte);
+    e.Bytes({0x88, 0x85});
+    e.U32(kOperandWidth);
+}
+
+void EmitMaskRaxByOperandWidth(X64Emitter& e) {
+    Label w4, w2, w1, done;
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x08); e.Jcc(0x4, done);
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x04); e.Jcc(0x4, w4);
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x02); e.Jcc(0x4, w2);
+    e.Jmp(w1);
+    e.Bind(w4); e.Bytes({0x89, 0xC0}); e.Jmp(done);
+    e.Bind(w2); e.Bytes({0x0F, 0xB7, 0xC0}); e.Jmp(done);
+    e.Bind(w1); e.Bytes({0x0F, 0xB6, 0xC0});
+    e.Bind(done);
+}
+
+void EmitMaskRdxByOperandWidth(X64Emitter& e) {
+    Label w4, w2, w1, done;
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x08); e.Jcc(0x4, done);
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x04); e.Jcc(0x4, w4);
+    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x02); e.Jcc(0x4, w2);
+    e.Jmp(w1);
+    e.Bind(w4); e.Bytes({0x89, 0xD2}); e.Jmp(done);
+    e.Bind(w2); e.Bytes({0x0F, 0xB7, 0xD2}); e.Jmp(done);
+    e.Bind(w1); e.Bytes({0x0F, 0xB6, 0xD2});
+    e.Bind(done);
+}
 }
 
 std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metadataRVA) {
@@ -252,7 +296,7 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     Label restore, writeback, dispatch, foundRecord, recordLoop;
     Label fetchByte, fetchReg, fetchImm32, fetchImm64, fetchOpcode, fetchMemAddress;
     Label memNoBase, memNoIndex, memScaleCheck4, memScaleCheck8, memScaleDone, memNoImageBase;
-    Label opNop, opMovRR, opMovRC, opMovRM, opMovMR, opLea;
+    Label opNop, opMovRR, opMovRC, opMovRM, opMovMR, opLea, opPushR, opPushC, opPopR, opCallNative;
     Label opAddRR, opAddRC, opSubRR, opSubRC, opAndRR, opAndRC, opOrRR, opOrRC, opXorRR, opXorRC;
     Label opCmpRR, opCmpRC, opTestRR, opTestRC;
     Label opJmp, opJz, opJnz, opJa, opJae, opJb, opJbe, opJg, opJge, opJl, opJle, opRet;
@@ -417,6 +461,8 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     const std::pair<uint8_t, Label*> opcodeTargets[] = {
         {static_cast<uint8_t>(VM_NOP), &opNop}, {static_cast<uint8_t>(VM_MOV_RR), &opMovRR}, {static_cast<uint8_t>(VM_MOV_RC), &opMovRC},
         {static_cast<uint8_t>(VM_MOV_RM), &opMovRM}, {static_cast<uint8_t>(VM_MOV_MR), &opMovMR}, {static_cast<uint8_t>(VM_LEA), &opLea},
+        {static_cast<uint8_t>(VM_PUSH_R), &opPushR}, {static_cast<uint8_t>(VM_PUSH_C), &opPushC}, {static_cast<uint8_t>(VM_POP_R), &opPopR},
+        {static_cast<uint8_t>(VM_CALL_NATIVE), &opCallNative},
         {static_cast<uint8_t>(VM_ADD_RR), &opAddRR}, {static_cast<uint8_t>(VM_ADD_RC), &opAddRC}, {static_cast<uint8_t>(VM_SUB_RR), &opSubRR}, {static_cast<uint8_t>(VM_SUB_RC), &opSubRC},
         {static_cast<uint8_t>(VM_AND_RR), &opAndRR}, {static_cast<uint8_t>(VM_AND_RC), &opAndRC}, {static_cast<uint8_t>(VM_OR_RR), &opOrRR}, {static_cast<uint8_t>(VM_OR_RC), &opOrRC},
         {static_cast<uint8_t>(VM_XOR_RR), &opXorRR}, {static_cast<uint8_t>(VM_XOR_RC), &opXorRC},
@@ -436,10 +482,13 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
 
     e.Bind(opMovRR);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
-    EmitLoadVmRegToRdxFromEcx(e); EmitStoreVmRegFromRdxToEbx(e); e.Jmp(dispatch);
+    EmitFetchOperandWidth(e, fetchByte);
+    EmitLoadVmRegToRdxFromEcx(e); EmitMaskRdxByOperandWidth(e);
+    EmitStoreVmRegFromRdxToEbx(e); e.Jmp(dispatch);
 
     e.Bind(opMovRC);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
+    EmitFetchOperandWidth(e, fetchByte); EmitMaskRaxByOperandWidth(e);
     EmitStoreVmRegFromRaxToEbx(e); e.Jmp(dispatch);
 
     e.Bind(opMovRM);
@@ -482,37 +531,108 @@ std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metad
     EmitFetchDstToEbx(e, fetchReg);
     e.Call(fetchByte);
     e.Call(fetchMemAddress);
+    e.Bytes({0x8A, 0x85}); e.U32(kMemWidth);
+    e.Bytes({0x88, 0x85}); e.U32(kOperandWidth);
+    EmitMaskRaxByOperandWidth(e);
     EmitStoreVmRegFromRaxToEbx(e); e.Jmp(dispatch);
 
-    e.Bind(opAddRR); EmitBinaryRR(e, fetchReg, 0x01, 0xD0, false); e.Jmp(dispatch);
-    e.Bind(opAddRC); EmitBinaryRC(e, fetchReg, fetchImm64, 0x01, 0xC2, false); e.Jmp(dispatch);
-    e.Bind(opSubRR); EmitBinaryRR(e, fetchReg, 0x29, 0xD0, false); e.Jmp(dispatch);
-    e.Bind(opSubRC); EmitBinaryRC(e, fetchReg, fetchImm64, 0x29, 0xC2, false); e.Jmp(dispatch);
-    e.Bind(opAndRR); EmitBinaryRR(e, fetchReg, 0x21, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opAndRC); EmitBinaryRC(e, fetchReg, fetchImm64, 0x21, 0xC2, true); e.Jmp(dispatch);
-    e.Bind(opOrRR);  EmitBinaryRR(e, fetchReg, 0x09, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opOrRC);  EmitBinaryRC(e, fetchReg, fetchImm64, 0x09, 0xC2, true); e.Jmp(dispatch);
-    e.Bind(opXorRR); EmitBinaryRR(e, fetchReg, 0x31, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opXorRC); EmitBinaryRC(e, fetchReg, fetchImm64, 0x31, 0xC2, true); e.Jmp(dispatch);
+    e.Bind(opPushR);
+    EmitFetchDstToEbx(e, fetchReg);
+    EmitFetchOperandWidth(e, fetchByte);
+    EmitLoadVmRegToRdxFromEbx(e);
+    EmitMaskRdxByOperandWidth(e);
+    e.Bytes({0x49, 0x89, 0xD3});                         // r11 = value
+    EmitReadRegMapToEcx(e, 4);
+    EmitLoadVmRegToRdxFromEcx(e);
+    e.Bytes({0x48, 0x83, 0xEA, 0x08});                   // sub rdx, 8
+    e.Bytes({0x48, 0x8B, 0xC2});                         // mov rax, rdx
+    EmitStoreVmRegFromRdxToEcx(e);
+    e.Bytes({0x4C, 0x89, 0x18});                         // mov [rax], r11
+    e.Jmp(dispatch);
+
+    e.Bind(opPushC);
+    e.Call(fetchReg);                                    // reserved operand slot
+    e.Call(fetchImm64);
+    EmitFetchOperandWidth(e, fetchByte);
+    EmitMaskRaxByOperandWidth(e);
+    e.Bytes({0x49, 0x89, 0xC3});                         // r11 = value
+    EmitReadRegMapToEcx(e, 4);
+    EmitLoadVmRegToRdxFromEcx(e);
+    e.Bytes({0x48, 0x83, 0xEA, 0x08});
+    e.Bytes({0x48, 0x8B, 0xC2});
+    EmitStoreVmRegFromRdxToEcx(e);
+    e.Bytes({0x4C, 0x89, 0x18});
+    e.Jmp(dispatch);
+
+    e.Bind(opPopR);
+    EmitFetchDstToEbx(e, fetchReg);
+    EmitFetchOperandWidth(e, fetchByte);
+    EmitReadRegMapToEcx(e, 4);
+    EmitLoadVmRegToRdxFromEcx(e);
+    e.Bytes({0x48, 0x8B, 0xC2});                         // rax = rsp
+    e.Bytes({0x48, 0x8B, 0x10});                         // rdx = [rax]
+    e.Bytes({0x48, 0x83, 0xC0, 0x08});                   // add rax, 8
+    e.Bytes({0x48, 0x8B, 0xD0});                         // rdx = new rsp
+    EmitStoreVmRegFromRdxToEcx(e);
+    e.Bytes({0x48, 0x8B, 0x50, 0xF8});                   // rdx = popped value
+    EmitMaskRdxByOperandWidth(e);
+    EmitStoreVmRegFromRdxToEbx(e);
+    e.Jmp(dispatch);
+
+    e.Bind(opCallNative);
+    e.Call(fetchImm32);
+    e.Bytes({0x41, 0x89, 0xC3});                         // r11d = target RVA
+    e.Bytes({0x4D, 0x01, 0xE3});                         // r11 += image base
+    e.Bytes({0x41, 0x50, 0x41, 0x51});                   // save runtime r8/r9
+    EmitReadRegMapToEcx(e, 1); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x48, 0x89, 0xD1});
+    EmitReadRegMapToEcx(e, 8); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x49, 0x89, 0xD0});
+    EmitReadRegMapToEcx(e, 9); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x49, 0x89, 0xD1});
+    EmitReadRegMapToEcx(e, 2); EmitLoadVmRegToRdxFromEcx(e);
+    e.Bytes({0x48, 0x83, 0xEC, 0x20});
+    e.Bytes({0x41, 0xFF, 0xD3});                         // call r11
+    e.Bytes({0x48, 0x83, 0xC4, 0x20});
+    e.Bytes({0x41, 0x59, 0x41, 0x58});                   // restore runtime r9/r8
+    EmitReadRegMapToEcx(e, 0);
+    e.Bytes({0x48, 0x89, 0xC2});
+    EmitStoreVmRegFromRdxToEcx(e);
+    e.Jmp(dispatch);
+    e.Bind(opAddRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x01, 0xD0, false); e.Jmp(dispatch);
+    e.Bind(opAddRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x01, 0xC2, false); e.Jmp(dispatch);
+    e.Bind(opSubRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x29, 0xD0, false); e.Jmp(dispatch);
+    e.Bind(opSubRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x29, 0xC2, false); e.Jmp(dispatch);
+    e.Bind(opAndRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x21, 0xD0, true); e.Jmp(dispatch);
+    e.Bind(opAndRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x21, 0xC2, true); e.Jmp(dispatch);
+    e.Bind(opOrRR);  EmitBinaryRR(e, fetchReg, fetchByte, 0x09, 0xD0, true); e.Jmp(dispatch);
+    e.Bind(opOrRC);  EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x09, 0xC2, true); e.Jmp(dispatch);
+    e.Bind(opXorRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x31, 0xD0, true); e.Jmp(dispatch);
+    e.Bind(opXorRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x31, 0xC2, true); e.Jmp(dispatch);
 
     e.Bind(opCmpRR);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRaxFromEbx(e); EmitLoadVmRegToRdxFromEcx(e);
+    EmitMaskRaxByOperandWidth(e); EmitMaskRdxByOperandWidth(e);
     e.Bytes({0x48, 0x39, 0xD0}); EmitSetArithmeticFlags(e); e.Jmp(dispatch);
 
     e.Bind(opCmpRC);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRdxFromEbx(e);
+    EmitMaskRdxByOperandWidth(e); EmitMaskRaxByOperandWidth(e);
     e.Bytes({0x48, 0x39, 0xC2}); EmitSetArithmeticFlags(e); e.Jmp(dispatch);
 
     e.Bind(opTestRR);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRaxFromEbx(e); EmitLoadVmRegToRdxFromEcx(e);
+    EmitMaskRaxByOperandWidth(e); EmitMaskRdxByOperandWidth(e);
     e.Bytes({0x48, 0x85, 0xD0}); EmitSetLogicFlags(e); e.Jmp(dispatch);
 
     e.Bind(opTestRC);
     EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
+    EmitFetchOperandWidth(e, fetchByte);
     EmitLoadVmRegToRdxFromEbx(e);
+    EmitMaskRdxByOperandWidth(e); EmitMaskRaxByOperandWidth(e);
     e.Bytes({0x48, 0x85, 0xC2}); EmitSetLogicFlags(e); e.Jmp(dispatch);
 
     e.Bind(opJmp);
@@ -679,3 +799,12 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
 }
 
 } // namespace CipherShell
+
+
+
+
+
+
+
+
+

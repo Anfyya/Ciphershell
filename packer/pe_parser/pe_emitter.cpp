@@ -1,4 +1,5 @@
 ﻿#include "pe_emitter.h"
+#include "pe_utils.h"
 #include <algorithm>
 #include <cstring>
 #include <new>
@@ -18,22 +19,17 @@ uint32_t PEEmitter::AlignUp(uint32_t value, uint32_t alignment) const {
 
 uint32_t PEEmitter::GetFileAlignment() const {
     if (!IsValid()) return 0x200;
-    uint32_t align = m_image->is64Bit ? m_image->ntHeaders64->OptionalHeader.FileAlignment
-                                      : m_image->ntHeaders32->OptionalHeader.FileAlignment;
-    return align < 0x200 ? 0x200 : align;
+    return PEUtils::FileAlignment(m_image);
 }
 
 uint32_t PEEmitter::GetSectionAlignment() const {
     if (!IsValid()) return 0x1000;
-    uint32_t align = m_image->is64Bit ? m_image->ntHeaders64->OptionalHeader.SectionAlignment
-                                      : m_image->ntHeaders32->OptionalHeader.SectionAlignment;
-    return align < 0x1000 ? 0x1000 : align;
+    return PEUtils::SectionAlignment(m_image);
 }
 
 uint32_t PEEmitter::GetSizeOfHeaders() const {
     if (!IsValid()) return 0;
-    return m_image->is64Bit ? m_image->ntHeaders64->OptionalHeader.SizeOfHeaders
-                            : m_image->ntHeaders32->OptionalHeader.SizeOfHeaders;
+    return PEUtils::SizeOfHeaders(m_image);
 }
 
 void PEEmitter::SetSizeOfHeaders(uint32_t value) {
@@ -72,19 +68,7 @@ void PEEmitter::RefreshPointers(uint32_t ntOffset) {
 }
 
 uint32_t PEEmitter::RvaToOffset(uint32_t rva) const {
-    if (!IsValid()) return 0;
-    const uint32_t sizeOfHeaders = GetSizeOfHeaders();
-    if (rva < sizeOfHeaders) return rva;
-
-    for (WORD i = 0; i < m_image->numSections; i++) {
-        const IMAGE_SECTION_HEADER& sec = m_image->sections[i];
-        uint32_t virtualSize = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
-        uint32_t span = (std::max)(virtualSize, static_cast<uint32_t>(sec.SizeOfRawData));
-        if (rva >= sec.VirtualAddress && rva < sec.VirtualAddress + span) {
-            return sec.PointerToRawData + (rva - sec.VirtualAddress);
-        }
-    }
-    return 0;
+    return PEUtils::RvaToOffset(m_image, rva);
 }
 
 bool PEEmitter::RelocateHeaders(uint32_t requiredHeaderEnd, uint32_t firstRaw, std::string& error) {
@@ -151,7 +135,7 @@ PEAppendSectionResult PEEmitter::AppendSection(
         }
         lastFileEnd = (std::max)(lastFileEnd, static_cast<uint32_t>(sec.PointerToRawData + sec.SizeOfRawData));
 
-        uint32_t virtualSize = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
+        uint32_t virtualSize = PEUtils::SectionMappedSpan(sec);
         lastVirtualEnd = (std::max)(lastVirtualEnd,
             static_cast<uint32_t>(sec.VirtualAddress + AlignUp(virtualSize, sectionAlign)));
     }
@@ -176,9 +160,9 @@ PEAppendSectionResult PEEmitter::AppendSection(
                 firstRaw = sec.PointerToRawData;
             }
             lastFileEnd = (std::max)(lastFileEnd, static_cast<uint32_t>(sec.PointerToRawData + sec.SizeOfRawData));
-            uint32_t virtualSize = sec.Misc.VirtualSize ? sec.Misc.VirtualSize : sec.SizeOfRawData;
-            lastVirtualEnd = (std::max)(lastVirtualEnd,
-                static_cast<uint32_t>(sec.VirtualAddress + AlignUp(virtualSize, sectionAlign)));
+            uint32_t virtualSize = PEUtils::SectionMappedSpan(sec);
+        lastVirtualEnd = (std::max)(lastVirtualEnd,
+            static_cast<uint32_t>(sec.VirtualAddress + AlignUp(virtualSize, sectionAlign)));
         }
     }
 
@@ -275,3 +259,6 @@ bool PEEmitter::SetSectionCharacteristics(uint32_t sectionIndex, uint32_t charac
 }
 
 } // namespace CipherShell
+
+
+

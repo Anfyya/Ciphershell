@@ -1,5 +1,5 @@
-/**
- * CipherShell Section 加密器 - 实现
+﻿/**
+ * CipherShell Section 鍔犲瘑鍣?- 瀹炵幇
  */
 
 #include "section_encryptor.h"
@@ -7,8 +7,8 @@
 #include <cstdlib>
 #include <ctime>
 
-// BUG6修复：使用密码学安全的随机数生成器替代 rand()
-// rand() 的输出可预测（种子空间小、线性同余算法），攻击者可暴力破解密钥
+// BUG6淇锛氫娇鐢ㄥ瘑鐮佸瀹夊叏鐨勯殢鏈烘暟鐢熸垚鍣ㄦ浛浠?rand()
+// rand() 鐨勮緭鍑哄彲棰勬祴锛堢瀛愮┖闂村皬銆佺嚎鎬у悓浣欑畻娉曪級锛屾敾鍑昏€呭彲鏆村姏鐮磋В瀵嗛挜
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
@@ -19,18 +19,51 @@
 
 namespace CipherShell {
 
+namespace {
+uint32_t LoadLe32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint32_t RotR32(uint32_t v, uint32_t bits) {
+    bits &= 31u;
+    return (v >> bits) | (v << ((32u - bits) & 31u));
+}
+
+void ApplyLegacyXor(BYTE* data, DWORD size, const CS_ENCRYPTION_KEY& key) {
+    for (DWORD i = 0; i < size; i++) {
+        data[i] ^= key.key[i & 31u];
+    }
+}
+
+void ApplyRollingSectionStream(BYTE* data, DWORD size, const CS_ENCRYPTION_KEY& key, bool encrypting) {
+    uint32_t state = LoadLe32(key.key);
+    if (state == 0) state = 0xC5C5E11u;
+    for (DWORD i = 0; i < size; i++) {
+        const uint8_t input = data[i];
+        const uint8_t mask = static_cast<uint8_t>(state) ^ key.key[i & 31u];
+        data[i] = static_cast<uint8_t>(input ^ mask);
+        const uint8_t feedback = encrypting ? data[i] : input;
+        state = RotR32(state, 8) ^ static_cast<uint32_t>(feedback);
+    }
+}
+}
+
+
 // ============================================================================
-// 构造/析构
+// 鏋勯€?鏋愭瀯
 // ============================================================================
 
 SectionEncryptor::SectionEncryptor() {
-    // BUG6修复：不再使用 srand/rand，密钥生成已改用 CSPRNG
+    // BUG6淇锛氫笉鍐嶄娇鐢?srand/rand锛屽瘑閽ョ敓鎴愬凡鏀圭敤 CSPRNG
 }
 
 SectionEncryptor::~SectionEncryptor() {}
 
 // ============================================================================
-// 公共接口
+// 鍏叡鎺ュ彛
 // ============================================================================
 
 std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
@@ -44,24 +77,23 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
         return result;
     }
 
-    // 遍历所有 sections
+    // 閬嶅巻鎵€鏈?sections
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
-        // 检查是否需要加密此 section
+        // 妫€鏌ユ槸鍚﹂渶瑕佸姞瀵嗘 section
         if (!ShouldEncryptSection(section, config)) {
             continue;
         }
 
-        // 生成或派生密钥
-        CS_ENCRYPTION_KEY sectionKey;
+        // 鐢熸垚鎴栨淳鐢熷瘑閽?        CS_ENCRYPTION_KEY sectionKey;
         if (config.usePerSectionKeys) {
             sectionKey = DeriveSectionKey(masterKey, i, section->VirtualAddress);
         } else {
             sectionKey = masterKey;
         }
 
-        // 加密 section
+        // 鍔犲瘑 section
         if (EncryptSection(image, i, sectionKey)) {
             CS_ENCRYPTED_SECTION encSection;
             encSection.sectionIndex = i;
@@ -85,7 +117,7 @@ bool SectionEncryptor::DecryptSections(
         return false;
     }
 
-    // 解密每个 section
+    // 瑙ｅ瘑姣忎釜 section
     for (const auto& encSection : encryptedSections) {
         if (!DecryptSection(image, encSection.sectionIndex, encSection.sectionKey)) {
             return false;
@@ -98,24 +130,22 @@ bool SectionEncryptor::DecryptSections(
 CS_ENCRYPTION_KEY SectionEncryptor::GenerateRandomKey() {
     CS_ENCRYPTION_KEY key;
 
-    // BUG6修复：使用密码学安全的随机数生成器
-    // rand() 种子空间仅 32 位，且输出序列可预测，不适用于密钥生成
-#ifdef _WIN32
-    // Windows 平台：使用 BCryptGenRandom（CNG API），提供 CSPRNG
+    // BUG6淇锛氫娇鐢ㄥ瘑鐮佸瀹夊叏鐨勯殢鏈烘暟鐢熸垚鍣?    // rand() 绉嶅瓙绌洪棿浠?32 浣嶏紝涓旇緭鍑哄簭鍒楀彲棰勬祴锛屼笉閫傜敤浜庡瘑閽ョ敓鎴?#ifdef _WIN32
+    // Windows 骞冲彴锛氫娇鐢?BCryptGenRandom锛圕NG API锛夛紝鎻愪緵 CSPRNG
     BCryptGenRandom(NULL, key.key, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     BCryptGenRandom(NULL, key.nonce, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     BCryptGenRandom(NULL, (PUCHAR)&key.counter, sizeof(key.counter), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 #else
-    // 跨平台：使用 std::random_device 获取硬件熵源
+    // 璺ㄥ钩鍙帮細浣跨敤 std::random_device 鑾峰彇纭欢鐔垫簮
     std::random_device rd;
-    // 生成随机密钥
+    // 鐢熸垚闅忔満瀵嗛挜
     for (int i = 0; i < 32; i += 4) {
         uint32_t val = rd();
         int remaining = 32 - i;
         int copyLen = remaining < 4 ? remaining : 4;
         memcpy(key.key + i, &val, copyLen);
     }
-    // 生成随机 nonce
+    // 鐢熸垚闅忔満 nonce
     for (int i = 0; i < 12; i += 4) {
         uint32_t val = rd();
         int remaining = 12 - i;
@@ -134,7 +164,7 @@ CS_ENCRYPTION_KEY SectionEncryptor::DeriveSectionKey(
     WORD sectionIndex,
     DWORD sectionRVA)
 {
-    // 构造 salt：section 索引 + RVA
+    // 鏋勯€?salt锛歴ection 绱㈠紩 + RVA
     uint8_t salt[8];
     salt[0] = (uint8_t)(sectionIndex);
     salt[1] = (uint8_t)(sectionIndex >> 8);
@@ -142,7 +172,7 @@ CS_ENCRYPTION_KEY SectionEncryptor::DeriveSectionKey(
     salt[3] = (uint8_t)(sectionRVA >> 8);
     salt[4] = (uint8_t)(sectionRVA >> 16);
     salt[5] = (uint8_t)(sectionRVA >> 24);
-    salt[6] = 0xC5;  // CipherShell 标记
+    salt[6] = 0xC5;  // CipherShell 鏍囪
     salt[7] = 0x5E;
 
     CS_ENCRYPTION_KEY derivedKey;
@@ -159,8 +189,8 @@ BYTE* SectionEncryptor::SerializeKeys(
         return nullptr;
     }
 
-    // 计算输出大小
-    // 格式：[section_count:4][section_info:N*56]
+    // 璁＄畻杈撳嚭澶у皬
+    // 鏍煎紡锛歔section_count:4][section_info:N*56]
     DWORD totalSize = 4 + (DWORD)encryptedSections.size() * (4 + 4 + 4 + 32 + 12 + 4);
 
     BYTE* output = new(std::nothrow) BYTE[totalSize];
@@ -170,12 +200,11 @@ BYTE* SectionEncryptor::SerializeKeys(
 
     DWORD offset = 0;
 
-    // 写入 section 数量
+    // 鍐欏叆 section 鏁伴噺
     *(DWORD*)(output + offset) = (DWORD)encryptedSections.size();
     offset += 4;
 
-    // 写入每个 section 的信息
-    for (const auto& encSection : encryptedSections) {
+    // 鍐欏叆姣忎釜 section 鐨勪俊鎭?    for (const auto& encSection : encryptedSections) {
         *(DWORD*)(output + offset) = encSection.sectionIndex;
         offset += 4;
 
@@ -200,7 +229,7 @@ BYTE* SectionEncryptor::SerializeKeys(
 }
 
 // ============================================================================
-// 内部实现
+// 鍐呴儴瀹炵幇
 // ============================================================================
 
 bool SectionEncryptor::EncryptSection(
@@ -214,24 +243,24 @@ bool SectionEncryptor::EncryptSection(
 
     PIMAGE_SECTION_HEADER section = &image->sections[sectionIndex];
 
-    // 检查 section 是否有数据
-    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
+    // 妫€鏌?section 鏄惁鏈夋暟鎹?    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
         return false;
     }
 
-    // 检查边界
-    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
+    // 妫€鏌ヨ竟鐣?    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
         return false;
     }
 
-    // 与启动 stub 保持一致：32 字节循环 XOR。
     BYTE* sectionData = image->rawData + section->PointerToRawData;
-    for (DWORD i = 0; i < section->SizeOfRawData; i++) {
-        sectionData[i] ^= key.key[i & 31];
+
+    // x64 stub 使用同一套滚动流解密；x86 仍保留旧格式以避免破坏现有 32 位启动 stub。
+    if (image->is64Bit) {
+        ApplyRollingSectionStream(sectionData, section->SizeOfRawData, key, true);
+    } else {
+        ApplyLegacyXor(sectionData, section->SizeOfRawData, key);
     }
 
-    // 给 section 加写权限，stub 需要写回解密后的数据
-    section->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    // 缁?section 鍔犲啓鏉冮檺锛宻tub 闇€瑕佸啓鍥炶В瀵嗗悗鐨勬暟鎹?    section->Characteristics |= IMAGE_SCN_MEM_WRITE;
     // section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
 
     return true;
@@ -248,26 +277,24 @@ bool SectionEncryptor::DecryptSection(
 
     PIMAGE_SECTION_HEADER section = &image->sections[sectionIndex];
 
-    // 检查 section 是否有数据
-    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
+    // 妫€鏌?section 鏄惁鏈夋暟鎹?    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
         return false;
     }
 
-    // 检查边界
-    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
+    // 妫€鏌ヨ竟鐣?    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
         return false;
     }
 
-    // 解密必须与 EncryptSection 和启动 stub 完全一致。
-    // XOR 是对称操作（加密 = 解密）。
-    // 保留现有轻量 XOR 方案，但必须使用完整 32 字节密钥循环。
-    // stub 中同样使用 XOR 解密，这里保持一致。
     BYTE* sectionData = image->rawData + section->PointerToRawData;
-    for (DWORD i = 0; i < section->SizeOfRawData; i++) {
-        sectionData[i] ^= key.key[i & 31];
+
+    // 与 EncryptSection 和启动 stub 保持一致。
+    if (image->is64Bit) {
+        ApplyRollingSectionStream(sectionData, section->SizeOfRawData, key, false);
+    } else {
+        ApplyLegacyXor(sectionData, section->SizeOfRawData, key);
     }
 
-    // 恢复执行权限
+    // 鎭㈠鎵ц鏉冮檺
     section->Characteristics |= IMAGE_SCN_MEM_EXECUTE;
 
     return true;
@@ -280,8 +307,8 @@ void SectionEncryptor::DeriveKey(
     CS_ENCRYPTION_KEY& derivedKey,
     uint32_t rounds)
 {
-    // 简化的密钥派生：使用 ChaCha20 迭代
-    // 实际应用中应使用更安全的 KDF 如 HKDF 或 PBKDF2
+    // 绠€鍖栫殑瀵嗛挜娲剧敓锛氫娇鐢?ChaCha20 杩唬
+    // 瀹為檯搴旂敤涓簲浣跨敤鏇村畨鍏ㄧ殑 KDF 濡?HKDF 鎴?PBKDF2
 
     uint8_t currentKey[32];
     memcpy(currentKey, masterKey.key, 32);
@@ -290,21 +317,20 @@ void SectionEncryptor::DeriveKey(
         ChaCha20 cipher;
         cipher.Init(currentKey, salt, round);
 
-        // 生成新的密钥材料
+        // 鐢熸垚鏂扮殑瀵嗛挜鏉愭枡
         uint8_t newKeyMaterial[32];
         memset(newKeyMaterial, 0, 32);
         cipher.Process(newKeyMaterial, newKeyMaterial, 32);
 
-        // 与当前密钥混合
-        for (int i = 0; i < 32; i++) {
+        // 涓庡綋鍓嶅瘑閽ユ贩鍚?        for (int i = 0; i < 32; i++) {
             currentKey[i] ^= newKeyMaterial[i];
         }
     }
 
-    // 设置派生密钥
+    // 璁剧疆娲剧敓瀵嗛挜
     memcpy(derivedKey.key, currentKey, 32);
 
-    // 从密钥派生 nonce
+    // 浠庡瘑閽ユ淳鐢?nonce
     ChaCha20 nonceCipher;
     uint8_t nonceSalt[12] = {0x4E, 0x4F, 0x4E, 0x43, 0x45, 0x5F,  // "NONCE_"
                              0x53, 0x41, 0x4C, 0x54, 0x5F, 0x58}; // "SALT_X"
@@ -315,7 +341,7 @@ void SectionEncryptor::DeriveKey(
 
     derivedKey.counter = 0;
 
-    // 清除临时数据
+    // 娓呴櫎涓存椂鏁版嵁
     SecureZeroMemory(currentKey, sizeof(currentKey));
 }
 
@@ -330,26 +356,25 @@ bool SectionEncryptor::IsDataSection(DWORD characteristics) {
 }
 
 bool SectionEncryptor::ShouldEncryptSection(PIMAGE_SECTION_HEADER section, const CS_ENCRYPT_CONFIG& config) {
-    // 跳过空 section
+    // 璺宠繃绌?section
     if (section->SizeOfRawData == 0) {
         return false;
     }
 
-    // 跳过头部 section（通常是 .rsrc, .reloc 等）
+    // 璺宠繃澶撮儴 section锛堥€氬父鏄?.rsrc, .reloc 绛夛級
     char name[9] = {0};
     memcpy(name, section->Name, 8);
 
-    // 保留资源段（如果配置要求）
-    if (strncmp(name, ".rsrc", 5) == 0 && !config.encryptResources) {
+    // 淇濈暀璧勬簮娈碉紙濡傛灉閰嶇疆瑕佹眰锛?    if (strncmp(name, ".rsrc", 5) == 0 && !config.encryptResources) {
         return false;
     }
 
-    // 保留重定位段
+    // 淇濈暀閲嶅畾浣嶆
     if (strncmp(name, ".reloc", 6) == 0) {
         return false;
     }
 
-    // 根据配置决定是否加密
+    // 鏍规嵁閰嶇疆鍐冲畾鏄惁鍔犲瘑
     if (config.encryptCodeSections && IsCodeSection(section->Characteristics)) {
         return true;
     }
@@ -369,3 +394,6 @@ void SectionEncryptor::SecureZeroMemory(void* ptr, size_t size) {
 }
 
 } // namespace CipherShell
+
+
+

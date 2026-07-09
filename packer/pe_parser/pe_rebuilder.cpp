@@ -1,8 +1,9 @@
-/**
- * CipherShell PE Rebuilder - 实现
+﻿/**
+ * CipherShell PE Rebuilder - 瀹炵幇
  */
 
 #include "pe_rebuilder.h"
+#include "pe_utils.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -11,18 +12,17 @@
 namespace CipherShell {
 
 // ============================================================================
-// 构造/析构
+// 鏋勯€?鏋愭瀯
 // ============================================================================
 
 PERebuilder::PERebuilder() {
-    // 初始化随机数生成器
-    srand((unsigned int)time(nullptr));
+    // 鍒濆鍖栭殢鏈烘暟鐢熸垚鍣?    srand((unsigned int)time(nullptr));
 }
 
 PERebuilder::~PERebuilder() {}
 
 // ============================================================================
-// 公共接口
+// 鍏叡鎺ュ彛
 // ============================================================================
 
 BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config, DWORD* outputSize) {
@@ -30,20 +30,18 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         return nullptr;
     }
 
-    // 简单方法：复制整个原始文件，然后修改
-    DWORD totalSize = image->rawSize + 0x10000;  // 额外空间
+    // 绠€鍗曟柟娉曪細澶嶅埗鏁翠釜鍘熷鏂囦欢锛岀劧鍚庝慨鏀?    DWORD totalSize = image->rawSize + 0x10000;  // 棰濆绌洪棿
 
-    // 分配输出缓冲区
-    BYTE* output = new(std::nothrow) BYTE[totalSize];
+    // 鍒嗛厤杈撳嚭缂撳啿鍖?    BYTE* output = new(std::nothrow) BYTE[totalSize];
     if (!output) {
         return nullptr;
     }
     memset(output, 0, totalSize);
 
-    // 复制原始数据
+    // 澶嶅埗鍘熷鏁版嵁
     memcpy(output, image->rawData, image->rawSize);
 
-    // 获取 NT Headers
+    // 鑾峰彇 NT Headers
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
     if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) >= image->rawSize) {
         *outputSize = image->rawSize;
@@ -52,12 +50,11 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
 
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
-    // 清除时间戳
-    if (config.zeroTimestamps) {
+    // 娓呴櫎鏃堕棿鎴?    if (config.zeroTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = 0;
     }
 
-    // 清除调试信息
+    // 娓呴櫎璋冭瘯淇℃伅
     if (!config.preserveDebugInfo) {
         if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)ntHeaders;
@@ -70,8 +67,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         }
     }
 
-    // 清除校验和
-    if (!config.preserveChecksum) {
+    // 娓呴櫎鏍￠獙鍜?    if (!config.preserveChecksum) {
         if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             ((PIMAGE_NT_HEADERS64)ntHeaders)->OptionalHeader.CheckSum = 0;
         } else {
@@ -79,7 +75,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         }
     }
 
-    // 随机化 section 名称
+    // 闅忔満鍖?section 鍚嶇О
     if (config.randomizeSectionNames) {
         PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
         for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
@@ -98,12 +94,10 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
 void PERebuilder::AddSection(std::vector<CS_SECTION_CONFIG>& sections, const CS_SECTION_CONFIG& section) {
     CS_SECTION_CONFIG fixedSection = section;
 
-    // BUG4修复：VirtualSize=0 会导致节区在内存中被映射为零大小，节区数据丢失
-    // Windows PE 加载器在 VirtualSize=0 时可能不分配内存页，导致运行时访问违例
-    // 至少应等于 SizeOfRawData（即 dataSize），确保数据能完整映射到内存
+    // BUG4淇锛歏irtualSize=0 浼氬鑷磋妭鍖哄湪鍐呭瓨涓鏄犲皠涓洪浂澶у皬锛岃妭鍖烘暟鎹涪澶?    // Windows PE 鍔犺浇鍣ㄥ湪 VirtualSize=0 鏃跺彲鑳戒笉鍒嗛厤鍐呭瓨椤碉紝瀵艰嚧杩愯鏃惰闂繚渚?    // 鑷冲皯搴旂瓑浜?SizeOfRawData锛堝嵆 dataSize锛夛紝纭繚鏁版嵁鑳藉畬鏁存槧灏勫埌鍐呭瓨
     if (fixedSection.virtualSize == 0 && fixedSection.dataSize > 0) {
         DWORD align = fixedSection.alignment > 0 ? fixedSection.alignment : 0x1000;
-        // 按 SectionAlignment 对齐
+        // 鎸?SectionAlignment 瀵归綈
         fixedSection.virtualSize = (fixedSection.dataSize + align - 1) & ~(align - 1);
     }
 
@@ -140,24 +134,24 @@ bool PERebuilder::SetEntryPoint(CS_PE_IMAGE* image, DWORD newEntryPoint) {
 }
 
 // ============================================================================
-// 重建实现
+// 閲嶅缓瀹炵幇
 // ============================================================================
 
 bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
-    // 复制原始头部
+    // 澶嶅埗鍘熷澶撮儴
     DWORD headerSize = image->sections[0].PointerToRawData;
     if (headerSize == 0 || headerSize > image->rawSize) headerSize = 0x400;
     if (headerSize > image->rawSize) headerSize = image->rawSize;
     
     memcpy(output, image->rawData, headerSize);
 
-    // 获取输出缓冲区中的 NT Headers 指针
+    // 鑾峰彇杈撳嚭缂撳啿鍖轰腑鐨?NT Headers 鎸囬拡
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
     if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) > headerSize) return true;
     
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
-    // 处理 Rich Header
+    // 澶勭悊 Rich Header
     if (!config.preserveRichHeader && image->hasRichHeader && image->richHeaderOffset > static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER))) {
         DWORD richClearSize = image->richHeaderOffset - static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER));
         if (richClearSize < headerSize) {
@@ -165,15 +159,13 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         }
     }
 
-    // 处理时间戳（修改输出缓冲区，不是原始镜像）
-    if (config.zeroTimestamps) {
+    // 澶勭悊鏃堕棿鎴筹紙淇敼杈撳嚭缂撳啿鍖猴紝涓嶆槸鍘熷闀滃儚锛?    if (config.zeroTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = 0;
     } else if (config.randomizeTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = GenerateRandomDWORD();
     }
 
-    // 处理调试信息（修改输出缓冲区）
-    if (!config.preserveDebugInfo) {
+    // 澶勭悊璋冭瘯淇℃伅锛堜慨鏀硅緭鍑虹紦鍐插尯锛?    if (!config.preserveDebugInfo) {
         if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
             ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
@@ -185,8 +177,7 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         }
     }
 
-    // 处理校验和
-    if (!config.preserveChecksum) {
+    // 澶勭悊鏍￠獙鍜?    if (!config.preserveChecksum) {
         if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
             ntHeaders64->OptionalHeader.CheckSum = 0;
@@ -200,7 +191,7 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 }
 
 bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
-    // 获取 NT Headers 信息
+    // 鑾峰彇 NT Headers 淇℃伅
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
     if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) > 0x1000) return false;
     
@@ -214,21 +205,19 @@ bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REB
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
-        // 安全检查
-        if (section->SizeOfRawData == 0) continue;
+        // 瀹夊叏妫€鏌?        if (section->SizeOfRawData == 0) continue;
         if (section->PointerToRawData == 0) continue;
         if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) continue;
 
-        // 复制 section 数据
-        DWORD copySize = (std::min)(section->SizeOfRawData, section->Misc.VirtualSize);
-        if (copySize > 0 && currentOffset + copySize <= config.fileAlignment * 1000) {
+        // 澶嶅埗 section 鏁版嵁
+        DWORD copySize = section->SizeOfRawData;
+        if (copySize > 0) {
             memcpy(output + currentOffset,
                    image->rawData + section->PointerToRawData,
                    copySize);
         }
 
-        // 更新 section 头中的偏移
-        DWORD sectionHeaderOffset = dosHeader->e_lfanew +
+        // 鏇存柊 section 澶翠腑鐨勫亸绉?        DWORD sectionHeaderOffset = dosHeader->e_lfanew +
             sizeof(DWORD) +  // PE signature
             sizeof(IMAGE_FILE_HEADER) +
             ntHeaders->FileHeader.SizeOfOptionalHeader +
@@ -239,7 +228,7 @@ bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REB
             outputSection->PointerToRawData = currentOffset;
             outputSection->SizeOfRawData = AlignValue(section->SizeOfRawData, config.fileAlignment);
 
-            // 随机化 section 名称
+            // 闅忔満鍖?section 鍚嶇О
             if (config.randomizeSectionNames) {
                 char name[9] = {0};
                 memcpy(name, outputSection->Name, 8);
@@ -260,8 +249,7 @@ bool PERebuilder::RebuildOverlay(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         return true;
     }
 
-    // 找到最后一个 section 的结束位置
-    DWORD lastSectionEnd = 0;
+    // 鎵惧埌鏈€鍚庝竴涓?section 鐨勭粨鏉熶綅缃?    DWORD lastSectionEnd = 0;
     for (WORD i = 0; i < image->numSections; i++) {
         DWORD sectionEnd = image->sections[i].PointerToRawData + image->sections[i].SizeOfRawData;
         if (sectionEnd > lastSectionEnd) {
@@ -269,7 +257,7 @@ bool PERebuilder::RebuildOverlay(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         }
     }
 
-    // 复制 overlay 数据
+    // 澶嶅埗 overlay 鏁版嵁
     DWORD overlaySize = image->rawSize - image->overlayOffset;
     memcpy(output + lastSectionEnd,
            image->rawData + image->overlayOffset,
@@ -279,7 +267,7 @@ bool PERebuilder::RebuildOverlay(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 }
 
 // ============================================================================
-// 辅助函数
+// 杈呭姪鍑芥暟
 // ============================================================================
 
 DWORD PERebuilder::AlignValue(DWORD value, DWORD alignment) {
@@ -300,7 +288,7 @@ DWORD PERebuilder::CalculateChecksum(BYTE* data, DWORD size) {
     DWORD remainder = size % 4;
     DWORD longs = size / 4;
 
-    // 对每个 DWORD 求和
+    // 瀵规瘡涓?DWORD 姹傚拰
     for (DWORD i = 0; i < longs; i++) {
         DWORD value = *(DWORD*)(data + i * 4);
         checksum += value;
@@ -309,7 +297,7 @@ DWORD PERebuilder::CalculateChecksum(BYTE* data, DWORD size) {
         }
     }
 
-    // 处理剩余字节
+    // 澶勭悊鍓╀綑瀛楄妭
     if (remainder > 0) {
         DWORD value = 0;
         memcpy(&value, data + longs * 4, remainder);
@@ -319,8 +307,7 @@ DWORD PERebuilder::CalculateChecksum(BYTE* data, DWORD size) {
         }
     }
 
-    // 高低16位相加
-    checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    // 楂樹綆16浣嶇浉鍔?    checksum = (checksum & 0xFFFF) + (checksum >> 16);
     checksum += (checksum >> 16);
     checksum &= 0xFFFF;
 
@@ -331,13 +318,10 @@ bool PERebuilder::UpdateChecksum(BYTE* peData, DWORD actualFileSize) {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)peData;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peData + static_cast<DWORD>(dosHeader->e_lfanew));
 
-    // BUG3修复：使用实际文件缓冲区大小而非 SizeOfImage（内存映像大小）
-    // SizeOfImage 是 PE 映射到内存后的大小（按 SectionAlignment 对齐），通常远大于文件大小
-    // 用 SizeOfImage 计算校验和会读取超出文件数据范围的内存，导致校验和错误
-    DWORD checksum = CalculateChecksum(peData, actualFileSize);
+    // BUG3淇锛氫娇鐢ㄥ疄闄呮枃浠剁紦鍐插尯澶у皬鑰岄潪 SizeOfImage锛堝唴瀛樻槧鍍忓ぇ灏忥級
+    // SizeOfImage 鏄?PE 鏄犲皠鍒板唴瀛樺悗鐨勫ぇ灏忥紙鎸?SectionAlignment 瀵归綈锛夛紝閫氬父杩滃ぇ浜庢枃浠跺ぇ灏?    // 鐢?SizeOfImage 璁＄畻鏍￠獙鍜屼細璇诲彇瓒呭嚭鏂囦欢鏁版嵁鑼冨洿鐨勫唴瀛橈紝瀵艰嚧鏍￠獙鍜岄敊璇?    DWORD checksum = CalculateChecksum(peData, actualFileSize);
 
-    // 更新校验和
-    if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+    // 鏇存柊鏍￠獙鍜?    if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
         ((PIMAGE_NT_HEADERS64)ntHeaders)->OptionalHeader.CheckSum = checksum;
     } else {
         ((PIMAGE_NT_HEADERS32)ntHeaders)->OptionalHeader.CheckSum = checksum;
@@ -355,3 +339,4 @@ BYTE PERebuilder::GenerateRandomBYTE() {
 }
 
 } // namespace CipherShell
+
