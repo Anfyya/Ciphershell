@@ -65,3 +65,11 @@ target_include_directories(test_cli_options PRIVATE ${CMAKE_SOURCE_DIR})
 
 add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
+
+add_executable(test_fail_closed_features
+    test_fail_closed_features.cpp
+)
+
+target_include_directories(test_fail_closed_features PRIVATE ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_fail_closed_features PRIVATE ciphershell_packer)
+add_test(NAME fail_closed_features COMMAND test_fail_closed_features)

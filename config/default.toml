@@ -24,7 +24,7 @@ simd_bridge = true
 x87_bridge = true
 
 [string_encryption]
-enabled = true
+enabled = false
 strength = 60
 mode = "startup"
 ascii = true
@@ -33,25 +33,25 @@ resources = false
 clear_after_use = false
 
 [import_protection]
-enabled = true
+enabled = false
 strength = 50
 
 [section_encryption]
-enabled = true
+enabled = false
 strength = 58
 mode = "startup"
 
 [control_flow]
-enabled = true
+enabled = false
 strength = 55
 
 [control_flow.flattening]
-enabled = true
+enabled = false
 strength = 55
 target_functions = []
 
 [control_flow.bogus]
-enabled = true
+enabled = false
 strength = 50
 
 [anti_debug]

@@ -88,9 +88,6 @@ bool SignatureEliminator::EliminateSignatures(CS_PE_IMAGE* image, const Eliminat
         ClearChecksum(image);
     }
 
-    // 规范化权限
-    NormalizePermissions(image);
-
     return true;
 }
 
@@ -300,31 +297,6 @@ bool SignatureEliminator::ClearChecksum(CS_PE_IMAGE* image) {
         image->ntHeaders64->OptionalHeader.CheckSum = 0;
     } else {
         image->ntHeaders32->OptionalHeader.CheckSum = 0;
-    }
-
-    return true;
-}
-
-bool SignatureEliminator::NormalizePermissions(CS_PE_IMAGE* image) {
-    // 确保 section 权限看起来正常
-    // 注意：保留加壳时设置的 WRITE 权限（stub 解密需要）
-
-    for (WORD i = 0; i < image->numSections; i++) {
-        // 只规范非加密段的权限，保留加密段已有的 WRITE 标志
-        if (image->sections[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
-            continue;  // 已经有写权限，保持不变（可能是加壳设置的）
-        }
-
-        // 代码段应该是 R-X
-        if (image->sections[i].Characteristics & IMAGE_SCN_CNT_CODE) {
-            image->sections[i].Characteristics = 
-                IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
-        }
-        // 数据段应该是 RW-
-        else if (image->sections[i].Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) {
-            image->sections[i].Characteristics = 
-                IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
-        }
     }
 
     return true;

@@ -7,6 +7,8 @@
 #include "pe_utils.h"
 #include <cstring>
 #include <algorithm>
+#include <functional>
+#include <unordered_set>
 
 namespace CipherShell {
 
@@ -281,7 +283,8 @@ bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
             &PEParser::ParseExceptionTable, "exception")) &&
         parseIfPresent(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &PEParser::ParseLoadConfig, "load config") &&
         parseIfPresent(IMAGE_DIRECTORY_ENTRY_DEBUG, &PEParser::ParseDebugDirectory, "debug") &&
-        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &PEParser::ParseDelayImports, "delay import");
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &PEParser::ParseDelayImports, "delay import") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_SECURITY, &PEParser::ParseSecurityDirectory, "security");
 }
 
 // ============================================================================
@@ -572,7 +575,86 @@ bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
     }
 
     DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
-    return resourceOffset != 0 && CheckBounds(image, resourceOffset, resourceDir.Size);
+    if (resourceOffset == 0 || !CheckBounds(image, resourceOffset, resourceDir.Size) ||
+        resourceDir.Size < sizeof(IMAGE_RESOURCE_DIRECTORY)) return false;
+
+    auto inDirectory = [&](uint32_t relativeOffset, uint32_t size) {
+        return relativeOffset <= resourceDir.Size && size <= resourceDir.Size - relativeOffset &&
+            CheckBounds(image, resourceOffset + relativeOffset, size);
+    };
+    std::unordered_set<uint32_t> visited;
+    std::function<bool(uint32_t, uint32_t, DWORD, DWORD, WORD, const std::string&)> walk;
+    walk = [&](uint32_t relativeOffset, uint32_t depth, DWORD type, DWORD id,
+               WORD language, const std::string& inheritedName) -> bool {
+        if (depth > 16 || !visited.insert(relativeOffset).second ||
+            !inDirectory(relativeOffset, sizeof(IMAGE_RESOURCE_DIRECTORY))) return false;
+
+        IMAGE_RESOURCE_DIRECTORY directory{};
+        std::memcpy(&directory, image->rawData + resourceOffset + relativeOffset,
+            sizeof(directory));
+        const uint32_t entryCount = static_cast<uint32_t>(directory.NumberOfNamedEntries) +
+            directory.NumberOfIdEntries;
+        const uint64_t entriesSize = static_cast<uint64_t>(entryCount) *
+            sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
+        const uint32_t entriesOffset = relativeOffset + sizeof(IMAGE_RESOURCE_DIRECTORY);
+        if (entriesSize > 0xFFFFFFFFull ||
+            !inDirectory(entriesOffset, static_cast<uint32_t>(entriesSize))) return false;
+
+        for (uint32_t i = 0; i < entryCount; ++i) {
+            IMAGE_RESOURCE_DIRECTORY_ENTRY entry{};
+            std::memcpy(&entry, image->rawData + resourceOffset + entriesOffset +
+                i * sizeof(entry), sizeof(entry));
+
+            std::string name = inheritedName;
+            DWORD numericId = entry.Id;
+            if (entry.NameIsString) {
+                const uint32_t nameOffset = entry.NameOffset;
+                if (!inDirectory(nameOffset, sizeof(WORD))) return false;
+                WORD length = 0;
+                std::memcpy(&length, image->rawData + resourceOffset + nameOffset,
+                    sizeof(length));
+                const uint64_t bytes = static_cast<uint64_t>(length) * sizeof(WCHAR);
+                if (bytes > 0xFFFFFFFFull ||
+                    !inDirectory(nameOffset + sizeof(WORD), static_cast<uint32_t>(bytes))) return false;
+                name.clear();
+                for (WORD index = 0; index < length; ++index) {
+                    WCHAR character = 0;
+                    std::memcpy(&character, image->rawData + resourceOffset + nameOffset +
+                        sizeof(WORD) + index * sizeof(WCHAR), sizeof(character));
+                    name.push_back(character <= 0x7Fu ? static_cast<char>(character) : '?');
+                }
+                numericId = 0;
+            }
+
+            const DWORD nextType = depth == 0 ? numericId : type;
+            const DWORD nextId = depth == 1 ? numericId : id;
+            const WORD nextLanguage = depth == 2 ? static_cast<WORD>(numericId) : language;
+            if (entry.DataIsDirectory) {
+                if (!walk(entry.OffsetToDirectory, depth + 1, nextType, nextId,
+                        nextLanguage, name)) return false;
+                continue;
+            }
+            if (depth < 2 || !inDirectory(entry.OffsetToData,
+                    sizeof(IMAGE_RESOURCE_DATA_ENTRY))) return false;
+            IMAGE_RESOURCE_DATA_ENTRY dataEntry{};
+            std::memcpy(&dataEntry, image->rawData + resourceOffset + entry.OffsetToData,
+                sizeof(dataEntry));
+            const DWORD dataOffset = RVAToOffset(image, dataEntry.OffsetToData);
+            if (dataOffset == 0 || !CheckBounds(image, dataOffset, dataEntry.Size)) return false;
+
+            CS_RESOURCE_ENTRY parsed{};
+            parsed.type = nextType;
+            parsed.id = nextId;
+            parsed.languageId = nextLanguage;
+            parsed.name = name;
+            parsed.dataRVA = dataEntry.OffsetToData;
+            parsed.dataSize = dataEntry.Size;
+            parsed.isNamed = !name.empty();
+            image->resources.entries.push_back(std::move(parsed));
+        }
+        return true;
+    };
+    return walk(0, 0, 0, 0, 0, std::string());
 }
 
 // ============================================================================
@@ -723,6 +805,8 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     auto hasField = [available](size_t offset, size_t size) {
         return offset <= available && size <= available - offset;
     };
+    if (available < sizeof(DWORD)) return false;
+    image->loadConfig.valid = TRUE;
 
     if (image->is64Bit) {
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags), sizeof(DWORD))) {
@@ -742,11 +826,18 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             image->loadConfig.hasRFGuard = (lc->GuardFlags &
                 (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
                  IMAGE_GUARD_RF_STRICT)) != 0;
-            image->loadConfig.valid = TRUE;
         }
     } else {
+        PIMAGE_LOAD_CONFIG_DIRECTORY32 lc =
+            reinterpret_cast<PIMAGE_LOAD_CONFIG_DIRECTORY32>(image->rawData + loadConfigOffset);
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable),
+                sizeof(lc->SEHandlerTable)) &&
+            hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerCount),
+                sizeof(lc->SEHandlerCount))) {
+            image->loadConfig.seHandlerTable = lc->SEHandlerTable;
+            image->loadConfig.seHandlerCount = lc->SEHandlerCount;
+        }
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardFlags), sizeof(DWORD))) {
-            PIMAGE_LOAD_CONFIG_DIRECTORY32 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY32)(image->rawData + loadConfigOffset);
             if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SecurityCookie), sizeof(lc->SecurityCookie)))
                 image->loadConfig.securityCookie = lc->SecurityCookie;
             if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
@@ -762,8 +853,37 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             image->loadConfig.hasRFGuard = (lc->GuardFlags &
                 (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
                  IMAGE_GUARD_RF_STRICT)) != 0;
-            image->loadConfig.valid = TRUE;
         }
+    }
+
+    if (!image->is64Bit && image->loadConfig.seHandlerCount != 0) {
+        const uint64_t imageBase = image->ntHeaders32->OptionalHeader.ImageBase;
+        if (image->loadConfig.seHandlerTable < imageBase ||
+            image->loadConfig.seHandlerTable - imageBase > 0xFFFFFFFFull ||
+            image->loadConfig.seHandlerCount > 0x1000000ull) {
+            image->loadConfig.valid = FALSE;
+            return false;
+        }
+        const DWORD tableRVA = static_cast<DWORD>(image->loadConfig.seHandlerTable - imageBase);
+        const DWORD tableOffset = RVAToOffset(image, tableRVA);
+        const uint64_t tableBytes = image->loadConfig.seHandlerCount * sizeof(DWORD);
+        if (tableOffset == 0 || tableBytes > image->rawSize - tableOffset) {
+            image->loadConfig.valid = FALSE;
+            return false;
+        }
+        image->loadConfig.safeSEHHandlerRVAs.reserve(
+            static_cast<size_t>(image->loadConfig.seHandlerCount));
+        for (uint64_t i = 0; i < image->loadConfig.seHandlerCount; ++i) {
+            DWORD handlerRVA = 0;
+            std::memcpy(&handlerRVA, image->rawData + tableOffset + i * sizeof(DWORD),
+                sizeof(handlerRVA));
+            if (RVAToOffset(image, handlerRVA) == 0) {
+                image->loadConfig.valid = FALSE;
+                return false;
+            }
+            image->loadConfig.safeSEHHandlerRVAs.push_back(handlerRVA);
+        }
+        image->loadConfig.hasSafeSEH = TRUE;
     }
 
     if (image->loadConfig.valid && image->loadConfig.guardCFFunctionTable != 0 &&
@@ -833,6 +953,15 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
         entry.sizeOfData = debugEntries[i].SizeOfData;
         entry.addressOfRawData = debugEntries[i].AddressOfRawData;
         entry.pointerToRawData = debugEntries[i].PointerToRawData;
+        if (entry.sizeOfData != 0) {
+            if (entry.pointerToRawData == 0 ||
+                !CheckBounds(image, entry.pointerToRawData, entry.sizeOfData)) return false;
+            if (entry.addressOfRawData != 0) {
+                const DWORD mappedOffset = RVAToOffset(image, entry.addressOfRawData);
+                if (mappedOffset == 0 || !CheckBounds(image, mappedOffset, entry.sizeOfData))
+                    return false;
+            }
+        }
         image->debugDir.entries.push_back(entry);
     }
 
@@ -858,8 +987,107 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
     DWORD delayOffset = RVAToOffset(image, delayImportDir.VirtualAddress);
     if (delayOffset == 0 || !CheckBounds(image, delayOffset, delayImportDir.Size)) return false;
 
-    // 延迟导入使用 IMAGE_DELAYLOAD_DESCRIPTOR 结构
-    return true;
+    struct DelayDescriptor {
+        DWORD attributes;
+        DWORD nameRVA;
+        DWORD moduleHandleRVA;
+        DWORD iatRVA;
+        DWORD intRVA;
+        DWORD boundIatRVA;
+        DWORD unloadIatRVA;
+        DWORD timestamp;
+    };
+    static_assert(sizeof(DelayDescriptor) == 32, "unexpected delay descriptor size");
+    const DWORD descriptorCount = delayImportDir.Size / sizeof(DelayDescriptor);
+    if (descriptorCount == 0 || delayImportDir.Size % sizeof(DelayDescriptor) != 0) return false;
+    bool terminated = false;
+
+    for (DWORD descriptorIndex = 0; descriptorIndex < descriptorCount; ++descriptorIndex) {
+        DelayDescriptor descriptor{};
+        std::memcpy(&descriptor, image->rawData + delayOffset +
+            descriptorIndex * sizeof(descriptor), sizeof(descriptor));
+        const bool empty = descriptor.attributes == 0 && descriptor.nameRVA == 0 &&
+            descriptor.moduleHandleRVA == 0 && descriptor.iatRVA == 0 &&
+            descriptor.intRVA == 0 && descriptor.boundIatRVA == 0 &&
+            descriptor.unloadIatRVA == 0 && descriptor.timestamp == 0;
+        if (empty) {
+            terminated = true;
+            break;
+        }
+        // Production rewriting only supports RVA-based delay descriptors.
+        if ((descriptor.attributes & 1u) == 0 || descriptor.nameRVA == 0 ||
+            descriptor.iatRVA == 0 || descriptor.intRVA == 0) return false;
+
+        CS_DELAY_IMPORT_DLL parsed{};
+        const DWORD nameOffset = RVAToOffset(image, descriptor.nameRVA);
+        if (nameOffset == 0 || !ReadCString(image, nameOffset, parsed.dllName)) return false;
+        parsed.moduleHandleRVA = descriptor.moduleHandleRVA;
+        parsed.iatRVA = descriptor.iatRVA;
+        parsed.intRVA = descriptor.intRVA;
+
+        const DWORD iatOffset = RVAToOffset(image, descriptor.iatRVA);
+        const DWORD intOffset = RVAToOffset(image, descriptor.intRVA);
+        if (iatOffset == 0 || intOffset == 0) return false;
+        const DWORD thunkSize = image->is64Bit
+            ? sizeof(IMAGE_THUNK_DATA64) : sizeof(IMAGE_THUNK_DATA32);
+        const DWORD maxThunks = (std::min)(
+            (image->rawSize - iatOffset) / thunkSize,
+            (image->rawSize - intOffset) / thunkSize);
+        bool thunkTerminated = false;
+        for (DWORD thunkIndex = 0; thunkIndex < maxThunks; ++thunkIndex) {
+            uint64_t thunk = 0;
+            std::memcpy(&thunk, image->rawData + intOffset + thunkIndex * thunkSize,
+                thunkSize);
+            if (thunk == 0) {
+                thunkTerminated = true;
+                break;
+            }
+            CS_IMPORT_FUNCTION function{};
+            function.thunkRVA = descriptor.iatRVA + thunkIndex * thunkSize;
+            const bool ordinal = image->is64Bit
+                ? IMAGE_SNAP_BY_ORDINAL64(thunk) != 0
+                : IMAGE_SNAP_BY_ORDINAL32(static_cast<DWORD>(thunk)) != 0;
+            function.isOrdinal = ordinal;
+            if (ordinal) {
+                function.ordinal = image->is64Bit
+                    ? IMAGE_ORDINAL64(thunk)
+                    : IMAGE_ORDINAL32(static_cast<DWORD>(thunk));
+            } else {
+                if (thunk > 0xFFFFFFFFull) return false;
+                const DWORD hintNameOffset = RVAToOffset(image, static_cast<DWORD>(thunk));
+                if (hintNameOffset == 0 || !CheckBounds(image, hintNameOffset, sizeof(WORD)) ||
+                    !ReadCString(image, hintNameOffset + sizeof(WORD), function.name)) return false;
+                std::memcpy(&function.ordinal, image->rawData + hintNameOffset, sizeof(WORD));
+            }
+            parsed.functions.push_back(std::move(function));
+        }
+        if (!thunkTerminated) return false;
+        image->delayImports.dlls.push_back(std::move(parsed));
+    }
+    return terminated;
+}
+
+bool PEParser::ParseSecurityDirectory(CS_PE_IMAGE* image) {
+    const IMAGE_DATA_DIRECTORY securityDir = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY]
+        : image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    // Unlike other data directories, VirtualAddress is a file offset.
+    if (securityDir.VirtualAddress == 0 || securityDir.Size < 8 ||
+        !CheckBounds(image, securityDir.VirtualAddress, securityDir.Size)) return false;
+
+    DWORD cursor = securityDir.VirtualAddress;
+    const DWORD end = cursor + securityDir.Size;
+    while (cursor < end) {
+        if (end - cursor < 8) return false;
+        DWORD certificateLength = 0;
+        std::memcpy(&certificateLength, image->rawData + cursor, sizeof(certificateLength));
+        if (certificateLength < 8 || certificateLength > end - cursor) return false;
+        const uint64_t aligned = (static_cast<uint64_t>(certificateLength) + 7u) & ~7ull;
+        if (aligned > end - cursor) return false;
+        cursor += static_cast<DWORD>(aligned);
+    }
+    image->hasSignature = TRUE;
+    return cursor == end;
 }
 
 // ============================================================================

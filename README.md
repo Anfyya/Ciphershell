@@ -81,10 +81,15 @@ PE32 / PE32+
 - x86/x64 函数发现，包含 `.pdata`、OEP、exports、TLS、明确 RVA 与 direct-call roots
 - 随机构建种子、opcode/register permutation、handler slot/variant 变异与不可达 junk handler
 - 认证 metadata、按函数派生的 bytecode 密钥与完整性标签
-- x86/x64 runtime、CALL/RET、guest stack、native/import/indirect call bridge
+- x86/x64 runtime、函数内 VM CALL/RET 与 guest stack；外部/间接 native CALL 在 ABI 证明完成前 fail-closed
 - SIMD/x87 严格指令桥与 x64 unwind/CFG 静态链接检查
-- VM 与 startup section encryption 的 W^X loader：临时 RW、恢复 RX/R、刷新 instruction cache，并在存在 TLS 时插入第一条 TLS callback
 - final output 重新解析后复验 metadata、bytecode、trampoline、patch、imports、unwind、CFG 与 W^X
+
+当前默认配置明确关闭以下尚未形成生产闭环的旧模块：CFG flattening、
+Bogus Flow、假导入保护、普通 section 加密和启动字符串加密。显式开启这些
+模块会由 `CapabilityChecker` 拒绝，而不会继续写出或报告 `applied`。其中
+控制流变换仍缺少 RIP-relative/CALL、ABI、unwind 与 CFG 修复；普通加密
+格式仍使用未认证滚动/XOR并在任务表中携带可恢复密钥。
 
 ## 目录
 

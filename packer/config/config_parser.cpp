@@ -107,7 +107,7 @@ simd_bridge = true                # SSE2/SSE4/AVX/AVX2 严格指令桥
 x87_bridge = true                 # x87 严格指令桥
 
 [string_encryption]
-enabled = true
+enabled = false                  # 未认证滚动/XOR格式尚未达到生产要求
 strength = 60
 mode = "startup"
 ascii = true
@@ -116,25 +116,25 @@ resources = false
 clear_after_use = false
 
 [import_protection]
-enabled = true
+enabled = false                  # 尚未改写真实 IAT 调用点
 strength = 50
 
 [section_encryption]
-enabled = true
+enabled = false                  # 任务表仍携带可恢复密钥，暂时 fail-closed
 strength = 58
 mode = "startup"
 
 [control_flow]
-enabled = true
+enabled = false
 strength = 55
 
 [control_flow.flattening]
-enabled = true
+enabled = false                  # 尚未完成 RIP/CALL/unwind/CFG 修复
 strength = 55
 target_functions = []
 
 [control_flow.bogus]
-enabled = true
+enabled = false                  # 尚未证明原函数语义保持
 strength = 50
 
 [anti_debug]

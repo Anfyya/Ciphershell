@@ -8,6 +8,56 @@
 
 namespace CipherShell {
 
+namespace {
+
+bool AdjustFileOffsetDirectories(
+    CS_PE_IMAGE* image,
+    uint32_t threshold,
+    uint32_t delta,
+    std::string& error)
+{
+    if (!image || delta == 0) return true;
+    IMAGE_DATA_DIRECTORY* security = image->is64Bit
+        ? &image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY]
+        : &image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    if (security->VirtualAddress >= threshold && security->VirtualAddress != 0) {
+        const uint64_t shifted = static_cast<uint64_t>(security->VirtualAddress) + delta;
+        if (shifted > 0xFFFFFFFFull) {
+            error = "security directory file offset overflows after PE layout change";
+            return false;
+        }
+        security->VirtualAddress = static_cast<uint32_t>(shifted);
+    }
+
+    const IMAGE_DATA_DIRECTORY debug = PEUtils::GetDataDirectory(
+        image, IMAGE_DIRECTORY_ENTRY_DEBUG);
+    if (debug.VirtualAddress == 0 || debug.Size == 0) return true;
+    const uint32_t debugOffset = PEUtils::RvaToOffset(image, debug.VirtualAddress);
+    if (debugOffset == 0 || debug.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0 ||
+        !PEUtils::CheckRawBounds(image, debugOffset, debug.Size)) {
+        error = "debug directory is malformed after PE layout change";
+        return false;
+    }
+    auto* entries = reinterpret_cast<IMAGE_DEBUG_DIRECTORY*>(image->rawData + debugOffset);
+    const uint32_t count = debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (entries[i].PointerToRawData < threshold || entries[i].PointerToRawData == 0)
+            continue;
+        const uint64_t shifted = static_cast<uint64_t>(entries[i].PointerToRawData) + delta;
+        if (shifted > 0xFFFFFFFFull) {
+            error = "debug raw-data file offset overflows after PE layout change";
+            return false;
+        }
+        entries[i].PointerToRawData = static_cast<uint32_t>(shifted);
+        if (i < image->debugDir.entries.size()) {
+            image->debugDir.entries[i].pointerToRawData = entries[i].PointerToRawData;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 PEEmitter::PEEmitter(CS_PE_IMAGE* image) : m_image(image) {}
 
 bool PEEmitter::IsValid() const {
@@ -103,6 +153,7 @@ bool PEEmitter::RelocateHeaders(uint32_t requiredHeaderEnd, uint32_t firstRaw, s
     if (m_image->hasOverlay && m_image->overlayOffset >= firstRaw) {
         m_image->overlayOffset += headerDelta;
     }
+    if (!AdjustFileOffsetDirectories(m_image, firstRaw, headerDelta, error)) return false;
     SetSizeOfHeaders(AlignUp(requiredHeaderEnd, fileAlign));
     return true;
 }
@@ -196,6 +247,11 @@ PEAppendSectionResult PEEmitter::AppendSection(
     m_image->rawData = newData;
     m_image->rawSize = newRawSize;
     RefreshPointers(ntOffset);
+
+    const uint32_t overlayShift = rawOffset + rawSize - lastFileEnd;
+    if (!AdjustFileOffsetDirectories(m_image, lastFileEnd, overlayShift, result.error)) {
+        return result;
+    }
 
     PIMAGE_SECTION_HEADER newSection = &m_image->sections[m_image->numSections];
     memset(newSection, 0, sizeof(IMAGE_SECTION_HEADER));
@@ -512,6 +568,5 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
 }
 
 } // namespace CipherShell
-
 
 

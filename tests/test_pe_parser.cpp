@@ -1,4 +1,5 @@
 #include "packer/pe_parser/pe_parser.h"
+#include "packer/pe_parser/pe_emitter.h"
 
 #include <cstring>
 #include <iostream>
@@ -100,9 +101,101 @@ bool TestOversizedExportTable() {
     return rejected;
 }
 
+bool TestDebugPayloadOutsideFile() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG] = {
+        kSectionRva, sizeof(IMAGE_DEBUG_DIRECTORY)};
+    auto* debug = reinterpret_cast<IMAGE_DEBUG_DIRECTORY*>(data + kSectionOffset);
+    debug->SizeOfData = 0x40;
+    debug->PointerToRawData = kFileSize - 0x10;
+
+    CipherShell::PEParser parser;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid &&
+        image->errorMessage.find("debug") != std::string::npos;
+    parser.FreeImage(image);
+    return rejected;
+}
+
+bool TestMalformedResourceTree() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE] = {kSectionRva, 32};
+    auto* directory = reinterpret_cast<IMAGE_RESOURCE_DIRECTORY*>(data + kSectionOffset);
+    directory->NumberOfIdEntries = 1;
+    auto* entry = reinterpret_cast<IMAGE_RESOURCE_DIRECTORY_ENTRY*>(directory + 1);
+    entry->Id = 1;
+    entry->OffsetToData = 0x100;
+
+    CipherShell::PEParser parser;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid &&
+        image->errorMessage.find("resource") != std::string::npos;
+    parser.FreeImage(image);
+    return rejected;
+}
+
+bool TestMalformedSecurityDirectory() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {
+        kFileSize - 8, 8};
+    const DWORD oversizedCertificate = 16;
+    std::memcpy(data + kFileSize - 8, &oversizedCertificate,
+        sizeof(oversizedCertificate));
+
+    CipherShell::PEParser parser;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid &&
+        image->errorMessage.find("security") != std::string::npos;
+    parser.FreeImage(image);
+    return rejected;
+}
+
 bool TestNonexistentFile() {
     CipherShell::PEParser parser;
     return parser.LoadFromFile("this-file-must-not-exist.exe") == nullptr;
+}
+
+bool TestSecurityDirectoryMovesWithOverlay() {
+    constexpr DWORD signedSize = kFileSize + 0x20;
+    std::unique_ptr<BYTE[]> data(new BYTE[signedSize]);
+    std::memset(data.get(), 0, signedSize);
+    std::unique_ptr<BYTE[]> minimal(MakeMinimalPE());
+    std::memcpy(data.get(), minimal.get(), kFileSize);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data.get() + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {kFileSize, 0x20};
+    const DWORD certificateLength = 0x20;
+    const WORD certificateRevision = 0x0200;
+    const WORD certificateType = 0x0002;
+    std::memcpy(data.get() + kFileSize, &certificateLength, sizeof(certificateLength));
+    std::memcpy(data.get() + kFileSize + 4, &certificateRevision, sizeof(certificateRevision));
+    std::memcpy(data.get() + kFileSize + 6, &certificateType, sizeof(certificateType));
+
+    CipherShell::PEParser parser;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data.release(), signedSize);
+    if (!image || !image->isValid || !image->hasSignature) {
+        parser.FreeImage(image);
+        return false;
+    }
+
+    CipherShell::PEEmitter emitter(image);
+    const std::vector<uint8_t> sectionData(16, 0xA5);
+    const char sectionName[8] = {'.', 'n', 'e', 'w', 0, 0, 0, 0};
+    const auto appended = emitter.AppendSection(sectionName, sectionData,
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+    const auto security = image->ntHeaders64->OptionalHeader.DataDirectory[
+        IMAGE_DIRECTORY_ENTRY_SECURITY];
+    DWORD movedLength = 0;
+    if (appended.success && security.VirtualAddress < image->rawSize) {
+        std::memcpy(&movedLength, image->rawData + security.VirtualAddress,
+            sizeof(movedLength));
+    }
+    const bool valid = appended.success && security.VirtualAddress == 0x600 &&
+        security.Size == 0x20 && movedLength == certificateLength;
+    parser.FreeImage(image);
+    return valid;
 }
 
 } // namespace
@@ -113,6 +206,11 @@ int main() {
     failures += !Expect(TestTruncatedImportDirectory(), "truncated import directory rejected");
     failures += !Expect(TestUnterminatedImportDirectory(), "unterminated import directory rejected");
     failures += !Expect(TestOversizedExportTable(), "oversized export table rejected");
+    failures += !Expect(TestDebugPayloadOutsideFile(), "debug payload outside file rejected");
+    failures += !Expect(TestMalformedResourceTree(), "malformed resource tree rejected");
+    failures += !Expect(TestMalformedSecurityDirectory(), "malformed certificate table rejected");
     failures += !Expect(TestNonexistentFile(), "nonexistent file rejected");
+    failures += !Expect(TestSecurityDirectoryMovesWithOverlay(),
+        "security directory follows moved certificate overlay");
     return failures == 0 ? 0 : 1;
 }

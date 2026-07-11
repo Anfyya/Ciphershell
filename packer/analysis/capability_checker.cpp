@@ -52,26 +52,45 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
                     "CFG image has no architecture-specific Guard check/dispatch pointer", true);
             }
         }
-    }
-
-    if (ctx.sectionEncryption.enabled) {
-        for (uint32_t i = 0; i < image->numSections; ++i) {
-            const uint32_t characteristics = image->sections[i].Characteristics;
-            if ((characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
-                (characteristics & IMAGE_SCN_MEM_WRITE) != 0) {
-                AddIssue(report, "SectionEncryption", image->sections[i].VirtualAddress,
-                    "input contains a writable-executable section; final W^X restoration is ambiguous",
+        if (!image->is64Bit) {
+            const WORD x86DllCharacteristics =
+                image->ntHeaders32->OptionalHeader.DllCharacteristics;
+            if (image->loadConfig.hasSafeSEH ||
+                (x86DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH) == 0) {
+                AddIssue(report, "SafeSEH", 0,
+                    "x86 image may use SEH/SafeSEH; per-function handler ownership is not proven for VM rewriting",
                     true);
             }
         }
     }
 
-    if (ctx.importProtection.enabled && ctx.importProtection.strength >= 70) {
-        AddIssue(report, "ImportProtection", 0, "runtime resolver callsite rewrite is required for high strength import protection", true);
+    if (ctx.sectionEncryption.enabled) {
+        AddIssue(report, "SectionEncryption", 0,
+            "startup section encryption still embeds recoverable task keys and uses an unauthenticated rolling/XOR stream",
+            true);
     }
 
-    if (ctx.stringEncryption.enabled && ctx.stringEncryption.mode == "on_demand") {
-        AddIssue(report, "StringEncryption", 0, "on-demand decrypt thunks are not yet available; use startup mode for this build", true);
+    if (ctx.importProtection.enabled) {
+        AddIssue(report, "ImportProtection", 0,
+            "real IAT entries and callsites are preserved; fake imports are not production import protection",
+            true);
+    }
+
+    if (ctx.stringEncryption.enabled) {
+        AddIssue(report, "StringEncryption", 0,
+            "startup string encryption still embeds recoverable per-string keys and uses an unauthenticated rolling/XOR stream",
+            true);
+    }
+
+    if (ctx.flattening.enabled) {
+        AddIssue(report, "ControlFlowFlattening", 0,
+            "relocated native instructions lack RIP-relative/CALL fixups, ABI preservation, unwind, and CFG repair",
+            true);
+    }
+    if (ctx.bogusFlow.enabled) {
+        AddIssue(report, "BogusFlow", 0,
+            "generated bogus flow does not preserve the original function control-flow semantics",
+            true);
     }
 
     return report;

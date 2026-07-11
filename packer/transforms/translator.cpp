@@ -43,10 +43,6 @@ bool IsExtendedRegisterClass(RegisterClass registerClass) {
         registerClass == RegisterClass::Mmx;
 }
 
-uint32_t AlignUpValue(uint32_t value, uint32_t alignment) {
-    return alignment ? (value + alignment - 1u) & ~(alignment - 1u) : value;
-}
-
 void InitializeInstruction(BytecodeInstr& instruction) {
     std::memset(&instruction, 0, sizeof(instruction));
     instruction.dst = VM_REG_INVALID;
@@ -572,37 +568,9 @@ bool Translator::TranslateBranch(const InstructionIR& instruction, BytecodeInstr
 }
 
 bool Translator::TranslateCall(const InstructionIR& instruction, BytecodeInstr& output) {
-    const auto operands = SemanticOperands(instruction);
-    const auto stackBytes = m_nativeCallStackBytes.find(instruction.address);
-    const uint32_t nativeStackBytes = stackBytes == m_nativeCallStackBytes.end()
-        ? 0u : stackBytes->second;
-    if (nativeStackBytes > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES) {
-        return FailInstruction(instruction, "native CALL stack arguments exceed bridge capacity");
-    }
-    const uint32_t abi = instruction.machineMode == MachineMode::X64
-        ? static_cast<uint32_t>(VM_ABI_WIN64)
-        : static_cast<uint32_t>(m_config.x86CallAbi);
-    output.aux = VM_CALL_AUX_ENCODE(abi, nativeStackBytes);
     if (instruction.isIndirectBranch) {
-        if (operands.size() != 1) return FailInstruction(instruction, "indirect CALL requires one target operand");
-        if (IsRegister(operands[0])) {
-            output.opcode = VM_CALL_INDIRECT_R;
-            output.flags |= VM_OPERAND_NATIVE_BRIDGE;
-            return EncodeRegisterOperand(instruction, *operands[0], output.src, output.srcBitOffset, output.flags, false);
-        }
-        if (IsMemory(operands[0])) {
-            if (operands[0]->memory.isImageAddress &&
-                m_config.importThunkRVAs.count(operands[0]->memory.resolvedRVA) != 0) {
-                output.opcode = VM_CALL_IMPORT;
-                output.immediate = operands[0]->memory.resolvedRVA;
-                output.flags |= VM_OPERAND_TARGET_IS_IMPORT | VM_OPERAND_NATIVE_BRIDGE;
-                return true;
-            }
-            output.opcode = VM_CALL_INDIRECT_M;
-            output.flags |= VM_OPERAND_SOURCE_MEMORY | VM_OPERAND_NATIVE_BRIDGE;
-            return EncodeMemoryOperand(instruction, *operands[0], output);
-        }
-        return FailInstruction(instruction, "indirect CALL target must be register or memory");
+        return FailInstruction(instruction,
+            "indirect/native CALL ABI and argument recovery are not statically proven");
     }
     if (!instruction.hasBranchTarget) return FailInstruction(instruction, "direct CALL has no target RVA");
     if (instruction.branchTargetRVA >= m_functionStart && instruction.branchTargetRVA < m_functionEnd) {
@@ -611,9 +579,8 @@ bool Translator::TranslateCall(const InstructionIR& instruction, BytecodeInstr& 
         output.branchTargetOffset = instruction.branchTargetRVA;
         output.immediate = instruction.rva + instruction.length;
     } else {
-        output.opcode = VM_CALL_NATIVE;
-        output.immediate = instruction.branchTargetRVA;
-        output.flags |= VM_OPERAND_NATIVE_BRIDGE;
+        return FailInstruction(instruction,
+            "external native CALL ABI and argument recovery are not statically proven");
     }
     return true;
 }
@@ -951,56 +918,6 @@ bool Translator::FinalizeControlFlow(TranslationResult& result) {
     return true;
 }
 
-void Translator::AnalyzeNativeCallStackArguments(const Function& function) {
-    m_nativeCallStackBytes.clear();
-    for (const auto& block : function.blocks) {
-        uint32_t pushedBytes = 0;
-        uint32_t writtenArgumentBytes = 0;
-        for (const auto& instruction : block.instructions) {
-            if (instruction.machineMode == MachineMode::X86 &&
-                instruction.mnemonic == InstructionMnemonic::Push) {
-                uint32_t width = instruction.stackWidth == 16 ? 2u : 4u;
-                pushedBytes = (std::min)(
-                    VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 1u, pushedBytes + width);
-            }
-            for (const auto& operand : instruction.operands) {
-                if (operand.type != OperandType::Memory || !OperandWrites(operand.action) ||
-                    !operand.memory.hasBase ||
-                    operand.memory.baseInfo.registerClass != RegisterClass::GeneralPurpose ||
-                    operand.memory.baseInfo.family != 4 || operand.memory.displacement < 0) continue;
-                const uint32_t width = WidthBytes(
-                    operand.memory.width ? operand.memory.width : operand.width);
-                if (width == 0) continue;
-                if (operand.memory.displacement >
-                        VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 0x20u) {
-                    writtenArgumentBytes = VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 1u;
-                    continue;
-                }
-                const uint32_t displacement = static_cast<uint32_t>(operand.memory.displacement);
-                if (instruction.machineMode == MachineMode::X64) {
-                    if (displacement < 0x20u) continue;
-                    writtenArgumentBytes = (std::max)(writtenArgumentBytes,
-                        displacement - 0x20u + width);
-                } else {
-                    writtenArgumentBytes = (std::max)(writtenArgumentBytes,
-                        displacement + width);
-                }
-            }
-            if (instruction.IsCall()) {
-                uint32_t bytes = instruction.machineMode == MachineMode::X64
-                    ? AlignUpValue(writtenArgumentBytes, 8)
-                    : AlignUpValue((std::max)(pushedBytes, writtenArgumentBytes), 2);
-                m_nativeCallStackBytes[instruction.address] = bytes;
-                pushedBytes = 0;
-                writtenArgumentBytes = 0;
-            } else if (instruction.IsBranch() || instruction.IsReturn()) {
-                pushedBytes = 0;
-                writtenArgumentBytes = 0;
-            }
-        }
-    }
-}
-
 bool Translator::ValidateFlagDataflow(
     const Function& function,
     uint32_t& terminalReturnStackCleanup) {
@@ -1157,7 +1074,6 @@ TranslationResult Translator::TranslateFunction(const Function& function) {
     }
     m_functionStart = function.entryAddress;
     m_functionEnd = function.entryAddress + function.size;
-    AnalyzeNativeCallStackArguments(function);
     if (!ValidateFlagDataflow(function, result.returnStackCleanup)) {
         result.failures = m_lastFailures;
         return result;
