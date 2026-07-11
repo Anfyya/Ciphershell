@@ -31,8 +31,8 @@ struct GlobalConfig {
         stripTimestamps(true),
         randomizeSections(true),
         antiDebugMode("implicit"),
-        stringEncryption(true),
-        importObfuscation(true),
+        stringEncryption(false),
+        importObfuscation(false),
         resourceEncryption(false) {}
 };
 

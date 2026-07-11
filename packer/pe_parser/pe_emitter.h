@@ -60,6 +60,11 @@ private:
     void SetSizeOfHeaders(uint32_t value);
     void SetSizeOfImage(uint32_t value);
     bool RelocateHeaders(uint32_t requiredHeaderEnd, uint32_t firstRaw, std::string& error);
+    // 在 buffer 重建后，把所有“文件偏移型”引用按 [shiftPoint, +inf) += delta 平移：
+    // section.PointerToRawData、overlayOffset、Security Directory 文件偏移、
+    // Debug Directory 每个 IMAGE_DEBUG_DIRECTORY.PointerToRawData（含同步副本）。
+    // 该操作为纯写入、不失败，必须在 rawData/rawSize 已替换到新 buffer 之后调用。
+    void ShiftFileOffsetReferences(uint32_t shiftPoint, uint32_t delta);
 
     CS_PE_IMAGE* m_image;
 };

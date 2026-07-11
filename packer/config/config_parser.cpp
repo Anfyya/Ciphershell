@@ -107,7 +107,9 @@ simd_bridge = true                # SSE2/SSE4/AVX/AVX2 严格指令桥
 x87_bridge = true                 # x87 严格指令桥
 
 [string_encryption]
-enabled = true
+# Fail-closed: 弱加密（未认证算法 + 可恢复密钥），默认关闭。
+# 显式 enabled = true 会在 CapabilityChecker 阶段（任何 PE 修改之前）被 fatal 拒绝。
+enabled = false
 strength = 60
 mode = "startup"
 ascii = true
@@ -116,25 +118,31 @@ resources = false
 clear_after_use = false
 
 [import_protection]
-enabled = true
+# Fail-closed: 仅追加假导入并保留真实 IAT，未改写 callsite。默认关闭。
+# 显式 enabled = true 会在 CapabilityChecker 阶段被 fatal 拒绝。
+enabled = false
 strength = 50
 
 [section_encryption]
-enabled = true
+# Fail-closed: 弱加密（未认证算法 + 可恢复密钥），默认关闭。
+# 显式 enabled = true 会在 CapabilityChecker 阶段被 fatal 拒绝。
+enabled = false
 strength = 58
 mode = "startup"
 
 [control_flow]
-enabled = true
+# Fail-closed: flattening / bogus flow 无法保证原函数语义保持。默认关闭。
+# 显式开启任一子开关会在 CapabilityChecker 阶段被 fatal 拒绝。
+enabled = false
 strength = 55
 
 [control_flow.flattening]
-enabled = true
+enabled = false
 strength = 55
 target_functions = []
 
 [control_flow.bogus]
-enabled = true
+enabled = false
 strength = 50
 
 [anti_debug]

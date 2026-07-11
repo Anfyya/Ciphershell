@@ -25,7 +25,8 @@ simd_bridge = true
 x87_bridge = true
 
 [string_encryption]
-enabled = true
+# Fail-closed: 弱加密（未认证算法 + 可恢复密钥）。显式开启会被 CapabilityChecker fatal 拒绝。
+enabled = false
 strength = 80
 mode = "startup"
 ascii = true
@@ -34,7 +35,8 @@ resources = false
 clear_after_use = false
 
 [import_protection]
-enabled = true
+# Fail-closed: 保留真实 IAT，未改写 callsite。显式开启会被 CapabilityChecker fatal 拒绝。
+enabled = false
 strength = 60
 
 [section_encryption]

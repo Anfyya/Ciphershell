@@ -106,7 +106,6 @@ private:
     uint8_t OpcodeForCondition(BranchKind branchKind) const;
 
     bool FinalizeControlFlow(TranslationResult& result);
-    void AnalyzeNativeCallStackArguments(const Function& function);
     bool ValidateFlagDataflow(const Function& function, uint32_t& terminalReturnStackCleanup);
     bool FailInstruction(const InstructionIR& instruction, const std::string& reason);
     static std::string FormatInstructionBytes(const InstructionIR& instruction);
@@ -117,7 +116,6 @@ private:
     std::vector<TranslationFailure> m_lastFailures;
     uint64_t m_functionStart = 0;
     uint64_t m_functionEnd = 0;
-    std::unordered_map<uint64_t, uint32_t> m_nativeCallStackBytes;
     bool m_initialized = false;
 };
 

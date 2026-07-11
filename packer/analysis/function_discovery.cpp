@@ -125,6 +125,24 @@ bool ValidateFunctionOwnership(FunctionDiscoveryResult& result) {
     return true;
 }
 
+// 仅识别明确访问 FS:[0]（TIB.ExceptionList 异常链头）的内存操作。
+// 不因任意 FS 段访问误判为 SEH：fs:[非零偏移] 是 TEB/TLS/PEB 访问，
+// fs:[base] 是 TEB 相对寻址，二者都不是异常链安装/卸载。
+bool FunctionAccessesExceptionChain(const Function& function) {
+    for (const auto& block : function.blocks) {
+        for (const auto& instr : block.instructions) {
+            for (const auto& op : instr.operands) {
+                if (op.type != OperandType::Memory) continue;
+                if (op.memory.segment != RegisterId::FS) continue;
+                if (op.memory.hasBase || op.memory.hasIndex) continue;
+                if (op.memory.displacement != 0) continue;
+                return true;  // fs:[0] = TIB.ExceptionList
+            }
+        }
+    }
+    return false;
+}
+
 void AssignFunctionNames(const CS_PE_IMAGE* image, std::vector<Function>& functions) {
     std::unordered_map<uint32_t, std::string> exports;
     for (const auto& exported : image->exports.functions) {
@@ -356,6 +374,27 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
     }
     if (!ValidateFunctionOwnership(result)) return result;
     AssignFunctionNames(image, result.functions);
+
+    // 函数级 SEH 判定：
+    // - SafeSEH handler 表中的入口 RVA 对应函数标记 usesSEH（handler 与函数入口
+    //   双方均为 RVA 坐标系，不混用 VA/file offset）。
+    // - 显式访问 FS:[0] 异常链的函数标记 usesSEH；普通 FS:[非零偏移] 的 TEB/TLS
+    //   访问不被误判。
+    // 是否允许 VM 化由 CapabilityChecker 在函数级决定（usesSEH 的目标函数拒绝），
+    // 不因未设置 IMAGE_DLLCHARACTERISTICS_NO_SEH 全局拒绝整份 x86 映像。
+    std::unordered_set<uint32_t> safeSEHHandlers(image->loadConfig.safeSEHHandlerRVAs.begin(),
+        image->loadConfig.safeSEHHandlerRVAs.end());
+    for (auto& function : result.functions) {
+        if (function.entryAddress <= 0xFFFFFFFFull &&
+            safeSEHHandlers.count(static_cast<uint32_t>(function.entryAddress)) != 0) {
+            function.usesSEH = true;
+            continue;
+        }
+        if (FunctionAccessesExceptionChain(function)) {
+            function.usesSEH = true;
+        }
+    }
+
     std::sort(result.functions.begin(), result.functions.end(), [](const auto& left, const auto& right) {
         return left.entryAddress < right.entryAddress;
     });

@@ -81,10 +81,22 @@ PE32 / PE32+
 - x86/x64 函数发现，包含 `.pdata`、OEP、exports、TLS、明确 RVA 与 direct-call roots
 - 随机构建种子、opcode/register permutation、handler slot/variant 变异与不可达 junk handler
 - 认证 metadata、按函数派生的 bytecode 密钥与完整性标签
-- x86/x64 runtime、CALL/RET、guest stack、native/import/indirect call bridge
+- x86/x64 runtime、CALL/RET、guest stack；Translator 只允许能静态证明属于当前 VM 控制流的直接 VM CALL，external native / import / indirect register / indirect memory CALL 一律翻译失败
 - SIMD/x87 严格指令桥与 x64 unwind/CFG 静态链接检查
-- VM 与 startup section encryption 的 W^X loader：临时 RW、恢复 RX/R、刷新 instruction cache，并在存在 TLS 时插入第一条 TLS callback
 - final output 重新解析后复验 metadata、bytecode、trampoline、patch、imports、unwind、CFG 与 W^X
+
+## Fail-closed 模块
+
+以下模块当前不具备完整生产语义闭环，默认关闭，且 protection level / preset 不会隐式开启。
+用户显式开启时，`CapabilityChecker` 会在任何 PE 内容、section、header、入口点、导入表或文件偏移被修改之前以 fatal issue 拒绝，输出状态只能是 `rejected` / `skipped` / `disabled`，绝不出现 `applied` 或 `partial`：
+
+- **section encryption** —— 未认证算法 + 可恢复密钥，无生产闭环
+- **startup string encryption** —— 未认证算法 + 可恢复密钥，无生产闭环
+- **import protection** —— 仅追加假导入并保留真实 IAT，未改写 callsite
+- **CFG flattening** —— 缺少 RIP-relative/CALL 重定位、ABI、unwind、CFG 修复，无法保持原函数语义
+- **bogus flow** —— 无法证明原函数语义保持
+
+`control_flow` 总开关与 `flattening` / `bogus` 子开关必须一致：总开关开启但无子功能（no-op）、或子功能开启却绕过总开关，均被 fatal 拒绝。
 
 ## 目录
 

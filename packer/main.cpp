@@ -722,6 +722,7 @@ int main(int argc, char* argv[]) {
         originalOEP = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
     }
     const WORD originalSectionCount = image->numSections;
+    (void)originalSectionCount;  // section encryption 已 fail-closed，不再需要该边界
     std::cout << "  原始入口点 (OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
 
     // ============================================================================
@@ -733,223 +734,47 @@ int main(int argc, char* argv[]) {
 
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
 
-    // Phase A: 字符串加密（明文代码段中的内联字符串，L2+）
+    // Phase A: 字符串加密 —— 弱加密（未认证算法 + 可恢复密钥），不具备生产语义闭环。
+    // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫，
+    // 绝不应用，绝不打印 applied/partial。
     if (buildCtx.stringEncryption.enabled) {
-        std::cout << "  应用字符串加密..." << std::endl;
-
-        CipherShell::StringEncryptor strEncryptor;
-        CipherShell::CS_STRING_CONFIG strConfig;
-        strConfig.encryptAnsiStrings = buildCtx.stringAscii;
-        strConfig.encryptWideStrings = buildCtx.stringUtf16;
-        strConfig.scanResources = buildCtx.stringResources;
-        strConfig.scanReadableSections = true;
-
-        auto strings = strEncryptor.ScanStrings(image.get(), strConfig);
-        if (strEncryptor.HasError()) {
-            std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor reason="
-                      << strEncryptor.GetLastError() << std::endl;
-            PrintFeatureStatus("string_encryption", "failed", strEncryptor.GetLastError());
-            return 1;
-        }
-        std::cout << "    发现 " << strings.size() << " 个字符串" << std::endl;
-
-        if (!strings.empty()) {
-            if (!strEncryptor.EncryptStrings(image.get(), strings)) {
-                std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor reason="
-                          << strEncryptor.GetLastError() << std::endl;
-                PrintFeatureStatus("string_encryption", "failed", strEncryptor.GetLastError());
-                return 1;
-            }
-            encryptedStringRegions.reserve(encryptedStringRegions.size() + strings.size());
-            for (const auto& s : strings) {
-                CipherShell::CS_ENCRYPTED_SECTION region{};
-                region.sectionIndex = 0xFFFF;
-                region.originalRVA = s.rva;
-                region.originalSize = s.length;
-                region.encryptedSize = s.length;
-                region.originalCharacteristics = IMAGE_SCN_MEM_READ;
-                for (uint32_t sectionIndex = 0; sectionIndex < image->numSections; ++sectionIndex) {
-                    const auto& section = image->sections[sectionIndex];
-                    const uint32_t span = (std::max)(section.Misc.VirtualSize,
-                        static_cast<DWORD>(section.SizeOfRawData));
-                    if (span != 0 && s.rva >= section.VirtualAddress &&
-                        s.rva - section.VirtualAddress < span) {
-                        region.originalCharacteristics = section.Characteristics;
-                        break;
-                    }
-                }
-                memcpy(region.sectionKey.key, s.key, 32);
-                memcpy(region.sectionKey.nonce, s.nonce, 12);
-                region.sectionKey.counter = 0;
-                encryptedStringRegions.push_back(region);
-            }
-            std::cout << "    已加密字符串并登记运行时解密任务" << std::endl;
-            PrintFeatureStatus("string_encryption", "applied", "mode=" + buildCtx.stringEncryption.mode);
-        } else {
-            PrintFeatureStatus("string_encryption", "skipped", "no_strings_found");
-        }
-    } else {
-        PrintFeatureStatus("string_encryption", "skipped", "disabled");
+        std::cerr << "STRING_ENCRYPTION_REJECT module=StringEncryption"
+                  << " reason=fail_closed_unfinished_cipher_with_recoverable_key" << std::endl;
+        PrintFeatureStatus("string_encryption", "rejected", "fail_closed_unfinished_closure");
+        return 1;
     }
+    PrintFeatureStatus("string_encryption", "skipped", "disabled");
 
-    // Phase B: 导入表混淆（L2+）
+    // Phase B: 导入表混淆 —— 仅追加假导入并保留真实 IAT，未改写 callsite，不具备生产闭环。
+    // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫。
     if (buildCtx.importProtection.enabled) {
-        std::cout << "  应用导入表混淆..." << std::endl;
-
-        CipherShell::ImportObfuscator obfuscator;
-        CipherShell::CS_IMPORT_OBFUSCATION_CONFIG obfConfig;
-        obfConfig.strategy = CipherShell::ImportObfuscationStrategy::StrategyB;
-
-        CipherShell::APIResolver resolver;
-        if (!resolver.Initialize()) {
-            std::cerr << "IMPORT_PROTECTION_FAIL module=APIResolver reason=initialize_failed" << std::endl;
-            PrintFeatureStatus("import_protection", "failed", "resolver_initialize_failed");
-            return 1;
-        }
-
-        auto obfImports = obfuscator.ObfuscateImports(image.get(), obfConfig, &resolver);
-        if (!obfuscator.WasApplied()) {
-            std::cerr << "IMPORT_PROTECTION_FAIL module=ImportObfuscator reason="
-                      << obfuscator.GetLastError() << std::endl;
-            PrintFeatureStatus("import_protection", "failed", obfuscator.GetLastError());
-            return 1;
-        }
-        std::cout << "    已处理 " << obfImports.size() << " 个导入函数" << std::endl;
-        PrintFeatureStatus(
-            "import_protection",
-            "applied",
-            "mode=rebuilt_import_directory real_iat=preserved fake_imports=" +
-                std::to_string(obfuscator.GetWrittenFakeImportCount()));
-    } else {
-        PrintFeatureStatus("import_protection", "skipped", "disabled");
+        std::cerr << "IMPORT_PROTECTION_REJECT module=ImportProtection"
+                  << " reason=fail_closed_real_iat_callsite_not_rewritten" << std::endl;
+        PrintFeatureStatus("import_protection", "rejected", "fail_closed_unfinished_closure");
+        return 1;
     }
+    PrintFeatureStatus("import_protection", "skipped", "disabled");
 
-    // Phase C: 控制流平坦化（L3+，暂禁用——GenerateFlattenedCode 需要优化）
-    if (buildCtx.flattening.enabled) {  // FIXME: 暂时禁用，待优化
-        std::cout << "  应用控制流平坦化..." << std::endl;
-
-        CipherShell::Disassembler disasm;
-        bool is64 = image->is64Bit != 0;
-        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
-                                     : image->ntHeaders32->OptionalHeader.ImageBase);
-
-        for (WORD si = 0; si < image->numSections; si++) {
-            IMAGE_SECTION_HEADER& sec = image->sections[si];
-            if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-
-            DWORD secOffset = sec.PointerToRawData;
-            DWORD secSize   = sec.SizeOfRawData;
-            if (secOffset + secSize > image->rawSize) continue;
-
-            BYTE* secData = image->rawData + secOffset;
-            uint64_t baseAddr = sec.VirtualAddress;
-
-            auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
-            if (disasm.HasError()) {
-                std::cerr << "CFG_FLATTEN_FAIL module=ZydisDecoder reason="
-                          << disasm.GetLastError() << std::endl;
-                PrintFeatureStatus("control_flow.flattening", "failed", disasm.GetLastError());
-                return 1;
-            }
-            if (functions.empty()) {
-                std::cout << "    代码段[" << si << "]: 未识别到可处理函数" << std::endl;
-                continue;
-            }
-            std::cout << "    代码段[" << si << "]: 识别到 " << functions.size() << " 个函数" << std::endl;
-
-            CipherShell::CFGFlattener flattener;
-            CipherShell::FlatteningConfig flatConfig;
-            flatConfig.enableStateEncryption = true;
-            flatConfig.enableStateRandomization = true;
-            flatConfig.junkCaseCount = 5;
-
-            uint32_t flattenedCount = 0;
-            for (const auto& func : functions) {
-                if (func.blocks.size() < 2) continue;
-
-                auto flatResult = flattener.FlattenFunction(func, flatConfig);
-                DWORD codeSize = 0;
-                BYTE* flatCode = flattener.GenerateFlattenedCode(flatResult, is64, &codeSize);
-                if (flatCode && codeSize > 0) {
-                    DWORD funcSize = (DWORD)(func.size);
-                    if (codeSize <= funcSize) {
-                        DWORD funcOffset = (DWORD)(func.entryAddress - baseAddr);
-                        memcpy(secData + funcOffset, flatCode, codeSize);
-                        if (codeSize < funcSize) {
-                            memset(secData + funcOffset + codeSize, 0xCC, funcSize - codeSize);
-                        }
-                        flattenedCount++;
-                    }
-                    delete[] flatCode;
-                }
-            }
-            std::cout << "    已平坦化 " << flattenedCount << " 个函数" << std::endl;
-        }
+    // Phase C: 控制流平坦化 —— 缺少 RIP-relative/CALL 重定位、ABI、unwind、CFG 修复，
+    // 无法保证原函数语义。由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；
+    // 此处保留显式 fail-closed 守卫，绝不应用。
+    if (buildCtx.flattening.enabled) {
+        std::cerr << "CFG_FLATTEN_REJECT module=ControlFlow"
+                  << " reason=fail_closed_no_relocation_abi_unwind_cfg_repair" << std::endl;
+        PrintFeatureStatus("control_flow.flattening", "rejected", "fail_closed_unfinished_closure");
+        return 1;
     }
+    PrintFeatureStatus("control_flow.flattening", "skipped", "disabled");
 
-    // Phase D: 虚假控制流（L3+，需在加密前反汇编明文代码）
+    // Phase D: 虚假控制流 —— 无法证明原函数语义保持，不具备生产闭环。
+    // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫。
     if (buildCtx.bogusFlow.enabled) {
-        std::cout << "  应用虚假控制流..." << std::endl;
-
-        CipherShell::BogusFlowInjector bogusInjector;
-        CipherShell::BogusFlowConfig bogusConfig;
-        bogusConfig.bogusBlocksPerReal = 2;
-        bogusConfig.duplicateCode = true;
-        bogusConfig.duplicateRatio = 0.3f;
-        bogusConfig.insertDeadCode = true;
-
-        CipherShell::Disassembler disasm;
-        bool is64 = image->is64Bit != 0;
-        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
-                                     : image->ntHeaders32->OptionalHeader.ImageBase);
-
-        for (WORD si = 0; si < image->numSections; si++) {
-            IMAGE_SECTION_HEADER& sec = image->sections[si];
-            if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-
-            DWORD secOffset = sec.PointerToRawData;
-            DWORD secSize   = sec.SizeOfRawData;
-            if (secOffset + secSize > image->rawSize) continue;
-
-            auto functions = disasm.AnalyzeCode(
-                image->rawData + secOffset, secSize,
-                sec.VirtualAddress, is64);
-            if (disasm.HasError()) {
-                std::cerr << "CFG_BOGUS_FAIL module=ZydisDecoder reason="
-                          << disasm.GetLastError() << std::endl;
-                PrintFeatureStatus("control_flow.bogus", "failed", disasm.GetLastError());
-                return 1;
-            }
-
-            uint32_t injectedCount = 0;
-            for (const auto& func : functions) {
-                if (func.blocks.size() < 2) continue;
-
-                auto bogusResult = bogusInjector.InjectIntoFunction(func, bogusConfig);
-
-                DWORD codeSize = 0;
-                BYTE* bogusCode = bogusInjector.GenerateBogusCode(bogusResult, is64, &codeSize);
-                if (bogusCode && codeSize > 0) {
-                    DWORD funcSize = static_cast<DWORD>(func.size);
-                    DWORD funcOffset = static_cast<DWORD>(func.entryAddress - sec.VirtualAddress);
-                    if (codeSize <= funcSize && funcOffset + funcSize <= secSize) {
-                        memcpy(image->rawData + secOffset + funcOffset, bogusCode, codeSize);
-                        if (codeSize < funcSize) {
-                            memset(image->rawData + secOffset + funcOffset + codeSize, 0x90, funcSize - codeSize);
-                        }
-                        injectedCount++;
-                    } else {
-                        std::cerr << "CFG_BOGUS_SKIP module=BogusFlow function_rva=0x" << std::hex
-                                  << func.entryAddress << std::dec
-                                  << " reason=generated_code_does_not_fit_original_function" << std::endl;
-                    }
-                    delete[] bogusCode;
-                }
-                bogusInjector.Cleanup(bogusResult);
-            }
-            std::cout << "    已向 " << injectedCount << " 个函数写入虚假控制流" << std::endl;
-        }
+        std::cerr << "CFG_BOGUS_REJECT module=ControlFlow"
+                  << " reason=fail_closed_cannot_prove_semantic_preservation" << std::endl;
+        PrintFeatureStatus("control_flow.bogus", "rejected", "fail_closed_unfinished_closure");
+        return 1;
     }
+    PrintFeatureStatus("control_flow.bogus", "skipped", "disabled");
 
     bool vmApplied = false;
     uint32_t vmRegisterCount = 0;
@@ -1346,40 +1171,22 @@ int main(int argc, char* argv[]) {
                   << "，拒绝函数数: " << rejectedCount << std::endl;
 
     }
-    // Phase F: Section 加密（L1+，最后执行——加密所有变换后的代码）
+    // Phase F: Section 加密 —— 弱加密（未认证算法 + 可恢复密钥），不具备生产语义闭环。
+    // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫，
+    // 绝不应用，绝不打印 applied/partial。
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
     CipherShell::StubEmbedResult loaderResult{};
     bool loaderApplied = false;
     if (buildCtx.sectionEncryption.enabled) {
-        std::cout << "  应用 Section 加密..." << std::endl;
-
-        CipherShell::SectionEncryptor encryptor;
-        CipherShell::CS_ENCRYPT_CONFIG encConfig;
-        encConfig.encryptCodeSections = true;
-        encConfig.encryptDataSections = false;
-        encConfig.encryptResources = config.global.resourceEncryption;
-        encConfig.excludeSectionsAtOrAfter = originalSectionCount;
-        encConfig.excludeRelocationTargets = TRUE;
-        CipherShell::CS_ENCRYPTION_KEY masterKey{};
-        if (!encryptor.GenerateRandomKey(masterKey)) {
-            std::cerr << "SECTION_ENCRYPTION_FAIL module=SectionEncryptor reason=secure_random_failed" << std::endl;
-            PrintFeatureStatus("section_encryption", "failed", "secure_random_failed");
-            return 1;
-        }
-
-        encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
-        std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
-            PrintFeatureStatus("section_encryption", encryptedSections.empty() ? "skipped" : "applied", encryptedSections.empty() ? "no_encryptable_sections" : "mode=" + buildCtx.sectionEncryption.mode);
-    } else {
-        PrintFeatureStatus("section_encryption", "skipped", "disabled");
+        std::cerr << "SECTION_ENCRYPTION_REJECT module=SectionEncryption"
+                  << " reason=fail_closed_unfinished_cipher_with_recoverable_key" << std::endl;
+        PrintFeatureStatus("section_encryption", "rejected", "fail_closed_unfinished_closure");
+        return 1;
     }
+    PrintFeatureStatus("section_encryption", "skipped", "disabled");
 
-    if (!encryptedStringRegions.empty()) {
-        encryptedSections.insert(encryptedSections.end(),
-            encryptedStringRegions.begin(), encryptedStringRegions.end());
-        std::cout << "    已追加 " << encryptedStringRegions.size()
-                  << " 个字符串运行时解密任务" << std::endl;
-    }
+    // 字符串运行时解密任务区域始终为空（string encryption 已 fail-closed）。
+    (void)encryptedStringRegions;
 
     // ============================================================================
     // Step 3: 签名消除

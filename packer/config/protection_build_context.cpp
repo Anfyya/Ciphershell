@@ -65,12 +65,19 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     }
 #endif
 
-    ctx.sectionEncryption = PresetFeature(ctx.quickLevel >= 1, 50 + ctx.quickLevel * 8, "startup");
-    ctx.stringEncryption = PresetFeature(ctx.quickLevel >= 2 && config.global.stringEncryption, 60, "startup");
-    ctx.importProtection = PresetFeature(ctx.quickLevel >= 2 && config.global.importObfuscation, 50, "metadata");
-    ctx.controlFlow = PresetFeature(ctx.quickLevel >= 3, 55, "mixed");
-    ctx.flattening = PresetFeature(ctx.quickLevel >= 3, 55, "basic");
-    ctx.bogusFlow = PresetFeature(ctx.quickLevel >= 3, 50, "safe_nop_only");
+    // 以下模块当前不具备完整生产语义闭环，预设绝不隐式开启：
+    //   section encryption / startup string encryption / import protection /
+    //   CFG flattening / bogus flow
+    // 仅当用户在配置中显式设置 enabled 时才会被打开，并由 CapabilityChecker
+    // 在任何 PE 修改之前以 fatal issue 拒绝。
+    // strength 仍然按等级预设，仅在显式开启时才参与（随后即被拒绝）。
+    ctx.sectionEncryption = PresetFeature(false, 50 + ctx.quickLevel * 8, "startup");
+    ctx.stringEncryption = PresetFeature(false, 60, "startup");
+    ctx.importProtection = PresetFeature(false, 50, "metadata");
+    ctx.controlFlow = PresetFeature(false, 55, "mixed");
+    ctx.flattening = PresetFeature(false, 55, "basic");
+    ctx.bogusFlow = PresetFeature(false, 50, "safe_nop_only");
+    // VM 具备完整语义闭环（ISA + runtime + 静态链接验证），允许按等级预设开启。
     ctx.vm = PresetFeature(ctx.quickLevel >= 4, 80 + (ctx.quickLevel >= 5 ? 10 : 0), "function_vm");
 
     if (config.vm.enabledSet) ctx.vm.enabled = config.vm.enabled;

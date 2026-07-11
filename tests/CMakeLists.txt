@@ -63,5 +63,16 @@ add_executable(test_cli_options
 
 target_include_directories(test_cli_options PRIVATE ${CMAKE_SOURCE_DIR})
 
+# Fail-closed 基线测试（仅编译，不运行）
+add_executable(test_fail_closed
+    test_fail_closed.cpp
+)
+
+target_link_libraries(test_fail_closed PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_fail_closed PRIVATE ${CMAKE_SOURCE_DIR})
+
 add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
