@@ -36,6 +36,17 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
+也可以直接运行仓库根目录的 `build_win.bat`。脚本会从自身位置构建，
+自动发现 VS2022/CMake，并将日志写入 `build/build_Release.log`；不再依赖
+任何开发者机器的固定盘符。若 NASM 不在 `PATH`，可先设置
+`CS_NASM_EXECUTABLE` 为 `nasm.exe` 的完整路径。
+
+测试目标默认参与编译，但依据本仓库的验证边界，运行测试可执行文件和
+加壳样本仍由使用者在隔离环境中手动完成。历史 `decryptor` 只保留为显式
+诊断目标，默认不构建；它没有生产恢复密钥契约，也不会再复制输入文件并
+误报“解密完成”。如需审查该诊断目标，可配置
+`-DCS_BUILD_LEGACY_DECRYPTOR=ON`。
+
 生成的解决方案位于 `build/CipherShell.sln`，也可以直接用 VS2022 打开。构建系统会从当前 CMake/VS2022 generator 自动发现 MSVC 与 Windows SDK，不依赖开发者机器上的固定绝对路径。
 
 ## 基本用法

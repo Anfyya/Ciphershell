@@ -15,6 +15,21 @@ bool IsPowerOfTwo(uint32_t value) {
     return value != 0 && (value & (value - 1u)) == 0;
 }
 
+bool CheckedAdd(DWORD left, DWORD right, DWORD& result) {
+    const uint64_t sum = static_cast<uint64_t>(left) + right;
+    if (sum > 0xFFFFFFFFull) return false;
+    result = static_cast<DWORD>(sum);
+    return true;
+}
+
+bool ReadCString(const CS_PE_IMAGE* image, DWORD offset, std::string& value) {
+    if (!image || !image->rawData || offset >= image->rawSize) return false;
+    const char* begin = reinterpret_cast<const char*>(image->rawData + offset);
+    const void* end = std::memchr(begin, '\0', image->rawSize - offset);
+    if (!end) return false;
+    value.assign(begin, static_cast<const char*>(end));
+    return true;
+}
 
 }
 
@@ -237,21 +252,36 @@ bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
 // ============================================================================
 
 bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
-    (void)ParseImportTable(image);
-    (void)ParseExportTable(image);
-    (void)ParseRelocationTable(image);
-    (void)ParseResourceTable(image);
-    (void)ParseTLS(image);
+    auto directory = [image](size_t index) -> IMAGE_DATA_DIRECTORY {
+        const DWORD count = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.NumberOfRvaAndSizes
+            : image->ntHeaders32->OptionalHeader.NumberOfRvaAndSizes;
+        if (index >= count || index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) return {};
+        return image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.DataDirectory[index]
+            : image->ntHeaders32->OptionalHeader.DataDirectory[index];
+    };
+    auto parseIfPresent = [&](size_t index, bool (PEParser::*parser)(CS_PE_IMAGE*),
+                              const char* name) {
+        const IMAGE_DATA_DIRECTORY dir = directory(index);
+        if (dir.VirtualAddress == 0 && dir.Size == 0) return true;
+        if (dir.VirtualAddress == 0 || dir.Size == 0 || !(this->*parser)(image)) {
+            SetError(image, std::string("Malformed ") + name + " directory");
+            return false;
+        }
+        return true;
+    };
 
-    if (image->is64Bit) {
-        (void)ParseExceptionTable(image);
-    }
-
-    (void)ParseLoadConfig(image);
-    (void)ParseDebugDirectory(image);
-    (void)ParseDelayImports(image);
-
-    return true;
+    return parseIfPresent(IMAGE_DIRECTORY_ENTRY_IMPORT, &PEParser::ParseImportTable, "import") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_EXPORT, &PEParser::ParseExportTable, "export") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_BASERELOC, &PEParser::ParseRelocationTable, "relocation") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_RESOURCE, &PEParser::ParseResourceTable, "resource") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_TLS, &PEParser::ParseTLS, "TLS") &&
+        (!image->is64Bit || parseIfPresent(IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+            &PEParser::ParseExceptionTable, "exception")) &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &PEParser::ParseLoadConfig, "load config") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DEBUG, &PEParser::ParseDebugDirectory, "debug") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &PEParser::ParseDelayImports, "delay import");
 }
 
 // ============================================================================
@@ -271,101 +301,108 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
     }
 
     DWORD importOffset = RVAToOffset(image, importDir.VirtualAddress);
-    if (importOffset == 0) {
+    if (importOffset == 0 || !CheckBounds(image, importOffset, importDir.Size)) {
         return false;
     }
+    const DWORD descriptorCount = importDir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    if (descriptorCount == 0) return false;
+    bool terminated = false;
 
-    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(image->rawData + importOffset);
-
-    while (importDesc->Name != 0) {
+    for (DWORD descriptorIndex = 0; descriptorIndex < descriptorCount; ++descriptorIndex) {
+        IMAGE_IMPORT_DESCRIPTOR descriptor{};
+        std::memcpy(&descriptor,
+            image->rawData + importOffset + descriptorIndex * sizeof(descriptor),
+            sizeof(descriptor));
+        if (descriptor.Name == 0 && descriptor.FirstThunk == 0 &&
+            descriptor.OriginalFirstThunk == 0) {
+            terminated = true;
+            break;
+        }
         CS_IMPORT_DLL importDll;
 
-        // DLL 鍚嶇О
-        DWORD nameOffset = RVAToOffset(image, importDesc->Name);
-        if (nameOffset == 0) {
-            importDesc++;
-            continue;
-        }
-        importDll.dllName = (char*)(image->rawData + nameOffset);
-        importDll.originalFirstThunkRVA = importDesc->OriginalFirstThunk;
-        importDll.firstThunkRVA = importDesc->FirstThunk;
+        // DLL 名称
+        const DWORD nameOffset = RVAToOffset(image, descriptor.Name);
+        if (nameOffset == 0 || !ReadCString(image, nameOffset, importDll.dllName)) return false;
+        importDll.originalFirstThunkRVA = descriptor.OriginalFirstThunk;
+        importDll.firstThunkRVA = descriptor.FirstThunk;
 
-        DWORD iltOffset = RVAToOffset(image, importDesc->OriginalFirstThunk);
-        DWORD iatOffset = RVAToOffset(image, importDesc->FirstThunk);
+        DWORD iltOffset = RVAToOffset(image, descriptor.OriginalFirstThunk);
+        const DWORD iatOffset = RVAToOffset(image, descriptor.FirstThunk);
 
         if (iltOffset == 0) {
             // 某些情况下 ILT 可能为0，使用 IAT
             iltOffset = iatOffset;
         }
 
-        if (iltOffset != 0 && iatOffset != 0) {
+        if (iltOffset == 0 || iatOffset == 0) return false;
+        {
+            const DWORD thunkSize = image->is64Bit
+                ? sizeof(IMAGE_THUNK_DATA64) : sizeof(IMAGE_THUNK_DATA32);
+            const DWORD maxThunks = (std::min)(
+                (image->rawSize - iltOffset) / thunkSize,
+                (image->rawSize - iatOffset) / thunkSize);
+            bool thunkTerminated = false;
             if (image->is64Bit) {
-                // 64位 Thunk
-                PIMAGE_THUNK_DATA64 ilt = (PIMAGE_THUNK_DATA64)(image->rawData + iltOffset);
-                PIMAGE_THUNK_DATA64 iat = (PIMAGE_THUNK_DATA64)(image->rawData + iatOffset);
-                DWORD thunkIndex = 0;
-
-                while (ilt->u1.AddressOfData != 0) {
+                for (DWORD thunkIndex = 0; thunkIndex < maxThunks; ++thunkIndex) {
+                    IMAGE_THUNK_DATA64 ilt{};
+                    std::memcpy(&ilt, image->rawData + iltOffset + thunkIndex * thunkSize,
+                        sizeof(ilt));
+                    if (ilt.u1.AddressOfData == 0) {
+                        thunkTerminated = true;
+                        break;
+                    }
                     CS_IMPORT_FUNCTION func;
-                    func.thunkRVA = importDesc->FirstThunk + thunkIndex * sizeof(IMAGE_THUNK_DATA64);
+                    func.thunkRVA = descriptor.FirstThunk + thunkIndex * thunkSize;
 
-                    if (IMAGE_SNAP_BY_ORDINAL64(ilt->u1.Ordinal)) {
+                    if (IMAGE_SNAP_BY_ORDINAL64(ilt.u1.Ordinal)) {
                         // 按序号导入
-                        func.ordinal = IMAGE_ORDINAL64(ilt->u1.Ordinal);
+                        func.isOrdinal = true;
+                        func.ordinal = IMAGE_ORDINAL64(ilt.u1.Ordinal);
                     } else {
                         // 按名称导入
                         func.isOrdinal = false;
-                        DWORD hintNameOffset = RVAToOffset(image, (DWORD)ilt->u1.AddressOfData);
-                        if (hintNameOffset != 0) {
-                            PIMAGE_IMPORT_BY_NAME importByName =
-                                (PIMAGE_IMPORT_BY_NAME)(image->rawData + hintNameOffset);
-                            func.name = importByName->Name;
-                            func.ordinal = importByName->Hint;
-                        }
+                        if (ilt.u1.AddressOfData > 0xFFFFFFFFull) return false;
+                        const DWORD hintNameOffset = RVAToOffset(
+                            image, static_cast<DWORD>(ilt.u1.AddressOfData));
+                        if (hintNameOffset == 0 || !CheckBounds(image, hintNameOffset, sizeof(WORD)) ||
+                            !ReadCString(image, hintNameOffset + sizeof(WORD), func.name)) return false;
+                        std::memcpy(&func.ordinal, image->rawData + hintNameOffset, sizeof(WORD));
                     }
 
                     importDll.functions.push_back(func);
-                    ilt++;
-                    iat++;
-                    thunkIndex++;
                 }
             } else {
-                // 32位 Thunk
-                PIMAGE_THUNK_DATA32 ilt = (PIMAGE_THUNK_DATA32)(image->rawData + iltOffset);
-                PIMAGE_THUNK_DATA32 iat = (PIMAGE_THUNK_DATA32)(image->rawData + iatOffset);
-                DWORD thunkIndex = 0;
-
-                while (ilt->u1.AddressOfData != 0) {
+                for (DWORD thunkIndex = 0; thunkIndex < maxThunks; ++thunkIndex) {
+                    IMAGE_THUNK_DATA32 ilt{};
+                    std::memcpy(&ilt, image->rawData + iltOffset + thunkIndex * thunkSize,
+                        sizeof(ilt));
+                    if (ilt.u1.AddressOfData == 0) {
+                        thunkTerminated = true;
+                        break;
+                    }
                     CS_IMPORT_FUNCTION func;
-                    func.thunkRVA = importDesc->FirstThunk + thunkIndex * sizeof(IMAGE_THUNK_DATA32);
+                    func.thunkRVA = descriptor.FirstThunk + thunkIndex * thunkSize;
 
-                    if (IMAGE_SNAP_BY_ORDINAL32(ilt->u1.Ordinal)) {
+                    if (IMAGE_SNAP_BY_ORDINAL32(ilt.u1.Ordinal)) {
                         func.isOrdinal = true;
-                        func.ordinal = IMAGE_ORDINAL32(ilt->u1.Ordinal);
+                        func.ordinal = IMAGE_ORDINAL32(ilt.u1.Ordinal);
                     } else {
                         func.isOrdinal = false;
-                        DWORD hintNameOffset = RVAToOffset(image, ilt->u1.AddressOfData);
-                        if (hintNameOffset != 0) {
-                            PIMAGE_IMPORT_BY_NAME importByName =
-                                (PIMAGE_IMPORT_BY_NAME)(image->rawData + hintNameOffset);
-                            func.name = importByName->Name;
-                            func.ordinal = importByName->Hint;
-                        }
+                        const DWORD hintNameOffset = RVAToOffset(image, ilt.u1.AddressOfData);
+                        if (hintNameOffset == 0 || !CheckBounds(image, hintNameOffset, sizeof(WORD)) ||
+                            !ReadCString(image, hintNameOffset + sizeof(WORD), func.name)) return false;
+                        std::memcpy(&func.ordinal, image->rawData + hintNameOffset, sizeof(WORD));
                     }
 
                     importDll.functions.push_back(func);
-                    ilt++;
-                    iat++;
-                    thunkIndex++;
                 }
             }
+            if (!thunkTerminated) return false;
         }
 
         image->imports.dlls.push_back(importDll);
-        importDesc++;
     }
-
-    return true;
+    return terminated;
 }
 
 // ============================================================================
@@ -385,17 +422,19 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
     }
 
     DWORD exportOffset = RVAToOffset(image, exportDir.VirtualAddress);
-    if (exportOffset == 0) {
+    if (exportOffset == 0 || !CheckBounds(image, exportOffset, sizeof(IMAGE_EXPORT_DIRECTORY))) {
         return false;
     }
 
-    PIMAGE_EXPORT_DIRECTORY exportDirPtr = (PIMAGE_EXPORT_DIRECTORY)(image->rawData + exportOffset);
+    IMAGE_EXPORT_DIRECTORY exportDirectory{};
+    std::memcpy(&exportDirectory, image->rawData + exportOffset, sizeof(exportDirectory));
+    const IMAGE_EXPORT_DIRECTORY* exportDirPtr = &exportDirectory;
+    if (exportDirPtr->NumberOfFunctions > image->rawSize / sizeof(DWORD) ||
+        exportDirPtr->NumberOfNames > exportDirPtr->NumberOfFunctions) return false;
 
-    // DLL 鍚嶇О
+    // DLL 名称
     DWORD dllNameOffset = RVAToOffset(image, exportDirPtr->Name);
-    if (dllNameOffset != 0) {
-        image->exports.dllName = (char*)(image->rawData + dllNameOffset);
-    }
+    if (dllNameOffset == 0 || !ReadCString(image, dllNameOffset, image->exports.dllName)) return false;
     image->exports.ordinalBase = exportDirPtr->Base;
 
     // 获取函数、名称、序号表
@@ -403,9 +442,16 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
     DWORD namesOffset = RVAToOffset(image, exportDirPtr->AddressOfNames);
     DWORD ordinalsOffset = RVAToOffset(image, exportDirPtr->AddressOfNameOrdinals);
 
-    if (functionsOffset == 0) {
-        return false;
-    }
+    const uint64_t functionBytes = static_cast<uint64_t>(exportDirPtr->NumberOfFunctions) * sizeof(DWORD);
+    const uint64_t nameBytes = static_cast<uint64_t>(exportDirPtr->NumberOfNames) * sizeof(DWORD);
+    const uint64_t ordinalBytes = static_cast<uint64_t>(exportDirPtr->NumberOfNames) * sizeof(WORD);
+    if (functionsOffset == 0 || functionBytes > 0xFFFFFFFFull ||
+        !CheckBounds(image, functionsOffset, static_cast<DWORD>(functionBytes)) ||
+        (exportDirPtr->NumberOfNames != 0 &&
+            (namesOffset == 0 || ordinalsOffset == 0 || nameBytes > 0xFFFFFFFFull ||
+             ordinalBytes > 0xFFFFFFFFull ||
+             !CheckBounds(image, namesOffset, static_cast<DWORD>(nameBytes)) ||
+             !CheckBounds(image, ordinalsOffset, static_cast<DWORD>(ordinalBytes))))) return false;
 
     DWORD* functions = (DWORD*)(image->rawData + functionsOffset);
     DWORD* names = namesOffset ? (DWORD*)(image->rawData + namesOffset) : nullptr;
@@ -418,9 +464,8 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
             WORD ordinal = ordinals[i];
             if (ordinal < exportDirPtr->NumberOfFunctions) {
                 DWORD nameOffset = RVAToOffset(image, names[i]);
-                if (nameOffset != 0) {
-                    ordinalToName[ordinal] = (char*)(image->rawData + nameOffset);
-                }
+                if (nameOffset == 0 || !ReadCString(image, nameOffset, ordinalToName[ordinal]))
+                    return false;
             }
         }
     }
@@ -433,13 +478,12 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
         func.functionRVA = functions[i];
         func.name = ordinalToName[i];
 
-        if (functions[i] >= exportDir.VirtualAddress &&
-            functions[i] < exportDir.VirtualAddress + exportDir.Size) {
+        const uint64_t exportEnd = static_cast<uint64_t>(exportDir.VirtualAddress) + exportDir.Size;
+        if (functions[i] >= exportDir.VirtualAddress && functions[i] < exportEnd) {
             func.isForwarded = true;
             DWORD forwarderOffset = RVAToOffset(image, functions[i]);
-            if (forwarderOffset != 0) {
-                func.forwarderName = (char*)(image->rawData + forwarderOffset);
-            }
+            if (forwarderOffset == 0 || !ReadCString(image, forwarderOffset, func.forwarderName))
+                return false;
         } else {
             func.isForwarded = false;
         }
@@ -467,23 +511,23 @@ bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
     }
 
     DWORD relocOffset = RVAToOffset(image, relocDir.VirtualAddress);
-    if (relocOffset == 0) {
+    if (relocOffset == 0 || !CheckBounds(image, relocOffset, relocDir.Size)) {
         return false;
     }
 
     DWORD currentOffset = relocOffset;
-    DWORD endOffset = relocOffset + relocDir.Size;
+    DWORD endOffset = 0;
+    if (!CheckedAdd(relocOffset, relocDir.Size, endOffset)) return false;
 
     while (currentOffset < endOffset) {
-        if (!CheckBounds(image, currentOffset, sizeof(IMAGE_BASE_RELOCATION))) {
-            break;
-        }
+        if (!CheckBounds(image, currentOffset, sizeof(IMAGE_BASE_RELOCATION))) return false;
 
         PIMAGE_BASE_RELOCATION relocBlock = (PIMAGE_BASE_RELOCATION)(image->rawData + currentOffset);
 
-        if (relocBlock->VirtualAddress == 0 || relocBlock->SizeOfBlock == 0) {
-            break;
-        }
+        if (relocBlock->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) ||
+            (relocBlock->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) % sizeof(WORD) != 0 ||
+            relocBlock->SizeOfBlock > endOffset - currentOffset) return false;
+        if (relocBlock->VirtualAddress == 0) return false;
 
         DWORD entryCount = (relocBlock->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
         WORD* entries = (WORD*)(image->rawData + currentOffset + sizeof(IMAGE_BASE_RELOCATION));
@@ -509,7 +553,7 @@ bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
         currentOffset += relocBlock->SizeOfBlock;
     }
 
-    return true;
+    return currentOffset == endOffset;
 }
 
 // ============================================================================
@@ -528,11 +572,7 @@ bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
     }
 
     DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
-    if (resourceOffset == 0) {
-        return false;
-    }
-
-    return true;
+    return resourceOffset != 0 && CheckBounds(image, resourceOffset, resourceDir.Size);
 }
 
 // ============================================================================
@@ -552,7 +592,10 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
     }
 
     DWORD tlsOffset = RVAToOffset(image, tlsDir.VirtualAddress);
-    if (tlsOffset == 0) {
+    const DWORD tlsStructSize = image->is64Bit
+        ? sizeof(IMAGE_TLS_DIRECTORY64) : sizeof(IMAGE_TLS_DIRECTORY32);
+    if (tlsOffset == 0 || tlsDir.Size < tlsStructSize ||
+        !CheckBounds(image, tlsOffset, tlsStructSize)) {
         return false;
     }
 
@@ -576,31 +619,40 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
 
     // 计算回调数量
     if (image->tls.callbacksAddress != 0) {
-        DWORD callbackOffset = RVAToOffset(image, (DWORD)(image->tls.callbacksAddress -
-            (image->is64Bit ? image->ntHeaders64->OptionalHeader.ImageBase :
-                              image->ntHeaders32->OptionalHeader.ImageBase)));
-
-        if (callbackOffset != 0 && callbackOffset < image->rawSize) {
-            const DWORD pointerSize = image->is64Bit ? 8u : 4u;
-            const DWORD maxCallbacks = (image->rawSize - callbackOffset) / pointerSize;
-            bool terminated = false;
-            for (DWORD count = 0; count < maxCallbacks; ++count) {
-                DWORD64 callback = 0;
-                std::memcpy(&callback, image->rawData + callbackOffset + count * pointerSize,
-                    pointerSize);
-                if (callback == 0) {
-                    terminated = true;
-                    break;
-                }
-                image->tls.callbackAddresses.push_back(callback);
-            }
-            if (!terminated) {
-                image->tls.callbackAddresses.clear();
-                image->tls.valid = FALSE;
-                return false;
-            }
-            image->tls.callbackCount = static_cast<DWORD>(image->tls.callbackAddresses.size());
+        const uint64_t imageBase = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.ImageBase
+            : image->ntHeaders32->OptionalHeader.ImageBase;
+        if (image->tls.callbacksAddress < imageBase ||
+            image->tls.callbacksAddress - imageBase > 0xFFFFFFFFull) {
+            image->tls.valid = FALSE;
+            return false;
         }
+        DWORD callbackOffset = RVAToOffset(
+            image, static_cast<DWORD>(image->tls.callbacksAddress - imageBase));
+
+        if (callbackOffset == 0 || callbackOffset >= image->rawSize) {
+            image->tls.valid = FALSE;
+            return false;
+        }
+        const DWORD pointerSize = image->is64Bit ? 8u : 4u;
+        const DWORD maxCallbacks = (image->rawSize - callbackOffset) / pointerSize;
+        bool terminated = false;
+        for (DWORD count = 0; count < maxCallbacks; ++count) {
+            DWORD64 callback = 0;
+            std::memcpy(&callback, image->rawData + callbackOffset + count * pointerSize,
+                pointerSize);
+            if (callback == 0) {
+                terminated = true;
+                break;
+            }
+            image->tls.callbackAddresses.push_back(callback);
+        }
+        if (!terminated) {
+            image->tls.callbackAddresses.clear();
+            image->tls.valid = FALSE;
+            return false;
+        }
+        image->tls.callbackCount = static_cast<DWORD>(image->tls.callbackAddresses.size());
     }
 
     return true;
@@ -623,9 +675,9 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
     }
 
     DWORD exceptionOffset = RVAToOffset(image, exceptionDir.VirtualAddress);
-    if (exceptionOffset == 0) {
-        return false;
-    }
+    if (exceptionOffset == 0 ||
+        exceptionDir.Size % sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) != 0 ||
+        !CheckBounds(image, exceptionOffset, exceptionDir.Size)) return false;
 
     DWORD entryCount = exceptionDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
     PIMAGE_RUNTIME_FUNCTION_ENTRY runtimeFuncs =
@@ -769,9 +821,8 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
     }
 
     DWORD debugOffset = RVAToOffset(image, debugDir.VirtualAddress);
-    if (debugOffset == 0) {
-        return false;
-    }
+    if (debugOffset == 0 || debugDir.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0 ||
+        !CheckBounds(image, debugOffset, debugDir.Size)) return false;
 
     DWORD entryCount = debugDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
     PIMAGE_DEBUG_DIRECTORY debugEntries = (PIMAGE_DEBUG_DIRECTORY)(image->rawData + debugOffset);
@@ -805,9 +856,7 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
     }
 
     DWORD delayOffset = RVAToOffset(image, delayImportDir.VirtualAddress);
-    if (delayOffset == 0) {
-        return false;
-    }
+    if (delayOffset == 0 || !CheckBounds(image, delayOffset, delayImportDir.Size)) return false;
 
     // 延迟导入使用 IMAGE_DELAYLOAD_DESCRIPTOR 结构
     return true;
@@ -925,5 +974,3 @@ void PEParser::SetError(CS_PE_IMAGE* image, const std::string& message) {
 }
 
 } // namespace CipherShell
-
-

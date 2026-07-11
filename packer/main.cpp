@@ -50,6 +50,7 @@
 #include "analysis/capability_checker.h"
 #include "config/protection_build_context.h"
 #include "vm/vm_verifier.h"
+#include "cli_options.h"
 
 namespace fs = std::filesystem;
 
@@ -589,60 +590,23 @@ int main(int argc, char* argv[]) {
     std::cout << "CipherShell v0.1 - 自研高强度代码保护壳" << std::endl;
     std::cout << "======================================" << std::endl;
 
-    // 解析命令行参数
-    std::string inputFile;
-    std::string outputFile;
-    std::string configFile;
-    int protectionLevel = 1;
-    bool verbose = false;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-
-        if (arg == "-h" || arg == "--help") {
-            PrintHelp();
-            return 0;
-        } else if (arg == "-o" || arg == "--output") {
-            if (i + 1 < argc) {
-                outputFile = argv[++i];
-            } else {
-                std::cerr << "错误: -o 选项需要指定输出文件路径" << std::endl;
-                return 1;
-            }
-        } else if (arg == "-l" || arg == "--level") {
-            if (i + 1 < argc) {
-                protectionLevel = std::stoi(argv[++i]);
-                if (protectionLevel < 1 || protectionLevel > 5) {
-                    std::cerr << "错误: 保护等级必须在 1-5 之间" << std::endl;
-                    return 1;
-                }
-            } else {
-                std::cerr << "错误: -l 选项需要指定保护等级" << std::endl;
-                return 1;
-            }
-        } else if (arg == "-c" || arg == "--config") {
-            if (i + 1 < argc) {
-                configFile = argv[++i];
-            } else {
-                std::cerr << "错误: -c 选项需要指定配置文件路径" << std::endl;
-                return 1;
-            }
-        } else if (arg == "-v" || arg == "--verbose") {
-            verbose = true;
-        } else if (inputFile.empty()) {
-            inputFile = arg;
-        } else {
-            std::cerr << "错误: 未知参数 '" << arg << "'" << std::endl;
-            return 1;
-        }
-    }
-
-    // 检查输入文件
-    if (inputFile.empty()) {
-        std::cerr << "错误: 未指定输入文件" << std::endl;
+    CipherShell::CommandLineOptions cli;
+    std::string cliError;
+    if (!CipherShell::ParseCommandLine(argc, argv, cli, cliError)) {
+        std::cerr << "错误: " << cliError << std::endl;
         PrintHelp();
         return 1;
     }
+    if (cli.showHelp) {
+        PrintHelp();
+        return 0;
+    }
+
+    std::string inputFile = std::move(cli.inputFile);
+    std::string outputFile = std::move(cli.outputFile);
+    std::string configFile = std::move(cli.configFile);
+    int protectionLevel = cli.protectionLevel;
+    const bool verbose = cli.verbose;
 
     if (!fs::exists(inputFile)) {
         std::cerr << "错误: 输入文件不存在: " << inputFile << std::endl;
@@ -1604,5 +1568,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
 

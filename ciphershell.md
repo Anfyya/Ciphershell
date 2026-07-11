@@ -1017,11 +1017,14 @@ CipherShell/
 ### 12.3 标准构建命令
 
 ```powershell
-cd D:\vscode\CipherShell
+cd <CipherShell 仓库目录>
 cmake -S . -B build
 cmake --build build --config Release
 git diff --check
 ```
+
+Windows 开发环境也可直接运行仓库根目录的 `build_win.bat`；脚本必须以
+自身目录为源码根目录，不得绑定开发者机器的固定盘符。
 
 编码 AI 不运行任何生成 exe。
 

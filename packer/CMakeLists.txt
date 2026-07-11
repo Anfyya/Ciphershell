@@ -91,8 +91,14 @@ endif()
 
 add_executable(ciphershell
     main.cpp
+    cli_options.cpp
 )
 
 target_link_libraries(ciphershell PRIVATE
     ciphershell_packer
 )
+
+if(MSVC)
+    target_compile_options(ciphershell_packer PRIVATE /sdl)
+    target_compile_options(ciphershell PRIVATE /sdl /permissive-)
+endif()

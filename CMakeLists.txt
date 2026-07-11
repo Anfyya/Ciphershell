@@ -4,6 +4,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(CipherShell VERSION 0.1.0 LANGUAGES C CXX)
 
+include(CTest)
+option(CS_BUILD_LEGACY_DECRYPTOR
+    "Build the unsupported legacy decryptor diagnostic tool" OFF)
+
 # ============================================================================
 # 编译选项
 # ============================================================================
@@ -189,7 +193,7 @@ endif()
 
 # MSVC 特定选项
 if(MSVC)
-    add_compile_options(/W3 /utf-8 /w14244 /wd4100)
+    add_compile_options(/W4 /WX /utf-8 /w14244 /wd4100)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_definitions(WIN32_LEAN_AND_MEAN)
     add_compile_definitions(NOMINMAX)
@@ -245,10 +249,13 @@ else()
 endif()
 
 # 测试仅在可链接时构建
-if(WIN32)
+if(WIN32 AND BUILD_TESTING)
     add_subdirectory(tests)
+endif()
+if(WIN32 AND CS_BUILD_LEGACY_DECRYPTOR)
     add_subdirectory(tools)
-else()
+endif()
+if(NOT WIN32)
     message(STATUS "Skipping tests (Windows-only)")
 endif()
 
