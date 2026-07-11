@@ -879,12 +879,12 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     };
 
     // 全部在 local 上构建，成功后才一次性提交，避免半解析状态。
+    // 旧版较短的结构合法：只要 declaredSize 自身合法且在文件范围内即允许解析，
+    // 只解析该版本实际存在的字段；后期新增字段（含 GuardFlags）缺失时按零处理，
+    // 不因缺少后期字段而拒绝整个 PE。
     CS_LOAD_CONFIG local{};
 
     if (image->is64Bit) {
-        if (!hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags), sizeof(DWORD))) {
-            return false;  // 连 GuardFlags 偏移都不在 declaredSize 内，无法判断 CFG
-        }
         PIMAGE_LOAD_CONFIG_DIRECTORY64 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY64)(image->rawData + loadConfigOffset);
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(lc->SecurityCookie)))
             local.securityCookie = lc->SecurityCookie;
@@ -900,15 +900,14 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             local.guardCFFunctionTable = lc->GuardCFFunctionTable;
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
             local.guardCFFunctionCount = lc->GuardCFFunctionCount;
-        local.guardFlags = lc->GuardFlags;
-        local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
-        local.hasRFGuard = (lc->GuardFlags &
-            (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
-             IMAGE_GUARD_RF_STRICT)) != 0;
-    } else {
-        if (!hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardFlags), sizeof(DWORD))) {
-            return false;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags), sizeof(DWORD))) {
+            local.guardFlags = lc->GuardFlags;
+            local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            local.hasRFGuard = (lc->GuardFlags &
+                (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
+                 IMAGE_GUARD_RF_STRICT)) != 0;
         }
+    } else {
         PIMAGE_LOAD_CONFIG_DIRECTORY32 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY32)(image->rawData + loadConfigOffset);
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SecurityCookie), sizeof(lc->SecurityCookie)))
             local.securityCookie = lc->SecurityCookie;
@@ -924,11 +923,13 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             local.guardCFFunctionTable = lc->GuardCFFunctionTable;
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
             local.guardCFFunctionCount = lc->GuardCFFunctionCount;
-        local.guardFlags = lc->GuardFlags;
-        local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
-        local.hasRFGuard = (lc->GuardFlags &
-            (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
-             IMAGE_GUARD_RF_STRICT)) != 0;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardFlags), sizeof(DWORD))) {
+            local.guardFlags = lc->GuardFlags;
+            local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            local.hasRFGuard = (lc->GuardFlags &
+                (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
+                 IMAGE_GUARD_RF_STRICT)) != 0;
+        }
     }
 
     // 只有所有已声明字段都通过验证后才能设置 valid = true。
@@ -990,6 +991,18 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             tableBytes > static_cast<uint64_t>(image->rawSize) - tableOffset) {
             return false;
         }
+        // 每个 handler RVA 必须位于映像范围、能映射到文件数据、且位于可执行 section。
+        auto handlerRvaIsValid = [&](DWORD rva) -> bool {
+            if (rva == 0) return false;
+            for (WORD i = 0; i < image->numSections; ++i) {
+                const IMAGE_SECTION_HEADER& s = image->sections[i];
+                const uint32_t span = PEUtils::SectionMappedSpan(s);
+                if (span == 0 || rva < s.VirtualAddress || rva - s.VirtualAddress >= span) continue;
+                if ((s.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) return false;
+                return RVAToOffset(image, rva) != 0;
+            }
+            return false;
+        };
         std::vector<DWORD> sehRVAs;
         sehRVAs.reserve(static_cast<size_t>(local.seHandlerCount));
         for (uint64_t i = 0; i < local.seHandlerCount; ++i) {
@@ -997,6 +1010,9 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             std::memcpy(&handlerRVA,
                 image->rawData + tableOffset + static_cast<size_t>(i * sizeof(DWORD)),
                 sizeof(handlerRVA));
+            if (!handlerRvaIsValid(handlerRVA)) {
+                return false;
+            }
             sehRVAs.push_back(handlerRVA);
         }
         local.safeSEHHandlerRVAs = std::move(sehRVAs);
@@ -1151,7 +1167,7 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
             return false;
         }
 
-        // 解析 INT 直到零终止项。
+        // 解析 INT 直到零终止项。func.thunkRVA = IAT 槽 RVA，用 64 位累加并校验回绕。
         std::vector<CS_IMPORT_FUNCTION> funcs;
         bool intTerminated = false;
         for (DWORD idx = 0; ; ++idx) {
@@ -1168,7 +1184,11 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
                 break;
             }
             CS_IMPORT_FUNCTION func;
-            func.thunkRVA = desc.ImportAddressTableRVA + idx * thunkSize;  // IAT 槽 RVA
+            // ImportAddressTableRVA + idx * thunkSize，显式防止 32 位回绕。
+            const uint64_t slotRVA = static_cast<uint64_t>(desc.ImportAddressTableRVA) +
+                static_cast<uint64_t>(idx) * thunkSize;
+            if (slotRVA > 0xFFFFFFFFull) return false;
+            func.thunkRVA = static_cast<DWORD>(slotRVA);
             const bool isOrdinal = image->is64Bit
                 ? IMAGE_SNAP_BY_ORDINAL64(thunkVal)
                 : IMAGE_SNAP_BY_ORDINAL32(static_cast<DWORD>(thunkVal));
@@ -1194,12 +1214,16 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
         }
         if (!intTerminated) return false;
 
-        // IAT 必须至少覆盖与 INT 相同数量的项及终止槽（不要求值相等）。
+        // IAT 必须至少覆盖与 INT 相同数量的项及终止槽，并读取确认最后的终止槽为零。
+        const size_t thunkCount = funcs.size();
         const uint64_t iatNeed = static_cast<uint64_t>(iatOff) +
-            (static_cast<uint64_t>(funcs.size()) + 1ull) * thunkSize;
+            (static_cast<uint64_t>(thunkCount) + 1ull) * thunkSize;
         if (iatNeed > static_cast<uint64_t>(image->rawSize)) {
             return false;
         }
+        uint64_t iatTerm = 0;
+        std::memcpy(&iatTerm, image->rawData + iatOff + thunkCount * thunkSize, thunkSize);
+        if (iatTerm != 0) return false;  // IAT 末尾终止槽非零
 
         // 8. moduleHandleRVA 非零时，至少容纳一个指针宽度。
         if (desc.ModuleHandleRVA != 0) {
@@ -1209,23 +1233,25 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
                 return false;
             }
         }
-        // 9. boundIatRVA 非零时，覆盖已解析 thunk 数量及终止槽。
-        if (desc.BoundImportAddressTableRVA != 0) {
-            const DWORD bOff = RVAToOffset(image, desc.BoundImportAddressTableRVA);
-            const uint64_t need = static_cast<uint64_t>(bOff) +
-                (static_cast<uint64_t>(funcs.size()) + 1ull) * thunkSize;
-            if (bOff == 0 || need > static_cast<uint64_t>(image->rawSize)) {
-                return false;
-            }
+        // 9/10. boundIatRVA / unloadIatRVA 非零时，不仅覆盖容量，还要读取并确认
+        // 末尾终止槽为零（验证表结构而非仅容量）。
+        auto tableTerminatorIsZero = [&](DWORD rva) -> bool {
+            const DWORD off = RVAToOffset(image, rva);
+            if (off == 0) return false;
+            const uint64_t need = static_cast<uint64_t>(off) +
+                (static_cast<uint64_t>(thunkCount) + 1ull) * thunkSize;
+            if (need > static_cast<uint64_t>(image->rawSize)) return false;
+            uint64_t term = 0;
+            std::memcpy(&term, image->rawData + off + thunkCount * thunkSize, thunkSize);
+            return term == 0;
+        };
+        if (desc.BoundImportAddressTableRVA != 0 &&
+            !tableTerminatorIsZero(desc.BoundImportAddressTableRVA)) {
+            return false;
         }
-        // 10. unloadIatRVA 非零时，覆盖已解析 thunk 数量及终止槽。
-        if (desc.UnloadInformationTableRVA != 0) {
-            const DWORD uOff = RVAToOffset(image, desc.UnloadInformationTableRVA);
-            const uint64_t need = static_cast<uint64_t>(uOff) +
-                (static_cast<uint64_t>(funcs.size()) + 1ull) * thunkSize;
-            if (uOff == 0 || need > static_cast<uint64_t>(image->rawSize)) {
-                return false;
-            }
+        if (desc.UnloadInformationTableRVA != 0 &&
+            !tableTerminatorIsZero(desc.UnloadInformationTableRVA)) {
+            return false;
         }
 
         // 12. 单个 descriptor 全部验证成功后才加入局部结果。

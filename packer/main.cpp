@@ -1133,7 +1133,7 @@ int main(int argc, char* argv[]) {
                       << " metadata=0x" << VM_METADATA_VERSION
                       << " runtime=0x" << VM_RUNTIME_VERSION << std::dec
                       << " scalar_memory=true memory_arithmetic=true"
-                      << " native_call_bridge=true simd_x87_bridge=true"
+                      << " native_call_bridge=false intra_vm_direct_call=true simd_x87_bridge=true"
                       << " fail_policy=error_code_in_eax_then_int3_ud2" << std::endl;
 
             for (const auto& record : vmRecords) {

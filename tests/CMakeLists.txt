@@ -74,5 +74,16 @@ target_link_libraries(test_fail_closed PRIVATE
 
 target_include_directories(test_fail_closed PRIVATE ${CMAKE_SOURCE_DIR})
 
+# PE 解析/发射加固回归测试（仅编译，不运行）
+add_executable(test_pe_hardening
+    test_pe_hardening.cpp
+)
+
+target_link_libraries(test_pe_hardening PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_pe_hardening PRIVATE ${CMAKE_SOURCE_DIR})
+
 add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)

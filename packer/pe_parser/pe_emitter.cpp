@@ -82,50 +82,6 @@ uint32_t PEEmitter::RvaToOffset(uint32_t rva) const {
     return PEUtils::RvaToOffset(m_image, rva);
 }
 
-bool PEEmitter::RelocateHeaders(uint32_t requiredHeaderEnd, uint32_t firstRaw, std::string& error) {
-    // 预计算并验证：所有可能失败的算术检查在分配新 buffer 与提交 image 之前完成。
-    if (requiredHeaderEnd <= firstRaw) {
-        error = "header relocation requested but required header end does not exceed first raw offset";
-        return false;
-    }
-    const uint32_t fileAlign = GetFileAlignment();
-    const uint32_t ntOffset = static_cast<uint32_t>(m_image->dosHeader->e_lfanew);
-    const uint32_t gap = requiredHeaderEnd - firstRaw;  // 已证 requiredHeaderEnd > firstRaw
-    const uint32_t headerDelta = AlignUp(gap, fileAlign);  // requiredHeaderEnd - firstRaw
-    uint32_t newRawSize = 0;
-    if (!CheckedAdd(m_image->rawSize, headerDelta, newRawSize)) {
-        error = "header relocation would overflow raw size";
-        return false;
-    }
-    // 校验对齐后的 headerDelta 不回绕。
-    if (headerDelta < gap) {
-        error = "header relocation alignment overflow";
-        return false;
-    }
-
-    // 分配新 buffer；分配失败时 image 完全不变。
-    BYTE* moved = new(std::nothrow) BYTE[newRawSize];
-    if (!moved) {
-        error = "no memory while relocating PE headers";
-        return false;
-    }
-
-    memset(moved, 0, newRawSize);
-    memcpy(moved, m_image->rawData, firstRaw);
-    memcpy(moved + firstRaw + headerDelta, m_image->rawData + firstRaw, m_image->rawSize - firstRaw);
-
-    // 所有可能失败的操作已完成，提交新 buffer。
-    delete[] m_image->rawData;
-    m_image->rawData = moved;
-    m_image->rawSize = newRawSize;
-    RefreshPointers(ntOffset);
-
-    // 平移所有文件偏移型引用（section/overlay/security/debug）。
-    ShiftFileOffsetReferences(firstRaw, headerDelta);
-    SetSizeOfHeaders(AlignUp(requiredHeaderEnd, fileAlign));
-    return true;
-}
-
 PEAppendSectionResult PEEmitter::AppendSection(
     const char name[8],
     const std::vector<uint8_t>& data,
@@ -145,59 +101,64 @@ PEAppendSectionResult PEEmitter::AppendSection(
     const uint32_t sectionAlign = GetSectionAlignment();
     const uint32_t ntOffset = static_cast<uint32_t>(m_image->dosHeader->e_lfanew);
 
-    // 预计算并验证：所有 32 位溢出检查在分配新 buffer 与提交 image 之前完成。
-    auto gatherSectionBounds = [&](uint32_t& firstRawOut, uint32_t& lastFileEndOut,
-                                   uint32_t& lastVirtualEndOut) -> bool {
-        uint32_t firstRaw = 0xFFFFFFFFu;
-        uint32_t lastFileEnd = 0;
-        uint32_t lastVirtualEnd = 0;
-        for (WORD i = 0; i < m_image->numSections; i++) {
-            const IMAGE_SECTION_HEADER& sec = m_image->sections[i];
-            if (sec.PointerToRawData != 0 && sec.PointerToRawData < firstRaw) {
-                firstRaw = sec.PointerToRawData;
-            }
-            // PointerToRawData + SizeOfRawData 溢出检查
-            uint32_t fileEnd = 0;
-            if (!CheckedAdd(sec.PointerToRawData, sec.SizeOfRawData, fileEnd)) return false;
-            lastFileEnd = (std::max)(lastFileEnd, fileEnd);
-            // VirtualAddress + AlignUp(virtualSize, sectionAlign) 溢出检查
-            const uint32_t vspan = PEUtils::SectionMappedSpan(sec);
-            const uint32_t alignedV = AlignUp(vspan, sectionAlign);
-            uint32_t vEnd = 0;
-            if (!CheckedAdd(sec.VirtualAddress, alignedV, vEnd)) return false;
-            lastVirtualEnd = (std::max)(lastVirtualEnd, vEnd);
-        }
-        firstRawOut = firstRaw;
-        lastFileEndOut = lastFileEnd;
-        lastVirtualEndOut = lastVirtualEnd;
-        return true;
-    };
+    // ========================================================================
+    // 统一 relocation plan：把“header 扩容”与“追加 section”合并为一个完整计划。
+    // 所有 32 位算术检查与 buffer 分配在提交 image 之前完成；任何失败都直接返回，
+    // image 的 rawData/rawSize/headers/sections/overlay/目录字段完全不变。
+    // ========================================================================
 
-    uint32_t firstRaw = 0, lastFileEnd = 0, lastVirtualEnd = 0;
-    if (!gatherSectionBounds(firstRaw, lastFileEnd, lastVirtualEnd)) {
-        result.error = "existing section raw/virtual bounds overflow";
-        return result;
+    // 收集现有 section 的边界（带溢出检查）。
+    uint32_t firstRaw = 0xFFFFFFFFu;
+    uint32_t lastFileEnd = 0;
+    uint32_t lastVirtualEnd = 0;
+    for (WORD i = 0; i < m_image->numSections; i++) {
+        const IMAGE_SECTION_HEADER& sec = m_image->sections[i];
+        if (sec.PointerToRawData != 0 && sec.PointerToRawData < firstRaw) {
+            firstRaw = sec.PointerToRawData;
+        }
+        uint32_t fileEnd = 0;
+        if (!CheckedAdd(sec.PointerToRawData, sec.SizeOfRawData, fileEnd)) {
+            result.error = "existing section raw end overflows";
+            return result;
+        }
+        lastFileEnd = (std::max)(lastFileEnd, fileEnd);
+        const uint32_t vspan = PEUtils::SectionMappedSpan(sec);
+        const uint32_t alignedV = AlignUp(vspan, sectionAlign);
+        uint32_t vEnd = 0;
+        if (!CheckedAdd(sec.VirtualAddress, alignedV, vEnd)) {
+            result.error = "existing section virtual end overflows";
+            return result;
+        }
+        lastVirtualEnd = (std::max)(lastVirtualEnd, vEnd);
     }
     if (firstRaw == 0xFFFFFFFFu) firstRaw = GetSizeOfHeaders();
 
-    // requiredHeaderEnd = section table 末尾（再增加一条）。
-    uint32_t requiredHeaderEnd = static_cast<uint32_t>(
+    // requiredHeaderEnd = 增加 1 条 section header 后的 section table 末尾。
+    const uint32_t requiredHeaderEnd = static_cast<uint32_t>(
         reinterpret_cast<BYTE*>(&m_image->sections[m_image->numSections + 1]) - m_image->rawData);
+
+    // headerDelta：仅当现有头部放不下 +1 条 section header 时才需要扩容。
+    // 此处只计算 delta，不提交。
+    uint32_t headerDelta = 0;
     if (requiredHeaderEnd > firstRaw) {
-        if (!RelocateHeaders(requiredHeaderEnd, firstRaw, result.error)) {
+        const uint32_t gap = requiredHeaderEnd - firstRaw;
+        headerDelta = AlignUp(gap, fileAlign);
+        if (headerDelta < gap) {  // AlignUp 回绕
+            result.error = "header relocation alignment overflow";
             return result;
         }
-        // 重定位后 section PointerToRawData 已平移，重新收集边界（同样带溢出检查）。
-        if (!gatherSectionBounds(firstRaw, lastFileEnd, lastVirtualEnd)) {
-            result.error = "post-relocation section raw/virtual bounds overflow";
-            return result;
-        }
-        if (firstRaw == 0xFFFFFFFFu) firstRaw = GetSizeOfHeaders();
     }
 
-    // 新 section 布局算术，全部带溢出检查。
-    const uint32_t rawOffset = AlignUp(lastFileEnd, fileAlign);
-    if (rawOffset < lastFileEnd) {  // AlignUp 回绕
+    // 平移后的 section 数据末尾 = lastFileEnd + headerDelta。
+    uint32_t shiftedLastFileEnd = 0;
+    if (!CheckedAdd(lastFileEnd, headerDelta, shiftedLastFileEnd)) {
+        result.error = "shifted section raw end overflows";
+        return result;
+    }
+
+    // 新 section 布局（全部带溢出检查，在分配 buffer 前完成）。
+    const uint32_t rawOffset = AlignUp(shiftedLastFileEnd, fileAlign);
+    if (rawOffset < shiftedLastFileEnd) {
         result.error = "raw offset alignment overflow";
         return result;
     }
@@ -209,38 +170,50 @@ PEAppendSectionResult PEEmitter::AppendSection(
     }
     const uint32_t virtualSize = AlignUp(static_cast<uint32_t>(data.size()), sectionAlign);
 
-    const uint32_t overlaySize = m_image->rawSize > lastFileEnd ? m_image->rawSize - lastFileEnd : 0;
-    // rawOffset + rawSize + overlaySize
+    const uint32_t overlaySize = m_image->rawSize > lastFileEnd
+        ? m_image->rawSize - lastFileEnd : 0;
+    // newRawSize = rawOffset + rawSize + overlaySize
     uint32_t newRawSize = 0;
-    if (!CheckedAdd(rawOffset, rawSize, newRawSize) ||
-        !CheckedAdd(newRawSize, overlaySize, newRawSize)) {
+    uint32_t overlayDestBase = 0;
+    if (!CheckedAdd(rawOffset, rawSize, overlayDestBase) ||
+        !CheckedAdd(overlayDestBase, overlaySize, newRawSize)) {
         result.error = "appended section raw size overflows";
         return result;
     }
-    // overlay 目标基址 = rawOffset + rawSize，并用作 shift delta。
-    uint32_t overlayDestBase = 0;
-    if (!CheckedAdd(rawOffset, rawSize, overlayDestBase)) {
-        result.error = "overlay destination offset overflows";
-        return result;
-    }
-    const uint32_t shiftDelta = overlayDestBase - lastFileEnd;  // overlayDestBase >= lastFileEnd
     // SizeOfImage = virtualAddress + virtualSize
     uint32_t newSizeOfImage = 0;
     if (!CheckedAdd(virtualAddress, virtualSize, newSizeOfImage)) {
         result.error = "SizeOfImage overflows";
         return result;
     }
+    const uint32_t newSizeOfHeaders = (headerDelta != 0)
+        ? AlignUp(requiredHeaderEnd, fileAlign) : GetSizeOfHeaders();
 
-    // 分配新 buffer；失败时 image 完全不变。
+    // 拷贝区域合法性（防止越界读源 buffer）。
+    //   头部 [0, firstRaw)；section 数据 [firstRaw, lastFileEnd)；
+    //   overlay [lastFileEnd, lastFileEnd+overlaySize)。
+    if (lastFileEnd < firstRaw || lastFileEnd > m_image->rawSize) {
+        result.error = "existing section bounds are inconsistent";
+        return result;
+    }
+
+    // 至此所有计算与验证完成。分配唯一的新 buffer；失败时 image 完全不变。
     BYTE* newData = new(std::nothrow) BYTE[newRawSize];
     if (!newData) {
         result.error = "no memory while appending section";
         return result;
     }
 
+    // 一次性填充新 buffer：
+    //   [0, firstRaw)                       ← 原头部
+    //   [firstRaw, firstRaw+headerDelta)    ← 零（头部间隙，仅扩容时存在）
+    //   [firstRaw+headerDelta, shiftedLastFileEnd) ← 原 section 数据
+    //   [rawOffset, rawOffset+rawSize)      ← 新 section 数据
+    //   [overlayDestBase, +overlaySize)     ← 原 overlay
     memset(newData, 0, newRawSize);
-    const uint32_t copyPrefix = (m_image->rawSize < lastFileEnd) ? m_image->rawSize : lastFileEnd;
-    memcpy(newData, m_image->rawData, copyPrefix);
+    memcpy(newData, m_image->rawData, firstRaw);
+    memcpy(newData + firstRaw + headerDelta, m_image->rawData + firstRaw,
+           lastFileEnd - firstRaw);
     memcpy(newData + rawOffset, data.data(), data.size());
     if (overlaySize) {
         memcpy(newData + overlayDestBase, m_image->rawData + lastFileEnd, overlaySize);
@@ -252,10 +225,12 @@ PEAppendSectionResult PEEmitter::AppendSection(
     m_image->rawSize = newRawSize;
     RefreshPointers(ntOffset);
 
-    // 平移 overlay/security/debug 的文件偏移引用。无 section 落在 lastFileEnd 之后，
-    // 故 section PointerToRawData 不会被错误平移。
-    ShiftFileOffsetReferences(lastFileEnd, shiftDelta);
+    // 用统一偏移映射重写所有文件偏移型引用（section/overlay/security/debug）。
+    // 必须在写入新 section header 之前调用：此时 numSections 仍是旧值，
+    // 新槽尚未写入，不会被映射误伤。
+    RemapFileOffsetReferences(firstRaw, lastFileEnd, headerDelta, overlayDestBase);
 
+    // 写入新 section header。
     PIMAGE_SECTION_HEADER newSection = &m_image->sections[m_image->numSections];
     memset(newSection, 0, sizeof(IMAGE_SECTION_HEADER));
     memcpy(newSection->Name, name, 8);
@@ -272,6 +247,7 @@ PEAppendSectionResult PEEmitter::AppendSection(
     } else {
         m_image->ntHeaders32->FileHeader.NumberOfSections = m_image->numSections;
     }
+    SetSizeOfHeaders(newSizeOfHeaders);
     SetSizeOfImage(newSizeOfImage);
 
     result.success = true;
@@ -282,34 +258,60 @@ PEAppendSectionResult PEEmitter::AppendSection(
     return result;
 }
 
-void PEEmitter::ShiftFileOffsetReferences(uint32_t shiftPoint, uint32_t delta) {
-    if (delta == 0) return;
-    // section.PointerToRawData
+void PEEmitter::RemapFileOffsetReferences(uint32_t firstRaw, uint32_t lastFileEnd,
+                                          uint32_t headerDelta, uint32_t overlayDestBase) {
+    // 统一偏移映射（两种区域不同 delta）：
+    //   off < firstRaw            → off
+    //   firstRaw <= off < lastFileEnd → off + headerDelta
+    //   off >= lastFileEnd        → overlayDestBase + (off - lastFileEnd)
+    // 返回 false 表示映射后越界（畸形输入），调用方已保证不会进入。
+    auto mapOffset = [&](uint32_t off, uint32_t& mapped) -> bool {
+        if (off == 0) { mapped = 0; return true; }
+        if (off < firstRaw) { mapped = off; return true; }
+        if (off < lastFileEnd) {
+            return CheckedAdd(off, headerDelta, mapped);
+        }
+        // overlay 区域：overlayDestBase + (off - lastFileEnd)
+        uint32_t tail = off - lastFileEnd;
+        return CheckedAdd(overlayDestBase, tail, mapped);
+    };
+
+    // 1. section.PointerToRawData（BSS 的 0 保持 0）。
     for (WORD i = 0; i < m_image->numSections; i++) {
-        if (m_image->sections[i].PointerToRawData >= shiftPoint) {
-            m_image->sections[i].PointerToRawData += delta;
+        uint32_t mapped = 0;
+        if (mapOffset(m_image->sections[i].PointerToRawData, mapped)) {
+            m_image->sections[i].PointerToRawData = mapped;
         }
     }
-    // overlayOffset
-    if (m_image->hasOverlay && m_image->overlayOffset >= shiftPoint) {
-        m_image->overlayOffset += delta;
+
+    // 2. overlayOffset。
+    if (m_image->hasOverlay) {
+        uint32_t mapped = 0;
+        if (mapOffset(m_image->overlayOffset, mapped)) {
+            m_image->overlayOffset = mapped;
+        }
     }
-    // Security Directory.VirtualAddress 是文件偏移（绝不做 RVA 转换）。
+
+    // 3. Security Directory.VirtualAddress 是文件偏移（绝不做 RVA 转换）。
     if (m_image->is64Bit) {
         IMAGE_DATA_DIRECTORY& secDir =
             m_image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-        if (secDir.VirtualAddress != 0 && secDir.VirtualAddress >= shiftPoint) {
-            secDir.VirtualAddress += delta;
+        uint32_t mapped = 0;
+        if (secDir.VirtualAddress != 0 && mapOffset(secDir.VirtualAddress, mapped)) {
+            secDir.VirtualAddress = mapped;
         }
     } else {
         IMAGE_DATA_DIRECTORY& secDir =
             m_image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-        if (secDir.VirtualAddress != 0 && secDir.VirtualAddress >= shiftPoint) {
-            secDir.VirtualAddress += delta;
+        uint32_t mapped = 0;
+        if (secDir.VirtualAddress != 0 && mapOffset(secDir.VirtualAddress, mapped)) {
+            secDir.VirtualAddress = mapped;
         }
     }
-    // Debug Directory 每个 IMAGE_DEBUG_DIRECTORY.PointerToRawData（含 image->debugDir.entries 同步副本）。
-    // 必须在 section PointerToRawData 平移之后计算 debug 目录文件偏移，使 RvaToOffset 指向新位置。
+
+    // 4. Debug Directory 每个 IMAGE_DEBUG_DIRECTORY.PointerToRawData（含同步副本）。
+    //    必须在 section PointerToRawData 重映射之后计算 debug 目录文件偏移，
+    //    使 RvaToOffset 指向新位置。
     const IMAGE_DATA_DIRECTORY dbgDir = PEUtils::GetDataDirectory(m_image, IMAGE_DIRECTORY_ENTRY_DEBUG);
     if (dbgDir.VirtualAddress == 0 || dbgDir.Size == 0) return;
     if (dbgDir.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0) return;
@@ -319,12 +321,13 @@ void PEEmitter::ShiftFileOffsetReferences(uint32_t shiftPoint, uint32_t delta) {
         m_image->rawData + dbgOff);
     const DWORD count = dbgDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
     for (DWORD i = 0; i < count; ++i) {
-        if (dbgEntries[i].PointerToRawData >= shiftPoint) {
-            dbgEntries[i].PointerToRawData += delta;
+        uint32_t mapped = 0;
+        if (mapOffset(dbgEntries[i].PointerToRawData, mapped)) {
+            dbgEntries[i].PointerToRawData = mapped;
         }
         if (i < m_image->debugDir.entries.size() &&
-            m_image->debugDir.entries[i].pointerToRawData >= shiftPoint) {
-            m_image->debugDir.entries[i].pointerToRawData += delta;
+            mapOffset(m_image->debugDir.entries[i].pointerToRawData, mapped)) {
+            m_image->debugDir.entries[i].pointerToRawData = mapped;
         }
     }
 }

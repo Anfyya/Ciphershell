@@ -59,12 +59,15 @@ private:
     void RefreshPointers(uint32_t ntOffset);
     void SetSizeOfHeaders(uint32_t value);
     void SetSizeOfImage(uint32_t value);
-    bool RelocateHeaders(uint32_t requiredHeaderEnd, uint32_t firstRaw, std::string& error);
-    // 在 buffer 重建后，把所有“文件偏移型”引用按 [shiftPoint, +inf) += delta 平移：
-    // section.PointerToRawData、overlayOffset、Security Directory 文件偏移、
+    // 在 buffer 重建后，把所有“文件偏移型”引用按统一映射重写到新位置：
+    //   off < firstRaw            → off            (头部不动)
+    //   firstRaw <= off < lastFileEnd → off + headerDelta   (section 数据随头部间隙平移)
+    //   off >= lastFileEnd        → overlayDestBase + (off - lastFileEnd)  (overlay 移到新 section 之后)
+    // 覆盖 section.PointerToRawData、overlayOffset、Security Directory 文件偏移、
     // Debug Directory 每个 IMAGE_DEBUG_DIRECTORY.PointerToRawData（含同步副本）。
-    // 该操作为纯写入、不失败，必须在 rawData/rawSize 已替换到新 buffer 之后调用。
-    void ShiftFileOffsetReferences(uint32_t shiftPoint, uint32_t delta);
+    // 纯写入、不失败，必须在 rawData/rawSize 已替换到新 buffer 之后、写入新 section 之前调用。
+    void RemapFileOffsetReferences(uint32_t firstRaw, uint32_t lastFileEnd,
+                                   uint32_t headerDelta, uint32_t overlayDestBase);
 
     CS_PE_IMAGE* m_image;
 };
