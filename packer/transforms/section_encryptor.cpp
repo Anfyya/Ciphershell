@@ -1,5 +1,5 @@
 /**
- * CipherShell Section 鍔犲瘑鍣?- 瀹炵幇
+ * CipherShell Section 加密器 - 实现
  */
 
 #include "section_encryptor.h"
@@ -9,8 +9,8 @@
 #include <ctime>
 #include <algorithm>
 
-// BUG6淇锛氫娇鐢ㄥ瘑鐮佸瀹夊叏鐨勯殢鏈烘暟鐢熸垚鍣ㄦ浛浠?rand()
-// rand() 鐨勮緭鍑哄彲棰勬祴锛堢瀛愮┖闂村皬銆佺嚎鎬у悓浣欑畻娉曪級锛屾敾鍑昏€呭彲鏆村姏鐮磋В瀵嗛挜
+// BUG6修复：使用密码学安全的随机数生成器替代 rand()
+// rand() 的输出可预测（种子空间小、线性同余算法），攻击者可暴力破解密钥
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
@@ -22,17 +22,17 @@
 namespace CipherShell {
 
 // ============================================================================
-// 鏋勯€?鏋愭瀯
+// 构造/析构
 // ============================================================================
 
 SectionEncryptor::SectionEncryptor() {
-    // BUG6淇锛氫笉鍐嶄娇鐢?srand/rand锛屽瘑閽ョ敓鎴愬凡鏀圭敤 CSPRNG
+    // BUG6修复：不再使用 srand/rand，密钥生成已改用 CSPRNG
 }
 
 SectionEncryptor::~SectionEncryptor() {}
 
 // ============================================================================
-// 鍏叡鎺ュ彛
+// 公共接口
 // ============================================================================
 
 std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
@@ -63,7 +63,7 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
             if (hasRelocationTarget) continue;
         }
 
-        // 妫€鏌ユ槸鍚﹂渶瑕佸姞瀵嗘 section
+        // 检查是否需要加密此 section
         if (!ShouldEncryptSection(section, config)) {
             continue;
         }
@@ -76,7 +76,7 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
         }
 
         const DWORD originalCharacteristics = section->Characteristics;
-        // 鍔犲瘑 section
+        // 加密 section
         if (EncryptSection(image, i, sectionKey)) {
             CS_ENCRYPTED_SECTION encSection{};
             encSection.sectionIndex = i;
@@ -101,7 +101,7 @@ bool SectionEncryptor::DecryptSections(
         return false;
     }
 
-    // 瑙ｅ瘑姣忎釜 section
+    // 解密每个 section
     for (const auto& encSection : encryptedSections) {
         if (!DecryptSection(image, encSection.sectionIndex, encSection.sectionKey)) {
             return false;
@@ -142,7 +142,7 @@ CS_ENCRYPTION_KEY SectionEncryptor::DeriveSectionKey(
     WORD sectionIndex,
     DWORD sectionRVA)
 {
-    // 鏋勯€?salt锛歴ection 绱㈠紩 + RVA
+    // 构造 salt：section 索引 + RVA
     uint8_t salt[8];
     salt[0] = (uint8_t)(sectionIndex);
     salt[1] = (uint8_t)(sectionIndex >> 8);
@@ -167,8 +167,8 @@ BYTE* SectionEncryptor::SerializeKeys(
         return nullptr;
     }
 
-    // 璁＄畻杈撳嚭澶у皬
-    // 鏍煎紡锛歔section_count:4][section_info:N*56]
+    // 计算输出大小
+    // 格式：[section_count:4][section_info:N*56]
     DWORD totalSize = 4 + (DWORD)encryptedSections.size() * (4 + 4 + 4 + 4 + 32 + 12 + 4);
 
     BYTE* output = new(std::nothrow) BYTE[totalSize];
@@ -178,7 +178,7 @@ BYTE* SectionEncryptor::SerializeKeys(
 
     DWORD offset = 0;
 
-    // 鍐欏叆 section 鏁伴噺
+    // 写入 section 数量
     *(DWORD*)(output + offset) = (DWORD)encryptedSections.size();
     offset += 4;
 
@@ -210,7 +210,7 @@ BYTE* SectionEncryptor::SerializeKeys(
 }
 
 // ============================================================================
-// 鍐呴儴瀹炵幇
+// 内部实现
 // ============================================================================
 
 bool SectionEncryptor::EncryptSection(
@@ -291,8 +291,8 @@ void SectionEncryptor::DeriveKey(
     CS_ENCRYPTION_KEY& derivedKey,
     uint32_t rounds)
 {
-    // 绠€鍖栫殑瀵嗛挜娲剧敓锛氫娇鐢?ChaCha20 杩唬
-    // 瀹為檯搴旂敤涓簲浣跨敤鏇村畨鍏ㄧ殑 KDF 濡?HKDF 鎴?PBKDF2
+    // 简化的密钥派生：使用 ChaCha20 迭代
+    // 实际应用中应使用更安全的 KDF 如 HKDF 或 PBKDF2
 
     uint8_t currentKey[32];
     memcpy(currentKey, masterKey.key, 32);
@@ -304,7 +304,7 @@ void SectionEncryptor::DeriveKey(
         ChaCha20 cipher;
         cipher.Init(currentKey, kdfNonce, round);
 
-        // 鐢熸垚鏂扮殑瀵嗛挜鏉愭枡
+        // 生成新的密钥材料
         uint8_t newKeyMaterial[32];
         memset(newKeyMaterial, 0, 32);
         cipher.Process(newKeyMaterial, newKeyMaterial, 32);
@@ -314,10 +314,10 @@ void SectionEncryptor::DeriveKey(
         }
     }
 
-    // 璁剧疆娲剧敓瀵嗛挜
+    // 设置派生密钥
     memcpy(derivedKey.key, currentKey, 32);
 
-    // 浠庡瘑閽ユ淳鐢?nonce
+    // 从密钥派生 nonce
     ChaCha20 nonceCipher;
     uint8_t nonceSalt[12] = {0x4E, 0x4F, 0x4E, 0x43, 0x45, 0x5F,  // "NONCE_"
                              0x53, 0x41, 0x4C, 0x54, 0x5F, 0x58}; // "SALT_X"
@@ -328,7 +328,7 @@ void SectionEncryptor::DeriveKey(
 
     derivedKey.counter = 0;
 
-    // 娓呴櫎涓存椂鏁版嵁
+    // 清除临时数据
     SecureZeroMemory(currentKey, sizeof(currentKey));
     SecureZeroMemory(kdfNonce, sizeof(kdfNonce));
 }
@@ -349,7 +349,7 @@ bool SectionEncryptor::ShouldEncryptSection(PIMAGE_SECTION_HEADER section, const
         return false;
     }
 
-    // 璺宠繃澶撮儴 section锛堥€氬父鏄?.rsrc, .reloc 绛夛級
+    // 跳过头部 section（通常是 .rsrc, .reloc 等）
     char name[9] = {0};
     memcpy(name, section->Name, 8);
 
@@ -357,12 +357,12 @@ bool SectionEncryptor::ShouldEncryptSection(PIMAGE_SECTION_HEADER section, const
         return false;
     }
 
-    // 淇濈暀閲嶅畾浣嶆
+    // 保留重定位段
     if (strncmp(name, ".reloc", 6) == 0) {
         return false;
     }
 
-    // 鏍规嵁閰嶇疆鍐冲畾鏄惁鍔犲瘑
+    // 根据配置决定是否加密
     if (config.encryptCodeSections && IsCodeSection(section->Characteristics)) {
         return true;
     }

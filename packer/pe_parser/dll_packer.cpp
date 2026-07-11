@@ -1,5 +1,5 @@
-﻿/**
- * CipherShell DLL 鍔犲３鍣?- 瀹炵幇
+/**
+ * CipherShell DLL 加壳器 - 实现
  */
 
 #include "dll_packer.h"
@@ -10,14 +10,14 @@
 namespace CipherShell {
 
 // ============================================================================
-// 鏋勯€?鏋愭瀯
+// 构造/析构
 // ============================================================================
 
 DLLPacker::DLLPacker() {}
 DLLPacker::~DLLPacker() {}
 
 // ============================================================================
-// 鍏叡鎺ュ彛
+// 公共接口
 // ============================================================================
 
 DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config) {
@@ -33,7 +33,7 @@ DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config
         return result;
     }
 
-    // 1. 瑙ｆ瀽瀵煎嚭琛?
+    // 1. 解析导出表
     if (config.preserveExports) {
         result.exports = ParseExports(image);
         if (result.exports.empty()) {
@@ -42,7 +42,7 @@ DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config
         }
     }
 
-    // 2. 鐢熸垚瀵煎嚭璺虫澘
+    // 2. 生成导出跳板
     if (config.preserveExports && !result.exports.empty()) {
         DWORD64 imageBase = image->is64Bit ?
             image->ntHeaders64->OptionalHeader.ImageBase :
@@ -57,10 +57,10 @@ DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config
         }
     }
 
-    // 3. 澶勭悊閲嶅畾浣?
+    // 3. 处理重定位
     if (config.preserveRelocations) {
         if (!ProcessRelocations(image, 0)) {
-            // 閲嶅畾浣嶅鐞嗗け璐ヤ笉鏄嚧鍛介敊璇?
+            // 重定位处理失败不是致命错误
         }
     }
 
@@ -69,10 +69,10 @@ DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config
         PreserveTLSCallbacks(image);
     }
 
-    // 5. 澶勭悊寮傚父琛紙x64锛?
+    // 5. 处理异常表（x64）
     if (config.preserveExceptions && image->is64Bit) {
-        // x64 寮傚父澶勭悊闇€瑕?.pdata 娈?
-        // 鍦ㄥ姞澹冲悗闇€瑕侀噸鏂版敞鍐?
+        // x64 异常处理需要 .pdata 段
+        // 在加壳后需要重新注册
     }
 
     result.success = true;
@@ -87,9 +87,9 @@ BYTE* DLLPacker::GenerateExportTrampolines(
 {
     if (!trampolineSize || exports.empty()) return nullptr;
 
-    // 浼扮畻璺虫澘澶у皬
-    // 姣忎釜瀵煎嚭鍑芥暟闇€瑕佷竴涓烦鏉匡細
-    //   jmp [target] 鎴?push addr; ret
+    // 估算跳板大小
+    // 每个导出函数需要一个跳板：
+    //   jmp [target] 或 push addr; ret
     DWORD perTrampoline = is64Bit ? 16 : 8;
     DWORD totalSize = (DWORD)exports.size() * perTrampoline + 64;
 
@@ -104,14 +104,14 @@ BYTE* DLLPacker::GenerateExportTrampolines(
         if (exp.isForwarded) continue;
 
         if (is64Bit) {
-            // x64: 浣跨敤 RIP 鐩稿璺宠浆
+            // x64: 使用 RIP 相对跳转
             // FF 25 xx xx xx xx  jmp [rip+offset]
             code[offset++] = 0xFF;
             code[offset++] = 0x25;
-            // RIP 鐩稿鍋忕Щ锛堟寚鍚戝悗闈㈢殑鍦板潃锛?
+            // RIP 相对偏移（指向后面的地址）
             *(uint32_t*)(code + offset) = 0;
             offset += 4;
-            // 缁濆鍦板潃
+            // 绝对地址
             *(uint64_t*)(code + offset) = imageBase + exp.rva;
             offset += 8;
         } else {
@@ -134,18 +134,18 @@ BYTE* DLLPacker::GenerateDllMainStub(
 {
     if (!stubSize) return nullptr;
 
-    // DllMain 绛惧悕锛欱OOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+    // DllMain 签名：BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
     if (is64Bit) {
         // x64 DllMain stub
         // rcx = hinstDLL, rdx = fdwReason, r8 = lpvReserved
         static const BYTE x64_stub[] = {
-            // 淇濆瓨鍙傛暟
+            // 保存参数
             0x48, 0x89, 0xC8,                   // mov rax, rcx (hinstDLL)
             0x48, 0x89, 0xD3,                   // mov rbx, rdx (fdwReason)
             0x49, 0x89, 0xC1,                   // mov r9, r8   (lpvReserved)
 
-            // 妫€鏌?fdwReason
+            // 检查 fdwReason
             0x48, 0x83, 0xFB, 0x00,             // cmp rbx, 0 (DLL_PROCESS_DETACH)
             0x74, 0x14,                         // jz .detach
             0x48, 0x83, 0xFB, 0x01,             // cmp rbx, 1 (DLL_PROCESS_ATTACH)
@@ -154,7 +154,7 @@ BYTE* DLLPacker::GenerateDllMainStub(
             0x74, 0x10,                         // jz .thread_attach
             0xEB, 0x18,                         // jmp .done
 
-            // .attach: 鍒濆鍖?VM锛岃В瀵嗕唬鐮?
+            // .attach: 初始化 VM，解密代码
             0xE8, 0x00, 0x00, 0x00, 0x00,       // call vm_init (鐩稿鍋忕Щ)
             0xEB, 0x10,                         // jmp .done
 
@@ -220,9 +220,9 @@ BYTE* DLLPacker::GenerateDllMainStub(
 bool DLLPacker::PatchExceptionTable(CS_PE_IMAGE* image, uint32_t newExceptionHandler) {
     if (!image || !image->is64Bit) return false;
 
-    // x64 鐨勫紓甯稿鐞嗗熀浜?.pdata 娈?
-    // 姣忎釜 RUNTIME_FUNCTION 鏉＄洰鍖呭惈鍑芥暟鐨勮捣濮嬪拰缁撴潫鍦板潃
-    // 鍔犲３鍚庨渶瑕佹洿鏂拌繖浜涙潯鐩垨浣跨敤 RtlAddFunctionTable 鍔ㄦ€佹敞鍐?
+    // x64 的异常处理基于 .pdata 段
+    // 每个 RUNTIME_FUNCTION 条目包含函数的起始和结束地址
+    // 加壳后需要更新这些条目或使用 RtlAddFunctionTable 动态注册
 
     return true;
 }
@@ -234,14 +234,14 @@ bool DLLPacker::RegisterDynamicExceptionTable(
 {
     if (!image || !runtimeFunctions) return false;
 
-    // 杩欎釜鍑芥暟鍦ㄨ繍琛屾椂琚?stub 璋冪敤
-    // 浣跨敤 RtlAddFunctionTable 娉ㄥ唽鍔ㄦ€佸紓甯稿鐞嗚〃
+    // 这个函数在运行时被 stub 调用
+    // 使用 RtlAddFunctionTable 注册动态异常处理表
 
     return true;
 }
 
 // ============================================================================
-// 鍐呴儴瀹炵幇
+// 内部实现
 // ============================================================================
 
 std::vector<DLLExportEntry> DLLPacker::ParseExports(CS_PE_IMAGE* image) {
@@ -267,15 +267,15 @@ std::vector<DLLExportEntry> DLLPacker::ParseExports(CS_PE_IMAGE* image) {
 }
 
 bool DLLPacker::RebuildExportTable(CS_PE_IMAGE* image, const std::vector<DLLExportEntry>& exports) {
-    // 閲嶅缓瀵煎嚭琛紝鏇存柊鍑芥暟鍦板潃鎸囧悜璺虫澘
+    // 重建导出表，更新函数地址指向跳板
     return true;
 }
 
 bool DLLPacker::ProcessRelocations(CS_PE_IMAGE* image, uint64_t newBase) {
     if (!image) return false;
 
-    // 閲嶅畾浣嶅鐞嗗浜?DLL 鑷冲叧閲嶈
-    // DLL 鍙兘琚姞杞藉埌闈為閫夊熀鍧€
+    // 重定位处理对于 DLL 至关重要
+    // DLL 可能被加载到非首选基址
 
     return true;
 }
@@ -283,8 +283,8 @@ bool DLLPacker::ProcessRelocations(CS_PE_IMAGE* image, uint64_t newBase) {
 bool DLLPacker::PreserveTLSCallbacks(CS_PE_IMAGE* image) {
     if (!image || !image->tls.valid) return true;
 
-    // TLS 鍥炶皟闇€瑕佸湪 DLL 鍔犺浇鏃舵纭皟鐢?
-    // 淇濈暀 TLS 鐩綍锛岀‘淇濆洖璋冩暟缁勫彲璁块棶
+    // TLS 回调需要在 DLL 加载时正确调用
+    // 保留 TLS 目录，确保回调数组可访问
 
     return true;
 }

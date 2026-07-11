@@ -1,6 +1,6 @@
 /**
- * CipherShell 涓荤▼搴忓叆鍙?
- * 鍛戒护琛岀晫闈?
+ * CipherShell 主程序入口
+ * 命令行界面
  */
 
 #include <iostream>
@@ -54,30 +54,30 @@
 namespace fs = std::filesystem;
 
 // ============================================================================
-// 甯姪淇℃伅
+// 帮助信息
 // ============================================================================
 
 void PrintHelp() {
     std::cout << R"(
-CipherShell v0.1 - 鑷爺楂樺己搴︿唬鐮佷繚鎶ゅ３
+CipherShell v0.1 - 自研高强度代码保护壳
 
-鐢ㄦ硶: ciphershell [閫夐」] <杈撳叆鏂囦欢>
+用法: ciphershell [选项] <输入文件>
 
-閫夐」:
-  -o, --output <鏂囦欢>      鎸囧畾杈撳嚭鏂囦欢璺緞
-  -l, --level <1-5>        璁剧疆淇濇姢绛夌骇 (榛樿: 1)
-  -c, --config <鏂囦欢>      鎸囧畾閰嶇疆鏂囦欢璺緞 (TOML 鏍煎紡)
-  -v, --verbose            鏄剧ず璇︾粏淇℃伅
-  -h, --help               鏄剧ず姝ゅ府鍔╀俊鎭?
+选项:
+  -o, --output <文件>      指定输出文件路径
+  -l, --level <1-5>        设置保护等级 (默认: 1)
+  -c, --config <文件>      指定配置文件路径 (TOML 格式)
+  -v, --verbose            显示详细信息
+  -h, --help               显示此帮助信息
 
-淇濇姢绛夌骇:
-  L1 (Guard)    鍩虹鍔犲瘑淇濇姢 (~1.05x 鎬ц兘寮€閿€)
-  L2 (Shield)   鎺у埗娴佸钩鍧﹀寲 (~2-3x 鎬ц兘寮€閿€)
-  L3 (Armor)    楂樼骇娣锋穯 (~5-8x 鎬ц兘寮€閿€)
-  L4 (Fortress) 浠ｇ爜铏氭嫙鍖?(~15-30x 鎬ц兘寮€閿€)
-  L5 (Citadel)  澶氬眰宓屽 VM (~50-100x+ 鎬ц兘寮€閿€)
+保护等级:
+  L1 (Guard)    基础加密保护 (~1.05x 性能开销)
+  L2 (Shield)   控制流平坦化 (~2-3x 性能开销)
+  L3 (Armor)    高级混淆 (~5-8x 性能开销)
+  L4 (Fortress) 代码虚拟化 (~15-30x 性能开销)
+  L5 (Citadel)  多层嵌套 VM (~50-100x+ 性能开销)
 
-绀轰緥:
+示例:
   ciphershell input.exe -o protected.exe -l 3
   ciphershell input.dll -l 2 -c config.toml
 )" << std::endl;
@@ -91,7 +91,7 @@ static void PrintFeatureStatus(const std::string& name, const std::string& statu
     std::cout << std::endl;
 }
 // ============================================================================
-// 涓诲嚱鏁?
+// 主函数
 // ============================================================================
 
 
@@ -574,11 +574,11 @@ static bool ValidateLoaderStaticLink(
 }
 
 int main(int argc, char* argv[]) {
-    // 璁剧疆鎺у埗鍙颁负 UTF-8 缂栫爜
+    // 设置控制台为 UTF-8 编码
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 
-    // 濡傛灉娌℃湁鍙傛暟锛屽惎鍔?GUI 妯″紡
+    // 如果没有参数，启动 GUI 模式
     if (argc == 1) {
         CipherShell::ConsoleGUI gui;
         gui.Initialize();
@@ -586,10 +586,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::cout << "CipherShell v0.1 - 鑷爺楂樺己搴︿唬鐮佷繚鎶ゅ３" << std::endl;
+    std::cout << "CipherShell v0.1 - 自研高强度代码保护壳" << std::endl;
     std::cout << "======================================" << std::endl;
 
-    // 瑙ｆ瀽鍛戒护琛屽弬鏁?
+    // 解析命令行参数
     std::string inputFile;
     std::string outputFile;
     std::string configFile;
@@ -613,7 +613,7 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) {
                 protectionLevel = std::stoi(argv[++i]);
                 if (protectionLevel < 1 || protectionLevel > 5) {
-                    std::cerr << "閿欒: 淇濇姢绛夌骇蹇呴』鍦?1-5 涔嬮棿" << std::endl;
+                    std::cerr << "错误: 保护等级必须在 1-5 之间" << std::endl;
                     return 1;
                 }
             } else {
@@ -632,12 +632,12 @@ int main(int argc, char* argv[]) {
         } else if (inputFile.empty()) {
             inputFile = arg;
         } else {
-            std::cerr << "閿欒: 鏈煡鍙傛暟 '" << arg << "'" << std::endl;
+            std::cerr << "错误: 未知参数 '" << arg << "'" << std::endl;
             return 1;
         }
     }
 
-    // 妫€鏌ヨ緭鍏ユ枃浠?
+    // 检查输入文件
     if (inputFile.empty()) {
         std::cerr << "错误: 未指定输入文件" << std::endl;
         PrintHelp();
@@ -645,25 +645,25 @@ int main(int argc, char* argv[]) {
     }
 
     if (!fs::exists(inputFile)) {
-        std::cerr << "閿欒: 杈撳叆鏂囦欢涓嶅瓨鍦? " << inputFile << std::endl;
+        std::cerr << "错误: 输入文件不存在: " << inputFile << std::endl;
         return 1;
     }
 
-    // 鑷姩鐢熸垚杈撳嚭鏂囦欢鍚?
+    // 自动生成输出文件名
     if (outputFile.empty()) {
         fs::path inputPath(inputFile);
         outputFile = inputPath.stem().string() + "_protected" + inputPath.extension().string();
     }
 
-    std::cout << "杈撳叆鏂囦欢: " << inputFile << std::endl;
-    std::cout << "杈撳嚭鏂囦欢: " << outputFile << std::endl;
-    std::cout << "淇濇姢绛夌骇: L" << protectionLevel << std::endl;
+    std::cout << "输入文件: " << inputFile << std::endl;
+    std::cout << "输出文件: " << outputFile << std::endl;
+    std::cout << "保护等级: L" << protectionLevel << std::endl;
 
     // ============================================================================
-    // Step 1: 瑙ｆ瀽杈撳叆 PE
+    // Step 1: 解析输入 PE
     // ============================================================================
 
-    std::cout << "\n[1/5] 瑙ｆ瀽杈撳叆 PE 鏂囦欢..." << std::endl;
+    std::cout << "\n[1/5] 解析输入 PE 文件..." << std::endl;
 
     CipherShell::PEParser parser;
     auto imageDeleter = [&parser](CipherShell::CS_PE_IMAGE* img) {
@@ -675,7 +675,7 @@ int main(int argc, char* argv[]) {
     );
 
     if (!image || !image->isValid) {
-        std::cerr << "閿欒: 鏃犳硶瑙ｆ瀽 PE 鏂囦欢";
+        std::cerr << "错误: 无法解析 PE 文件";
         if (image) {
             std::cerr << " - " << image->errorMessage;
         }
@@ -683,8 +683,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "  PE 瑙ｆ瀽鎴愬姛" << std::endl;
-    std::cout << "  鏋舵瀯: " << (image->is64Bit ? "x64" : "x86") << std::endl;
+    std::cout << "  PE 解析成功" << std::endl;
+    std::cout << "  架构: " << (image->is64Bit ? "x64" : "x86") << std::endl;
     std::cout << "  鍏ュ彛鐐? 0x" << std::hex;
     if (image->is64Bit) {
         std::cout << image->ntHeaders64->OptionalHeader.AddressOfEntryPoint;
@@ -692,35 +692,35 @@ int main(int argc, char* argv[]) {
         std::cout << image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
     }
     std::cout << std::dec << std::endl;
-    std::cout << "  Section 鏁伴噺: " << image->numSections << std::endl;
+    std::cout << "  Section 数量: " << image->numSections << std::endl;
 
     if (verbose) {
-        std::cout << "  瀵煎叆 DLL 鏁伴噺: " << image->imports.dlls.size() << std::endl;
-        std::cout << "  瀵煎嚭鍑芥暟鏁伴噺: " << image->exports.functions.size() << std::endl;
-        std::cout << "  閲嶅畾浣嶆潯鐩暟閲? " << image->relocs.entries.size() << std::endl;
+        std::cout << "  导入 DLL 数量: " << image->imports.dlls.size() << std::endl;
+        std::cout << "  导出函数数量: " << image->exports.functions.size() << std::endl;
+        std::cout << "  重定位条目数量: " << image->relocs.entries.size() << std::endl;
     }
 
     // ============================================================================
-    // Step 1.5: 鍔犺浇閰嶇疆
+    // Step 1.5: 加载配置
     // ============================================================================
 
     CipherShell::CipherShellConfig config;
     CipherShell::ConfigParser configParser;
 
     if (!configFile.empty()) {
-        std::cout << "\n[1.5] 鍔犺浇閰嶇疆鏂囦欢: " << configFile << std::endl;
+        std::cout << "\n[1.5] 加载配置文件: " << configFile << std::endl;
         config = configParser.LoadFromFile(configFile);
         if (configParser.HasError()) {
-            std::cerr << "閿欒: " << configParser.GetLastError() << std::endl;
+            std::cerr << "错误: " << configParser.GetLastError() << std::endl;
             return 1;
         }
         protectionLevel = config.global.protectionLevel;
         if (protectionLevel < 1 || protectionLevel > 5) {
-            std::cerr << "閿欒: 閰嶇疆涓殑淇濇姢绛夌骇蹇呴』鍦?1-5 涔嬮棿" << std::endl;
+            std::cerr << "错误: 配置中的保护等级必须在 1-5 之间" << std::endl;
             return 1;
         }
     } else {
-        // 浣跨敤榛樿閰嶇疆
+        // 使用默认配置
         config.global.protectionLevel = protectionLevel;
     }
 
@@ -761,17 +761,17 @@ int main(int argc, char* argv[]) {
     std::cout << "  鍘熷鍏ュ彛鐐?(OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
 
     // ============================================================================
-    // Step 2: 搴旂敤淇濇姢鍙樻崲
-    // 閲嶈: 鍏堝仛浠ｇ爜鍒嗘瀽/鍙樻崲锛堟槑鏂囦唬鐮佸彲鍙嶆眹缂栵級锛屾渶鍚庢墠鍋?Section 鍔犲瘑
+    // Step 2: 应用保护变换
+    // 重要: 先做代码分析/变换（明文代码可反汇编），最后才做 Section 加密
     // ============================================================================
 
-    std::cout << "\n[2/5] 搴旂敤淇濇姢鍙樻崲 (L" << protectionLevel << ")..." << std::endl;
+    std::cout << "\n[2/5] 应用保护变换 (L" << protectionLevel << ")..." << std::endl;
 
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
 
-    // Phase A: 瀛楃涓插姞瀵嗭紙鏄庢枃浠ｇ爜娈典腑鐨勫唴鑱斿瓧绗︿覆锛孡2+锛?
+    // Phase A: 字符串加密（明文代码段中的内联字符串，L2+）
     if (buildCtx.stringEncryption.enabled) {
-        std::cout << "  搴旂敤瀛楃涓插姞瀵?.." << std::endl;
+        std::cout << "  应用字符串加密..." << std::endl;
 
         CipherShell::StringEncryptor strEncryptor;
         CipherShell::CS_STRING_CONFIG strConfig;
@@ -787,7 +787,7 @@ int main(int argc, char* argv[]) {
             PrintFeatureStatus("string_encryption", "failed", strEncryptor.GetLastError());
             return 1;
         }
-        std::cout << "    鍙戠幇 " << strings.size() << " 涓瓧绗︿覆" << std::endl;
+        std::cout << "    发现 " << strings.size() << " 个字符串" << std::endl;
 
         if (!strings.empty()) {
             if (!strEncryptor.EncryptStrings(image.get(), strings)) {
@@ -828,9 +828,9 @@ int main(int argc, char* argv[]) {
         PrintFeatureStatus("string_encryption", "skipped", "disabled");
     }
 
-    // Phase B: 瀵煎叆琛ㄦ贩娣嗭紙L2+锛?
+    // Phase B: 导入表混淆（L2+）
     if (buildCtx.importProtection.enabled) {
-        std::cout << "  搴旂敤瀵煎叆琛ㄦ贩娣?.." << std::endl;
+        std::cout << "  应用导入表混淆..." << std::endl;
 
         CipherShell::ImportObfuscator obfuscator;
         CipherShell::CS_IMPORT_OBFUSCATION_CONFIG obfConfig;
@@ -860,9 +860,9 @@ int main(int argc, char* argv[]) {
         PrintFeatureStatus("import_protection", "skipped", "disabled");
     }
 
-    // Phase C: 鎺у埗娴佸钩鍧﹀寲锛圠3+锛屾殏绂佺敤鈥斺€擥enerateFlattenedCode 闇€瑕佷紭鍖栵級
-    if (buildCtx.flattening.enabled) {  // FIXME: 鏆傛椂绂佺敤锛屽緟浼樺寲
-        std::cout << "  搴旂敤鎺у埗娴佸钩鍧﹀寲..." << std::endl;
+    // Phase C: 控制流平坦化（L3+，暂禁用——GenerateFlattenedCode 需要优化）
+    if (buildCtx.flattening.enabled) {  // FIXME: 暂时禁用，待优化
+        std::cout << "  应用控制流平坦化..." << std::endl;
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
@@ -923,9 +923,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Phase D: 铏氬亣鎺у埗娴侊紙L3+锛岄渶鍦ㄥ姞瀵嗗墠鍙嶆眹缂栨槑鏂囦唬鐮侊級
+    // Phase D: 虚假控制流（L3+，需在加密前反汇编明文代码）
     if (buildCtx.bogusFlow.enabled) {
-        std::cout << "  搴旂敤铏氬亣鎺у埗娴?.." << std::endl;
+        std::cout << "  应用虚假控制流..." << std::endl;
 
         CipherShell::BogusFlowInjector bogusInjector;
         CipherShell::BogusFlowConfig bogusConfig;
@@ -997,9 +997,9 @@ int main(int argc, char* argv[]) {
     CipherShell::VMRuntimeBuildResult runtimeResult{};
     std::vector<CipherShell::FunctionPatchResult> patchResults;
 
-    // Phase E: 鍑芥暟绾?VM 淇濇姢銆傝繖閲屽彧鍏佽瀹屾暣钀界洏鐨勬暟鎹繘鍏ヤ笅涓€姝ワ紝澶辫触蹇呴』鏄庣‘璇婃柇銆?
+    // Phase E: 函数级 VM 保护。这里只允许完整落盘的数据进入下一步，失败必须明确诊断。
     if (buildCtx.vm.enabled) {
-        std::cout << "  搴旂敤浠ｇ爜铏氭嫙鍖?(Mirage VM)..." << std::endl;
+        std::cout << "  应用代码虚拟化 (Mirage VM)..." << std::endl;
 
         VM_CALL_ABI configuredX86CallAbi = VM_ABI_X86_AUTO;
         if (!config.vm.bytecodeEncryption || config.vm.nativeBodyPolicy != "destroy" ||
@@ -1378,16 +1378,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::cout << "    VM bytecode 鍐欏叆鍑芥暟鏁? " << virtualizedCount
-                  << "锛屾嫆缁濆嚱鏁版暟: " << rejectedCount << std::endl;
+        std::cout << "    VM bytecode 写入函数数: " << virtualizedCount
+                  << "，拒绝函数数: " << rejectedCount << std::endl;
 
     }
-    // Phase F: Section 鍔犲瘑锛圠1+锛屾渶鍚庢墽琛屸€斺€斿姞瀵嗘墍鏈夊彉鎹㈠悗鐨勪唬鐮侊級
+    // Phase F: Section 加密（L1+，最后执行——加密所有变换后的代码）
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
     CipherShell::StubEmbedResult loaderResult{};
     bool loaderApplied = false;
     if (buildCtx.sectionEncryption.enabled) {
-        std::cout << "  搴旂敤 Section 鍔犲瘑..." << std::endl;
+        std::cout << "  应用 Section 加密..." << std::endl;
 
         CipherShell::SectionEncryptor encryptor;
         CipherShell::CS_ENCRYPT_CONFIG encConfig;
@@ -1404,7 +1404,7 @@ int main(int argc, char* argv[]) {
         }
 
         encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
-        std::cout << "    宸插姞瀵?" << encryptedSections.size() << " 涓?Section" << std::endl;
+        std::cout << "    已加密 " << encryptedSections.size() << " 个 Section" << std::endl;
             PrintFeatureStatus("section_encryption", encryptedSections.empty() ? "skipped" : "applied", encryptedSections.empty() ? "no_encryptable_sections" : "mode=" + buildCtx.sectionEncryption.mode);
     } else {
         PrintFeatureStatus("section_encryption", "skipped", "disabled");
@@ -1418,17 +1418,17 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
-    // Step 3: 绛惧悕娑堥櫎
+    // Step 3: 签名消除
     // ============================================================================
 
-    std::cout << "\n[3/5] 娑堥櫎澹崇鍚?.." << std::endl;
+    std::cout << "\n[3/5] 消除壳签名..." << std::endl;
 
     {
         CipherShell::SignatureEliminator sigEliminator;
 
         auto sigMatches = sigEliminator.DetectSignatures(image.get());
         if (!sigMatches.empty()) {
-            std::cout << "  鍙戠幇 " << sigMatches.size() << " 涓鍚嶅尮閰?" << std::endl;
+            std::cout << "  发现 " << sigMatches.size() << " 个签名匹配:" << std::endl;
             for (const auto& match : sigMatches) {
                 std::cout << "    - " << match.signatureName << " (" << match.detector << ")" << std::endl;
             }
@@ -1438,17 +1438,17 @@ int main(int argc, char* argv[]) {
         sigEliminator.EliminateSignatures(image.get(), elimConfig);
 
         if (sigEliminator.VerifyElimination(image.get())) {
-            std::cout << "  绛惧悕娑堥櫎鎴愬姛" << std::endl;
+            std::cout << "  签名消除成功" << std::endl;
         } else {
-            std::cout << "  璀﹀憡: 浠嶆湁绛惧悕娈嬬暀" << std::endl;
+            std::cout << "  警告: 仍有签名残留" << std::endl;
         }
     }
 
     // ============================================================================
-    // Step 4: 宓屽叆 Stub
+    // Step 4: 嵌入 Stub
     // ============================================================================
 
-    std::cout << "\n[4/6] 宓屽叆瑙ｅ瘑 Stub..." << std::endl;
+    std::cout << "\n[4/6] 嵌入解密 Stub..." << std::endl;
 
     if (!encryptedSections.empty()) {
         CipherShell::StubBuilder stubBuilder;
@@ -1477,7 +1477,7 @@ int main(int argc, char* argv[]) {
     // Step 5: 閲嶅缓 PE
     // ============================================================================
 
-    std::cout << "\n[5/6] 鍐欏叆杈撳嚭鏂囦欢..." << std::endl;
+    std::cout << "\n[5/6] 写入输出文件..." << std::endl;
 
     CipherShell::PERebuilder rebuilder;
     CipherShell::CS_REBUILD_CONFIG rebuildConfig;
@@ -1491,7 +1491,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<BYTE[]> outputData(rebuilder.RebuildImage(image.get(), rebuildConfig, &outputSize));
 
     if (!outputData || outputSize == 0) {
-        std::cerr << "閿欒: PE 閲嶅缓澶辫触" << std::endl;
+        std::cerr << "错误: PE 重建失败" << std::endl;
         return 1;
     }
 
@@ -1533,13 +1533,13 @@ int main(int argc, char* argv[]) {
     parser.FreeImage(rebuiltImage);
     std::cout << "PE_STATIC_CHECK_PASS module=PEVerifier" << std::endl;
 
-    std::cout << "  PE 閲嶅缓鎴愬姛" << std::endl;
-    std::cout << "  杈撳嚭澶у皬: " << outputSize << " 瀛楄妭" << std::endl;
+    std::cout << "  PE 重建成功" << std::endl;
+    std::cout << "  输出大小: " << outputSize << " 字节" << std::endl;
 
-    // 鍐欏叆杈撳嚭鏂囦欢
+    // 写入输出文件
     FILE* outFile = fopen(outputFile.c_str(), "wb");
     if (!outFile) {
-        std::cerr << "閿欒: 鏃犳硶鍒涘缓杈撳嚭鏂囦欢: " << outputFile << std::endl;
+        std::cerr << "错误: 无法创建输出文件: " << outputFile << std::endl;
         return 1;
     }
     const size_t written = fwrite(outputData.get(), 1, outputSize, outFile);
@@ -1551,14 +1551,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "  杈撳嚭鏂囦欢宸蹭繚瀛? " << outputFile << std::endl;
-    std::cout << "  鏂囦欢澶у皬: " << outputSize << " 瀛楄妭" << std::endl;
+    std::cout << "  输出文件已保存: " << outputFile << std::endl;
+    std::cout << "  文件大小: " << outputSize << " 字节" << std::endl;
 
     // ============================================================================
-    // Step 6: 楠岃瘉杈撳嚭
+    // Step 6: 验证输出
     // ============================================================================
 
-    std::cout << "\n[6/6] 楠岃瘉杈撳嚭鏂囦欢..." << std::endl;
+    std::cout << "\n[6/6] 验证输出文件..." << std::endl;
 
     CipherShell::CS_PE_IMAGE* verifyImage = parser.LoadFromFile(outputFile);
     if (!verifyImage || !verifyImage->isValid) {
@@ -1598,8 +1598,8 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n======================================" << std::endl;
-    std::cout << "CipherShell 澶勭悊瀹屾垚!" << std::endl;
-    std::cout << "杈撳嚭鏂囦欢: " << outputFile << std::endl;
+    std::cout << "CipherShell 处理完成!" << std::endl;
+    std::cout << "输出文件: " << outputFile << std::endl;
     std::cout << "======================================" << std::endl;
 
     return 0;

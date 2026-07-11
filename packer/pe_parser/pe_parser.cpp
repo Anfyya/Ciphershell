@@ -1,5 +1,5 @@
 /**
- * CipherShell PE Parser - 瀹炵幇
+ * CipherShell PE Parser - 实现
  */
 
 #include "pe_parser.h"
@@ -19,7 +19,7 @@ bool IsPowerOfTwo(uint32_t value) {
 }
 
 // ============================================================================
-// 鏋勯€?鏋愭瀯
+// 构造/析构
 // ============================================================================
 
 PEParser::PEParser() {}
@@ -27,18 +27,18 @@ PEParser::PEParser() {}
 PEParser::~PEParser() {}
 
 // ============================================================================
-// 鍏叡鎺ュ彛
+// 公共接口
 // ============================================================================
 
 CS_PE_IMAGE* PEParser::LoadFromFile(const std::string& filePath) {
-    // 鎵撳紑鏂囦欢
+    // 打开文件
     HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
         return nullptr;
     }
 
-    // 鑾峰彇鏂囦欢澶у皬
+    // 获取文件大小
     DWORD fileSize = GetFileSize(hFile, nullptr);
     if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
         CloseHandle(hFile);
@@ -51,7 +51,7 @@ CS_PE_IMAGE* PEParser::LoadFromFile(const std::string& filePath) {
         return nullptr;
     }
 
-    // 璇诲彇鏂囦欢
+    // 读取文件
     DWORD bytesRead;
     if (!ReadFile(hFile, buffer, fileSize, &bytesRead, nullptr) || bytesRead != fileSize) {
         delete[] buffer;
@@ -60,11 +60,11 @@ CS_PE_IMAGE* PEParser::LoadFromFile(const std::string& filePath) {
     }
     CloseHandle(hFile);
 
-    // 瑙ｆ瀽
+    // 解析
     CS_PE_IMAGE* image = LoadFromBuffer(buffer, fileSize);
     if (image) {
         image->filePath = filePath;
-        // 娉ㄦ剰锛歳awData 鐨勬墍鏈夋潈杞Щ鍒?image锛屼笉鍐?delete
+        // 注意：rawData 的所有权转移到 image，不再 delete
     } else {
         delete[] buffer;
     }
@@ -77,7 +77,7 @@ CS_PE_IMAGE* PEParser::LoadFromBuffer(BYTE* buffer, DWORD size) {
         return nullptr;
     }
 
-    // 鍒涘缓 PE 闀滃儚
+    // 创建 PE 镜像
     CS_PE_IMAGE* image = new(std::nothrow) CS_PE_IMAGE();
     if (!image) {
         return nullptr;
@@ -87,7 +87,7 @@ CS_PE_IMAGE* PEParser::LoadFromBuffer(BYTE* buffer, DWORD size) {
     image->rawSize = size;
     image->isValid = FALSE;
 
-    // 楠岃瘉鍩烘湰 PE 缁撴瀯
+    // 验证基本 PE 结构
     if (!IsValidPE(image)) {
         SetError(image, "Invalid PE file");
         return image;
@@ -97,18 +97,18 @@ CS_PE_IMAGE* PEParser::LoadFromBuffer(BYTE* buffer, DWORD size) {
         return image;
     }
 
-    // 瑙ｆ瀽鏁版嵁鐩綍
+    // 解析数据目录
     if (!ParseDataDirectories(image)) {
         return image;
     }
 
-    // 瑙ｆ瀽 Rich Header
+    // 解析 Rich Header
     ParseRichHeader(image);
 
-    // 妫€娴?.NET
+    // 检测 .NET
     DetectDotNet(image);
 
-    // 妫€娴?Overlay
+    // 检测 Overlay
     DetectOverlay(image);
 
     image->isValid = TRUE;
@@ -125,7 +125,7 @@ void PEParser::FreeImage(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 澶撮儴瑙ｆ瀽
+// 头部解析
 // ============================================================================
 
 bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
@@ -233,7 +233,7 @@ bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 鏁版嵁鐩綍瑙ｆ瀽
+// 数据目录解析
 // ============================================================================
 
 bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
@@ -255,7 +255,8 @@ bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 瀵煎叆琛ㄨВ鏋?// ============================================================================
+// 导入表解析
+// ============================================================================
 
 bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
     IMAGE_DATA_DIRECTORY importDir;
@@ -293,13 +294,13 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
         DWORD iatOffset = RVAToOffset(image, importDesc->FirstThunk);
 
         if (iltOffset == 0) {
-            // 鏌愪簺鎯呭喌涓?ILT 鍙兘涓?锛屼娇鐢?IAT
+            // 某些情况下 ILT 可能为0，使用 IAT
             iltOffset = iatOffset;
         }
 
         if (iltOffset != 0 && iatOffset != 0) {
             if (image->is64Bit) {
-                // 64浣?Thunk
+                // 64位 Thunk
                 PIMAGE_THUNK_DATA64 ilt = (PIMAGE_THUNK_DATA64)(image->rawData + iltOffset);
                 PIMAGE_THUNK_DATA64 iat = (PIMAGE_THUNK_DATA64)(image->rawData + iatOffset);
                 DWORD thunkIndex = 0;
@@ -309,7 +310,7 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
                     func.thunkRVA = importDesc->FirstThunk + thunkIndex * sizeof(IMAGE_THUNK_DATA64);
 
                     if (IMAGE_SNAP_BY_ORDINAL64(ilt->u1.Ordinal)) {
-                        // 鎸夊簭鍙峰鍏?                        func.isOrdinal = true;
+                        // 按序号导入
                         func.ordinal = IMAGE_ORDINAL64(ilt->u1.Ordinal);
                     } else {
                         // 鎸夊悕绉板鍏?                        func.isOrdinal = false;
@@ -328,7 +329,7 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
                     thunkIndex++;
                 }
             } else {
-                // 32浣?Thunk
+                // 32位 Thunk
                 PIMAGE_THUNK_DATA32 ilt = (PIMAGE_THUNK_DATA32)(image->rawData + iltOffset);
                 PIMAGE_THUNK_DATA32 iat = (PIMAGE_THUNK_DATA32)(image->rawData + iatOffset);
                 DWORD thunkIndex = 0;
@@ -367,7 +368,8 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 瀵煎嚭琛ㄨВ鏋?// ============================================================================
+// 导出表解析
+// ============================================================================
 
 bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
     IMAGE_DATA_DIRECTORY exportDir;
@@ -395,7 +397,7 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
     }
     image->exports.ordinalBase = exportDirPtr->Base;
 
-    // 鑾峰彇鍑芥暟銆佸悕绉般€佸簭鍙疯〃
+    // 获取函数、名称、序号表
     DWORD functionsOffset = RVAToOffset(image, exportDirPtr->AddressOfFunctions);
     DWORD namesOffset = RVAToOffset(image, exportDirPtr->AddressOfNames);
     DWORD ordinalsOffset = RVAToOffset(image, exportDirPtr->AddressOfNameOrdinals);
@@ -408,7 +410,7 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
     DWORD* names = namesOffset ? (DWORD*)(image->rawData + namesOffset) : nullptr;
     WORD* ordinals = ordinalsOffset ? (WORD*)(image->rawData + ordinalsOffset) : nullptr;
 
-    // 鏋勫缓搴忓彿鍒板悕绉扮殑鏄犲皠
+    // 构建序号到名称的映射
     std::vector<std::string> ordinalToName(exportDirPtr->NumberOfFunctions);
     if (names && ordinals) {
         for (DWORD i = 0; i < exportDirPtr->NumberOfNames; i++) {
@@ -422,9 +424,9 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
         }
     }
 
-    // 鏋勫缓瀵煎嚭鍑芥暟鍒楄〃
+    // 构建导出函数列表
     for (DWORD i = 0; i < exportDirPtr->NumberOfFunctions; i++) {
-        if (functions[i] == 0) continue;  // 绌烘Ы浣?
+        if (functions[i] == 0) continue;  // 空槽位
         CS_EXPORT_FUNCTION func;
         func.ordinal = (WORD)(i + exportDirPtr->Base);
         func.functionRVA = functions[i];
@@ -448,7 +450,7 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 閲嶅畾浣嶈〃瑙ｆ瀽
+// 重定位表解析
 // ============================================================================
 
 bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
@@ -510,7 +512,7 @@ bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 璧勬簮琛ㄨВ鏋?// ============================================================================
+// 资源表解析
 
 bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
     IMAGE_DATA_DIRECTORY resourceDir;
@@ -533,7 +535,7 @@ bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// TLS 瑙ｆ瀽
+// TLS 解析
 // ============================================================================
 
 bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
@@ -571,7 +573,7 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
 
     image->tls.valid = TRUE;
 
-    // 璁＄畻鍥炶皟鏁伴噺
+    // 计算回调数量
     if (image->tls.callbacksAddress != 0) {
         DWORD callbackOffset = RVAToOffset(image, (DWORD)(image->tls.callbacksAddress -
             (image->is64Bit ? image->ntHeaders64->OptionalHeader.ImageBase :
@@ -604,7 +606,7 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 寮傚父澶勭悊琛ㄨВ鏋?(x64)
+// 异常处理表解析 (x64)
 // ============================================================================
 
 bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
@@ -640,7 +642,7 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// Load Config 瑙ｆ瀽
+// Load Config 解析
 // ============================================================================
 
 bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
@@ -750,7 +752,7 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// Debug 鐩綍瑙ｆ瀽
+// Debug 目录解析
 // ============================================================================
 
 bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
@@ -786,7 +788,7 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 寤惰繜瀵煎叆瑙ｆ瀽
+// 延迟导入解析
 // ============================================================================
 
 bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
@@ -806,17 +808,17 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // 寤惰繜瀵煎叆浣跨敤 IMAGE_DELAYLOAD_DESCRIPTOR 缁撴瀯
+    // 延迟导入使用 IMAGE_DELAYLOAD_DESCRIPTOR 结构
     return true;
 }
 
 // ============================================================================
-// Rich Header 瑙ｆ瀽
+// Rich Header 解析
 // ============================================================================
 
 bool PEParser::ParseRichHeader(CS_PE_IMAGE* image) {
-    // Rich Header 鍦?DOS Header 鍜?PE 绛惧悕涔嬮棿
-    // 鎼滅储 "Rich" 鏍囪
+    // Rich Header 在 DOS Header 和 PE 签名之间
+    // 搜索 "Rich" 标记
     DWORD richSignature = 0x68636952;  // "Rich"
     if (!image || !image->rawData || !image->dosHeader ||
         image->dosHeader->e_lfanew <= static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
@@ -838,7 +840,8 @@ bool PEParser::ParseRichHeader(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// .NET 妫€娴?// ============================================================================
+// .NET 检测
+// ============================================================================
 
 bool PEParser::DetectDotNet(CS_PE_IMAGE* image) {
     IMAGE_DATA_DIRECTORY comDir;
@@ -853,7 +856,7 @@ bool PEParser::DetectDotNet(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// Overlay 妫€娴?// ============================================================================
+// Overlay 检测
 
 bool PEParser::DetectOverlay(CS_PE_IMAGE* image) {
     DWORD lastSectionEnd = 0;
@@ -864,7 +867,7 @@ bool PEParser::DetectOverlay(CS_PE_IMAGE* image) {
         }
     }
 
-    // 妫€鏌ユ槸鍚︽湁棰濆鏁版嵁
+    // 检查是否有额外数据
     if (lastSectionEnd < image->rawSize) {
         image->hasOverlay = TRUE;
         image->overlayOffset = lastSectionEnd;
@@ -874,7 +877,7 @@ bool PEParser::DetectOverlay(CS_PE_IMAGE* image) {
 }
 
 // ============================================================================
-// 杈呭姪鍑芥暟
+// 辅助函数
 // ============================================================================
 
 DWORD PEParser::RVAToOffset(CS_PE_IMAGE* image, DWORD rva) {
@@ -886,7 +889,7 @@ bool PEParser::IsValidPE(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // 妫€鏌?DOS 绛惧悕
+    // 检查 DOS 签名
     if (image->rawData[0] != 'M' || image->rawData[1] != 'Z') {
         return false;
     }
@@ -909,7 +912,7 @@ bool PEParser::IsValidPE(CS_PE_IMAGE* image) {
 }
 
 bool PEParser::CheckBounds(CS_PE_IMAGE* image, DWORD offset, DWORD size) {
-    // BUG2淇锛氶槻姝?offset+size 鏁存暟婧㈠嚭缁曡繃杈圭晫妫€鏌?    // 渚嬪 offset=0xFFFFFFF0, size=0x20 鏃? offset+size=0x10 浼氶敊璇湴閫氳繃妫€鏌?    // 瀹夊叏鍐欐硶锛氬厛妫€鏌?offset 鏄惁瓒婄晫锛屽啀鐢ㄥ噺娉曟鏌?size
+    // 安全写法：先检查 offset 是否越界，再用减法检查 size
     return (offset <= image->rawSize && size <= image->rawSize - offset);
 }
 
