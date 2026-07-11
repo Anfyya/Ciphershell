@@ -106,6 +106,10 @@ public:
      */
     bool GenerateFakeImports(CS_PE_IMAGE* image, uint32_t count);
 
+    bool WasApplied() const { return m_applied; }
+    uint32_t GetWrittenFakeImportCount() const { return m_writtenFakeImportCount; }
+    const std::string& GetLastError() const { return m_lastError; }
+
 private:
     // 策略实现
     bool ApplyStrategyA(CS_PE_IMAGE* image, const CS_IMPORT_OBFUSCATION_CONFIG& config, APIResolver* resolver);
@@ -116,6 +120,11 @@ private:
     bool IsCriticalImport(const char* dllName, const char* funcName);
     std::string GenerateRandomDLLName();
     std::string GenerateRandomFuncName();
+
+    bool m_applied = false;
+    uint32_t m_writtenFakeImportCount = 0;
+    std::string m_lastError;
+    std::vector<CS_OBFUSCATED_IMPORT> m_generatedFakeImports;
 
     // 常用的假 DLL 和函数名称
     static const char* s_fakeDLLNames[];

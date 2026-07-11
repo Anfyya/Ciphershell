@@ -7,6 +7,7 @@
 #define CS_VM_CONTEXT_H
 
 #include <stdint.h>
+#include "../../runtime/common/vm_isa.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,121 +22,6 @@ extern "C" {
 #define VM_MAX_OPCODE       256     // 最大 opcode 数
 #define VM_KEY_SIZE         32      // 密钥大小
 #define VM_NONCE_SIZE       12      // nonce 大小
-
-// ============================================================================
-// VM 指令操作码定义（基础模板，实际编号每次加壳随机化）
-// ============================================================================
-
-// 数据传送
-#define VM_NOP              0x00
-#define VM_MOV_RR           0x01    // vReg <- vReg
-#define VM_MOV_RC           0x02    // vReg <- Const
-#define VM_MOV_RM           0x03    // vReg <- [vReg + Offset]
-#define VM_MOV_MR           0x04    // [vReg + Offset] <- vReg
-#define VM_MOV_RM8          0x05
-#define VM_MOV_MR8          0x06
-#define VM_MOV_RM16         0x07
-#define VM_MOV_MR16         0x08
-#define VM_LEA              0x09    // vReg <- vReg + vReg * Scale + Offset
-#define VM_XCHG             0x0A    // 交换两个寄存器
-
-// 栈操作
-#define VM_PUSH_R           0x10
-#define VM_PUSH_C           0x11
-#define VM_PUSH_MEM         0x12
-#define VM_POP_R            0x13
-#define VM_POP_MEM          0x14
-#define VM_PUSHAD           0x15    // 保存所有寄存器
-#define VM_POPAD            0x16    // 恢复所有寄存器
-#define VM_PUSHF            0x17    // 保存 flags
-#define VM_POPF             0x18    // 恢复 flags
-
-// 算术
-#define VM_ADD_RR           0x20
-#define VM_ADD_RC           0x21
-#define VM_SUB_RR           0x22
-#define VM_SUB_RC           0x23
-#define VM_MUL_RR           0x24
-#define VM_IMUL_RR          0x25
-#define VM_IMUL_RRC         0x26    // vReg = vReg * Const
-#define VM_DIV_RR           0x27
-#define VM_IDIV_RR          0x28
-#define VM_NEG_R            0x29
-#define VM_INC_R            0x2A
-#define VM_DEC_R            0x2B
-#define VM_ADC_RR           0x2C    // 带进位加
-#define VM_SBB_RR           0x2D    // 带借位减
-
-// 逻辑/位操作
-#define VM_AND_RR           0x30
-#define VM_AND_RC           0x31
-#define VM_OR_RR            0x32
-#define VM_OR_RC            0x33
-#define VM_XOR_RR           0x34
-#define VM_XOR_RC           0x35
-#define VM_NOT_R            0x36
-#define VM_SHL_RR           0x37
-#define VM_SHL_RC           0x38
-#define VM_SHR_RR           0x39
-#define VM_SHR_RC           0x3A
-#define VM_SAR_RR           0x3B
-#define VM_SAR_RC           0x3C
-#define VM_ROL_RR           0x3D
-#define VM_ROR_RR           0x3E
-#define VM_BT_RR            0x3F    // 位测试
-#define VM_BTS_RR           0x40    // 位测试并设置
-#define VM_BTR_RR           0x41    // 位测试并清除
-#define VM_BSWAP            0x42    // 字节交换
-
-// 比较/测试
-#define VM_CMP_RR           0x50
-#define VM_CMP_RC           0x51
-#define VM_TEST_RR          0x52
-#define VM_TEST_RC          0x53
-
-// 控制流
-#define VM_JMP              0x60    // 无条件跳转（bytecode内偏移）
-#define VM_JMP_R            0x61    // 间接跳转 vReg
-#define VM_JZ               0x62
-#define VM_JNZ              0x63
-#define VM_JA               0x64
-#define VM_JB               0x65
-#define VM_JG               0x66
-#define VM_JL               0x67
-#define VM_JGE              0x68
-#define VM_JLE              0x69
-#define VM_JO               0x6A
-#define VM_JNO              0x6B
-#define VM_JS               0x6C
-#define VM_JNS              0x6D
-#define VM_CALL_VM          0x6E    // VM内部函数调用
-#define VM_RET_VM           0x6F    // VM内部返回
-
-// 与外部世界交互
-#define VM_CALL_NATIVE      0x70    // 调用真实API
-#define VM_VMENTER          0x71    // native -> VM
-#define VM_VMEXIT           0x72    // VM -> native
-#define VM_SYSCALL          0x73    // 直接syscall
-#define VM_JAE              0x74    // CF=0, unsigned >= / not below
-#define VM_JBE              0x75    // CF=1 or ZF=1, unsigned <= / not above
-
-// 特殊
-#define VM_ANTI_DEBUG       0x80    // 内联反调试
-#define VM_CRC_CHECK        0x81    // 完整性校验
-#define VM_RDTSC            0x82    // 读时间戳
-#define VM_CPUID            0x83    // CPUID
-#define VM_INT3             0x84    // INT3 断点（用于Nanomite）
-
-// 标志位定义
-#define VM_FLAG_CF          0x0001  // Carry
-#define VM_FLAG_PF          0x0004  // Parity
-#define VM_FLAG_AF          0x0010  // Auxiliary
-#define VM_FLAG_ZF          0x0040  // Zero
-#define VM_FLAG_SF          0x0080  // Sign
-#define VM_FLAG_TF          0x0100  // Trap
-#define VM_FLAG_IF          0x0200  // Interrupt Enable
-#define VM_FLAG_DF          0x0400  // Direction
-#define VM_FLAG_OF          0x0800  // Overflow
 
 // ============================================================================
 // VM EFLAGS 模拟结构

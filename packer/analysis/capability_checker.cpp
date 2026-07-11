@@ -1,16 +1,10 @@
 ﻿#include "capability_checker.h"
+#include "../pe_parser/pe_utils.h"
 #include <algorithm>
 
 namespace CipherShell {
 
 namespace {
-bool IsLikelyDll(const CS_PE_IMAGE* image) {
-    if (!image) return false;
-    WORD chars = image->is64Bit ? image->ntHeaders64->FileHeader.Characteristics
-                                : image->ntHeaders32->FileHeader.Characteristics;
-    return (chars & IMAGE_FILE_DLL) != 0;
-}
-
 void AddIssue(CapabilityReport& report, const char* module, uint32_t rva, const char* reason, bool fatal) {
     CapabilityIssue issue;
     issue.module = module;
@@ -30,14 +24,38 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
     }
 
     if (ctx.vm.enabled) {
-        if (!image->is64Bit) {
-            AddIssue(report, "VM", 0, "function VM runtime currently supports x64 targets only", true);
+        if (ctx.sectionEncryption.enabled) {
+            AddIssue(report, "SectionEncryption", 0,
+                "VM and startup section encryption cannot be combined until the loader restores W^X and preserves TLS initialization order",
+                true);
         }
-        if (IsLikelyDll(image)) {
-            AddIssue(report, "VM", 0, "DLL export/DllMain VM chain is not enabled before x64 EXE VM is complete", true);
+        const WORD dllCharacteristics = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.DllCharacteristics
+            : image->ntHeaders32->OptionalHeader.DllCharacteristics;
+        const bool cfgCharacteristic =
+            (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) != 0;
+        if (cfgCharacteristic && (!image->loadConfig.valid || !image->loadConfig.hasCFG)) {
+            AddIssue(report, "LoadConfig", 0,
+                "PE advertises CFG but its Load Config Guard metadata is invalid", true);
         }
         if (image->loadConfig.valid && image->loadConfig.hasCFG) {
-            AddIssue(report, "LoadConfig", 0, "CFG Guard target table update is not implemented for VM trampolines", true);
+            if ((image->loadConfig.guardFlags & IMAGE_GUARD_XFG_ENABLED) != 0) {
+                AddIssue(report, "LoadConfig", 0,
+                    "XFG requires signature-aware dispatch metadata that the VM native bridge cannot reproduce",
+                    true);
+            }
+            if (image->loadConfig.hasRFGuard) {
+                AddIssue(report, "LoadConfig", 0,
+                    "Return Flow Guard instrumentation is incompatible with generated VM runtime returns",
+                    true);
+            }
+            const bool guardTargetMissing = image->is64Bit
+                ? image->loadConfig.guardCFDispatchFunctionPointer == 0
+                : image->loadConfig.guardCFCheckFunctionPointer == 0;
+            if (guardTargetMissing) {
+                AddIssue(report, "LoadConfig", 0,
+                    "CFG image has no architecture-specific Guard check/dispatch pointer", true);
+            }
         }
     }
 
@@ -61,6 +79,14 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
         reason = "function too small for entry trampoline";
         return false;
     }
+    if (!func.boundaryTrusted || func.blocks.empty() || func.decodedBytes == 0) {
+        reason = "function has no trusted recursive-decoder boundary";
+        return false;
+    }
+    if (func.hasExternalInteriorReference) {
+        reason = "another function branches into the protected function interior";
+        return false;
+    }
     if (func.usesSEH) {
         reason = "function marked as SEH/exception user";
         return false;
@@ -69,8 +95,21 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
         uint32_t begin = static_cast<uint32_t>(func.entryAddress);
         uint32_t end = begin + func.size;
         for (const auto& entry : image->exceptions.entries) {
-            if (begin < entry.endAddress && end > entry.beginAddress) {
-                reason = "x64 unwind entry overlaps function; no generated unwind info yet";
+            if (begin >= entry.endAddress || end <= entry.beginAddress) continue;
+            if (begin != entry.beginAddress || end > entry.endAddress) {
+                reason = "function boundary does not match its x64 runtime-function entry";
+                return false;
+            }
+            const uint32_t unwindOffset = PEUtils::RvaToOffset(image, entry.unwindData);
+            if (unwindOffset == 0 || unwindOffset >= image->rawSize) {
+                reason = "x64 unwind info is outside the PE image";
+                return false;
+            }
+            const uint8_t versionAndFlags = image->rawData[unwindOffset];
+            const uint8_t version = versionAndFlags & 0x07u;
+            const uint8_t flags = versionAndFlags >> 3;
+            if ((version != 1 && version != 2) || (flags & 0x07u) != 0) {
+                reason = "x64 function uses exception handlers or chained unwind metadata";
                 return false;
             }
         }
@@ -78,12 +117,8 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
 
     for (const auto& block : func.blocks) {
         for (const auto& instr : block.instructions) {
-            if (instr.isIndirect) {
-                reason = "indirect control flow requires native bridge or user annotation";
-                return false;
-            }
-            if (instr.isCall && !instr.hasTarget) {
-                reason = "indirect call requires native bridge";
+            if (instr.isIndirectBranch && !instr.IsCall()) {
+                reason = "indirect non-call control flow has no statically verifiable VM target";
                 return false;
             }
         }

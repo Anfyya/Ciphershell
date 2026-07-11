@@ -3,10 +3,17 @@
  */
 
 #include "string_encryptor.h"
+#include "runtime_stream_cipher.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <unordered_map>
+#ifdef _WIN32
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <random>
+#endif
 
 namespace CipherShell {
 
@@ -15,7 +22,6 @@ namespace CipherShell {
 // ============================================================================
 
 StringEncryptor::StringEncryptor() {
-    srand((unsigned int)time(nullptr));
 }
 
 StringEncryptor::~StringEncryptor() {}
@@ -29,6 +35,7 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
     const CS_STRING_CONFIG& config)
 {
     std::vector<CS_STRING_ENTRY> result;
+    m_lastError.clear();
 
     if (!image || !image->isValid) {
         return result;
@@ -43,12 +50,22 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
             continue;
         }
 
-        bool readable = (section->Characteristics & IMAGE_SCN_MEM_READ) != 0;
-        bool code = (section->Characteristics & IMAGE_SCN_CNT_CODE) != 0;
-        bool initializedData = (section->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
-        if (!code && (!config.scanReadableSections || !readable || !initializedData)) {
+        if (section->PointerToRawData > image->rawSize ||
+            section->SizeOfRawData > image->rawSize - section->PointerToRawData) {
             continue;
         }
+
+        bool readable = (section->Characteristics & IMAGE_SCN_MEM_READ) != 0;
+        bool executable = (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        bool code = (section->Characteristics & IMAGE_SCN_CNT_CODE) != 0;
+        bool initializedData = (section->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+        if (code || executable || !config.scanReadableSections || !readable || !initializedData) {
+            continue;
+        }
+
+        char sectionName[9] = {};
+        std::memcpy(sectionName, section->Name, 8);
+        if (std::strncmp(sectionName, ".rsrc", 5) == 0 && !config.scanResources) continue;
 
         const BYTE* sectionData = image->rawData + section->PointerToRawData;
         DWORD sectionSize = section->SizeOfRawData;
@@ -86,8 +103,10 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
                     entry.original = (const char*)(sectionData + pos);
 
                     // 生成独立密钥
-                    GenerateRandomBytes(entry.key, 32);
-                    GenerateRandomBytes(entry.nonce, 12);
+                    if (!GenerateRandomBytes(entry.key, 32) || !GenerateRandomBytes(entry.nonce, 12)) {
+                        m_lastError = "secure random generation failed for ANSI string";
+                        return {};
+                    }
 
                     result.push_back(entry);
                     pos += strLen;
@@ -126,8 +145,10 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
                     }
                     entry.original = narrowBuf;
 
-                    GenerateRandomBytes(entry.key, 32);
-                    GenerateRandomBytes(entry.nonce, 12);
+                    if (!GenerateRandomBytes(entry.key, 32) || !GenerateRandomBytes(entry.nonce, 12)) {
+                        m_lastError = "secure random generation failed for UTF-16 string";
+                        return {};
+                    }
 
                     result.push_back(entry);
                     pos += strLen * 2;
@@ -249,15 +270,17 @@ bool StringEncryptor::EncryptStrings(
     for (auto& entry : strings) {
         // 检查偏移是否有效
         if (entry.offset + entry.length > image->rawSize) {
-            continue;
+            m_lastError = "string range is outside file data";
+            return false;
         }
 
         // 获取字符串数据
         BYTE* data = image->rawData + entry.offset;
 
-        // 与启动 stub / GenerateDecryptFunction 保持一致：32 字节循环 XOR。
-        for (DWORD i = 0; i < entry.length; i++) {
-            data[i] ^= entry.key[i & 31];
+        if (image->is64Bit) {
+            RuntimeStreamCipher::ApplyRolling(data, entry.length, entry.key, true);
+        } else {
+            RuntimeStreamCipher::ApplyLegacyXor(data, entry.length, entry.key);
         }
 
         // 更新加密后大小
@@ -414,10 +437,23 @@ DWORD StringEncryptor::AlignValue(DWORD value, DWORD alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-void StringEncryptor::GenerateRandomBytes(uint8_t* buffer, DWORD length) {
-    for (DWORD i = 0; i < length; i++) {
-        buffer[i] = (uint8_t)(rand() % 256);
+bool StringEncryptor::GenerateRandomBytes(uint8_t* buffer, DWORD length) {
+    if (!buffer || length == 0) return false;
+#ifdef _WIN32
+    return BCryptGenRandom(
+        nullptr,
+        reinterpret_cast<PUCHAR>(buffer),
+        length,
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+    try {
+        std::random_device random;
+        for (DWORD i = 0; i < length; i++) buffer[i] = static_cast<uint8_t>(random());
+        return true;
+    } catch (...) {
+        return false;
     }
+#endif
 }
 
 } // namespace CipherShell

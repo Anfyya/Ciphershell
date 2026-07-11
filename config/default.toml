@@ -1,58 +1,74 @@
-# CipherShell 保护配置文件
-# 自动生成 - 请根据需要修改
+# CipherShell production configuration
 
 [global]
-protection_level = 3              # 全局默认保护等级 1-5
-strip_debug_info = true           # 删除所有调试信息
-strip_rich_header = true          # 删除 Rich Header（编译器指纹）
-strip_timestamps = true           # 时间戳归零
-randomize_section_names = true    # Section 名称随机化
-anti_debug_mode = "implicit"      # "explicit" | "implicit" | "hybrid"
-string_encryption = true          # 全局字符串加密
-import_obfuscation = true         # 导入表混淆
-resource_encryption = false       # 资源加密（可能影响兼容性）
+protection_level = 3
+strip_debug_info = true
+strip_rich_header = true
+strip_timestamps = true
+randomize_section_names = true
 
 [vm]
-register_count = 24               # 虚拟寄存器数量（16-64）
-stack_size = 0x20000              # 虚拟栈大小
-opcode_width = "variable"         # "fixed_8" | "fixed_16" | "variable"
-handler_mutation = true           # Handler 代码变异
-bytecode_encryption = "rolling"   # "none" | "xor" | "rolling" | "aes_ctr"
-embed_junk_handlers = true        # 嵌入无意义的假 handler 干扰分析
+enabled = false
+strength = 80
+target_functions = []
+target_rvas = []
+register_count = 24
+stack_size = 0x20000
+opcode_randomization = true
+handler_mutation = false
+bytecode_encryption = true
+native_body_policy = "destroy"
+x86_call_abi = "auto"
+embed_junk_handlers = false
+simd_bridge = true
+x87_bridge = true
+
+[string_encryption]
+enabled = true
+strength = 60
+mode = "startup"
+ascii = true
+utf16 = true
+resources = false
+clear_after_use = false
+
+[import_protection]
+enabled = true
+strength = 50
+
+[section_encryption]
+enabled = true
+strength = 58
+mode = "startup"
+
+[control_flow]
+enabled = true
+strength = 55
+
+[control_flow.flattening]
+enabled = true
+strength = 55
+target_functions = []
+
+[control_flow.bogus]
+enabled = true
+strength = 50
 
 [anti_debug]
-timing_checks = true              # 时序检测
-hardware_bp_detection = true      # 硬件断点检测
-software_bp_detection = true      # INT3 / 0xCC 扫描
-memory_integrity = true           # 代码完整性校验
-debugger_window_scan = false      # 扫描调试器窗口类名（可选，易被绕过）
-parent_process_check = true       # 父进程检测
-thread_hiding = true              # NtSetInformationThread HideFromDebugger
-kernel_debugger_check = true      # 内核调试器检测
+timing_checks = true
+hardware_bp_detection = true
+software_bp_detection = true
+memory_integrity = true
+debugger_window_scan = false
+parent_process_check = true
+thread_hiding = true
+kernel_debugger_check = true
 
 [anti_dump]
-erase_pe_header = true            # 运行时擦除 PE 头
-section_permission_guard = true   # 动态权限管理
-nanomite_patches = true           # INT3 Nanomite 技术
+erase_pe_header = true
+section_permission_guard = true
+nanomite_patches = true
 
 [performance]
-auto_hotspot_analysis = true      # 自动分析热点函数并降低其保护等级
-max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自动降级）
-
-# 函数级精确控制
-[[function_overrides]]
-pattern = "main"                  # 函数名匹配（支持通配符）
-level = 5                         # 覆盖为最高保护
-
-[[function_overrides]]
-pattern = "render_*"              # 渲染相关函数
-level = 1                         # 性能敏感，仅做基础加密
-
-[[function_overrides]]
-pattern = "license_check*"        # 授权验证函数
-level = 5                         # 最高保护
-vm_nesting = 2                    # 双层 VM 嵌套
-
-[[function_overrides]]
-pattern = "crypto_*"              # 已有加密函数
-level = 2                         # 避免过度保护影响性能
+auto_hotspot_analysis = true
+max_vm_overhead_ratio = 15.0

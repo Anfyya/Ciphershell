@@ -5,6 +5,7 @@
 # ============================================================================
 
 add_library(ciphershell_packer STATIC
+    ../runtime/common/vm_crypto.c
     # PE 解析器
     pe_parser/pe_parser.cpp
     pe_parser/pe_emitter.cpp
@@ -19,6 +20,8 @@ add_library(ciphershell_packer STATIC
     transforms/reloc_fixer.cpp
 
     # 分析引擎 — Phase 3
+    analysis/instruction_ir.cpp
+    analysis/function_discovery.cpp
     analysis/disassembler.cpp
     analysis/cfg_builder.cpp
     analysis/capability_checker.cpp
@@ -33,14 +36,15 @@ add_library(ciphershell_packer STATIC
     transforms/stub_builder.cpp
 
     # 转译器 — Phase 4
+    vm/vm_schema.cpp
+    vm/vm_verifier.cpp
     transforms/translator.cpp
     transforms/vm_section_emitter.cpp
     transforms/vm_runtime_builder.cpp
+    transforms/vm_instruction_bridge_builder.cpp
     transforms/function_trampoline_patcher.cpp
-    transforms/vm_nester.cpp
 
     # 变异引擎 — Phase 4
-    mutation/bytecode_encryptor.cpp
     mutation/mutation_engine.cpp
 
     # 配置解析
@@ -63,6 +67,11 @@ target_include_directories(ciphershell_packer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
+if(WIN32)
+    add_dependencies(ciphershell_packer vm_runtime_blobs)
+    target_include_directories(ciphershell_packer PRIVATE "${CS_RUNTIME_GENERATED_DIR}")
+endif()
+
 # 链接依赖
 if(WIN32)
     target_sources(ciphershell_packer PRIVATE
@@ -70,9 +79,10 @@ if(WIN32)
     )
 endif()
 
-target_link_libraries(ciphershell_packer PRIVATE
-    # Windows API
-)
+target_link_libraries(ciphershell_packer PRIVATE Zydis)
+if(WIN32)
+    target_link_libraries(ciphershell_packer PRIVATE bcrypt)
+endif()
 
 # ============================================================================
 # Packer 可执行文件

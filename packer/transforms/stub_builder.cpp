@@ -119,7 +119,10 @@ static std::vector<BYTE> build_x86_multi(const std::vector<CS_STUB_PARAMS>& task
     return c;
 }
 
-static std::vector<BYTE> build_x64_multi(const std::vector<CS_STUB_PARAMS>& tasks, DWORD oepRVA) {
+static std::vector<BYTE> build_x64_multi(
+    const std::vector<CS_STUB_PARAMS>& tasks,
+    DWORD oepRVA,
+    bool preservePEHeaders = false) {
     std::vector<BYTE> c;
 
     // rbx = PEB
@@ -183,8 +186,9 @@ static std::vector<BYTE> build_x64_multi(const std::vector<CS_STUB_PARAMS>& task
     size_t done = c.size();
     patch_rel32(c, doneJz, done);
 
-    // Existing anti-dump behavior: erase e_lfanew before transferring control.
-    emit8(c, 0xC7); emit8(c, 0x43); emit8(c, 0x3C); emit32(c, 0);
+    if (!preservePEHeaders) {
+        emit8(c, 0xC7); emit8(c, 0x43); emit8(c, 0x3C); emit32(c, 0);
+    }
 
     emit8(c, 0x48); emit8(c, 0x8D); emit8(c, 0x83); emit32(c, oepRVA); // lea rax, [rbx+oep]
     emit8(c, 0xFF); emit8(c, 0xE0);                                     // jmp rax
@@ -201,7 +205,7 @@ static std::vector<BYTE> build_x86(const CS_STUB_PARAMS& p) {
 }
 
 static std::vector<BYTE> build_x64(const CS_STUB_PARAMS& p) {
-    return build_x64_multi(one_task(p), p.oepRVA);
+    return build_x64_multi(one_task(p), p.oepRVA, false);
 }
 
 StubBuilder::StubBuilder() {}
@@ -228,7 +232,8 @@ bool StubBuilder::GenerateX64Stub(const CS_STUB_PARAMS& p, BYTE** out, DWORD* sz
 }
 
 bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
-    const std::vector<CS_ENCRYPTED_SECTION>& encSections, DWORD oep)
+    const std::vector<CS_ENCRYPTED_SECTION>& encSections, DWORD oep,
+    bool preservePEHeaders)
 {
     if (!img || encSections.empty()) return false;
 
@@ -247,7 +252,7 @@ bool StubBuilder::EmbedStub(CS_PE_IMAGE* img,
     }
     if (tasks.empty()) return false;
 
-    std::vector<BYTE> stub = img->is64Bit ? build_x64_multi(tasks, oep)
+    std::vector<BYTE> stub = img->is64Bit ? build_x64_multi(tasks, oep, preservePEHeaders)
                                           : build_x86_multi(tasks, oep);
     if (stub.empty()) return false;
 

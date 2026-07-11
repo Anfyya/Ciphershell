@@ -6,9 +6,8 @@
 #ifndef CS_MUTATION_ENGINE_H
 #define CS_MUTATION_ENGINE_H
 
+#include <array>
 #include <cstdint>
-#include <ctime>
-#include <vector>
 #include <unordered_map>
 
 namespace CipherShell {
@@ -18,29 +17,16 @@ namespace CipherShell {
 // ============================================================================
 
 struct MutationConfig {
-    uint32_t    seed;                   // 随机种子
+    std::array<uint8_t, 32> seed{};     // 256 位构建种子
     uint32_t    registerCount;          // 寄存器数量
     bool        randomizeOpcodeMap;     // 随机化 opcode 映射
     bool        randomizeRegisterMap;   // 随机化寄存器映射
-    bool        mutateHandlers;         // 变异 handler 代码
-    bool        insertJunkHandlers;     // 插入假 handler
-    uint32_t    junkHandlerCount;       // 假 handler 数量
-    bool        randomizeDispatchMode;  // 随机化 dispatch 模式
-    bool        randomizeStackLayout;   // 随机化栈布局
 
     MutationConfig() :
-        seed(0),
         registerCount(24),
         randomizeOpcodeMap(true),
-        randomizeRegisterMap(true),
-        mutateHandlers(true),
-        insertJunkHandlers(true),
-        junkHandlerCount(20),
-        randomizeDispatchMode(true),
-        randomizeStackLayout(true)
-    {
-        seed = (uint32_t)time(nullptr);
-    }
+        randomizeRegisterMap(true)
+    {}
 };
 
 // ============================================================================
@@ -50,23 +36,6 @@ struct MutationConfig {
 struct MutatedISA {
     std::unordered_map<uint8_t, uint8_t>   opcodeMap;      // 标准 opcode → 变异 opcode
     std::unordered_map<uint8_t, uint8_t>   registerMap;    // x86 reg → vReg
-    std::vector<uint8_t>                    handlerOrder;   // handler 排列顺序
-    std::vector<uint8_t>                    junkOpcodes;    // 假 handler 的 opcode
-    uint32_t                                dispatchMode;   // dispatch 模式
-    uint32_t                                stackBase;      // 栈基址
-    uint32_t                                stackSize;      // 栈大小
-};
-
-// ============================================================================
-// Handler 变异信息
-// ============================================================================
-
-struct MutatedHandler {
-    uint8_t     originalOpcode;         // 原始 opcode
-    uint8_t     mutatedOpcode;          // 变异后的 opcode
-    std::vector<uint8_t>   code;        // 变异后的 handler 代码
-    uint32_t    codeSize;               // 代码大小
-    bool        isJunk;                 // 是否是假 handler
 };
 
 // ============================================================================
@@ -92,31 +61,10 @@ public:
     MutatedISA GenerateMutatedISA();
 
     /**
-     * 变异 handler 代码
-     * @param originalHandler 原始 handler 代码
-     * @param originalSize 原始大小
-     * @return 变异后的 handler
-     */
-    MutatedHandler MutateHandler(const uint8_t* originalHandler, uint32_t originalSize);
-
-    /**
-     * 生成假 handler
-     * @return 假 handler
-     */
-    MutatedHandler GenerateJunkHandler();
-
-    /**
-     * 生成变异后的 handler 表
-     * @param isa 变异后的 ISA
-     * @return handler 表数据
-     */
-    std::vector<MutatedHandler> GenerateHandlerTable(const MutatedISA& isa);
-
-    /**
      * 获取变异种子（用于记录/重放）
      * @return 种子值
      */
-    uint32_t GetSeed() const;
+    uint64_t GetSeedFingerprint() const;
 
 private:
     // Opcode 随机化
@@ -125,22 +73,13 @@ private:
     // 寄存器随机化
     std::unordered_map<uint8_t, uint8_t> RandomizeRegisterMap();
 
-    // Handler 排列随机化
-    std::vector<uint8_t> RandomizeHandlerOrder();
-
-    // Handler 代码变异
-    void MutateCode(std::vector<uint8_t>& code);
-    void InsertJunkInstructions(std::vector<uint8_t>& code);
-    void RemapRegisters(std::vector<uint8_t>& code);
-    void RearrangeCode(std::vector<uint8_t>& code);
-
     // 辅助函数
     uint32_t NextRandom();
-    uint8_t NextRandomByte();
+    uint32_t RandomBelow(uint32_t upperBound);
 
     // 成员变量
     MutationConfig m_config;
-    uint32_t m_randomState;
+    uint64_t m_streamOffset;
     bool m_initialized;
 };
 

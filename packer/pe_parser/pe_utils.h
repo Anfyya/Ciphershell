@@ -107,7 +107,8 @@ inline uint32_t RecomputeSizeOfImage(const CS_PE_IMAGE* image) {
         const IMAGE_SECTION_HEADER& sec = image->sections[i];
         const uint32_t span = SectionMappedSpan(sec);
         if (span == 0) continue;
-        size = (std::max)(size, sec.VirtualAddress + AlignUp(span, align));
+        const uint32_t sectionEnd = static_cast<uint32_t>(sec.VirtualAddress) + AlignUp(span, align);
+        size = (std::max)(size, sectionEnd);
     }
     return size;
 }

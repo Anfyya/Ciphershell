@@ -13,6 +13,10 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <array>
+#include <unordered_set>
+#include <cctype>
+#include <cstdio>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -22,6 +26,7 @@
 #include "pe_parser/pe_parser.h"
 #include "pe_parser/pe_rebuilder.h"
 #include "pe_parser/pe_emitter.h"
+#include "pe_parser/pe_utils.h"
 #include "transforms/section_encryptor.h"
 #include "transforms/string_encryptor.h"
 #include "transforms/import_obfuscator.h"
@@ -29,6 +34,7 @@
 #include "config/config_parser.h"
 #include "signature/signature_eliminator.h"
 #include "analysis/disassembler.h"
+#include "analysis/function_discovery.h"
 #include "analysis/cfg_builder.h"
 #include "transforms/cfg_flattener.h"
 #include "transforms/opaque_predicates.h"
@@ -36,13 +42,14 @@
 #include "transforms/stub_builder.h"
 #include "transforms/translator.h"
 #include "transforms/vm_section_emitter.h"
-#include "transforms/vm_nester.h"
 #include "mutation/mutation_engine.h"
 #include "gui/console_gui.h"
 #include "transforms/function_trampoline_patcher.h"
 #include "transforms/vm_runtime_builder.h"
+#include "transforms/vm_instruction_bridge_builder.h"
 #include "analysis/capability_checker.h"
 #include "config/protection_build_context.h"
+#include "vm/vm_verifier.h"
 
 namespace fs = std::filesystem;
 
@@ -88,57 +95,20 @@ static void PrintFeatureStatus(const std::string& name, const std::string& statu
 // ============================================================================
 
 
-static bool IsMinimalVMInterpreterOpcode(uint8_t opcode) {
-    switch (opcode) {
-        case VM_NOP:
-        case VM_MOV_RR:
-        case VM_MOV_RC:
-        case VM_MOV_RM:
-        case VM_MOV_MR:
-        case VM_LEA:
-        case VM_PUSH_R:
-        case VM_PUSH_C:
-        case VM_POP_R:
-        case VM_CALL_NATIVE:
-        case VM_ADD_RR:
-        case VM_ADD_RC:
-        case VM_SUB_RR:
-        case VM_SUB_RC:
-        case VM_AND_RR:
-        case VM_AND_RC:
-        case VM_OR_RR:
-        case VM_OR_RC:
-        case VM_XOR_RR:
-        case VM_XOR_RC:
-        case VM_CMP_RR:
-        case VM_CMP_RC:
-        case VM_TEST_RR:
-        case VM_TEST_RC:
-        case VM_JMP:
-        case VM_JZ:
-        case VM_JNZ:
-        case VM_JA:
-        case VM_JAE:
-        case VM_JB:
-        case VM_JBE:
-        case VM_JG:
-        case VM_JGE:
-        case VM_JL:
-        case VM_JLE:
-        case VM_RET_VM:
-            return true;
-        default:
-            return false;
-    }
+static bool IsRuntimeInterpreterOpcode(uint8_t opcode, bool is64Bit) {
+    const auto* descriptor = CipherShell::VMSchema::Lookup(opcode);
+    return descriptor &&
+        (is64Bit ? descriptor->runtimeSupportedX64 : descriptor->runtimeSupportedX86);
 }
 
-static bool IsMinimalVMInterpreterProgram(
+static bool IsRuntimeInterpreterProgram(
     const std::vector<CipherShell::BytecodeInstr>& instructions,
+    bool is64Bit,
     std::string& reason)
 {
     for (const auto& instr : instructions) {
-        if (!IsMinimalVMInterpreterOpcode(instr.opcode)) {
-            reason = "unsupported_minimal_interpreter_opcode_" +
+        if (!IsRuntimeInterpreterOpcode(instr.opcode, is64Bit)) {
+            reason = "runtime_handler_missing_for_opcode_" +
                 std::to_string(static_cast<unsigned>(instr.opcode));
             return false;
         }
@@ -158,306 +128,33 @@ static void PrintVMRegisterMapReport(const std::unordered_map<uint8_t, uint8_t>&
     }
 }
 
-static uint32_t ReadLe32(const std::vector<uint8_t>& data, size_t pos) {
-    return static_cast<uint32_t>(data[pos]) |
-        (static_cast<uint32_t>(data[pos + 1]) << 8) |
-        (static_cast<uint32_t>(data[pos + 2]) << 16) |
-        (static_cast<uint32_t>(data[pos + 3]) << 24);
-}
-
-static uint64_t ReadLe64(const std::vector<uint8_t>& data, size_t pos) {
-    uint64_t value = 0;
-    for (int i = 0; i < 8; i++) {
-        value |= static_cast<uint64_t>(data[pos + i]) << (i * 8);
-    }
-    return value;
-}
-
-static std::string HexValue(uint64_t value) {
-    std::ostringstream oss;
-    oss << "0x" << std::hex << value;
-    return oss.str();
-}
-
-static bool IsValidVMRegisterId(uint8_t reg, uint32_t registerCount) {
-    return reg == CipherShell::VM_REG_INVALID || reg < registerCount;
-}
-
-static bool IsVmJumpOpcode(uint8_t opcode) {
-    switch (opcode) {
-        case VM_JMP:
-        case VM_JZ:
-        case VM_JNZ:
-        case VM_JA:
-        case VM_JAE:
-        case VM_JB:
-        case VM_JBE:
-        case VM_JG:
-        case VM_JGE:
-        case VM_JL:
-        case VM_JLE:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool IsVmConditionalJumpOpcode(uint8_t opcode) {
-    return IsVmJumpOpcode(opcode) && opcode != VM_JMP;
-}
-
-struct VMStaticDecodedInstr {
-    uint32_t offset = 0;
-    uint32_t size = 0;
-    uint8_t opcode = 0;
-    bool hasTarget = false;
-    uint32_t target = 0;
-    bool terminal = false;
-};
-
-static bool DecodeAndValidateVMRecordBytecode(
-    const CipherShell::VMFunctionRecord& record,
-    const std::vector<uint8_t>& bytecode,
-    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+static bool ValidateVMRegisterMap(
+    const std::unordered_map<uint8_t, uint8_t>& registerMap,
     uint32_t registerCount,
-    uint32_t& opcodeCount,
     std::string& reason)
 {
-    opcodeCount = 0;
-    if (registerCount == 0 || registerCount > 32) {
-        reason = "invalid_register_count";
-        return false;
-    }
-    if (record.bytecodeOffset > bytecode.size() ||
-        record.bytecodeSize > bytecode.size() - record.bytecodeOffset) {
-        reason = "record_bytecode_range_outside_blob";
+    if (registerCount < 16 || registerCount > 32) {
+        reason = "register_count_out_of_range";
         return false;
     }
 
-    uint8_t reverseOpcode[256];
-    for (uint32_t i = 0; i < 256; i++) reverseOpcode[i] = static_cast<uint8_t>(i);
-    for (const auto& kv : opcodeMap) reverseOpcode[kv.second] = kv.first;
-
-    const size_t begin = record.bytecodeOffset;
-    const size_t end = begin + record.bytecodeSize;
-    size_t ip = begin;
-    bool hasRet = false;
-    std::vector<VMStaticDecodedInstr> decoded;
-
-    auto failAt = [&](const std::string& what, size_t at) {
-        reason = what + " function_rva=" + HexValue(record.functionRVA) +
-            " bytecode_offset=" + HexValue(static_cast<uint64_t>(at - begin));
-        return false;
-    };
-    auto requireBytes = [&](size_t count, size_t at, const std::string& what) {
-        if (at + count > end) {
-            reason = what + " function_rva=" + HexValue(record.functionRVA) +
-                " bytecode_offset=" + HexValue(static_cast<uint64_t>(at - begin));
+    bool seen[32] = {};
+    for (uint8_t nativeReg = 0; nativeReg < 16; nativeReg++) {
+        auto it = registerMap.find(nativeReg);
+        if (it == registerMap.end()) {
+            reason = "missing_native_register_" + std::to_string(static_cast<unsigned>(nativeReg));
             return false;
         }
-        return true;
-    };
-
-    while (ip < end) {
-        VMStaticDecodedInstr instr{};
-        instr.offset = static_cast<uint32_t>(ip - begin);
-        uint8_t encodedOpcode = bytecode[ip++];
-        instr.opcode = reverseOpcode[encodedOpcode];
-
-        if (!IsMinimalVMInterpreterOpcode(instr.opcode)) {
-            reason = "unsupported_runtime_opcode function_rva=" + HexValue(record.functionRVA) +
-                " bytecode_offset=" + HexValue(instr.offset) +
-                " encoded=" + HexValue(encodedOpcode) +
-                " opcode=" + HexValue(instr.opcode);
+        if (it->second >= registerCount) {
+            reason = "mapped_register_out_of_range_native_" +
+                std::to_string(static_cast<unsigned>(nativeReg));
             return false;
         }
-
-        switch (instr.opcode) {
-            case VM_NOP:
-                break;
-
-            case VM_RET_VM:
-                instr.terminal = true;
-                hasRet = true;
-                break;
-
-            case VM_MOV_RR:
-            case VM_ADD_RR:
-            case VM_SUB_RR:
-            case VM_AND_RR:
-            case VM_OR_RR:
-            case VM_XOR_RR:
-            case VM_CMP_RR:
-            case VM_TEST_RR: {
-                if (!requireBytes(3, ip, "rr_operand_oob")) return false;
-                uint8_t dst = bytecode[ip++];
-                uint8_t src = bytecode[ip++];
-                uint8_t width = bytecode[ip++];
-                if (!IsValidVMRegisterId(dst, registerCount) || !IsValidVMRegisterId(src, registerCount)) {
-                    return failAt("invalid_register_id", ip - 3);
-                }
-                if (!(width == 1 || width == 2 || width == 4 || width == 8)) return failAt("invalid_operand_width", ip - 1);
-                break;
-            }
-
-            case VM_MOV_RC:
-            case VM_ADD_RC:
-            case VM_SUB_RC:
-            case VM_AND_RC:
-            case VM_OR_RC:
-            case VM_XOR_RC:
-            case VM_CMP_RC:
-            case VM_TEST_RC:
-            case VM_PUSH_C: {
-                if (!requireBytes(10, ip, "rc_operand_oob")) return false;
-                uint8_t dst = bytecode[ip++];
-                if (!IsValidVMRegisterId(dst, registerCount)) return failAt("invalid_register_id", ip - 1);
-                ip += 8;
-                uint8_t width = bytecode[ip++];
-                if (!(width == 1 || width == 2 || width == 4 || width == 8)) return failAt("invalid_operand_width", ip - 1);
-                break;
-            }
-
-            case VM_PUSH_R:
-            case VM_POP_R: {
-                if (!requireBytes(2, ip, "single_reg_operand_oob")) return false;
-                uint8_t reg = bytecode[ip++];
-                uint8_t width = bytecode[ip++];
-                if (!IsValidVMRegisterId(reg, registerCount)) return failAt("invalid_register_id", ip - 2);
-                if (!(width == 1 || width == 2 || width == 4 || width == 8)) return failAt("invalid_operand_width", ip - 1);
-                break;
-            }
-
-            case VM_MOV_RM:
-            case VM_MOV_MR:
-            case VM_LEA: {
-                if (!requireBytes(15, ip, "memory_operand_oob")) return false;
-                uint8_t dst = bytecode[ip++];
-                uint8_t src = bytecode[ip++];
-                uint8_t base = bytecode[ip++];
-                uint8_t index = bytecode[ip++];
-                uint8_t scale = bytecode[ip++];
-                uint8_t width = bytecode[ip++];
-                uint8_t kind = bytecode[ip++];
-                (void)ReadLe64(bytecode, ip);
-                ip += 8;
-                if (!IsValidVMRegisterId(dst, registerCount) ||
-                    !IsValidVMRegisterId(src, registerCount) ||
-                    !IsValidVMRegisterId(base, registerCount) ||
-                    !IsValidVMRegisterId(index, registerCount)) {
-                    return failAt("invalid_register_id", ip - 15);
-                }
-                if (!(scale == 1 || scale == 2 || scale == 4 || scale == 8)) {
-                    return failAt("invalid_memory_scale", ip - 11);
-                }
-                if (!(width == 1 || width == 2 || width == 4 || width == 8)) {
-                    return failAt("invalid_memory_width", ip - 10);
-                }
-                if (kind > 1) return failAt("invalid_memory_kind", ip - 9);
-                break;
-            }
-
-            case VM_JMP:
-            case VM_JZ:
-            case VM_JNZ:
-            case VM_JA:
-            case VM_JAE:
-            case VM_JB:
-            case VM_JBE:
-            case VM_JG:
-            case VM_JGE:
-            case VM_JL:
-            case VM_JLE: {
-                if (!requireBytes(4, ip, "jump_operand_oob")) return false;
-                instr.hasTarget = true;
-                instr.target = ReadLe32(bytecode, ip);
-                ip += 4;
-                if (instr.target >= record.bytecodeSize) {
-                    return failAt("jump_target_outside_record", begin + instr.target);
-                }
-                break;
-            }
-
-            case VM_CALL_NATIVE: {
-                if (!requireBytes(4, ip, "native_call_operand_oob")) return false;
-                ip += 4;
-                break;
-            }
-
-            default:
-                return failAt("unsupported_static_decoder_opcode", ip - 1);
-        }
-
-        instr.size = static_cast<uint32_t>((ip - begin) - instr.offset);
-        decoded.push_back(instr);
-        opcodeCount++;
-    }
-
-    if (decoded.empty()) {
-        reason = "empty_decoded_bytecode function_rva=" + HexValue(record.functionRVA);
-        return false;
-    }
-    if (!hasRet) {
-        reason = "ret_missing function_rva=" + HexValue(record.functionRVA);
-        return false;
-    }
-
-    auto findIndexByOffset = [&](uint32_t offset, size_t& index) {
-        for (size_t i = 0; i < decoded.size(); i++) {
-            if (decoded[i].offset == offset) {
-                index = i;
-                return true;
-            }
-        }
-        return false;
-    };
-
-    std::vector<uint8_t> visited(decoded.size(), 0);
-    std::vector<size_t> stack;
-    stack.push_back(0);
-    bool reachableRet = false;
-
-    auto pushOffset = [&](uint32_t offset, const std::string& edgeName) {
-        size_t idx = 0;
-        if (!findIndexByOffset(offset, idx)) {
-            reason = edgeName + "_not_instruction_boundary function_rva=" + HexValue(record.functionRVA) +
-                " target=" + HexValue(offset);
+        if (seen[it->second]) {
+            reason = "duplicate_vm_register_" + std::to_string(static_cast<unsigned>(it->second));
             return false;
         }
-        if (!visited[idx]) stack.push_back(idx);
-        return true;
-    };
-
-    while (!stack.empty()) {
-        size_t idx = stack.back();
-        stack.pop_back();
-        if (idx >= decoded.size() || visited[idx]) continue;
-        visited[idx] = 1;
-        const auto& instr = decoded[idx];
-        uint32_t next = instr.offset + instr.size;
-
-        if (instr.terminal) {
-            reachableRet = true;
-            continue;
-        }
-        if (instr.hasTarget) {
-            if (!pushOffset(instr.target, "jump_target")) return false;
-            if (IsVmConditionalJumpOpcode(instr.opcode) && next < record.bytecodeSize) {
-                if (!pushOffset(next, "fallthrough")) return false;
-            }
-            continue;
-        }
-        if (next < record.bytecodeSize) {
-            if (!pushOffset(next, "fallthrough")) return false;
-        } else {
-            reason = "control_flow_falls_off_without_ret function_rva=" + HexValue(record.functionRVA);
-            return false;
-        }
-    }
-
-    if (!reachableRet) {
-        reason = "ret_not_reachable function_rva=" + HexValue(record.functionRVA);
-        return false;
+        seen[it->second] = true;
     }
     return true;
 }
@@ -465,9 +162,92 @@ static bool DecodeAndValidateVMRecordBytecode(
 static const char* PatchKindName(CipherShell::FunctionPatchKind kind) {
     switch (kind) {
         case CipherShell::FunctionPatchKind::NearRel32: return "rel32";
-        case CipherShell::FunctionPatchKind::X64AbsoluteR11: return "abs64";
+        case CipherShell::FunctionPatchKind::X64AbsoluteIndirect: return "abs64_indirect";
         default: return "none";
     }
+}
+
+static bool RvaRangeHasPermissions(
+    const CipherShell::CS_PE_IMAGE* image,
+    uint32_t rva,
+    uint32_t size,
+    DWORD required,
+    DWORD forbidden)
+{
+    if (!image || !image->sections) return false;
+    if (size == 0) return false;
+    for (WORD i = 0; i < image->numSections; ++i) {
+        const auto& section = image->sections[i];
+        if (!CipherShell::PEUtils::RvaInSection(section, rva)) continue;
+        const uint32_t span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+        const uint32_t offset = rva - section.VirtualAddress;
+        return offset <= span && size <= span - offset &&
+            (section.Characteristics & required) == required &&
+            (section.Characteristics & forbidden) == 0;
+    }
+    return false;
+}
+
+static bool IsReadOnlyExecutableRva(const CipherShell::CS_PE_IMAGE* image, uint32_t rva) {
+    return RvaRangeHasPermissions(image, rva, 1,
+        IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE);
+}
+
+static bool WildcardMatchInsensitive(const std::string& pattern, const std::string& value) {
+    size_t patternIndex = 0;
+    size_t valueIndex = 0;
+    size_t star = std::string::npos;
+    size_t retry = 0;
+    auto equal = [](char left, char right) {
+        return std::tolower(static_cast<unsigned char>(left)) ==
+            std::tolower(static_cast<unsigned char>(right));
+    };
+    while (valueIndex < value.size()) {
+        if (patternIndex < pattern.size() &&
+            (pattern[patternIndex] == '?' || equal(pattern[patternIndex], value[valueIndex]))) {
+            ++patternIndex;
+            ++valueIndex;
+        } else if (patternIndex < pattern.size() && pattern[patternIndex] == '*') {
+            star = patternIndex++;
+            retry = valueIndex;
+        } else if (star != std::string::npos) {
+            patternIndex = star + 1;
+            valueIndex = ++retry;
+        } else return false;
+    }
+    while (patternIndex < pattern.size() && pattern[patternIndex] == '*') ++patternIndex;
+    return patternIndex == pattern.size();
+}
+
+static bool FunctionSelected(
+    const CipherShell::Function& function,
+    const std::vector<std::string>& patterns,
+    const std::vector<uint32_t>& targetRVAs)
+{
+    if (patterns.empty() && targetRVAs.empty()) return true;
+    if (function.entryAddress <= 0xFFFFFFFFULL &&
+        std::binary_search(targetRVAs.begin(), targetRVAs.end(),
+            static_cast<uint32_t>(function.entryAddress))) return true;
+    std::ostringstream rva;
+    rva << "0x" << std::hex << function.entryAddress;
+    for (const auto& pattern : patterns) {
+        if (WildcardMatchInsensitive(pattern, function.name) ||
+            WildcardMatchInsensitive(pattern, rva.str())) return true;
+    }
+    return false;
+}
+
+static bool ParseX86CallAbi(const std::string& value, VM_CALL_ABI& abi) {
+    std::string normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (normalized == "auto") abi = VM_ABI_X86_AUTO;
+    else if (normalized == "cdecl") abi = VM_ABI_X86_CDECL;
+    else if (normalized == "stdcall") abi = VM_ABI_X86_STDCALL;
+    else if (normalized == "fastcall") abi = VM_ABI_X86_FASTCALL;
+    else if (normalized == "thiscall") abi = VM_ABI_X86_THISCALL;
+    else return false;
+    return true;
 }
 
 static std::string FormatImageBytesAtRva(CipherShell::CS_PE_IMAGE* image, uint32_t rva, uint32_t count) {
@@ -486,10 +266,12 @@ static std::string FormatImageBytesAtRva(CipherShell::CS_PE_IMAGE* image, uint32
 }
 
 static bool ValidateVMStaticLink(
+    CipherShell::CS_PE_IMAGE* image,
     const std::vector<CipherShell::VMFunctionRecord>& records,
     const std::vector<uint8_t>& bytecode,
     const CipherShell::VMEmitResult& emitResult,
     const CipherShell::VMRuntimeBuildResult& runtimeResult,
+    const CipherShell::VMInstructionBridgeBuildResult& bridgeResult,
     const std::vector<CipherShell::FunctionPatchResult>& patchResults,
     const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     const std::unordered_map<uint8_t, uint8_t>& registerMap,
@@ -498,7 +280,15 @@ static bool ValidateVMStaticLink(
     std::string& reason)
 {
     opcodeCounts.clear();
-    if (!runtimeResult.executionReady) { reason = "runtime_not_execution_ready"; return false; }
+    if (!runtimeResult.executionReady || !runtimeResult.keySharePatched ||
+        !runtimeResult.cfgVerified || !runtimeResult.relocationsVerified) {
+        reason = "runtime_not_execution_ready_or_linkage_unverified";
+        return false;
+    }
+    if (!bridgeResult.success || !bridgeResult.cfgTableVerified || !bridgeResult.unwindVerified) {
+        reason = "instruction_bridge_not_statically_linked";
+        return false;
+    }
     if (!emitResult.success || emitResult.sectionRVA == 0 || emitResult.sectionRawOffset == 0 ||
         emitResult.sectionSize == 0 || emitResult.metadataRVA == 0 || emitResult.bytecodeRVA == 0) {
         reason = "metadata_or_bytecode_not_linked";
@@ -509,10 +299,73 @@ static bool ValidateVMStaticLink(
         reason = "runtime_or_trampoline_missing";
         return false;
     }
+    if (!RvaRangeHasPermissions(image, emitResult.metadataRVA, emitResult.metadataSize,
+            IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE) ||
+        !RvaRangeHasPermissions(image, emitResult.bytecodeRVA,
+            static_cast<uint32_t>(bytecode.size()), IMAGE_SCN_MEM_READ,
+            IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE)) {
+        reason = "metadata_or_bytecode_section_permissions_invalid";
+        return false;
+    }
+    if (!RvaRangeHasPermissions(image, runtimeResult.sectionRVA,
+            runtimeResult.runtimeImageSize,
+            IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE) ||
+        !IsReadOnlyExecutableRva(image, runtimeResult.runtimeEntryRVA)) {
+        reason = "runtime_section_permissions_invalid";
+        return false;
+    }
+    for (const auto& trampoline : runtimeResult.trampolines) {
+        if (!RvaRangeHasPermissions(image, trampoline.trampolineRVA,
+                trampoline.trampolineSize,
+                IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE)) {
+            reason = "trampoline_section_permissions_invalid";
+            return false;
+        }
+    }
     if (records.empty() || bytecode.empty()) { reason = "records_or_bytecode_empty"; return false; }
     if (opcodeMap.empty() || registerMap.empty()) { reason = "opcode_or_register_map_missing"; return false; }
+    std::string registerMapReason;
+    if (!ValidateVMRegisterMap(registerMap, registerCount, registerMapReason)) {
+        reason = "invalid_register_map: " + registerMapReason;
+        return false;
+    }
     if (runtimeResult.trampolines.size() != records.size()) { reason = "trampoline_count_mismatch"; return false; }
     if (patchResults.size() != records.size()) { reason = "patch_result_count_mismatch"; return false; }
+    if (runtimeResult.architecture == VM_ARCH_X64) {
+        if (!runtimeResult.unwindVerified || runtimeResult.unwindEntries.size() < records.size()) {
+            reason = "x64_runtime_or_trampoline_unwind_missing";
+            return false;
+        }
+        for (const auto& unwind : runtimeResult.unwindEntries) {
+            const auto found = std::find_if(image->exceptions.entries.begin(), image->exceptions.entries.end(),
+                [&unwind](const CipherShell::CS_RUNTIME_FUNCTION& entry) {
+                    return entry.beginAddress == unwind.beginRVA &&
+                        entry.endAddress == unwind.endRVA && entry.unwindData == unwind.unwindRVA;
+                });
+            if (found == image->exceptions.entries.end()) {
+                reason = "x64_runtime_unwind_not_linked_into_exception_directory";
+                return false;
+            }
+        }
+    }
+
+    std::array<uint8_t, 256> reverseOpcodeMap{};
+    std::array<uint8_t, 256> seenEncodedOpcodes{};
+    if (opcodeMap.size() != 256) {
+        reason = "opcode_map_is_not_a_full_permutation";
+        return false;
+    }
+    for (const auto& mapping : opcodeMap) {
+        if (seenEncodedOpcodes[mapping.second]) {
+            reason = "opcode_map_is_not_injective";
+            return false;
+        }
+        seenEncodedOpcodes[mapping.second] = 1;
+        reverseOpcodeMap[mapping.second] = mapping.first;
+    }
+    std::unordered_set<uint32_t> guardTargets(image->loadConfig.guardFunctionRVAs.begin(),
+        image->loadConfig.guardFunctionRVAs.end());
+    size_t verifiedBridgeCount = 0;
 
     for (const auto& record : records) {
         if (record.functionRVA == 0 || record.functionSize == 0 || record.bytecodeSize == 0) {
@@ -536,7 +389,14 @@ static bool ValidateVMStaticLink(
         }
         bool hasVerifiedPatch = false;
         for (const auto& patch : patchResults) {
-            if (patch.functionRVA == record.functionRVA && patch.success && patch.verified && patch.trampolineRVA != 0) {
+            if (patch.functionRVA == record.functionRVA && patch.success && patch.verified &&
+                patch.nativeBodyDestroyed && patch.trampolineRVA != 0) {
+                std::string patchVerificationError;
+                if (!CipherShell::FunctionTrampolinePatcher::VerifyAppliedPatch(
+                        image, patch, patchVerificationError)) {
+                    reason = "function_patch_reverification_failed: " + patchVerificationError;
+                    return false;
+                }
                 hasVerifiedPatch = true;
                 break;
             }
@@ -546,13 +406,95 @@ static bool ValidateVMStaticLink(
             return false;
         }
 
-        uint32_t opcodeCount = 0;
-        std::string decodeReason;
-        if (!DecodeAndValidateVMRecordBytecode(record, bytecode, opcodeMap, registerCount, opcodeCount, decodeReason)) {
-            reason = "bytecode_decoder_check_failed: " + decodeReason;
+        const auto verification = CipherShell::VMBytecodeVerifier::VerifyPlainRecord(
+            record, bytecode, opcodeMap, registerMap, registerCount,
+            runtimeResult.architecture == VM_ARCH_X64);
+        if (!verification.success) {
+            reason = "bytecode_decoder_check_failed: " + verification.error;
             return false;
         }
-        opcodeCounts[record.functionRVA] = opcodeCount;
+        opcodeCounts[record.functionRVA] = verification.instructionCount;
+
+        for (uint32_t offset = 0; offset < record.bytecodeSize;
+             offset += CipherShell::VMSchema::InstructionSize()) {
+            CipherShell::BytecodeInstr instruction{};
+            std::string decodeReason;
+            if (!CipherShell::VMSchema::Decode(
+                    bytecode.data() + record.bytecodeOffset + offset,
+                    CipherShell::VMSchema::InstructionSize(), reverseOpcodeMap.data(),
+                    instruction, decodeReason)) {
+                reason = "bridge_static_decode_failed: " + decodeReason;
+                return false;
+            }
+            if (instruction.opcode == VM_CALL_NATIVE) {
+                if (instruction.immediate > 0xFFFFFFFFULL ||
+                    !IsReadOnlyExecutableRva(image,
+                        static_cast<uint32_t>(instruction.immediate))) {
+                    reason = "direct_native_call_target_is_not_read_only_executable";
+                    return false;
+                }
+            } else if (instruction.opcode == VM_CALL_IMPORT) {
+                const uint32_t pointerSize = image->is64Bit ? 8u : 4u;
+                if (instruction.immediate > 0xFFFFFFFFULL ||
+                    !RvaRangeHasPermissions(image,
+                        static_cast<uint32_t>(instruction.immediate), pointerSize,
+                        IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_EXECUTE)) {
+                    reason = "import_call_iat_slot_permissions_invalid";
+                    return false;
+                }
+            }
+            if (instruction.opcode != VM_BRIDGE_SIMD && instruction.opcode != VM_BRIDGE_X87) continue;
+            const auto linked = std::find_if(bridgeResult.links.begin(), bridgeResult.links.end(),
+                [&](const CipherShell::VMInstructionBridgeLink& link) {
+                    return link.functionRVA == record.functionRVA &&
+                        link.thunkRVA == instruction.immediate;
+                });
+            if (linked == bridgeResult.links.end() ||
+                !IsReadOnlyExecutableRva(image, linked->thunkRVA) ||
+                !IsReadOnlyExecutableRva(image, linked->nativeInstructionRVA) ||
+                (instruction.flags & VM_OPERAND_BRIDGE_LINKED) == 0 ||
+                (linked->usesAvx && (record.flags & VM_RECORD_FLAG_USES_AVX) == 0)) {
+                reason = "bridge_target_or_record_flags_not_linked";
+                return false;
+            }
+            if (instruction.opcode == VM_BRIDGE_X87) {
+                if (!linked->usesX87 || (record.flags & VM_RECORD_FLAG_USES_X87) == 0) {
+                    reason = "x87_bridge_record_flag_missing";
+                    return false;
+                }
+            } else if (linked->usesX87 || (record.flags & VM_RECORD_FLAG_USES_SIMD) == 0) {
+                reason = "simd_bridge_record_flag_missing";
+                return false;
+            }
+            if (image->loadConfig.hasCFG && guardTargets.count(linked->thunkRVA) == 0) {
+                reason = "bridge_thunk_missing_from_guard_cf_table";
+                return false;
+            }
+            if (image->is64Bit) {
+                const auto exactUnwind = std::find_if(image->exceptions.entries.begin(),
+                    image->exceptions.entries.end(), [&](const CipherShell::CS_RUNTIME_FUNCTION& entry) {
+                        return entry.beginAddress == linked->unwindBeginRVA &&
+                            entry.endAddress == linked->nativeInstructionRVA +
+                                linked->nativeInstructionSize && entry.unwindData != 0;
+                    });
+                if (exactUnwind == image->exceptions.entries.end()) {
+                    reason = "x64_bridge_native_instruction_unwind_missing";
+                    return false;
+                }
+            }
+            ++verifiedBridgeCount;
+        }
+    }
+    if (verifiedBridgeCount != bridgeResult.links.size()) {
+        reason = "bridge_link_count_mismatch";
+        return false;
+    }
+    std::string emittedVerificationError;
+    if (!CipherShell::VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
+            image, emitResult.metadataRVA, records, bytecode,
+            emitResult.runtimeKeyShare, emittedVerificationError)) {
+        reason = "emitted_metadata_or_bytecode_verification_failed: " + emittedVerificationError;
+        return false;
     }
     return true;
 }
@@ -589,7 +531,7 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) {
                 outputFile = argv[++i];
             } else {
-                std::cerr << "閿欒: -o 閫夐」闇€瑕佹寚瀹氳緭鍑烘枃浠惰矾寰? << std::endl;
+                std::cerr << "错误: -o 选项需要指定输出文件路径" << std::endl;
                 return 1;
             }
         } else if (arg == "-l" || arg == "--level") {
@@ -600,14 +542,14 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
             } else {
-                std::cerr << "閿欒: -l 閫夐」闇€瑕佹寚瀹氫繚鎶ょ瓑绾? << std::endl;
+                std::cerr << "错误: -l 选项需要指定保护等级" << std::endl;
                 return 1;
             }
         } else if (arg == "-c" || arg == "--config") {
             if (i + 1 < argc) {
                 configFile = argv[++i];
             } else {
-                std::cerr << "閿欒: -c 閫夐」闇€瑕佹寚瀹氶厤缃枃浠惰矾寰? << std::endl;
+                std::cerr << "错误: -c 选项需要指定配置文件路径" << std::endl;
                 return 1;
             }
         } else if (arg == "-v" || arg == "--verbose") {
@@ -622,7 +564,7 @@ int main(int argc, char* argv[]) {
 
     // 妫€鏌ヨ緭鍏ユ枃浠?
     if (inputFile.empty()) {
-        std::cerr << "閿欒: 鏈寚瀹氳緭鍏ユ枃浠? << std::endl;
+        std::cerr << "错误: 未指定输入文件" << std::endl;
         PrintHelp();
         return 1;
     }
@@ -709,6 +651,11 @@ int main(int argc, char* argv[]) {
 
     CipherShell::ProtectionBuildContext buildCtx =
         CipherShell::ProtectionBuildContext::FromConfig(config, protectionLevel, verbose);
+    if (!buildCtx.entropyReady) {
+        std::cerr << "BUILD_CONTEXT_FAIL module=ProtectionBuildContext"
+                  << " reason=system_csprng_unavailable" << std::endl;
+        return 1;
+    }
 
     for (const auto& warning : configParser.GetWarnings()) {
         std::cerr << "CONFIG_WARN module=ConfigParser reason=" << warning << std::endl;
@@ -735,6 +682,7 @@ int main(int argc, char* argv[]) {
     } else {
         originalOEP = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
     }
+    const WORD originalSectionCount = image->numSections;
     std::cout << "  鍘熷鍏ュ彛鐐?(OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
 
     // ============================================================================
@@ -758,10 +706,21 @@ int main(int argc, char* argv[]) {
         strConfig.scanReadableSections = true;
 
         auto strings = strEncryptor.ScanStrings(image.get(), strConfig);
+        if (strEncryptor.HasError()) {
+            std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor reason="
+                      << strEncryptor.GetLastError() << std::endl;
+            PrintFeatureStatus("string_encryption", "failed", strEncryptor.GetLastError());
+            return 1;
+        }
         std::cout << "    鍙戠幇 " << strings.size() << " 涓瓧绗︿覆" << std::endl;
 
         if (!strings.empty()) {
-            strEncryptor.EncryptStrings(image.get(), strings);
+            if (!strEncryptor.EncryptStrings(image.get(), strings)) {
+                std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor reason="
+                          << strEncryptor.GetLastError() << std::endl;
+                PrintFeatureStatus("string_encryption", "failed", strEncryptor.GetLastError());
+                return 1;
+            }
             encryptedStringRegions.reserve(encryptedStringRegions.size() + strings.size());
             for (const auto& s : strings) {
                 CipherShell::CS_ENCRYPTED_SECTION region{};
@@ -774,7 +733,7 @@ int main(int argc, char* argv[]) {
                 region.sectionKey.counter = 0;
                 encryptedStringRegions.push_back(region);
             }
-            std::cout << "    宸插姞瀵嗘墍鏈夊瓧绗︿覆锛屽苟鐧昏杩愯鏃惰В瀵嗕换鍔? << std::endl;
+            std::cout << "    已加密字符串并登记运行时解密任务" << std::endl;
             PrintFeatureStatus("string_encryption", "applied", "mode=" + buildCtx.stringEncryption.mode);
         } else {
             PrintFeatureStatus("string_encryption", "skipped", "no_strings_found");
@@ -789,14 +748,28 @@ int main(int argc, char* argv[]) {
 
         CipherShell::ImportObfuscator obfuscator;
         CipherShell::CS_IMPORT_OBFUSCATION_CONFIG obfConfig;
-        obfConfig.strategy = CipherShell::ImportObfuscationStrategy::StrategyC;
+        obfConfig.strategy = CipherShell::ImportObfuscationStrategy::StrategyB;
 
         CipherShell::APIResolver resolver;
-        resolver.Initialize();
+        if (!resolver.Initialize()) {
+            std::cerr << "IMPORT_PROTECTION_FAIL module=APIResolver reason=initialize_failed" << std::endl;
+            PrintFeatureStatus("import_protection", "failed", "resolver_initialize_failed");
+            return 1;
+        }
 
         auto obfImports = obfuscator.ObfuscateImports(image.get(), obfConfig, &resolver);
-        std::cout << "    娣锋穯浜?" << obfImports.size() << " 涓鍏ュ嚱鏁? << std::endl;
-            PrintFeatureStatus("import_protection", "partial", "runtime_resolver_callsite_rewrite_not_closed");
+        if (!obfuscator.WasApplied()) {
+            std::cerr << "IMPORT_PROTECTION_FAIL module=ImportObfuscator reason="
+                      << obfuscator.GetLastError() << std::endl;
+            PrintFeatureStatus("import_protection", "failed", obfuscator.GetLastError());
+            return 1;
+        }
+        std::cout << "    已处理 " << obfImports.size() << " 个导入函数" << std::endl;
+        PrintFeatureStatus(
+            "import_protection",
+            "applied",
+            "mode=rebuilt_import_directory real_iat=preserved fake_imports=" +
+                std::to_string(obfuscator.GetWrittenFakeImportCount()));
     } else {
         PrintFeatureStatus("import_protection", "skipped", "disabled");
     }
@@ -807,6 +780,8 @@ int main(int argc, char* argv[]) {
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
+        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
+                                     : image->ntHeaders32->OptionalHeader.ImageBase);
 
         for (WORD si = 0; si < image->numSections; si++) {
             IMAGE_SECTION_HEADER& sec = image->sections[si];
@@ -820,11 +795,17 @@ int main(int argc, char* argv[]) {
             uint64_t baseAddr = sec.VirtualAddress;
 
             auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
+            if (disasm.HasError()) {
+                std::cerr << "CFG_FLATTEN_FAIL module=ZydisDecoder reason="
+                          << disasm.GetLastError() << std::endl;
+                PrintFeatureStatus("control_flow.flattening", "failed", disasm.GetLastError());
+                return 1;
+            }
             if (functions.empty()) {
-                std::cout << "    浠ｇ爜娈礫" << si << "]: 鏈瘑鍒埌鍑芥暟锛堝彲鑳芥棤杩斿洖鎸囦护锛? << std::endl;
+                std::cout << "    代码段[" << si << "]: 未识别到可处理函数" << std::endl;
                 continue;
             }
-            std::cout << "    浠ｇ爜娈礫" << si << "]: 璇嗗埆鍒?" << functions.size() << " 涓嚱鏁? << std::endl;
+            std::cout << "    代码段[" << si << "]: 识别到 " << functions.size() << " 个函数" << std::endl;
 
             CipherShell::CFGFlattener flattener;
             CipherShell::FlatteningConfig flatConfig;
@@ -852,7 +833,7 @@ int main(int argc, char* argv[]) {
                     delete[] flatCode;
                 }
             }
-            std::cout << "    骞冲潶鍖栦簡 " << flattenedCount << " 涓嚱鏁? << std::endl;
+            std::cout << "    已平坦化 " << flattenedCount << " 个函数" << std::endl;
         }
     }
 
@@ -869,6 +850,8 @@ int main(int argc, char* argv[]) {
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
+        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
+                                     : image->ntHeaders32->OptionalHeader.ImageBase);
 
         for (WORD si = 0; si < image->numSections; si++) {
             IMAGE_SECTION_HEADER& sec = image->sections[si];
@@ -881,6 +864,12 @@ int main(int argc, char* argv[]) {
             auto functions = disasm.AnalyzeCode(
                 image->rawData + secOffset, secSize,
                 sec.VirtualAddress, is64);
+            if (disasm.HasError()) {
+                std::cerr << "CFG_BOGUS_FAIL module=ZydisDecoder reason="
+                          << disasm.GetLastError() << std::endl;
+                PrintFeatureStatus("control_flow.bogus", "failed", disasm.GetLastError());
+                return 1;
+            }
 
             uint32_t injectedCount = 0;
             for (const auto& func : functions) {
@@ -908,35 +897,90 @@ int main(int argc, char* argv[]) {
                 }
                 bogusInjector.Cleanup(bogusResult);
             }
-            std::cout << "    娉ㄥ叆浜?" << injectedCount << " 涓嚱鏁扮殑铏氬亣鎺у埗娴? << std::endl;
+            std::cout << "    已向 " << injectedCount << " 个函数写入虚假控制流" << std::endl;
         }
     }
+
+    bool vmApplied = false;
+    uint32_t vmRegisterCount = 0;
+    std::vector<uint8_t> vmBytecodeBlob;
+    std::vector<CipherShell::VMFunctionRecord> vmRecords;
+    std::vector<CipherShell::Function> protectedFunctions;
+    CipherShell::VMInstructionBridgeBuildResult bridgeResult{};
+    CipherShell::VMEmitResult emitResult{};
+    CipherShell::VMRuntimeBuildResult runtimeResult{};
+    std::vector<CipherShell::FunctionPatchResult> patchResults;
 
     // Phase E: 鍑芥暟绾?VM 淇濇姢銆傝繖閲屽彧鍏佽瀹屾暣钀界洏鐨勬暟鎹繘鍏ヤ笅涓€姝ワ紝澶辫触蹇呴』鏄庣‘璇婃柇銆?
     if (buildCtx.vm.enabled) {
         std::cout << "  搴旂敤浠ｇ爜铏氭嫙鍖?(Mirage VM)..." << std::endl;
 
+        VM_CALL_ABI configuredX86CallAbi = VM_ABI_X86_AUTO;
+        if (!config.vm.bytecodeEncryption || config.vm.nativeBodyPolicy != "destroy" ||
+            !ParseX86CallAbi(config.vm.x86CallAbi, configuredX86CallAbi)) {
+            std::cerr << "VM_INIT_FAIL module=CapabilityChecker"
+                      << " reason=invalid_production_vm_configuration"
+                      << " bytecode_encryption=" << (config.vm.bytecodeEncryption ? "true" : "false")
+                      << " native_body_policy=" << config.vm.nativeBodyPolicy
+                      << " x86_call_abi=" << config.vm.x86CallAbi << std::endl;
+            PrintFeatureStatus("vm", "failed", "invalid_production_vm_configuration");
+            return 1;
+        }
+
+        if (config.vm.handlerMutation || config.vm.embedJunkHandlers) {
+            std::cerr << "VM_INIT_FAIL module=CapabilityChecker"
+                      << " reason=runtime_handler_mutation_not_linked"
+                      << " handler_mutation=" << (config.vm.handlerMutation ? "true" : "false")
+                      << " embed_junk_handlers=" << (config.vm.embedJunkHandlers ? "true" : "false")
+                      << std::endl;
+            PrintFeatureStatus("vm", "failed", "runtime_handler_mutation_not_linked");
+            return 1;
+        }
+        if (config.vm.stackSize < 0x4000 || config.vm.stackSize > 0x70000 ||
+            (config.vm.stackSize & 0x0FFF) != 0) {
+            std::cerr << "VM_INIT_FAIL module=CapabilityChecker"
+                      << " reason=guest_stack_size_must_be_page_aligned_16k_to_448k"
+                      << " stack_size=" << config.vm.stackSize << std::endl;
+            PrintFeatureStatus("vm", "failed", "invalid_guest_stack_size");
+            return 1;
+        }
+
         CipherShell::MutationEngine mutEngine;
         CipherShell::MutationConfig mutConfig;
-        mutConfig.randomizeOpcodeMap = true;
+        mutConfig.randomizeOpcodeMap = config.vm.opcodeRandomization;
         mutConfig.randomizeRegisterMap = true;
-        mutConfig.mutateHandlers = true;
-        mutConfig.insertJunkHandlers = true;
-        mutConfig.junkHandlerCount = 20;
+        mutConfig.registerCount = static_cast<uint32_t>(config.vm.registerCount);
         mutConfig.seed = buildCtx.isaSeed;
-        mutEngine.Initialize(mutConfig);
+        if (!mutEngine.Initialize(mutConfig)) {
+            std::cerr << "VM_INIT_FAIL module=MutationEngine reason=register_count_must_be_16_to_32" << std::endl;
+            PrintFeatureStatus("vm", "failed", "invalid_register_count");
+            return 1;
+        }
 
         CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
         buildCtx.opcodeMap = mutatedISA.opcodeMap;
         buildCtx.registerMap = mutatedISA.registerMap;
-        std::cout << "    ISA 鍙樺紓绉嶅瓙: 0x" << std::hex << mutEngine.GetSeed() << std::dec << std::endl;
+        std::string registerMapReason;
+        if (!ValidateVMRegisterMap(buildCtx.registerMap, mutConfig.registerCount, registerMapReason)) {
+            std::cerr << "VM_INIT_FAIL module=MutationEngine reason=" << registerMapReason << std::endl;
+            PrintFeatureStatus("vm", "failed", registerMapReason);
+            return 1;
+        }
+        std::cout << "    ISA seed fingerprint: 0x" << std::hex
+                  << mutEngine.GetSeedFingerprint() << std::dec << std::endl;
 
         CipherShell::Translator translator;
         CipherShell::TranslationConfig transConfig;
         transConfig.virtualRegisterCount = mutConfig.registerCount;
-        transConfig.enableOpcodeRandomization = true;
-        transConfig.enableJunkInsertion = true;
-        transConfig.junkRatio = 10;
+        transConfig.x86CallAbi = configuredX86CallAbi;
+        transConfig.enableSimdBridge = config.vm.simdBridge;
+        transConfig.enableX87Bridge = config.vm.x87Bridge;
+        vmRegisterCount = transConfig.virtualRegisterCount;
+        for (const auto& dll : image->imports.dlls) {
+            for (const auto& imported : dll.functions) {
+                transConfig.importThunkRVAs.insert(imported.thunkRVA);
+            }
+        }
         if (!translator.Initialize(transConfig)) {
             std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed" << std::endl;
             return 1;
@@ -944,31 +988,67 @@ int main(int argc, char* argv[]) {
         translator.SetOpcodeMap(buildCtx.opcodeMap);
         translator.SetRegisterMap(buildCtx.registerMap);
         PrintVMRegisterMapReport(buildCtx.registerMap);
-        std::cout << "VM_MEMORY_SUPPORT load_store=MOV_RM,MOV_MR address_calc=LEA memory_arithmetic=false addressing=base_disp,index_scale,rip_relative_image_rva widths=1,2,4,8 stack_policy=rsp_mutation_rejected" << std::endl;
-        std::cout << "VM_CALL_STACK_POLICY call=reject push=reject pop=reject native_bridge=not_implemented" << std::endl;
-
-
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
+        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
+                                     : image->ntHeaders32->OptionalHeader.ImageBase);
         uint32_t virtualizedCount = 0;
         uint32_t rejectedCount = 0;
-        std::vector<uint8_t> vmBytecodeBlob;
-        std::vector<CipherShell::VMFunctionRecord> vmRecords;
+        uint32_t selectedCount = 0;
+        std::vector<CipherShell::TranslationResult> pendingTranslations;
 
-        for (WORD si = 0; si < image->numSections; si++) {
-            IMAGE_SECTION_HEADER& sec = image->sections[si];
-            if (!(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        CipherShell::FunctionDiscovery functionDiscovery;
+        auto discoveryResult = functionDiscovery.Discover(image.get(), disasm);
+        if (!discoveryResult.success) {
+            std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
+                      << discoveryResult.error << std::endl;
+            PrintFeatureStatus("vm", "failed", discoveryResult.error);
+            return 1;
+        }
+        for (const auto& issue : discoveryResult.issues) {
+            std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x" << std::hex
+                      << issue.rva << std::dec << " reason=" << issue.reason << std::endl;
+        }
 
-            DWORD secOffset = sec.PointerToRawData;
-            DWORD secSize   = sec.SizeOfRawData;
-            if (secOffset + secSize > image->rawSize) continue;
+        for (const auto& pattern : buildCtx.vm.targetFunctions) {
+            const bool matched = std::any_of(discoveryResult.functions.begin(),
+                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
+                    std::ostringstream rva;
+                    rva << "0x" << std::hex << function.entryAddress;
+                    return WildcardMatchInsensitive(pattern, function.name) ||
+                        WildcardMatchInsensitive(pattern, rva.str());
+                });
+            if (!matched) {
+                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_pattern_matched_none"
+                          << " pattern=" << pattern << std::endl;
+                PrintFeatureStatus("vm", "failed", "target_pattern_matched_none");
+                return 1;
+            }
+        }
+        for (uint32_t targetRVA : buildCtx.vm.targetRVAs) {
+            const bool matched = std::any_of(discoveryResult.functions.begin(),
+                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
+                    return function.entryAddress == targetRVA;
+                });
+            if (!matched) {
+                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_rva_matched_none"
+                          << " rva=0x" << std::hex << targetRVA << std::dec << std::endl;
+                PrintFeatureStatus("vm", "failed", "target_rva_matched_none");
+                return 1;
+            }
+        }
 
-            BYTE* secData = image->rawData + secOffset;
-            uint64_t baseAddr = sec.VirtualAddress;
-            auto functions = disasm.AnalyzeCode(secData, secSize, baseAddr, is64);
-
-            for (const auto& func : functions) {
-                if (func.blocks.size() < 2 || func.size < 5) continue;
+        for (const auto& func : discoveryResult.functions) {
+                if (!FunctionSelected(func, buildCtx.vm.targetFunctions,
+                        buildCtx.vm.targetRVAs)) continue;
+                ++selectedCount;
+                if (func.size < 5) {
+                    ++rejectedCount;
+                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " reason=function_too_small" << std::endl;
+                    continue;
+                }
                 if (func.entryAddress > 0xFFFFFFFFULL || func.size > 0xFFFFFFFFULL) {
                     std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
                               << std::dec << " reason=function_range_too_large" << std::endl;
@@ -1003,7 +1083,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 std::string interpreterRejectReason;
-                if (!IsMinimalVMInterpreterProgram(transResult.instructions, interpreterRejectReason)) {
+                if (!IsRuntimeInterpreterProgram(transResult.instructions, is64, interpreterRejectReason)) {
                     std::cerr << "VM_REJECT module=VMRuntimeBuilder function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
                               << " reason=" << interpreterRejectReason << std::endl;
@@ -1011,41 +1091,79 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                auto vmBytecode = translator.GenerateBytecode(transResult, nullptr, nullptr);
-                if (vmBytecode.empty()) {
-                    std::cerr << "VM_BYTECODE_FAIL module=TranslatorBytecode function_rva=0x" << std::hex
-                              << func.entryAddress << std::dec << " reason=empty_bytecode" << std::endl;
-                    rejectedCount++;
-                    continue;
-                }
+                protectedFunctions.push_back(func);
+                pendingTranslations.push_back(std::move(transResult));
+        }
 
+        const bool explicitTargets = !buildCtx.vm.targetFunctions.empty() ||
+            !buildCtx.vm.targetRVAs.empty();
+        if (explicitTargets && selectedCount == 0) {
+            std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=explicit_targets_matched_none"
+                      << std::endl;
+            PrintFeatureStatus("vm", "failed", "explicit_targets_matched_none");
+            return 1;
+        }
+        if (explicitTargets && rejectedCount != 0) {
+            std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=explicit_target_rejected count="
+                      << rejectedCount << std::endl;
+            PrintFeatureStatus("vm", "failed", "explicit_target_rejected");
+            return 1;
+        }
+
+        if (!pendingTranslations.empty()) {
+            CipherShell::VMInstructionBridgeBuilder bridgeBuilder;
+            bridgeResult = bridgeBuilder.Build(image.get(), protectedFunctions,
+                pendingTranslations, buildCtx.vmBridgeSectionName,
+                buildCtx.vmBridgeUnwindSectionName, buildCtx.vmGuardSectionName);
+            if (!bridgeResult.success) {
+                std::cerr << "VM_BRIDGE_FAIL module=VMInstructionBridgeBuilder reason="
+                          << bridgeResult.error << std::endl;
+                PrintFeatureStatus("vm", "failed", bridgeResult.error);
+                return 1;
+            }
+            for (size_t i = 0; i < pendingTranslations.size(); ++i) {
+                auto vmBytecode = translator.GenerateBytecode(pendingTranslations[i]);
+                if (vmBytecode.empty()) {
+                    std::cerr << "VM_BYTECODE_FAIL module=TranslatorBytecode function_rva=0x"
+                              << std::hex << protectedFunctions[i].entryAddress << std::dec
+                              << " reason=unlinked_or_invalid_bytecode" << std::endl;
+                    PrintFeatureStatus("vm", "failed", "unlinked_or_invalid_bytecode");
+                    return 1;
+                }
                 CipherShell::VMFunctionRecord record{};
-                record.functionRVA = static_cast<uint32_t>(func.entryAddress);
-                record.functionSize = static_cast<uint32_t>(func.size);
+                record.functionRVA = static_cast<uint32_t>(protectedFunctions[i].entryAddress);
+                record.functionSize = protectedFunctions[i].size;
                 record.bytecodeOffset = static_cast<uint32_t>(vmBytecodeBlob.size());
                 record.bytecodeSize = static_cast<uint32_t>(vmBytecode.size());
-                record.opcodeMapOffset = 0;
-                record.registerMapOffset = 0;
-                record.flags = is64 ? 1u : 0u;
+                record.flags = is64 ? VM_RECORD_FLAG_X64 : 0u;
+                if (pendingTranslations[i].usesSimd) record.flags |= VM_RECORD_FLAG_USES_SIMD;
+                if (pendingTranslations[i].usesAvx) record.flags |= VM_RECORD_FLAG_USES_AVX;
+                if (pendingTranslations[i].usesX87) record.flags |= VM_RECORD_FLAG_USES_X87;
+                record.returnStackCleanup = pendingTranslations[i].returnStackCleanup;
+                record.guestStackSize = static_cast<uint32_t>(config.vm.stackSize);
                 vmRecords.push_back(record);
                 vmBytecodeBlob.insert(vmBytecodeBlob.end(), vmBytecode.begin(), vmBytecode.end());
-                virtualizedCount++;
+                ++virtualizedCount;
             }
         }
 
         if (!vmRecords.empty()) {
             CipherShell::VMSectionEmitter vmEmitter;
-            auto emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
+            emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
                 buildCtx.opcodeMap, buildCtx.registerMap, 0, buildCtx.vmSectionName);
             if (!emitResult.success) {
                 std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
                                 PrintFeatureStatus("vm", "failed", emitResult.error);
                 return 1;
             }
+            vmRecords = emitResult.records;
 
             CipherShell::VMRuntimeBuilder runtimeBuilder;
-            auto runtimeResult = runtimeBuilder.Build(image.get(), vmRecords,
-                emitResult.metadataRVA, buildCtx.vmRuntimeSectionName);
+            runtimeResult = runtimeBuilder.Build(image.get(), vmRecords,
+                emitResult.metadataRVA, emitResult.runtimeKeyShare,
+                buildCtx.vmRuntimeSectionName,
+                buildCtx.vmUnwindSectionName,
+                buildCtx.vmRelocSectionName);
             if (!runtimeResult.success) {
                 std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
                                 PrintFeatureStatus("vm", "failed", runtimeResult.error);
@@ -1053,8 +1171,15 @@ int main(int argc, char* argv[]) {
             }
 
             std::string patchError;
-            if (!vmEmitter.PatchRuntimeEntry(image.get(), emitResult.metadataRVA,
-                    runtimeResult.runtimeEntryRVA, &patchError)) {
+            const uint32_t runtimeVerifiedFlags = runtimeResult.unwindVerified
+                ? VM_METADATA_FLAG_UNWIND_VERIFIED : 0u;
+            const uint32_t linkageVerifiedFlags = runtimeVerifiedFlags |
+                (runtimeResult.cfgVerified ? VM_METADATA_FLAG_CFG_VERIFIED : 0u);
+            if (!vmEmitter.PatchLinkage(image.get(), emitResult.metadataRVA,
+                    runtimeResult.sectionRVA, runtimeResult.runtimeEntryRVA,
+                    runtimeResult.runtimeImageSize,
+                    runtimeResult.trampolines, emitResult.runtimeKeyShare,
+                    linkageVerifiedFlags, &patchError)) {
                 std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
                                 PrintFeatureStatus("vm", "failed", patchError);
                 return 1;
@@ -1067,7 +1192,8 @@ int main(int argc, char* argv[]) {
             }
 
             CipherShell::FunctionTrampolinePatcher patcher;
-            auto patchResults = patcher.PatchFunctions(image.get(), runtimeResult.trampolines, vmRecords, true);
+            patchResults = patcher.PatchFunctions(
+                image.get(), runtimeResult.trampolines, vmRecords, protectedFunctions, true);
             for (const auto& patch : patchResults) {
                 if (!patch.success) {
                     std::cerr << "VM_PATCH_FAIL module=FunctionTrampolinePatcher function_rva=0x"
@@ -1078,9 +1204,21 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            if (!vmEmitter.PatchLinkage(image.get(), emitResult.metadataRVA,
+                    runtimeResult.sectionRVA, runtimeResult.runtimeEntryRVA,
+                    runtimeResult.runtimeImageSize,
+                    runtimeResult.trampolines,
+                    emitResult.runtimeKeyShare,
+                    VM_METADATA_FLAG_NATIVE_BODY_DESTROYED | linkageVerifiedFlags, &patchError)) {
+                std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
+                PrintFeatureStatus("vm", "failed", patchError);
+                return 1;
+            }
+
             std::string staticCheckReason;
             std::unordered_map<uint32_t, uint32_t> vmOpcodeCounts;
-            if (!ValidateVMStaticLink(vmRecords, vmBytecodeBlob, emitResult, runtimeResult,
+            if (!ValidateVMStaticLink(image.get(), vmRecords, vmBytecodeBlob, emitResult, runtimeResult,
+                    bridgeResult,
                     patchResults, buildCtx.opcodeMap, buildCtx.registerMap,
                     transConfig.virtualRegisterCount, vmOpcodeCounts, staticCheckReason)) {
                 std::cerr << "VM_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
@@ -1090,6 +1228,7 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "VM_STATIC_CHECK_PASS module=VMStaticLinkChecker records="
                       << vmRecords.size() << std::endl;
+            vmApplied = true;
             std::cout << "VM_RUNTIME_SECTION rva=0x" << std::hex << runtimeResult.sectionRVA
                       << " raw=0x" << runtimeResult.sectionRawOffset
                       << " size=0x" << runtimeResult.sectionSize
@@ -1099,10 +1238,12 @@ int main(int argc, char* argv[]) {
                       << " size=0x" << emitResult.sectionSize
                       << " metadata=0x" << emitResult.metadataRVA
                       << " bytecode=0x" << emitResult.bytecodeRVA << std::dec << std::endl;
-            std::cout << "VM_DEBUG_TRACE_LAYOUT runtime_version_off=32 runtime_flags_off=36 enter_count_off=40"
-                      << " last_function_rva_off=44 last_opcode_off=48 last_error_code_off=52"
-                      << " last_bytecode_offset_off=56 last_ret_value_low32_off=60 fail_policy=int3_ud2" << std::endl;
-            std::cout << "VM_MEMORY_SUPPORT load_store=MOV_RM,MOV_MR address_calc=LEA memory_arithmetic=false widths=1,2,4,8" << std::endl;
+            std::cout << "VM_RUNTIME_CAPABILITIES schema=0x" << std::hex << VM_SCHEMA_VERSION
+                      << " metadata=0x" << VM_METADATA_VERSION
+                      << " runtime=0x" << VM_RUNTIME_VERSION << std::dec
+                      << " scalar_memory=true memory_arithmetic=true"
+                      << " native_call_bridge=true simd_x87_bridge=true"
+                      << " fail_policy=error_code_in_eax_then_int3_ud2" << std::endl;
 
             for (const auto& record : vmRecords) {
                 const CipherShell::VMTrampolineRecord* trampoline = nullptr;
@@ -1123,25 +1264,21 @@ int main(int argc, char* argv[]) {
                           << " patch_type=" << (patch ? PatchKindName(patch->patchKind) : "none")
                           << " bytecode_offset=0x" << record.bytecodeOffset
                           << " bytecode_size=0x" << record.bytecodeSize
+                          << " guest_stack_size=0x" << record.guestStackSize
                           << " opcode_count=" << std::dec << opcodeCount
                           << " patched_first16=" << FormatImageBytesAtRva(image.get(), record.functionRVA, 16)
                           << " trampoline_first16=" << FormatImageBytesAtRva(image.get(), trampoline ? trampoline->trampolineRVA : 0, 16)
                           << std::endl;
             }
-            std::cout << "VM_MANUAL_TEST_COMMAND compile=\"D:\\vs2022\\vs2022.exe\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x86\\cl.exe /nologo /EHsc /O2 /Fe:tests\\samples\\vm_manual_x64_sample.exe tests\\samples\\vm_manual_x64_sample.cpp\"" << std::endl;
-            std::cout << "VM_MANUAL_TEST_COMMAND pack=\"ciphershell tests\\samples\\vm_manual_x64_sample.exe -o tests\\samples\\vm_manual_x64_sample.vm.exe -l 4 -v\"" << std::endl;
-            std::cout << "VM_MANUAL_DEBUG_HINT first_check=metadata_trace_slots,last_error_code,runtime_section,trampoline_patch,bytecode_offset" << std::endl;
-            PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
         } else {
-            PrintFeatureStatus("vm", "skipped", "no_supported_functions");
+            std::cerr << "VM_BUILD_FAIL module=VM reason=no_supported_functions" << std::endl;
+            PrintFeatureStatus("vm", "failed", "no_supported_functions");
+            return 1;
         }
 
         std::cout << "    VM bytecode 鍐欏叆鍑芥暟鏁? " << virtualizedCount
                   << "锛屾嫆缁濆嚱鏁版暟: " << rejectedCount << std::endl;
 
-        if (buildCtx.quickLevel >= 5) {
-            std::cout << "  宓屽 VM 绛夊緟涓€绾?VM runtime 鎵ц鍣?ready 鍚庡惎鐢? << std::endl;
-        }
     }
     // Phase F: Section 鍔犲瘑锛圠1+锛屾渶鍚庢墽琛屸€斺€斿姞瀵嗘墍鏈夊彉鎹㈠悗鐨勪唬鐮侊級
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
@@ -1153,7 +1290,14 @@ int main(int argc, char* argv[]) {
         encConfig.encryptCodeSections = true;
         encConfig.encryptDataSections = false;
         encConfig.encryptResources = config.global.resourceEncryption;
-        CipherShell::CS_ENCRYPTION_KEY masterKey = encryptor.GenerateRandomKey();
+        encConfig.excludeSectionsAtOrAfter = originalSectionCount;
+        encConfig.excludeRelocationTargets = TRUE;
+        CipherShell::CS_ENCRYPTION_KEY masterKey{};
+        if (!encryptor.GenerateRandomKey(masterKey)) {
+            std::cerr << "SECTION_ENCRYPTION_FAIL module=SectionEncryptor reason=secure_random_failed" << std::endl;
+            PrintFeatureStatus("section_encryption", "failed", "secure_random_failed");
+            return 1;
+        }
 
         encryptedSections = encryptor.EncryptSections(image.get(), encConfig, masterKey);
         std::cout << "    宸插姞瀵?" << encryptedSections.size() << " 涓?Section" << std::endl;
@@ -1165,8 +1309,8 @@ int main(int argc, char* argv[]) {
     if (!encryptedStringRegions.empty()) {
         encryptedSections.insert(encryptedSections.end(),
             encryptedStringRegions.begin(), encryptedStringRegions.end());
-        std::cout << "    宸茶拷鍔?" << encryptedStringRegions.size()
-                  << " 涓瓧绗︿覆杩愯鏃惰В瀵嗕换鍔? << std::endl;
+        std::cout << "    已追加 " << encryptedStringRegions.size()
+                  << " 个字符串运行时解密任务" << std::endl;
     }
 
     // ============================================================================
@@ -1204,12 +1348,13 @@ int main(int argc, char* argv[]) {
 
     if (!encryptedSections.empty()) {
         CipherShell::StubBuilder stubBuilder;
-        if (!stubBuilder.EmbedStub(image.get(), encryptedSections, originalOEP)) {
+        if (!stubBuilder.EmbedStub(
+                image.get(), encryptedSections, originalOEP, buildCtx.vm.enabled)) {
             std::cerr << "  閿欒: Stub 宓屽叆澶辫触" << std::endl;
             return 1;
         }
     } else {
-        std::cout << "  璺宠繃锛堟棤鍔犲瘑 section锛? << std::endl;
+        std::cout << "  跳过（没有需要解密的 section）" << std::endl;
     }
 
     // ============================================================================
@@ -1234,6 +1379,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    BYTE* verificationBuffer = new(std::nothrow) BYTE[outputSize];
+    if (!verificationBuffer) {
+        std::cerr << "PE_STATIC_CHECK_FAIL module=PEVerifier reason=allocation_failed" << std::endl;
+        return 1;
+    }
+    std::memcpy(verificationBuffer, outputData.get(), outputSize);
+    CipherShell::CS_PE_IMAGE* rebuiltImage = parser.LoadFromBuffer(verificationBuffer, outputSize);
+    if (!rebuiltImage || !rebuiltImage->isValid) {
+        if (rebuiltImage) parser.FreeImage(rebuiltImage);
+        else delete[] verificationBuffer;
+        std::cerr << "PE_STATIC_CHECK_FAIL module=PEVerifier reason=rebuilt_image_parse_failed" << std::endl;
+        return 1;
+    }
+    if (vmApplied) {
+        std::string finalVMReason;
+        std::unordered_map<uint32_t, uint32_t> finalOpcodeCounts;
+        if (!ValidateVMStaticLink(rebuiltImage, vmRecords, vmBytecodeBlob, emitResult,
+                runtimeResult, bridgeResult, patchResults, buildCtx.opcodeMap,
+                buildCtx.registerMap, vmRegisterCount, finalOpcodeCounts, finalVMReason)) {
+            parser.FreeImage(rebuiltImage);
+            std::cerr << "VM_FINAL_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
+                      << finalVMReason << std::endl;
+            return 1;
+        }
+    }
+    parser.FreeImage(rebuiltImage);
+    std::cout << "PE_STATIC_CHECK_PASS module=PEVerifier" << std::endl;
+
     std::cout << "  PE 閲嶅缓鎴愬姛" << std::endl;
     std::cout << "  杈撳嚭澶у皬: " << outputSize << " 瀛楄妭" << std::endl;
 
@@ -1243,8 +1416,14 @@ int main(int argc, char* argv[]) {
         std::cerr << "閿欒: 鏃犳硶鍒涘缓杈撳嚭鏂囦欢: " << outputFile << std::endl;
         return 1;
     }
-    fwrite(outputData.get(), 1, outputSize, outFile);
-    fclose(outFile);
+    const size_t written = fwrite(outputData.get(), 1, outputSize, outFile);
+    const int closeResult = fclose(outFile);
+    if (written != outputSize || closeResult != 0) {
+        std::remove(outputFile.c_str());
+        std::cerr << "PE_WRITE_FAIL module=PEWriter reason=short_or_failed_write"
+                  << " expected=" << outputSize << " written=" << written << std::endl;
+        return 1;
+    }
 
     std::cout << "  杈撳嚭鏂囦欢宸蹭繚瀛? " << outputFile << std::endl;
     std::cout << "  鏂囦欢澶у皬: " << outputSize << " 瀛楄妭" << std::endl;
@@ -1256,11 +1435,30 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[6/6] 楠岃瘉杈撳嚭鏂囦欢..." << std::endl;
 
     CipherShell::CS_PE_IMAGE* verifyImage = parser.LoadFromFile(outputFile);
-    if (verifyImage && verifyImage->isValid) {
-        std::cout << "  楠岃瘉鎴愬姛: 杈撳嚭鏂囦欢鏄湁鏁堢殑 PE" << std::endl;
-        parser.FreeImage(verifyImage);
-    } else {
-        std::cerr << "  璀﹀憡: 杈撳嚭鏂囦欢鍙兘涓嶆槸鏈夋晥鐨?PE" << std::endl;
+    if (!verifyImage || !verifyImage->isValid) {
+        if (verifyImage) parser.FreeImage(verifyImage);
+        std::remove(outputFile.c_str());
+        std::cerr << "PE_WRITE_VERIFY_FAIL module=PEVerifier reason=written_image_parse_failed" << std::endl;
+        return 1;
+    }
+    if (vmApplied) {
+        std::string writtenVMReason;
+        std::unordered_map<uint32_t, uint32_t> writtenOpcodeCounts;
+        if (!ValidateVMStaticLink(verifyImage, vmRecords, vmBytecodeBlob, emitResult,
+                runtimeResult, bridgeResult, patchResults, buildCtx.opcodeMap,
+                buildCtx.registerMap, vmRegisterCount, writtenOpcodeCounts,
+                writtenVMReason)) {
+            parser.FreeImage(verifyImage);
+            std::remove(outputFile.c_str());
+            std::cerr << "VM_WRITE_VERIFY_FAIL module=VMStaticLinkChecker reason="
+                      << writtenVMReason << std::endl;
+            return 1;
+        }
+    }
+    parser.FreeImage(verifyImage);
+    std::cout << "  输出文件静态复验成功" << std::endl;
+    if (vmApplied) {
+        PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
     }
 
     std::cout << "\n======================================" << std::endl;

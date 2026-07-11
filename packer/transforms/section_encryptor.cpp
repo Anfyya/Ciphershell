@@ -3,9 +3,11 @@
  */
 
 #include "section_encryptor.h"
+#include "runtime_stream_cipher.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <algorithm>
 
 // BUG6淇锛氫娇鐢ㄥ瘑鐮佸瀹夊叏鐨勯殢鏈烘暟鐢熸垚鍣ㄦ浛浠?rand()
 // rand() 鐨勮緭鍑哄彲棰勬祴锛堢瀛愮┖闂村皬銆佺嚎鎬у悓浣欑畻娉曪級锛屾敾鍑昏€呭彲鏆村姏鐮磋В瀵嗛挜
@@ -18,39 +20,6 @@
 #endif
 
 namespace CipherShell {
-
-namespace {
-uint32_t LoadLe32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-        (static_cast<uint32_t>(p[1]) << 8) |
-        (static_cast<uint32_t>(p[2]) << 16) |
-        (static_cast<uint32_t>(p[3]) << 24);
-}
-
-uint32_t RotR32(uint32_t v, uint32_t bits) {
-    bits &= 31u;
-    return (v >> bits) | (v << ((32u - bits) & 31u));
-}
-
-void ApplyLegacyXor(BYTE* data, DWORD size, const CS_ENCRYPTION_KEY& key) {
-    for (DWORD i = 0; i < size; i++) {
-        data[i] ^= key.key[i & 31u];
-    }
-}
-
-void ApplyRollingSectionStream(BYTE* data, DWORD size, const CS_ENCRYPTION_KEY& key, bool encrypting) {
-    uint32_t state = LoadLe32(key.key);
-    if (state == 0) state = 0xC5C5E11u;
-    for (DWORD i = 0; i < size; i++) {
-        const uint8_t input = data[i];
-        const uint8_t mask = static_cast<uint8_t>(state) ^ key.key[i & 31u];
-        data[i] = static_cast<uint8_t>(input ^ mask);
-        const uint8_t feedback = encrypting ? data[i] : input;
-        state = RotR32(state, 8) ^ static_cast<uint32_t>(feedback);
-    }
-}
-}
-
 
 // ============================================================================
 // 鏋勯€?鏋愭瀯
@@ -81,12 +50,25 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
+        if (i >= config.excludeSectionsAtOrAfter) continue;
+        if (config.excludeRelocationTargets) {
+            const uint32_t span = (std::max)(section->Misc.VirtualSize,
+                static_cast<DWORD>(section->SizeOfRawData));
+            const bool hasRelocationTarget = std::any_of(
+                image->relocs.entries.begin(), image->relocs.entries.end(),
+                [&](const CS_RELOC_ENTRY& entry) {
+                    return span != 0 && entry.fullRVA >= section->VirtualAddress &&
+                        entry.fullRVA - section->VirtualAddress < span;
+                });
+            if (hasRelocationTarget) continue;
+        }
+
         // 妫€鏌ユ槸鍚﹂渶瑕佸姞瀵嗘 section
         if (!ShouldEncryptSection(section, config)) {
             continue;
         }
 
-        // 鐢熸垚鎴栨淳鐢熷瘑閽?        CS_ENCRYPTION_KEY sectionKey;
+        CS_ENCRYPTION_KEY sectionKey{};
         if (config.usePerSectionKeys) {
             sectionKey = DeriveSectionKey(masterKey, i, section->VirtualAddress);
         } else {
@@ -127,36 +109,30 @@ bool SectionEncryptor::DecryptSections(
     return true;
 }
 
-CS_ENCRYPTION_KEY SectionEncryptor::GenerateRandomKey() {
-    CS_ENCRYPTION_KEY key;
+bool SectionEncryptor::GenerateRandomKey(CS_ENCRYPTION_KEY& key) {
+    std::memset(&key, 0, sizeof(key));
 
-    // BUG6淇锛氫娇鐢ㄥ瘑鐮佸瀹夊叏鐨勯殢鏈烘暟鐢熸垚鍣?    // rand() 绉嶅瓙绌洪棿浠?32 浣嶏紝涓旇緭鍑哄簭鍒楀彲棰勬祴锛屼笉閫傜敤浜庡瘑閽ョ敓鎴?#ifdef _WIN32
-    // Windows 骞冲彴锛氫娇鐢?BCryptGenRandom锛圕NG API锛夛紝鎻愪緵 CSPRNG
-    BCryptGenRandom(NULL, key.key, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    BCryptGenRandom(NULL, key.nonce, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    BCryptGenRandom(NULL, (PUCHAR)&key.counter, sizeof(key.counter), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+#ifdef _WIN32
+    if (BCryptGenRandom(nullptr, key.key, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+        BCryptGenRandom(nullptr, key.nonce, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+        BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&key.counter),
+            sizeof(key.counter), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        std::memset(&key, 0, sizeof(key));
+        return false;
+    }
 #else
-    // 璺ㄥ钩鍙帮細浣跨敤 std::random_device 鑾峰彇纭欢鐔垫簮
-    std::random_device rd;
-    // 鐢熸垚闅忔満瀵嗛挜
-    for (int i = 0; i < 32; i += 4) {
-        uint32_t val = rd();
-        int remaining = 32 - i;
-        int copyLen = remaining < 4 ? remaining : 4;
-        memcpy(key.key + i, &val, copyLen);
+    try {
+        std::random_device rd;
+        for (uint8_t& value : key.key) value = static_cast<uint8_t>(rd());
+        for (uint8_t& value : key.nonce) value = static_cast<uint8_t>(rd());
+        key.counter = static_cast<uint32_t>(rd());
+    } catch (...) {
+        std::memset(&key, 0, sizeof(key));
+        return false;
     }
-    // 鐢熸垚闅忔満 nonce
-    for (int i = 0; i < 12; i += 4) {
-        uint32_t val = rd();
-        int remaining = 12 - i;
-        int copyLen = remaining < 4 ? remaining : 4;
-        memcpy(key.nonce + i, &val, copyLen);
-    }
-    uint32_t counterVal = rd();
-    key.counter = counterVal;
 #endif
 
-    return key;
+    return true;
 }
 
 CS_ENCRYPTION_KEY SectionEncryptor::DeriveSectionKey(
@@ -204,7 +180,7 @@ BYTE* SectionEncryptor::SerializeKeys(
     *(DWORD*)(output + offset) = (DWORD)encryptedSections.size();
     offset += 4;
 
-    // 鍐欏叆姣忎釜 section 鐨勪俊鎭?    for (const auto& encSection : encryptedSections) {
+    for (const auto& encSection : encryptedSections) {
         *(DWORD*)(output + offset) = encSection.sectionIndex;
         offset += 4;
 
@@ -243,11 +219,11 @@ bool SectionEncryptor::EncryptSection(
 
     PIMAGE_SECTION_HEADER section = &image->sections[sectionIndex];
 
-    // 妫€鏌?section 鏄惁鏈夋暟鎹?    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
+    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
         return false;
     }
 
-    // 妫€鏌ヨ竟鐣?    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
+    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
         return false;
     }
 
@@ -255,12 +231,12 @@ bool SectionEncryptor::EncryptSection(
 
     // x64 stub 使用同一套滚动流解密；x86 仍保留旧格式以避免破坏现有 32 位启动 stub。
     if (image->is64Bit) {
-        ApplyRollingSectionStream(sectionData, section->SizeOfRawData, key, true);
+        RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, true);
     } else {
-        ApplyLegacyXor(sectionData, section->SizeOfRawData, key);
+        RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
     }
 
-    // 缁?section 鍔犲啓鏉冮檺锛宻tub 闇€瑕佸啓鍥炶В瀵嗗悗鐨勬暟鎹?    section->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    section->Characteristics |= IMAGE_SCN_MEM_WRITE;
     // section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
 
     return true;
@@ -277,11 +253,11 @@ bool SectionEncryptor::DecryptSection(
 
     PIMAGE_SECTION_HEADER section = &image->sections[sectionIndex];
 
-    // 妫€鏌?section 鏄惁鏈夋暟鎹?    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
+    if (section->SizeOfRawData == 0 || section->PointerToRawData == 0) {
         return false;
     }
 
-    // 妫€鏌ヨ竟鐣?    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
+    if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) {
         return false;
     }
 
@@ -289,9 +265,9 @@ bool SectionEncryptor::DecryptSection(
 
     // 与 EncryptSection 和启动 stub 保持一致。
     if (image->is64Bit) {
-        ApplyRollingSectionStream(sectionData, section->SizeOfRawData, key, false);
+        RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, false);
     } else {
-        ApplyLegacyXor(sectionData, section->SizeOfRawData, key);
+        RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
     }
 
     // 鎭㈠鎵ц鏉冮檺
@@ -312,17 +288,20 @@ void SectionEncryptor::DeriveKey(
 
     uint8_t currentKey[32];
     memcpy(currentKey, masterKey.key, 32);
+    uint8_t kdfNonce[12] = {};
+    const uint32_t nonceBytes = (std::min)(saltLength, static_cast<uint32_t>(sizeof(kdfNonce)));
+    if (salt && nonceBytes != 0) std::memcpy(kdfNonce, salt, nonceBytes);
 
     for (uint32_t round = 0; round < rounds; round++) {
         ChaCha20 cipher;
-        cipher.Init(currentKey, salt, round);
+        cipher.Init(currentKey, kdfNonce, round);
 
         // 鐢熸垚鏂扮殑瀵嗛挜鏉愭枡
         uint8_t newKeyMaterial[32];
         memset(newKeyMaterial, 0, 32);
         cipher.Process(newKeyMaterial, newKeyMaterial, 32);
 
-        // 涓庡綋鍓嶅瘑閽ユ贩鍚?        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < 32; i++) {
             currentKey[i] ^= newKeyMaterial[i];
         }
     }
@@ -343,6 +322,7 @@ void SectionEncryptor::DeriveKey(
 
     // 娓呴櫎涓存椂鏁版嵁
     SecureZeroMemory(currentKey, sizeof(currentKey));
+    SecureZeroMemory(kdfNonce, sizeof(kdfNonce));
 }
 
 bool SectionEncryptor::IsCodeSection(DWORD characteristics) {
@@ -365,7 +345,7 @@ bool SectionEncryptor::ShouldEncryptSection(PIMAGE_SECTION_HEADER section, const
     char name[9] = {0};
     memcpy(name, section->Name, 8);
 
-    // 淇濈暀璧勬簮娈碉紙濡傛灉閰嶇疆瑕佹眰锛?    if (strncmp(name, ".rsrc", 5) == 0 && !config.encryptResources) {
+    if (strncmp(name, ".rsrc", 5) == 0 && !config.encryptResources) {
         return false;
     }
 

@@ -1,1526 +1,1204 @@
-# CipherShell — 自研高强度代码保护壳 设计书
+# CipherShell — Windows x86/x64 生产级代码保护系统设计书
 
 > **项目代号**：CipherShell  
-> **版本**：v0.1 Draft  
-> **作者**：安方怡（yjln / Anfyya）  
-> **日期**：2026-06-27  
-> **状态**：设计阶段
+> **文档版本**：v1.0 Production Architecture Baseline  
+> **更新日期**：2026-07-10  
+> **目标平台**：Windows PE32 / PE32+，EXE / DLL  
+> **实现语言**：C++17、C、x86/x64 汇编  
+> **构建工具**：CMake、MSVC、NASM  
+> **文档状态**：最终生产架构约束，不是 MVP、原型或临时路线图
 
 ---
 
-## 一、项目概述
+## 0. 不可变更的工程原则
 
-### 1.1 项目目标
+本节是 CipherShell 的最高优先级约束。后续实现、重构、AI 编码提示词和代码审查都必须遵守。
 
-CipherShell 是一款自研的 Windows 可执行文件保护系统，定位为**高强度加密壳 / 代码保护器（Protector）**。核心设计哲学：
-
-- **零特征重叠**：与市面所有已知壳（VMProtect、Themida/WinLicense、Obsidium、ASPack、UPX、PELock、Enigma 等）在二进制特征、VM 架构、section 命名、stub 签名上完全不同
-- **最大化反逆向**：多层嵌套保护架构，使静态分析（IDA Pro、Ghidra、Binary Ninja）和动态调试（x64dbg、WinDbg、Frida）均极度困难
-- **可控的保护粒度**：用户自选函数级 / 基本块级 / 指令级保护，以及保护强度等级，在安全性与运行时性能之间自由权衡
-- **双模式输入**：支持导入编译后的 PE 文件（EXE/DLL，**必须实现**），以及可选的源码级保护（编译器插件/预处理方式）
-
-### 1.2 与现有产品的差异化策略
-
-| 维度 | VMProtect | Themida | CipherShell（本项目） |
-|------|-----------|---------|----------------------|
-| VM 架构 | 基于栈的 VM，handler 模式相对固定 | RISC 风格 VM，FISH/TIGER 虚拟机 | 混合架构 VM（栈+寄存器），每次生成完全不同的 ISA |
-| 特征签名 | `.vmp0`/`.vmp1` section，已被大量签名库收录 | 固定 stub 入口模式，Oreans watermark | 无固定 section 名、无固定入口模式、无 watermark，所有元数据随机化 |
-| 反调试 | 成熟但模式已被广泛研究和绕过 | 强但 anti-anti-debug 工具链完善 | 基于不可预测时序 + 密钥派生的隐式检测，无显式 API 调用可 hook |
-| 代码变异 | Handler 多态但结构可识别 | 代码变形强度高 | 多维变异（opcode 编码 + handler AST 级变形 + 执行语义等价替换） |
-| 性能控制 | 有限的粒度选择 | 粗粒度选择 | 五级保护等级 + 函数级精确标注 + 自动热点分析建议 |
-
-### 1.3 支持目标
-
-- **输入格式**：PE32 (x86)、PE32+ (x64) 的 EXE 和 DLL；可选 C/C++ 源码（通过 LLVM Pass 或预处理器）
-- **操作系统**：Windows 7 SP1 ~ Windows 11（含最新版本）
-- **开发语言**：Packer 端使用 C++ (C++17)；Stub/VM 引擎使用 C (无 CRT) + NASM 汇编
-- **构建工具链**：MSVC (x86/x64) + NASM + CMake
+1. **不做 MVP**：不以“先能运行”为理由引入最终必然废弃的架构。
+2. **不做最小可运行实例**：可以限制某个功能的合法适用范围，但不能用假的 runtime、空 handler、NOP 替代、静默跳过或原生逻辑回退来伪造功能完成。
+3. **不分阶段交付临时架构**：所有新增模块必须直接接入最终生产数据流。
+4. **不保留双轨生产路径**：正式构建中只能存在一套解码器、一套 IR、一套 PE 修改模型和一套功能状态判定。
+5. **不使用 fallback 掩盖错误**：Zydis 解码失败、Translator 不支持、runtime 缺失、静态链接不完整时必须 fail-closed。
+6. **不承诺“以后再替换”**：确认最终应使用的组件必须直接采用。例如 x86/x64 指令解码最终使用 Zydis，就不得继续扩展手写 ModRM/SIB/REX 解码器。
+7. **功能必须真实闭环**：一个功能只有在配置、分析、变换、PE 写入、runtime 支持、静态验证和状态报告全部闭环后才能标记 `applied`。
+8. **保护等级不是架构核心**：L1-L5 仅作为配置预设。所有保护功能必须可以独立启用、关闭、调节强度和设置作用范围。
+9. **不运行产物的开发约束**：编码 AI 只负责代码、配置、编译和静态检查；原始 EXE、加壳 EXE 和测试 EXE 的运行验证由用户手动完成。
+10. **不以编译通过代替功能完成**：编译通过是必要条件，不是功能正确性的证明。
 
 ---
 
-## 二、总体架构
+## 1. 项目定位
 
-### 2.1 系统架构全景
+CipherShell 是面向合法软件保护场景的 Windows 原生代码保护系统，目标是对 PE32/PE32+ 程序提供函数级代码虚拟化、数据保护、导入保护、控制流变换、完整性验证和可审计的失败策略。
 
+### 1.1 核心目标
+
+- 支持 Windows x86 与 x64 的 EXE、DLL。
+- 对指定函数实施真正的 native → trampoline → VM runtime → bytecode → native return 执行闭环。
+- 每次构建随机化 VM opcode、虚拟寄存器映射、metadata cookie、section 名称和可变布局。
+- 保护功能独立配置，不以等级硬编码决定功能开关。
+- 对不支持的输入明确拒绝，不产生“看似加壳成功、实际仍执行 native”的文件。
+- 对 PE 修改进行统一建模，避免多个模块互相覆盖 Header、Section 或 Data Directory。
+- 保留完整静态诊断，使用户能够定位 Translator、metadata、trampoline、runtime 或 PE 重建错误。
+
+### 1.2 非目标
+
+- 不保护 .NET IL；检测到 CLR Header 时明确拒绝或交由独立产品线。
+- 不以内核驱动作为基础依赖。
+- 不依赖云端服务才能完成加壳。
+- 不通过恶意行为、持久化或系统破坏实现保护。
+- 不将反调试、反虚拟机当作 VM 正确性的替代品。
+
+---
+
+## 2. 最终总体架构
+
+```text
+输入 PE + 保护配置
+        │
+        ▼
+┌──────────────────────────────┐
+│ PE Platform Layer            │
+│ Parser / Image Model         │
+│ Directory Model / Validation │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Zydis Decode Layer           │
+│ x86/x64 machine instruction  │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ CipherShell Unified IR       │
+│ Instruction / Operand / CFG  │
+│ Function / Data-flow         │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Protection Planner           │
+│ BuildContext / Capability    │
+│ Scope / FailurePolicy        │
+└──────────────┬───────────────┘
+               │
+       ┌───────┴───────────────────────────┐
+       ▼                                   ▼
+┌──────────────────────┐        ┌────────────────────────┐
+│ VM Protection        │        │ Non-VM Protections     │
+│ Translator           │        │ Strings / Imports      │
+│ Bytecode / Metadata  │        │ Sections / CFG / CFI   │
+│ Runtime / Trampoline │        │ Integrity              │
+└───────────┬──────────┘        └────────────┬───────────┘
+            └──────────────┬─────────────────┘
+                           ▼
+┌──────────────────────────────┐
+│ PEEmitter                    │
+│ Append / Patch / Fill        │
+│ Directory & Header Updates   │
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│ Static Verifiers             │
+│ VM / PE / CFG / Directory    │
+└──────────────┬───────────────┘
+               ▼
+┌──────────────────────────────┐
+│ PERebuilder                  │
+│ Serialization Only           │
+└──────────────┬───────────────┘
+               ▼
+         输出受保护 PE
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        CipherShell Protector                        │
-│                                                                     │
-│  ┌───────────┐   ┌──────────────┐   ┌──────────────┐              │
-│  │ 输入层     │──→│ 分析层        │──→│ 保护层        │              │
-│  │           │   │              │   │              │              │
-│  │ PE Parser │   │ 反汇编引擎    │   │ 代码虚拟化    │              │
-│  │ COFF 解析 │   │ CFG 构建器    │   │ 控制流混淆    │              │
-│  │ 源码接口   │   │ 数据流分析    │   │ 变异引擎      │              │
-│  │ 配置解析   │   │ 热点标注      │   │ 数据加密      │              │
-│  └───────────┘   └──────────────┘   │ 反调试注入    │              │
-│                                     └──────┬───────┘              │
-│                                            │                      │
-│                                     ┌──────▼───────┐              │
-│                                     │ 输出层        │              │
-│                                     │              │              │
-│                                     │ PE 重建器    │              │
-│                                     │ Stub 链接器  │              │
-│                                     │ 签名消除器   │              │
-│                                     └──────────────┘              │
-└─────────────────────────────────────────────────────────────────────┘
+
+### 2.1 单一数据流原则
+
+正式构建必须始终经过同一数据流：
+
+```text
+Zydis → Unified IR → CFG → Translator → VM Bytecode → Metadata
+       → Runtime/Trampoline → PEEmitter → Static Verification → PERebuilder
 ```
 
-### 2.2 数据流
+不得出现以下生产路径：
 
+- Zydis 失败后退回自研 decoder。
+- Translator 失败后保留原函数继续标记 VM applied。
+- runtime 不完整时仍写出 VM record。
+- PEEmitter 修改后由 PERebuilder 重新猜测布局。
+- 不支持指令转 NOP。
+- 配置字段未被解析但不报错。
+
+---
+
+## 3. ProtectionBuildContext 与配置决策
+
+所有模块共享一个不可变的构建上下文。模块不得各自生成互不一致的 opcode map、register map、密钥或 section 名称。
+
+```cpp
+struct ProtectionBuildContext {
+    uint64_t buildSeed;
+    TargetArchitecture architecture;   // X86 / X64
+    TargetImageKind imageKind;          // EXE / DLL
+
+    VMOptions vm;
+    StringProtectionOptions strings;
+    ImportProtectionOptions imports;
+    SectionProtectionOptions sections;
+    ControlFlowOptions controlFlow;
+    IntegrityOptions integrity;
+
+    ScopePolicy scope;
+    FailurePolicy failurePolicy;
+
+    OpcodeMap opcodeMap;
+    ReverseOpcodeMap reverseOpcodeMap;
+    RegisterMap registerMap;
+    VMMetadataLayout metadataLayout;
+    RuntimeLayout runtimeLayout;
+    BuildKeys keys;
+    GeneratedSectionNames sectionNames;
+};
 ```
-                 ┌──────────────────────────────────┐
-                 │        输入阶段                    │
-                 │  原始 PE ──→ PE Parser             │
-                 │  保护配置 ──→ Config Parser         │
-                 │  [可选] 源码 ──→ LLVM Pass         │
-                 └──────────────┬───────────────────┘
-                                │
-                 ┌──────────────▼───────────────────┐
-                 │        分析阶段                    │
-                 │  反汇编 ──→ 指令流                 │
-                 │  CFG 构建 ──→ 基本块图             │
-                 │  标记目标函数/区域                  │
-                 │  分析导入表/重定位表/资源            │
-                 └──────────────┬───────────────────┘
-                                │
-                 ┌──────────────▼───────────────────┐
-                 │        变换阶段（按保护等级）       │
-                 │                                   │
-                 │  L1: 代码段 XOR 加密              │
-                 │  L2: + 控制流平坦化               │
-                 │  L3: + 虚假控制流注入             │
-                 │  L4: + 代码虚拟化 (VM)            │
-                 │  L5: + 多层嵌套 VM + 全变异       │
-                 │                                   │
-                 │  各等级均叠加：                     │
-                 │    反调试逻辑注入                   │
-                 │    导入表混淆                      │
-                 │    字符串加密                      │
-                 │    数据段加密                      │
-                 └──────────────┬───────────────────┘
-                                │
-                 ┌──────────────▼───────────────────┐
-                 │        输出阶段                    │
-                 │  Stub 生成（变异后）               │
-                 │  Section 布局（随机化）             │
-                 │  PE 头重建 + 校验                  │
-                 │  特征消除 + 最终写出               │
-                 └──────────────────────────────────┘
+
+### 3.1 配置优先级
+
+```text
+命令行显式参数
+    > TOML 模块化配置
+    > --level 预设展开结果
+    > 内置安全默认值
+```
+
+`--level` 只能转换为模块化配置，不得在主流程中作为 `if (level >= 4)` 的核心功能判断。
+
+### 3.2 功能状态
+
+每个模块只能输出以下状态之一：
+
+- `applied`：完整闭环并通过静态验证。
+- `partial`：仅用于明确存在的非关键子能力；不得用于 VM 主链闭环。
+- `skipped`：配置关闭、作用域为空或由用户策略明确跳过。
+- `failed`：请求启用但无法安全完成。
+
+标准输出格式：
+
+```text
+FEATURE_STATUS name=vm status=applied reason=static_link_verified
+FEATURE_STATUS name=import_protection status=failed reason=runtime_resolver_missing
 ```
 
 ---
 
-## 三、模块详细设计
+## 4. PE 平台层
 
-### 3.1 输入层
+### 4.1 PEParser
 
-#### 3.1.1 PE 解析器（PE Parser）
+PEParser 负责将原始文件解析为统一内存模型，至少覆盖：
 
-自研 PE 解析器，不依赖第三方库（避免引入可被识别的解析特征）。
+- DOS Header、NT Headers、Optional Header。
+- x86/x64 Section Table。
+- Import、Delay Import、Export。
+- Base Relocation。
+- Resource。
+- TLS。
+- x64 Exception Directory / `.pdata` / unwind 信息。
+- Load Config、CFG Guard、SafeSEH。
+- Debug Directory、Rich Header。
+- Security Directory / Authenticode 范围。
+- Overlay。
+- CLR Header 检测。
 
-**功能清单**：
+解析器必须执行严格边界检查，所有 RVA、raw offset、size 运算使用防溢出逻辑。
 
-- 解析 DOS Header、NT Headers（x86/x64 双模式）
-- 解析所有 Section Headers，保留原始属性
-- 完整解析 Data Directory 的全部 16 项：
-  - 导入表（Import Table / IAT / ILT）
-  - 导出表（Export Table）
-  - 重定位表（Base Relocation Table）
-  - 资源表（Resource Table）
-  - TLS 表（Thread Local Storage）
-  - 异常处理表（Exception Directory，x64 必需）
-  - 调试目录（Debug Directory）—— 解析后删除
-  - 延迟导入表（Delay Import）
-  - CLR Header（检测 .NET 程序并拒绝/提示）
-  - Load Config（SEH/CFG/RF Guard 信息）
-  - Bound Import（解析后丢弃）
-- 验证 PE 完整性：checksum、overlay 数据、签名（Authenticode）
-- Rich Header 解析与可选删除（消除编译器指纹）
+### 4.2 PEEmitter
 
-**数据结构**：
+PEEmitter 是所有内存 PE 修改的唯一入口，负责：
 
-```c
-typedef struct _CS_PE_IMAGE {
-    // 原始文件
-    BYTE*                   rawData;
-    DWORD                   rawSize;
-    
-    // 解析后的头
-    PIMAGE_DOS_HEADER       dosHeader;
-    PIMAGE_NT_HEADERS64     ntHeaders;      // 统一用64位结构，x86时做适配
-    PIMAGE_SECTION_HEADER   sections;
-    WORD                    numSections;
-    BOOL                    is64Bit;
-    
-    // 解析后的目录
-    CS_IMPORT_TABLE         imports;         // 解析后的导入表
-    CS_EXPORT_TABLE         exports;         // 解析后的导出表
-    CS_RELOC_TABLE          relocs;          // 解析后的重定位表
-    CS_RESOURCE_TREE        resources;       // 解析后的资源树
-    CS_TLS_INFO             tls;             // TLS回调信息
-    CS_EXCEPTION_TABLE      exceptions;      // x64异常处理
-    CS_LOAD_CONFIG          loadConfig;      // CFG/RF Guard信息
-    
-    // 元数据
-    BOOL                    hasOverlay;
-    DWORD                   overlayOffset;
-    BOOL                    hasSignature;
-    BOOL                    hasRichHeader;
-    BOOL                    isDotNet;
-} CS_PE_IMAGE;
+- `AppendSection`
+- `PatchBytes`
+- `FillBytes`
+- Header 扩容与 raw data 搬移
+- `NumberOfSections`
+- `SizeOfImage`
+- `SizeOfHeaders`
+- Section `VirtualAddress / VirtualSize / PointerToRawData / SizeOfRawData`
+- Data Directory 更新
+- Overlay 位移更新
+- x64 unwind/exception 表更新
+- CFG Guard 兼容更新
+- Base relocation 更新
+- TLS / import / export 相关目录写入
+
+禁止保护模块直接通过裸指针随意改 Header。
+
+### 4.3 PERebuilder
+
+PERebuilder 只负责序列化已经由 PEEmitter 确定的最终内存映像，不得：
+
+- 重新排列 section。
+- 重新猜测 RVA/raw offset。
+- 覆盖 PEEmitter 已写入的数据。
+- 忽略新增 runtime、metadata 或 trampoline section。
+
+### 4.4 输出验证
+
+写出前必须验证：
+
+- Section 无 raw/virtual 重叠。
+- 所有 Data Directory 范围合法。
+- EntryPoint 落在可执行 section。
+- runtime/trampoline 落在可执行 section。
+- metadata 落在可读且默认不可写 section；仅 debug trace 需要时按配置提供可写数据区。
+- x64 `.pdata` 与 unwind 信息与新增可执行区域一致。
+- CFG Guard 目标表在启用时包含新增合法间接调用目标。
+- DLL 的导出、TLS、初始化顺序与 loader 语义保持一致。
+
+---
+
+## 5. 正式指令解码与统一 IR
+
+### 5.1 Zydis 是唯一生产解码器
+
+CipherShell 正式生产路径必须使用固定版本、固定 tag/commit 的 Zydis。依赖应内置于 `third_party` 或由固定 commit 的 CMake FetchContent 获取，不要求用户安装全局库。
+
+Zydis 负责：
+
+- x86/x64 指令长度与 mnemonic。
+- legacy prefix、REX、ModRM、SIB。
+- register、immediate、memory operand。
+- operand width 与访问类型。
+- RIP-relative 与 relative branch/call。
+- instruction category。
+- flags read/write 元数据。
+
+Zydis 不负责：
+
+- 函数边界最终判定。
+- CFG 策略。
+- VM 语义翻译。
+- native bridge。
+- PE 修改。
+
+生产代码中必须删除或禁止：
+
+- `DecodeModRMInstr`
+- `DecodedModRM`
+- 手写 REX/ModRM/SIB 解析
+- 通过 `instr.bytes[0]` 推断语义
+- Zydis 失败后使用 legacy decoder
+
+### 5.2 统一 IR
+
+```cpp
+enum class OperandType {
+    None,
+    Register,
+    Immediate,
+    Memory,
+    Pointer
+};
+
+enum class OperandAction {
+    None,
+    Read,
+    Write,
+    ReadWrite
+};
+
+struct MemoryOperandIR {
+    RegisterId segment;
+    RegisterId base;
+    RegisterId index;
+    uint8_t scale;
+    int64_t displacement;
+    uint16_t width;
+    bool hasBase;
+    bool hasIndex;
+    bool hasDisplacement;
+    bool isRipRelative;
+    uint64_t resolvedVA;
+    uint32_t resolvedRVA;
+};
+
+struct OperandIR {
+    OperandType type;
+    OperandAction action;
+    uint16_t width;
+    RegisterId reg;
+    uint64_t immediate;
+    bool immediateSigned;
+    bool immediateRelative;
+    MemoryOperandIR memory;
+};
+
+struct InstructionIR {
+    uint64_t address;
+    uint32_t rva;
+    uint8_t length;
+    std::array<uint8_t, 15> rawBytes;
+    InstructionMnemonic mnemonic;
+    InstructionCategory category;
+    MachineMode machineMode;
+    uint16_t operandWidth;
+    uint16_t stackWidth;
+    std::vector<OperandIR> operands;
+
+    BranchKind branchKind;
+    bool hasBranchTarget;
+    uint64_t branchTargetVA;
+    uint32_t branchTargetRVA;
+
+    uint64_t flagsRead;
+    uint64_t flagsWritten;
+};
 ```
 
-#### 3.1.2 保护配置系统
+IR 不得保存指向 Zydis 临时对象的指针。
 
-使用 TOML 格式的配置文件定义保护策略（选择 TOML 而非 JSON/YAML，因为可读性好且解析库轻量）。
+### 5.3 部分寄存器语义
+
+必须区分 AL/AH/AX/EAX/RAX、R8B/R8W/R8D/R8 等不同宽度。
+
+- 写 EAX/R8D 等 32 位 GPR：高 32 位清零。
+- 写 AX/AL：只修改相应低位。
+- AH/BH/CH/DH：若 runtime 未实现高 8 位语义，必须拒绝函数。
+- 不得将所有同族寄存器粗暴映射成完整 64 位写入。
+
+### 5.4 CFGBuilder
+
+CFGBuilder 只使用 IR 提供的 category、branch kind 和绝对 branch target，不再自行解析 rel8/rel32。
+
+必须验证：
+
+- target 位于合法可执行 section。
+- target 是指令边界。
+- 函数内与函数外跳转明确分类。
+- indirect branch/call 不猜测目标。
+- basic block 不重叠。
+- 所有可达路径有明确终止或后继。
+
+---
+
+## 6. CapabilityChecker 与失败策略
+
+CapabilityChecker 在任何破坏性修改前检查：
+
+- PE 架构和类型。
+- CFG Guard / CET / SafeSEH / unwind 要求。
+- DLL 特殊约束。
+- 目标函数是否完整可解码。
+- 当前 runtime 是否覆盖所有目标指令和 operand 形式。
+- import resolver、on-demand string runtime 等依赖是否闭环。
+
+标准失败原因示例：
+
+```text
+zydis_decode_failed
+unsupported_instruction_mnemonic
+unsupported_operand_form
+partial_register_write_not_supported
+high_8bit_register_not_supported
+memory_arithmetic_not_supported
+native_call_bridge_not_supported
+import_call_bridge_not_supported
+indirect_call_not_supported
+vm_native_stack_mapping_not_supported
+branch_target_outside_function
+branch_target_not_instruction_boundary
+runtime_resolver_missing
+unwind_rewrite_required
+cfg_guard_rewrite_required
+```
+
+任何错误必须包含：
+
+- function RVA
+- instruction RVA
+- mnemonic
+- operand summary
+- raw bytes
+- reason
+
+---
+
+## 7. Mirage VM 最终架构
+
+### 7.1 目标执行闭环
+
+```text
+原函数调用
+  → patched entry
+  → trampoline
+  → VM runtime entry
+  → 定位 metadata
+  → 根据 functionRVA 查 VMFunctionRecord
+  → 解密 bytecode
+  → reverse opcode map
+  → handler dispatch
+  → 执行 VM 指令
+  → 恢复寄存器、RFLAGS、栈与返回值
+  → 返回原调用者
+```
+
+只要其中任一环缺失，VM 不得标记 `applied`。
+
+### 7.2 VM 上下文
+
+最终 VMContext 至少包含：
+
+```cpp
+struct VMContext {
+    uint64_t vmRegs[64];
+    uint64_t vmIP;
+    uint64_t vmSP;
+
+    uint8_t ZF;
+    uint8_t SF;
+    uint8_t CF;
+    uint8_t OF;
+    uint8_t PF;
+    uint8_t AF;
+
+    NativeRegisterSnapshot native;
+    uint64_t savedRflags;
+    uint64_t imageBase;
+    uint64_t metadataVA;
+
+    const uint8_t* bytecode;
+    uint32_t bytecodeSize;
+    const uint8_t* reverseOpcodeMap;
+    const uint8_t* registerMap;
+
+    VMTraceState* trace;
+};
+```
+
+### 7.3 ISA
+
+正式 ISA 必须覆盖 Windows 编译器常见标量代码，而不是只覆盖演示函数。
+
+#### 数据传送
+
+- MOV RR / RC / RM / MR
+- LEA
+- MOVZX / MOVSX / MOVSXD
+- XCHG
+- 部分寄存器读写语义
+
+#### 算术与逻辑
+
+- ADD、ADC、SUB、SBB
+- AND、OR、XOR、NOT、NEG
+- INC、DEC
+- SHL、SHR、SAR、ROL、ROR
+- MUL、IMUL、DIV、IDIV
+- CMP、TEST
+
+#### 控制流
+
+- JMP
+- 全套 JCC，包括 PF 相关条件
+- CMOVcc
+- SETcc
+- VM 内部 CALL/RET
+- native bridge CALL
+- import thunk bridge
+- indirect call/branch 的受控策略
+
+#### 栈与调用约定
+
+- PUSH / POP
+- Windows x64 shadow space
+- 16-byte stack alignment
+- 参数寄存器 RCX/RDX/R8/R9
+- x86 cdecl/stdcall/fastcall/thiscall
+- non-volatile register 规则
+
+#### SIMD 与浮点
+
+最终生产架构必须定义 SSE2、SSE4、AVX/AVX2 与 x87 的处理策略。可以采用专用 VM handler 或严格的 native bridge，但不得使用隐式 native fallback。所有 bridge 都必须是正式、可验证、可配置的组件。
+
+### 7.4 BytecodeInstr
+
+```cpp
+struct BytecodeInstr {
+    uint8_t opcode;
+
+    uint8_t dst;
+    uint8_t src;
+    uint8_t extra;
+    uint16_t operandWidth;
+
+    uint64_t immediate;
+
+    uint8_t memBase;
+    uint8_t memIndex;
+    uint8_t memScale;
+    int64_t memDisp;
+    uint16_t memWidth;
+    MemoryKind memoryKind;
+
+    uint32_t branchTargetOffset;
+};
+```
+
+编码格式必须由统一 schema 描述，Translator、Emitter、runtime decoder 和静态 verifier 共用同一份定义，禁止四处复制长度常量。
+
+### 7.5 Translator
+
+Translator 只消费统一 IR，不解析原始 opcode 字节。
+
+核心规则：
+
+```text
+MOV reg,reg → VM_MOV_RR
+MOV reg,imm → VM_MOV_RC
+MOV reg,mem → VM_MOV_RM
+MOV mem,reg → VM_MOV_MR
+LEA reg,mem → VM_LEA
+ADD reg,reg → VM_ADD_RR
+ADD reg,imm → VM_ADD_RC
+CMP reg,mem → 对应正式 memory handler
+TEST reg,imm → VM_TEST_RC
+JCC target → VM bytecode instruction boundary offset
+```
+
+不支持的语义必须拒绝，不得：
+
+- 转 NOP。
+- 删除指令。
+- 保留原 native 指令并继续标记 VM applied。
+- 把 CALL 粗暴映射为 VM_CALL_VM。
+
+### 7.6 Flags
+
+必须按 operand width 精确计算：
+
+- ZF、SF、CF、OF、PF、AF。
+- ADD/SUB/CMP 的进位与溢出。
+- TEST/AND/OR/XOR 清 CF/OF。
+- INC/DEC 不修改 CF。
+- SHL/SHR/SAR 的边界计数语义。
+- 32 位结果零扩展与 flags 计算使用 32 位宽度。
+
+JCC 条件映射必须严格区分：
+
+```text
+JA  = !CF && !ZF
+JAE = !CF
+JB  = CF
+JBE = CF || ZF
+JG  = !ZF && SF == OF
+JGE = SF == OF
+JL  = SF != OF
+JLE = ZF || SF != OF
+```
+
+### 7.7 Metadata
+
+Metadata 使用版本化格式，所有 offset/size 必须边界验证。
+
+当前基础布局：
+
+| Offset | 字段 |
+|---:|---|
+| 0x00 | cookie |
+| 0x04 | encoded record count |
+| 0x08 | encoded record table offset |
+| 0x0C | encoded reverse opcode map offset |
+| 0x10 | encoded register map offset |
+| 0x14 | encoded bytecode offset |
+| 0x18 | encoded bytecode total size |
+| 0x1C | encoded runtime entry RVA |
+| 0x20 | encoded runtime version |
+| 0x24 | encoded runtime flags |
+| 0x28 | enter_count |
+| 0x2C | last_function_rva |
+| 0x30 | last_opcode |
+| 0x34 | last_error_code |
+| 0x38 | last_bytecode_offset |
+| 0x3C | last_ret_value_low32 |
+| 0x40 | reserved trace 0 |
+| 0x44 | reserved trace 1 |
+
+正式生产版必须进一步增加：
+
+- metadata total size
+- header checksum/MAC
+- record size/version
+- opcode schema version
+- bytecode authentication tag
+- architecture marker
+- build identifier
+
+### 7.8 Trace 与 runtime 错误
+
+Debug/test 配置可启用无 CRT trace slot，不写文件日志。
+
+至少支持：
+
+```text
+VM_ERR_METADATA_INVALID
+VM_ERR_RECORD_NOT_FOUND
+VM_ERR_BYTECODE_RANGE
+VM_ERR_OPCODE_UNSUPPORTED
+VM_ERR_REGISTER_MAP_INVALID
+VM_ERR_MEMORY_ADDR_INVALID
+VM_ERR_HANDLER_BUG
+VM_ERR_RET_WITHOUT_CONTEXT
+VM_ERR_STACK_ALIGNMENT
+VM_ERR_NATIVE_BRIDGE
+VM_ERR_UNWIND
+```
+
+调试模式失败路径写入错误码后触发 `int3; ud2`，不得静默返回。
+
+### 7.9 Runtime 生成
+
+runtime 必须是正式位置无关代码，不能依赖 packer 进程地址、CRT 或未解析外部符号。
+
+推荐最终结构：
+
+- 独立 runtime 源码/汇编模块。
+- 编译为可提取、可重定位的 code/data blob。
+- 明确 relocation/fixup 表。
+- 由 VMRuntimeBuilder 按最终 section RVA 应用 fixup。
+- runtime 与 metadata version 双向校验。
+- x86 与 x64 分别实现，不用大量条件字节拼接共享一份脆弱 emitter。
+
+手写机器码 emitter 只能作为 runtime 生成基础设施，不得通过散落的魔法字节承担全部解释器维护。最终应有汇编源或结构化 assembler backend，使 handler 能被审查和验证。
+
+### 7.10 TrampolinePatcher
+
+#### x86
+
+- 近跳 `E9 rel32`。
+- 必须覆盖完整指令边界。
+- 被覆盖的额外字节按策略填充。
+
+#### x64
+
+按顺序选择：
+
+1. `E9 rel32`，目标位于 ±2GB。
+2. 原函数附近 relay thunk，再由 relay 绝对跳转。
+3. 足够覆盖长度时使用正式 absolute jump sequence。
+
+Patcher 必须：
+
+- 使用 Zydis 计算可覆盖的完整指令长度。
+- 不切断指令。
+- 记录 patch kind、function RVA、trampoline RVA、覆盖长度。
+- 验证写入后的跳转目标。
+- 处理 x64 unwind 与 CFG Guard。
+- 按配置销毁或加密 native body，避免原始逻辑仍可直接执行。
+
+### 7.11 Native Bridge
+
+Native bridge 是正式 VM 子系统，不是 fallback。
+
+必须处理：
+
+- Windows x64 调用约定。
+- x86 多种调用约定。
+- 参数寄存器与 stack args。
+- shadow space 与 16-byte 对齐。
+- 返回值 RAX/XMM0。
+- volatile/non-volatile GPR、XMM。
+- import thunk 与直接 native target。
+- 异常传播与 unwind。
+- bridge 白名单与 capability check。
+
+---
+
+## 8. VM 随机化与变异
+
+每次构建由 BuildContext 统一生成：
+
+- opcode map 与 reverse map。
+- native register → VM register map。
+- metadata cookie 与派生密钥。
+- bytecode operand encoding。
+- handler 排列。
+- section 名称。
+- runtime layout。
+
+最终变异能力包括：
+
+- handler 指令选择变异。
+- handler 内部寄存器分配变异。
+- dispatcher 结构变异。
+- bytecode schema 变异。
+- authenticated bytecode encryption。
+- 假 handler 与不可达 metadata 噪声。
+
+所有变异必须保持统一 schema，可由 packer 侧 verifier 解码验证，不能靠随机字节堆叠。
+
+---
+
+## 9. 非 VM 保护模块
+
+### 9.1 字符串保护
+
+必须支持两种明确模式：
+
+#### startup
+
+程序初始化时统一解密。兼容性较好，但明文生命周期长。
+
+#### on_demand
+
+- 改写字符串引用点。
+- 每个字符串独立或派生密钥。
+- 调用 decrypt thunk 后返回临时缓冲区。
+- 可配置用后清零与缓存策略。
+- 支持 ANSI、UTF-16、只读数据与资源字符串。
+
+如果 on-demand 引用点重写未闭环，配置请求必须失败，不能自动降级为 startup。
+
+### 9.2 导入保护
+
+完整导入保护必须包含：
+
+- 必需 loader API 的 bootstrap 策略。
+- DLL/API 名称哈希。
+- runtime resolver。
+- resolver cache。
+- IAT/thunk/callsite 重写。
+- delay import 处理。
+- forwarded export 处理。
+- API-set schema 处理。
+- x86/x64 调用兼容。
+- 真正写入 PE 的可选 fake imports。
+
+只有修改导入表而没有 runtime resolver/callsite rewrite 时不得标记 `applied`。
+
+### 9.3 Section 加密
+
+- 每个目标 section 独立密钥。
+- authenticated encryption 或至少完整性校验。
+- loader/runtime 解密顺序明确。
+- TLS、OEP、DLL 初始化顺序兼容。
+- 解密后权限恢复遵守 W^X 策略。
+- 不与 VM runtime/metadata section 冲突。
+
+### 9.4 控制流变换
+
+控制流平坦化、bogus flow、不透明谓词均必须基于 IR/CFG 操作，不能直接在原始字节上随意插入。
+
+必须维护：
+
+- branch relocation。
+- block boundary。
+- flags 与寄存器活跃性。
+- x64 unwind。
+- CFG Guard。
+- exception edge。
+
+“生成了假块对象”不等于已应用；只有真实写入输出 PE 且通过 CFG/PE 验证才可计数。
+
+### 9.5 完整性保护
+
+完整性保护应作为独立功能：
+
+- runtime/metadata/bytecode MAC。
+- 关键 native thunk 校验。
+- 可配置校验时机。
+- 失败策略明确。
+
+不得让完整性模块掩盖 VM 执行错误。
+
+### 9.6 反调试与反分析
+
+反调试是独立可配置模块，不能作为基础运行依赖。设计原则：
+
+- 不破坏合法用户环境。
+- 不影响 VM 正确性诊断。
+- debug/test build 默认关闭或使用明显错误码。
+- 不在 VM 核心未闭环时优先开发。
+- 所有检测与响应必须可独立关闭、调强度、指定范围。
+
+---
+
+## 10. 模块化 TOML 配置
 
 ```toml
-# CipherShell 保护配置示例
-
 [global]
-protection_level = 3              # 全局默认保护等级 1-5
-strip_debug_info = true           # 删除所有调试信息
-strip_rich_header = true          # 删除 Rich Header（编译器指纹）
-strip_timestamps = true           # 时间戳归零
-randomize_section_names = true    # Section 名称随机化
-anti_debug_mode = "implicit"      # "explicit" | "implicit" | "hybrid"
-string_encryption = true          # 全局字符串加密
-import_obfuscation = true         # 导入表混淆
-resource_encryption = false       # 资源加密（可能影响兼容性）
+seed = 0
+verbose = true
+strip_debug_info = true
+strip_rich_header = true
+randomize_section_names = true
+
+[section_encryption]
+enabled = false
+strength = 70
+target_sections = [".text", ".rdata"]
+
+[string_encryption]
+enabled = false
+strength = 80
+mode = "on_demand"
+ascii = true
+utf16 = true
+resources = false
+clear_after_use = true
+
+[import_protection]
+enabled = false
+strength = 80
+api_hash = true
+fake_imports = true
+hide_real_imports = true
+
+[control_flow.flattening]
+enabled = false
+strength = 70
+
+[control_flow.bogus_flow]
+enabled = false
+strength = 60
 
 [vm]
-register_count = 24               # 虚拟寄存器数量（16-64）
-stack_size = 0x20000              # 虚拟栈大小
-opcode_width = "variable"         # "fixed_8" | "fixed_16" | "variable"
-handler_mutation = true           # Handler 代码变异
-bytecode_encryption = "rolling"   # "none" | "xor" | "rolling" | "aes_ctr"
-embed_junk_handlers = true        # 嵌入无意义的假 handler 干扰分析
+enabled = true
+strength = 90
+target_functions = []
+target_rvas = [0x1234]
+register_count = 32
+opcode_randomization = true
+handler_mutation = true
+bytecode_encryption = true
+native_body_policy = "destroy"
 
-[anti_debug]
-timing_checks = true              # 时序检测
-hardware_bp_detection = true      # 硬件断点检测
-software_bp_detection = true      # INT3 / 0xCC 扫描
-memory_integrity = true           # 代码完整性校验
-debugger_window_scan = false      # 扫描调试器窗口类名（可选，易被绕过）
-parent_process_check = true       # 父进程检测
-thread_hiding = true              # NtSetInformationThread HideFromDebugger
-kernel_debugger_check = true      # 内核调试器检测
+[integrity]
+enabled = true
+strength = 80
+protect_metadata = true
+protect_bytecode = true
 
-[anti_dump]
-erase_pe_header = true            # 运行时擦除 PE 头
-section_permission_guard = true   # 动态权限管理
-nanomite_patches = true           # INT3 Nanomite 技术
+[scope]
+target_functions = []
+target_rvas = []
+target_sections = []
+protect_exports = false
 
-[performance]
-auto_hotspot_analysis = true      # 自动分析热点函数并降低其保护等级
-max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自动降级）
-
-# 函数级精确控制
-[[function_overrides]]
-pattern = "main"                  # 函数名匹配（支持通配符）
-level = 5                         # 覆盖为最高保护
-
-[[function_overrides]]
-pattern = "render_*"              # 渲染相关函数
-level = 1                         # 性能敏感，仅做基础加密
-
-[[function_overrides]]
-pattern = "license_check*"        # 授权验证函数
-level = 5                         # 最高保护
-vm_nesting = 2                    # 双层 VM 嵌套
-
-[[function_overrides]]
-pattern = "crypto_*"              # 已有加密函数
-level = 2                         # 避免过度保护影响性能
+[failure_policy]
+on_decode_failure = "fail_build"
+on_unsupported_instruction = "reject_function"
+on_vm_runtime_missing = "fail_build"
+on_native_bridge_missing = "reject_function"
+on_import_runtime_missing = "fail_build"
+on_on_demand_string_runtime_missing = "fail_build"
+on_cfg_guard_rewrite_required = "fail_build"
+on_unwind_rewrite_required = "fail_build"
 ```
 
-#### 3.1.3 源码模式接口（可选实现）
-
-通过 LLVM Pass 在编译阶段注入保护。本质是 **IR 级别的控制流混淆**，在编译器生成机器码之前完成变换。
-
-**实现方式**：编写自定义 LLVM Pass（ModulePass / FunctionPass），在 `opt` 阶段插入。
-
-**支持的 IR 级变换**：
-
-- **控制流平坦化（Control Flow Flattening）**：将所有基本块重组为 switch-case 分发结构
-- **虚假控制流（Bogus Control Flow）**：插入永不触发的分支路径 + 不透明谓词
-- **指令替换（Instruction Substitution）**：`add` → 等价的 `sub + not` 组合等
-- **常量拆分（Constant Unfolding）**：立即数拆分为多步运算
-- **字符串加密**：编译期加密字符串字面量，运行期解密
-- **函数调用间接化**：直接 call 替换为函数指针表间接调用
-
-**与二进制模式的关系**：源码模式产出的目标文件（.obj / .o）可以正常链接为 PE，然后再经过二进制模式的 VM 保护。两层保护可叠加。
-
-```
-源码 ──→ [LLVM Pass: CFG混淆 + 指令替换] ──→ .obj ──→ 链接 ──→ EXE ──→ [CipherShell 二进制保护] ──→ 最终 EXE
-```
-
-> **注**：源码模式实现优先级低于二进制模式。若自动化实现存在困难，可仅提供 LLVM Pass 源码模板和集成指南，由用户手动配置编译流程。
+旧字段如 `[import_obfuscation]`、`[global] import_obfuscation` 可以在迁移窗口内给出明确 deprecation error/warning，但正式默认配置、示例和文档必须只使用新 schema。
 
 ---
 
-### 3.2 分析层
+## 11. 静态验证体系
 
-#### 3.2.1 反汇编引擎
+### 11.1 VM bytecode verifier
 
-集成 **Zydis**（选择理由：纯 C、无依赖、维护活跃、x86/x64 全支持、许可证友好 MIT）。
+对每个 record：
 
-**功能**：
+- reverse opcode map 解码。
+- opcode 是否在 runtime schema 中。
+- 指令长度是否越界。
+- register id 是否合法。
+- operand width 是否合法。
+- memory base/index/scale/disp 是否可表达。
+- branch target 是否位于 record 内且为指令边界。
+- 所有可达控制流是否终止于 RET/VMEXIT/受控 bridge。
+- 不存在从未定义 handler 进入的路径。
+- bytecode authentication 信息匹配。
 
-- 线性扫描（Linear Sweep）+ 递归下降（Recursive Descent）双模式反汇编
-- 完整解码每条指令的操作数类型、寻址模式、前缀
-- 识别函数边界（通过 prologue/epilogue 模式 + 交叉引用分析）
-- 标记所有分支目标地址，构建跳转关系图
+### 11.2 VM static link checker
 
-#### 3.2.2 控制流图构建器（CFG Builder）
+必须验证：
 
-```c
-typedef struct _CS_BASIC_BLOCK {
-    DWORD                   id;              // 基本块唯一ID
-    DWORD64                 startRVA;        // 起始地址
-    DWORD64                 endRVA;          // 结束地址（含末尾指令）
-    CS_INSTRUCTION*         instructions;    // 指令列表
-    DWORD                   instrCount;
-    
-    // 控制流边
-    struct _CS_BASIC_BLOCK** successors;     // 后继块
-    DWORD                   numSuccessors;
-    struct _CS_BASIC_BLOCK** predecessors;   // 前驱块
-    DWORD                   numPredecessors;
-    
-    // 分析标记
-    BOOL                    isLoopHeader;    // 是否为循环头
-    BOOL                    isHotspot;       // 性能热点
-    DWORD                   protectionLevel; // 分配的保护等级
-    DWORD                   dominatorTreeId; // 支配树节点ID
-} CS_BASIC_BLOCK;
+- runtime `executionReady=true`。
+- runtime section/metadata section/bytecode 均存在。
+- runtime entry 已回填 metadata。
+- record 与 trampoline 一一对应。
+- function patch 已验证。
+- opcode/register map 非空且版本匹配。
+- native body policy 已落实。
+- x64 unwind/CFG 要求已满足。
 
-typedef struct _CS_FUNCTION {
-    DWORD64                 entryRVA;
-    char                    name[256];       // 如有符号信息
-    CS_BASIC_BLOCK**        blocks;
-    DWORD                   blockCount;
-    CS_FUNCTION_FLAGS       flags;           // 叶子函数、递归、使用SEH等
-    DWORD                   assignedLevel;   // 保护等级
-} CS_FUNCTION;
-```
+### 11.3 PE verifier
 
-**CFG 构建流程**：
-
-1. 从入口点和导出函数开始递归下降反汇编
-2. 在每个分支指令处切割基本块
-3. 建立后继/前驱关系
-4. 计算支配树（Dominator Tree），用于后续混淆变换的安全性验证
-5. 识别循环结构（通过回边检测），标记性能敏感区域
-6. 根据配置文件的 `function_overrides` 分配每个函数的保护等级
-
-#### 3.2.3 数据流分析
-
-- **活跃变量分析（Liveness Analysis）**：确定每个基本块入口/出口处哪些寄存器是活跃的，用于安全插入垃圾代码（只能使用死寄存器）
-- **常量传播分析**：识别可优化的常量表达式，为常量拆分提供目标
-- **栈帧分析**：识别函数的栈帧布局（局部变量、参数），确保虚拟化后栈行为一致
+- 输出 PE 可重新解析。
+- Section 与 Directory 全部合法。
+- PEEmitter 写入结果未被 Rebuilder 覆盖。
+- runtime、trampoline、metadata、resolver、string thunk 均位于正确权限 section。
+- DLL/EXE loader 语义一致。
 
 ---
 
-### 3.3 保护层 — 核心变换引擎
+## 12. 构建、依赖与工程结构
 
-#### 3.3.1 保护等级定义
+### 12.1 推荐结构
 
-| 等级 | 名称 | 包含的保护措施 | 典型性能开销 | 适用场景 |
-|------|------|---------------|-------------|---------|
-| L1 | **Guard** | Section 加密 + 字符串加密 + 导入表混淆 + 基础反调试 | ~1.05x | 性能敏感的主循环 |
-| L2 | **Shield** | L1 + 控制流平坦化 + 常量拆分 | ~2-3x | 一般业务逻辑 |
-| L3 | **Armor** | L2 + 虚假控制流注入 + 不透明谓词 + 混合变异 | ~5-8x | 重要逻辑 |
-| L4 | **Fortress** | L3 + 单层代码虚拟化（VM）+ Handler 变异 | ~15-30x | 核心算法、授权验证 |
-| L5 | **Citadel** | L4 + 多层嵌套 VM + 全维度变异 + Nanomite + 完整性互锁 | ~50-100x+ | 最高价值代码 |
-
-> 用户可为整个程序设置默认等级，并对特定函数覆盖。保护器会自动分析调用频率，对热点路径上的函数给出降级建议（需用户确认）。
-
-#### 3.3.2 L1 — 基础加密保护
-
-**Section 加密**：
-
-```
-加密流程：
-  1. 遍历所有代码段（.text 及其他含可执行代码的 section）
-  2. 使用 ChaCha20 流密码加密（密钥嵌入 stub，每次加壳随机生成）
-  3. 标记 section 为不可执行（去除 IMAGE_SCN_MEM_EXECUTE）
-  4. Stub 运行时解密 → 恢复可执行权限 → 跳转执行
-
-密钥管理：
-  - 256-bit 随机密钥，嵌入 stub 中，自身也被白盒加密保护
-  - 密钥的存储位置在 stub 代码中通过代码混淆隐藏
-  - 解密完成后密钥从内存中擦除（SecureZeroMemory）
-```
-
-**字符串加密**：
-
-```
-1. 扫描所有 section 中的可打印字符串引用
-2. 将字符串数据替换为加密版本
-3. 在引用处插入解密 thunk：
-   原始：  push offset aHelloWorld    ; "Hello World"
-   加壳后：call decrypt_string_0x1A3  ; 解密并返回指针
-           push eax
-4. 每个字符串使用不同的加密密钥（从主密钥派生）
-5. 解密后的字符串存储在动态分配的内存中，用完即擦除（可选）
-```
-
-**导入表混淆**：
-
-```
-策略A — API Hash 化：
-  1. 清空原始 IAT，只保留 kernel32!LoadLibraryA 和 kernel32!GetProcAddress
-  2. 其余所有 API 调用改为：运行时通过 DLL 名 hash + 函数名 hash 动态 resolve
-  3. Hash 算法自定义（非标准 CRC32/djb2，避免被通用工具识别）
-
-策略B — 导入表重建伪装：
-  1. 生成一组看起来合理但无关的假导入项（干扰静态分析判断程序行为）
-  2. 真正的 API 调用通过隐藏的 hash resolve 完成
-  3. 假导入项中的函数实际被调用（调用后立即丢弃返回值），避免被 loader 优化掉
-
-策略C — 混合模式（默认）：
-  结合 A 和 B，真实 API 用 hash resolve，同时保留一组无关的假导入表
-```
-
-#### 3.3.3 L2 — 控制流混淆
-
-**控制流平坦化（Control Flow Flattening）**：
-
-将函数的正常控制流结构（if-else、for、while）拍平为一个由 dispatcher 驱动的状态机。
-
-```
-原始 CFG：                       平坦化后：
-                                
-  ┌──→ [BB1] ──→ [BB2]           ┌─────────────┐
-  │      │         │              │ Dispatcher   │◄──────────────┐
-  │      ▼         ▼              │ switch(state)│               │
-  │    [BB3] ──→ [BB4]           └──┬──┬──┬──┬──┘               │
-  │      │                          │  │  │  │                   │
-  └──────┘                          ▼  ▼  ▼  ▼                  │
-                                [BB1][BB2][BB3][BB4]             │
-                                  │    │    │    │               │
-                                  └────┴────┴────┴──→ state = next
-                                                       └────────┘
-```
-
-```c
-// 平坦化变换伪代码
-void flatten_function(CS_FUNCTION* func) {
-    // 1. 为每个基本块分配一个随机 state ID（非顺序）
-    for (BB : func->blocks) {
-        BB->stateId = generate_random_state_id();
-    }
-    
-    // 2. 创建 dispatcher 基本块
-    //    switch (state_var) {
-    //        case 0x7A3F: goto BB1;
-    //        case 0x1D92: goto BB2;
-    //        ...
-    //    }
-    
-    // 3. 在每个基本块末尾，将原始的跳转替换为 state_var = next_state_id
-    //    对于条件分支：state_var = cond ? stateA : stateB
-    
-    // 4. state_var 自身可以做加密：
-    //    实际存储的是 state_var ^ rolling_key
-    //    dispatcher 中做 switch((state_var ^ rolling_key) & mask)
-    //    增加 pattern matching 难度
-}
-```
-
-**不透明谓词（Opaque Predicates）**：
-
-插入条件判断，其结果在编译时已知（恒真/恒假），但静态分析工具无法轻易证明。
-
-```c
-// 基于数论的不透明谓词
-// 对任意整数 x：x^2 mod 4 ∈ {0, 1}，永远不等于 2 或 3
-BOOL opaque_always_true(int x) {
-    return ((x * x) % 4 != 2);  // 恒真，但 IDA 无法证明
-}
-
-// 基于指针别名的不透明谓词
-// 两个指向同一地址的指针，解引用必然相等
-// 但静态分析的别名分析往往不够精确
-BOOL opaque_alias(int* p, int* q) {
-    // p 和 q 实际指向同一地址（由加壳器保证）
-    return (*p == *q);  // 恒真
-}
-
-// 基于浮点精度的不透明谓词
-BOOL opaque_float() {
-    volatile double x = 1.0;
-    return (x + 1e-15 != x);  // 在IEEE 754下恒真
-}
-```
-
-**常量拆分**：
-
-```c
-// 原始
-mov eax, 0xDEADBEEF
-
-// 拆分后（每次加壳生成不同的拆分方案）
-mov eax, 0x9E2D5A81
-xor eax, 0x40806B6E     // 0x9E2D5A81 ^ 0x40806B6E == 0xDEADBEEF
-add eax, 0x12345678
-sub eax, 0x12345678      // 无效操作对，增加噪音
-ror eax, 0               // 更多噪音
-```
-
-#### 3.3.4 L3 — 高级混淆
-
-**虚假控制流注入（Bogus Control Flow）**：
-
-在真实基本块前后插入由不透明谓词守护的假路径。假路径中包含看起来合理但永远不会执行的代码（从程序其他位置复制并变异的代码片段），大幅增加 Ghidra/IDA 的反编译输出噪音。
-
-```
-原始：                  注入后：
-                       
- [BB_real]             [opaque_check] ──真──→ [BB_real]
-                            │ 假（永不触发）
-                            ▼
-                       [BB_bogus_1] ──→ [BB_bogus_2] ──→ [opaque_loop_back]
-                                                               │
-                                                               ▼
-                                                          [BB_real] (再次)
-```
-
-**代码复制与分裂（Code Duplication / Splitting）**：
-
-- 将一个基本块复制为多个语义等价但代码不同的副本
-- 通过不透明谓词随机选择执行哪个副本
-- 每个副本使用不同的寄存器分配和指令选择
-- 效果：同一段逻辑在反汇编中出现多次，无法确定哪个是"真的"
-
-#### 3.3.5 L4 — 代码虚拟化（VM 核心）
-
-##### 3.3.5.1 VM 架构设计 — "Mirage Engine"
-
-CipherShell 的 VM 引擎代号为 **Mirage**。区别于 VMProtect 的纯栈式 VM 和 Themida 的纯寄存器式 VM，Mirage 采用**混合架构**：
-
-```
-Mirage VM 架构：
-
-  ┌──────────────────────────────────────────────┐
-  │              Virtual CPU                      │
-  │                                              │
-  │  ┌──────────────┐  ┌──────────────────────┐  │
-  │  │ 虚拟寄存器组  │  │ 虚拟栈               │  │
-  │  │ vR0 - vR23   │  │ [         ...       ] │  │
-  │  │ （数量可配置） │  │ ← vSP               │  │
-  │  └──────────────┘  └──────────────────────┘  │
-  │                                              │
-  │  ┌──────────────┐  ┌──────────────────────┐  │
-  │  │ 虚拟 Flags   │  │ 上下文保存区          │  │
-  │  │ vZF/vSF/vCF  │  │ 真实寄存器快照        │  │
-  │  │ vOF/vPF      │  │ 真实 EFLAGS 快照      │  │
-  │  └──────────────┘  └──────────────────────┘  │
-  │                                              │
-  │  ┌──────────────────────────────────────────┐ │
-  │  │ Bytecode Stream                          │ │
-  │  │ [enc_opcode][operands...][enc_opcode]... │ │
-  │  │       ↑ vIP                              │ │
-  │  └──────────────────────────────────────────┘ │
-  │                                              │
-  │  ┌──────────────────────────────────────────┐ │
-  │  │ Handler Dispatch Table                   │ │
-  │  │ [handler_0][handler_1]...[handler_N]     │ │
-  │  │ + [junk_handler_0]...[junk_handler_M]    │ │
-  │  └──────────────────────────────────────────┘ │
-  └──────────────────────────────────────────────┘
-```
-
-**关键设计决策**：
-
-| 决策项 | 选择 | 理由 |
-|--------|------|------|
-| 架构风格 | 混合（栈+寄存器） | 增加分析复杂度：分析者无法套用纯栈或纯寄存器 VM 的已有分析框架 |
-| 寄存器数量 | 可配置 16-64 | 更多虚拟寄存器 = 更多映射可能性 = 更难追踪 |
-| Opcode 编码 | 变长指令 | 固定长度更容易被模式匹配；变长配合加密后完全无法静态切割 |
-| Dispatch 方式 | 间接跳转表 + 计算跳转混合 | 纯跳转表容易被识别；混合后部分 handler 通过计算地址跳转 |
-| Bytecode 加密 | 滚动密钥流 + 密文反馈 | 单条指令被修改 → 后续所有指令解密失败 → 防 patch |
-
-##### 3.3.5.2 ISA（指令集）设计
-
-Mirage 的指令集不固定——每次加壳时通过变异引擎重新生成。以下是**基础模板**，实际生成时 opcode 编号、编码格式、操作数顺序全部随机化。
-
-```
-指令集模板（约 60 条核心指令）：
-
-── 数据传送 ──
-VM_MOV_RR       vReg ← vReg
-VM_MOV_RC       vReg ← Const
-VM_MOV_RM       vReg ← [vReg + Offset]      ; 内存读
-VM_MOV_MR       [vReg + Offset] ← vReg      ; 内存写
-VM_MOV_RM8/16   部分宽度的内存读
-VM_MOV_MR8/16   部分宽度的内存写
-VM_LEA          vReg ← vReg + vReg * Scale + Offset
-
-── 栈操作 ──
-VM_PUSH_R       push vReg
-VM_PUSH_C       push Const
-VM_POP_R        pop → vReg
-VM_PUSH_FLAGS   push vFlags
-VM_POP_FLAGS    pop → vFlags
-
-── 算术 ──
-VM_ADD_RR       vReg += vReg
-VM_ADD_RC       vReg += Const
-VM_SUB_RR       vReg -= vReg
-VM_MUL_RR       vReg *= vReg
-VM_IMUL         有符号乘法
-VM_DIV          无符号除法
-VM_IDIV         有符号除法
-VM_NEG          vReg = -vReg
-VM_INC          vReg++
-VM_DEC          vReg--
-
-── 逻辑 / 位操作 ──
-VM_AND_RR       vReg &= vReg
-VM_OR_RR        vReg |= vReg
-VM_XOR_RR       vReg ^= vReg
-VM_NOT          vReg = ~vReg
-VM_SHL          vReg <<= N
-VM_SHR          vReg >>= N (逻辑右移)
-VM_SAR          vReg >>= N (算术右移)
-VM_ROL / VM_ROR 循环移位
-VM_BT / VM_BTS / VM_BTR  位测试与设置
-
-── 比较 / 测试 ──
-VM_CMP_RR       比较并设置 vFlags
-VM_CMP_RC       
-VM_TEST_RR      按位与测试
-
-── 控制流 ──
-VM_JMP          无条件跳转（bytecode 内偏移）
-VM_JZ / VM_JNZ  条件跳转（基于 vFlags）
-VM_JA / VM_JB / VM_JG / VM_JL / ...  全套条件跳转
-VM_CALL_VM      VM 内部函数调用（push return offset, jmp）
-VM_RET_VM       VM 内部返回
-
-── 与外部世界交互 ──
-VM_CALL_NATIVE  调用真实 API（通过 hash resolve）
-VM_VMENTER      从 native 进入 VM（保存 CPU 状态）
-VM_VMEXIT       从 VM 退出到 native（恢复 CPU 状态）
-VM_SYSCALL      可选：直接 syscall 绕过 API hook（高级）
-
-── 特殊 ──
-VM_NOP          空操作（但解密密钥仍然滚动）
-VM_ANTI_DEBUG   内联反调试检查
-VM_CRC_CHECK    内联完整性校验
-VM_RDTSC        读时间戳（用于 timing 检测）
-```
-
-##### 3.3.5.3 x86/x64 → Mirage Bytecode 转译器
-
-**转译策略**：
-
-```
-策略1 — 直接映射（大部分指令）：
-  x86 mov eax, ebx  →  VM_MOV_RR vR[map(eax)], vR[map(ebx)]
-  
-策略2 — 展开（复杂指令拆为多条 VM 指令）：
-  x86 rep movsb  →  VM 循环序列：
-    VM_CMP_RC vR[map(ecx)], 0
-    VM_JZ end
-    VM_MOV_RM8 vTmp, [vR[map(esi)]]
-    VM_MOV_MR8 [vR[map(edi)]], vTmp
-    VM_INC vR[map(esi)]
-    VM_INC vR[map(edi)]
-    VM_DEC vR[map(ecx)]
-    VM_JMP loop_start
-    
-策略3 — VMEXIT 回退（极少数难以模拟的指令）：
-  x86 cpuid       →  VM_VMEXIT → 执行原始 cpuid → VM_VMENTER
-  x86 fpu 指令    →  VM_VMEXIT → 执行 → VM_VMENTER
-  x86 SSE/AVX    →  VM_VMEXIT → 执行 → VM_VMENTER
-  
-  VMEXIT/VMENTER 对的存在也增加了分析难度（上下文切换点）
-```
-
-**EFLAGS 精确模拟**——这是 VM 正确性的最大挑战：
-
-```c
-// 每条算术/逻辑指令都需要精确模拟受影响的 flags
-typedef struct _VM_FLAGS {
-    BYTE CF;  // Carry
-    BYTE ZF;  // Zero
-    BYTE SF;  // Sign
-    BYTE OF;  // Overflow
-    BYTE PF;  // Parity
-    BYTE AF;  // Auxiliary (BCD 运算需要，可降低优先级)
-} VM_FLAGS;
-
-// ADD 的 flags 计算
-void compute_add_flags(VM_FLAGS* f, uint64_t a, uint64_t b, uint64_t result, int bitwidth) {
-    uint64_t signMask = 1ULL << (bitwidth - 1);
-    
-    f->ZF = (result & ((1ULL << bitwidth) - 1)) == 0;
-    f->SF = (result & signMask) != 0;
-    f->CF = (result < a);  // 无符号溢出
-    f->OF = ((a ^ b ^ signMask) & (a ^ result) & signMask) != 0;  // 有符号溢出
-    f->PF = compute_parity(result & 0xFF);
-    f->AF = ((a ^ b ^ result) & 0x10) != 0;
-}
-```
-
-##### 3.3.5.4 Dispatcher 实现
-
-**多种 Dispatch 模式随机混合**：
-
-```c
-// 模式A：跳转表 Dispatch（最常见，也最容易被识别）
-void dispatch_table(VM_CONTEXT* ctx) {
-    while (1) {
-        BYTE opcode = decrypt_next_opcode(ctx);
-        ctx->handlerTable[opcode](ctx);
-    }
-}
-
-// 模式B：计算跳转 Dispatch（handler 地址通过计算得出）
-void dispatch_computed(VM_CONTEXT* ctx) {
-    while (1) {
-        BYTE opcode = decrypt_next_opcode(ctx);
-        // 地址 = base + opcode * stride + offset_table[opcode]
-        // 每次加壳 base/stride/offset_table 都不同
-        uintptr_t target = ctx->dispatchBase 
-                         + opcode * ctx->dispatchStride 
-                         + ctx->dispatchOffsets[opcode];
-        ((VM_HANDLER)target)(ctx);
-    }
-}
-
-// 模式C：Threaded Dispatch（每个 handler 末尾直接跳转到下一个）
-// 无集中的 dispatch 循环，分析者无法找到单一的"调度器"
-void handler_add_threaded(VM_CONTEXT* ctx) {
-    // ... 执行 ADD 操作 ...
-    
-    // 末尾直接解码下一条并跳转
-    BYTE nextOp = decrypt_next_opcode(ctx);
-    goto *ctx->handlerTable[nextOp];  // computed goto (GCC extension)
-    // MSVC 下用内联汇编实现等效
-}
-
-// 实际使用：混合三种模式
-// 一部分 handler 用跳转表到达，一部分用计算跳转，一部分用 threaded
-// 混合比例每次加壳随机
-```
-
-#### 3.3.6 L5 — 多层嵌套 VM + 全维度变异
-
-**嵌套 VM**：将部分 VM handler 的实现本身也虚拟化——用另一套不同 ISA 的 VM 来执行。
-
-```
-外层 VM (ISA-A)
-  ├── handler_add:      由 ISA-A 的 bytecode 实现
-  ├── handler_xor:      由 ISA-A 的 bytecode 实现
-  ├── handler_cmp:      ★ 由内层 VM (ISA-B) 的 bytecode 实现
-  │                         ├── ISA-B handler_sub
-  │                         ├── ISA-B handler_and
-  │                         └── ISA-B handler_flags
-  ├── handler_call_api: ★ 由内层 VM (ISA-C) 的 bytecode 实现
-  │                         └── ...
-  └── handler_mov:      由 ISA-A 的 bytecode 实现
-  
-每层 VM 的 ISA 完全不同（不同的 opcode 编码、不同的寄存器数量、不同的 dispatch 方式）
-```
-
-**全维度变异清单**：
-
-1. **Opcode 编码随机化**：每次加壳生成新的 opcode ↔ handler 映射
-2. **Opcode 宽度变异**：部分指令用 8-bit opcode，部分用 12-bit 或 16-bit
-3. **寄存器映射随机化**：x86 寄存器到虚拟寄存器的映射每次不同
-4. **Handler 代码 AST 变形**：同一语义的 handler 生成结构不同的机器码
-   - 指令选择变异（`add` ↔ `sub+neg`、`xor` ↔ `not+and+or` 等）
-   - 寄存器分配变异（handler 内部使用不同的物理寄存器）
-   - 垃圾代码插入（在 handler 间插入无意义但看起来有意义的指令序列）
-   - 指令调度变异（无数据依赖的指令重排序）
-5. **Dispatch 方式混合**：跳转表 / 计算跳转 / threaded dispatch 随机混合
-6. **虚拟栈布局变异**：栈增长方向、对齐方式、栈帧结构每次不同
-7. **Bytecode 编码变异**：操作数编码方式（大端/小端、变长/定长、offset 编码方式）每次不同
-8. **Handler 顺序和位置随机化**：handler 在内存中的排列顺序随机，不相邻
-9. **假 Handler 注入**：插入大量永远不会被调度到的假 handler，增加分析噪音
-
----
-
-### 3.4 反调试与反分析系统
-
-#### 3.4.1 设计哲学
-
-**核心原则：隐式检测，隐式响应。**
-
-传统壳的反调试（如直接调用 `IsDebuggerPresent`、`NtQueryInformationProcess`）容易被 hook/patch 绕过。CipherShell 采用不同策略：
-
-- **不调用可被 hook 的 API**（或仅作为诱饵）
-- **检测结果不直接触发退出**，而是悄悄破坏解密密钥或虚拟机状态
-- **检测逻辑分散嵌入 VM handler 中**，无法被集中 patch
-
-#### 3.4.2 反调试技术矩阵
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        反调试技术分类                                │
-│                                                                     │
-│  ┌─────────────────────┐  ┌──────────────────────┐                 │
-│  │ 时序检测（Timing）    │  │ 状态检测（State）     │                 │
-│  │                     │  │                      │                 │
-│  │ • RDTSC 差值检测     │  │ • PEB.BeingDebugged  │                 │
-│  │ • QPC 差值检测       │  │   (直接读PEB，不调API)│                 │
-│  │ • GetTickCount64    │  │ • PEB.NtGlobalFlag   │                 │
-│  │ • Thread cycle计数   │  │ • Heap flags         │                 │
-│  │ • 多点时序交叉验证   │  │ • DR0-DR7 硬件断点    │                 │
-│  └─────────────────────┘  │ • KUSER_SHARED_DATA  │                 │
-│                           │   .KdDebuggerEnabled │                 │
-│  ┌─────────────────────┐  └──────────────────────┘                 │
-│  │ 完整性检测           │                                           │
-│  │ (Integrity)         │  ┌──────────────────────┐                 │
-│  │                     │  │ 环境检测              │                 │
-│  │ • 代码段CRC校验      │  │ (Environment)        │                 │
-│  │ • Handler代码校验    │  │                      │                 │
-│  │ • API入口点INT3扫描  │  │ • 父进程名检测        │                 │
-│  │ • 关键函数头部校验    │  │ • 已加载模块扫描      │                 │
-│  │   (检测inline hook) │  │   (检测注入的DLL)     │                 │
-│  │ • 重定位完整性       │  │ • 窗口类名/标题扫描   │                 │
-│  └─────────────────────┘  │ • VM/沙箱检测         │                 │
-│                           │ • 远程调试器端口扫描   │                 │
-│  ┌─────────────────────┐  └──────────────────────┘                 │
-│  │ 主动对抗             │                                           │
-│  │ (Active)            │                                           │
-│  │                     │                                           │
-│  │ • NtSetInformation  │                                           │
-│  │   Thread 隐藏线程   │                                           │
-│  │ • 异常处理链验证     │                                           │
-│  │ • 自修改代码触发     │                                           │
-│  │   单步异常           │                                           │
-│  │ • 心跳线程互相监控   │                                           │
-│  └─────────────────────┘                                           │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### 3.4.3 隐式响应机制
-
-```c
-// 检测到调试时，不做任何明显操作
-// 而是"投毒"——污染 VM 的解密密钥
-
-void anti_debug_response_poison(VM_CONTEXT* ctx, DWORD detectionId) {
-    // 每种检测方式用不同的异或值污染密钥
-    // 这样逆向者需要同时绕过所有检测才能正常运行
-    ctx->decryptKey ^= detectionId;
-    
-    // 污染后：
-    // - 后续 bytecode 解密出错 → 错误的 opcode → 错误的 handler
-    // - 程序不会立即崩溃，而是在之后某个不确定的时间点产生错误行为
-    // - 逆向者很难定位"到底是哪里出了问题"
-}
-
-// 进阶：延迟炸弹
-// 污染不立即生效，而是在N条指令后才开始影响
-void anti_debug_response_delayed(VM_CONTEXT* ctx, DWORD detectionId) {
-    ctx->poisonCountdown = rand() % 1000 + 500;  // 500-1500条指令后生效
-    ctx->pendingPoison = detectionId;
-}
-
-// 在 dispatcher 中：
-void dispatcher_tick(VM_CONTEXT* ctx) {
-    if (ctx->poisonCountdown > 0) {
-        ctx->poisonCountdown--;
-        if (ctx->poisonCountdown == 0) {
-            ctx->decryptKey ^= ctx->pendingPoison;
-        }
-    }
-    // ... 正常 dispatch
-}
-```
-
-#### 3.4.4 反 Dump 保护
-
-```
-技术组合：
-
-1. PE 头擦除
-   - Stub 完成初始化后，用 VirtualProtect 将 PE 头区域设为 PAGE_NOACCESS
-   - 然后用随机数据覆写 DOS Header + NT Headers
-   - dump 工具（如 Scylla）无法重建 PE
-
-2. Section 权限动态管理
-   - 代码段平时设为 PAGE_NOACCESS
-   - 只在即将执行时临时解密 + 设为 PAGE_EXECUTE_READ
-   - 执行完毕后立即重新加密 + 恢复 PAGE_NOACCESS
-   - 任何时刻 dump 都无法获得完整的解密代码
-
-3. Nanomite 技术
-   - 将原始代码中的条件跳转替换为 INT3 (0xCC)
-   - 注册 VEH/SEH 异常处理器
-   - 异常处理器中根据上下文（寄存器值、触发地址）决定跳转目标
-   - dump 后的代码无法执行（缺少异常处理器的跳转逻辑）
-
-4. Guard Pages
-   - 在关键数据结构周围设置 PAGE_GUARD 页
-   - 正常执行通过异常处理器透明处理
-   - 调试器/dump 工具触发 guard 时行为异常
-
-5. API 重定向
-   - 关键 API 不通过 IAT 调用，而是复制 API 前几条指令到自有内存中执行
-   - 即使重建 IAT 也无法恢复完整的 API 调用关系
-```
-
-#### 3.4.5 反虚拟机/沙箱检测
-
-```
-检测目标：VMware, VirtualBox, Hyper-V, QEMU, Sandboxie, Windows Sandbox, 
-          ANY.RUN, VirusTotal, Cuckoo Sandbox
-
-检测手段（可选启用，某些场景下目标程序确实需要在 VM 中运行）：
-
-1. CPUID 指令检测虚拟化特征位
-2. 特定 I/O 端口检测 (VMware backdoor: port 0x5658)
-3. 注册表键检测 (HKLM\SOFTWARE\VMware, VBox...)
-4. MAC 地址前缀检测 (00:0C:29 VMware, 08:00:27 VBox)
-5. 设备驱动扫描 (vmhgfs.sys, VBoxGuest.sys)
-6. 进程列表扫描 (vmtoolsd.exe, VBoxService.exe)
-7. 文件系统特征 (%SystemRoot%\system32\drivers\vm*.sys)
-8. 时序异常检测（VM 中的指令执行时间与裸机有细微差异）
-9. 内存容量 / 磁盘大小检测（沙箱通常资源较少）
-10. 最近文件 / 桌面文件数量检测（沙箱通常为空）
-```
-
----
-
-### 3.5 反静态分析系统
-
-#### 3.5.1 反 IDA Pro / Ghidra 策略
-
-```
-1. 破坏线性扫描反汇编：
-   - 在代码流中插入精心构造的垃圾字节
-   - 利用 IDA 的线性扫描假设：在跳转目标前插入不完整的指令前缀
-   - 效果：IDA 的自动分析会将代码错误地对齐，产出大量错误反汇编
-
-2. 反递归下降：
-   - 使用间接跳转（计算地址后 jmp reg）替代直接跳转
-   - 交叉引用（xref）被切断 → IDA 无法自动发现目标基本块
-   - 函数被识别为更小的碎片，CFG 严重不完整
-
-3. 反反编译器（Hex-Rays / Ghidra Decompiler）：
-   - 构造反编译器无法合并的控制流结构（不可归约图）
-   - 插入大量别名指针操作，污染类型推断
-   - 使用位操作替代算术运算，反编译器输出变得不可读
-   
-4. 反签名扫描：
-   - 所有代码经过变异引擎处理，无固定字节序列
-   - Section 名称随机（不使用 .vmp / .themida / .packed 等已知名称）
-   - PE 时间戳、Checksum 随机化
-   - 清除所有调试目录、Rich Header
-   - 不在代码中嵌入任何版本字符串或水印
-```
-
-#### 3.5.2 零特征保证
-
-**消除所有已知壳特征的检查清单**：
-
-| 特征类别 | 已知壳的特征 | CipherShell 的处理 |
-|---------|------------|-------------------|
-| Section 名称 | `.vmp0`/`.vmp1` (VMP), `.themida` (Themida), `UPX0`/`UPX1` (UPX) | 随机 8 字节名称，每次加壳不同 |
-| 入口点模式 | VMP: `push reg / call` 序列; Themida: 特定 stub 模式 | 入口点代码完全变异，无固定模式 |
-| PE 元数据 | Rich Header、特定 linker 版本、时间戳 | 全部删除或随机化 |
-| 导入表 | VMP: 极少导入; Themida: 特定 DLL 列表 | 生成合理的假导入表，模拟正常程序 |
-| 资源 | Themida: 嵌入特定资源 | 不嵌入任何自有资源 |
-| 字符串 | 壳引擎的错误消息、版本号 | 所有 stub 字符串加密，无明文 |
-| 代码模式 | VMP dispatcher 的 `fetch-decode-dispatch` 循环 | Dispatch 方式随机化，无固定循环结构 |
-| 内存布局 | VMP: 特定的 section 权限组合 | 权限组合模拟正常编译器输出 |
-
----
-
-### 3.6 Stub 生成与 PE 重建
-
-#### 3.6.1 Stub 架构
-
-Stub 是嵌入到输出 PE 中的运行时引擎，负责解密、反调试和 VM 执行。
-
-```
-Stub 组成：
-
-┌────────────────────────────────────┐
-│ Stage 0: 初始解密器                 │
-│ - 最小的代码，解密 Stage 1           │
-│ - 自身经过重度变异                   │
-│ - 使用 PEB 遍历获取 API，无导入依赖  │
-├────────────────────────────────────┤
-│ Stage 1: 运行时引擎                 │
-│ - 反调试初始化                      │
-│ - 解密代码段 / 数据段               │
-│ - 修复导入表（hash resolve）        │
-│ - 处理重定位                        │
-│ - 初始化 VM 引擎                    │
-│ - 启动心跳监控线程                   │
-├────────────────────────────────────┤
-│ Stage 2: VM 引擎（Mirage）          │
-│ - Dispatcher                       │
-│ - Handler 集合                     │
-│ - Bytecode 流                      │
-├────────────────────────────────────┤
-│ Stage 3: 数据区                     │
-│ - 加密后的原始 section 数据          │
-│ - 加密后的 bytecode                 │
-│ - Handler 跳转表                   │
-│ - 反调试校验值                      │
-│ - API hash 表                      │
-└────────────────────────────────────┘
-```
-
-#### 3.6.2 PE 重建器
-
-```
-输出 PE 的 Section 布局（随机化示例）：
-
-Section 0: [随机名]  - 加密后的原始 .text
-Section 1: [随机名]  - 加密后的原始 .rdata
-Section 2: [随机名]  - 加密后的原始 .data
-Section 3: .rsrc      - 资源段（保持名称以兼容 Windows loader）
-Section 4: [随机名]  - Stub Stage 0
-Section 5: [随机名]  - 加密后的 Stub Stage 1 + Stage 2
-Section 6: [随机名]  - 加密后的 bytecode + 数据区
-Section 7: .reloc     - 重定位段（如果是 DLL 则必须保留）
-
-注意：
-- Section 的顺序也是随机的（但 .rsrc 和 .reloc 需遵守 Windows loader 约束）
-- 每个 section 的 VirtualSize 和 SizeOfRawData 添加随机 padding
-- Section 属性设置模拟正常编译器输出（不全设 RWX）
-```
-
-#### 3.6.3 DLL 加壳特殊处理
-
-DLL 加壳比 EXE 复杂，需要额外注意：
-
-```
-1. 入口点：DLL 的入口点是 DllMain，接收 DLL_PROCESS_ATTACH 等通知
-   - Stub 需要在 DLL_PROCESS_ATTACH 时完成初始化
-   - 需要正确处理 DLL_THREAD_ATTACH/DETACH
-   - 需要在 DLL_PROCESS_DETACH 时清理
-
-2. 导出表：DLL 的导出函数必须保持可调用
-   - 导出函数地址指向 VM 入口 trampoline
-   - 每个导出函数有独立的 VMENTER 跳板
-
-3. 重定位：DLL 可能被加载到非首选基址
-   - 必须保留和正确处理重定位表
-   - VM 内部的地址引用也需要重定位支持
-
-4. TLS：某些 DLL 使用 TLS 回调
-   - 需要保留 TLS 目录
-   - 可以利用 TLS 回调作为额外的初始化/反调试点
-
-5. 异常处理（x64）：x64 DLL 的 SEH 基于 .pdata
-   - 需要生成正确的 RUNTIME_FUNCTION 条目
-   - 或使用 RtlAddFunctionTable 动态注册
-```
-
----
-
-### 3.7 签名消除引擎
-
-专门负责确保输出文件不会触发任何已知的壳检测签名。
-
-```
-检测规避手段：
-
-1. Anti-PEiD / Detect-It-Easy：
-   - 这些工具依赖入口点字节模式匹配
-   - 入口点代码完全变异，每次不同
-   - 导入表结构模拟正常程序
-
-2. Anti-YARA：
-   - 不存在任何跨样本一致的字节序列（signature）
-   - 所有字符串加密
-   - 代码变异消除固定 pattern
-
-3. Anti-Heuristic：
-   - Section 权限不全设 RWX（分阶段修改权限）
-   - 入口点位于代码段合理位置（不在最后一个 section）
-   - PE 头各字段值在合理范围内
-   - 导入表包含合理的函数集（不为空，也不只有 LoadLibrary）
-
-4. 自测试流程：
-   - 加壳完成后自动用 DIE (Detect It Easy) 签名库扫描
-   - 如果匹配到任何已知壳签名 → 重新变异并再次生成
-   - 循环直到零匹配
-```
-
----
-
-## 四、性能控制策略
-
-### 4.1 性能开销模型
-
-```
-各保护措施的开销估算：
-
-基础加密 (L1)：
-  ├── Section 解密：一次性开销，程序启动时 ~10-50ms（取决于代码段大小）
-  ├── 字符串解密：每次使用 ~1μs（可缓存）
-  ├── API hash resolve：首次调用 ~5μs，后续缓存命中 ~0
-  └── 总运行时开销：约 1.02-1.05x
-
-控制流混淆 (L2)：
-  ├── 平坦化 dispatcher：每个基本块 +1 次间接跳转 + 状态更新
-  ├── 不透明谓词：每个谓词 ~2-5 条指令
-  └── 总运行时开销：约 2-3x
-
-高级混淆 (L3)：
-  ├── 虚假控制流：增加代码体积但不影响执行路径（分支预测器可学习）
-  ├── 代码分裂：增加 I-Cache 压力
-  └── 总运行时开销：约 5-8x
-
-VM 保护 (L4)：
-  ├── Fetch-Decode-Dispatch 循环开销
-  ├── 间接跳转导致分支预测失败
-  ├── Bytecode 解密开销
-  ├── EFLAGS 模拟开销
-  └── 总运行时开销：约 15-30x
-
-嵌套 VM (L5)：
-  ├── 多层 dispatch 叠加
-  └── 总运行时开销：约 50-100x+
-```
-
-### 4.2 自动热点建议
-
-```
-流程：
-1. 对输入 PE 进行静态分析
-2. 识别循环结构（回边计数估算）
-3. 估算每个函数的调用频率（通过调用图入度分析）
-4. 对高频函数（循环体内、高入度）建议降低保护等级
-5. 生成建议报告，用户确认后应用
-
-示例输出：
-  ⚠ 函数 render_frame (0x00401000) 位于主循环内，估算调用频率极高
-    建议保护等级：L1 (当前配置: L4)
-    预估性能改善：~20x
-    
-  ⚠ 函数 process_input (0x00402000) 每帧调用
-    建议保护等级：L2 (当前配置: L4)
-    
-  ✓ 函数 validate_license (0x00405000) 仅启动时调用一次
-    当前 L5 保护等级适合，无需调整
-```
-
-### 4.3 运行时动态降级（高级，可选）
-
-```
-概念：根据运行时性能监控动态调整保护强度
-
-实现：
-- 在 VM dispatcher 中嵌入轻量级性能计数器
-- 如果检测到 VM 执行耗时超过阈值（如配置的 max_vm_overhead_ratio）
-- 动态将部分 bytecode "JIT 编译" 回 native 代码执行
-- 但 JIT 编译后的代码仍然经过基础混淆
-
-风险：
-- JIT 代码是可分析的 native 代码，降低了保护强度
-- 需要权衡：如果对性能不敏感，建议关闭此特性
-```
-
----
-
-## 五、构建与工具链
-
-### 5.1 项目结构
-
-```
+```text
 CipherShell/
-├── CMakeLists.txt
-├── README.md
-├── docs/
-│   └── design.md                    ← 本文档
-│
-├── packer/                          # 加壳器主程序
-│   ├── main.cpp                     # 入口 + CLI 解析
-│   ├── pe_parser/                   # PE 解析器
-│   │   ├── pe_parser.h
-│   │   ├── pe_parser.cpp
-│   │   ├── pe_rebuilder.h
-│   │   └── pe_rebuilder.cpp
-│   ├── analysis/                    # 分析引擎
-│   │   ├── disassembler.h           # Zydis 封装
-│   │   ├── cfg_builder.h            # CFG 构建器
-│   │   ├── data_flow.h              # 数据流分析
-│   │   └── hotspot_analyzer.h       # 热点分析
-│   ├── transforms/                  # 变换引擎
-│   │   ├── section_encryptor.h      # Section 加密 (L1)
-│   │   ├── string_encryptor.h       # 字符串加密 (L1)
-│   │   ├── import_obfuscator.h      # 导入表混淆 (L1)
-│   │   ├── cfg_flattener.h          # 控制流平坦化 (L2)
-│   │   ├── opaque_predicates.h      # 不透明谓词 (L2/L3)
-│   │   ├── bogus_flow.h             # 虚假控制流 (L3)
-│   │   ├── translator.h             # x86→VM 转译器 (L4)
-│   │   └── vm_nester.h              # VM 嵌套 (L5)
-│   ├── mutation/                    # 变异引擎
-│   │   ├── opcode_randomizer.h
-│   │   ├── handler_mutator.h
-│   │   ├── junk_generator.h
-│   │   └── register_shuffler.h
-│   ├── config/                      # 配置解析
-│   │   └── config_parser.h
-│   └── signature/                   # 签名消除
-│       └── signature_eliminator.h
-│
-├── stub/                            # 运行时 Stub
-│   ├── stage0/                      # 初始解密器
-│   │   ├── stage0.asm               # NASM 汇编
-│   │   └── stage0_template.h        # 编译后的 shellcode 模板
-│   ├── stage1/                      # 运行时引擎
-│   │   ├── runtime.c                # 无 CRT 的 C 代码
-│   │   ├── anti_debug.c
-│   │   ├── import_resolver.c
-│   │   ├── reloc_fixer.c
-│   │   └── peb_utils.asm
-│   └── vm/                          # Mirage VM 引擎
-│       ├── dispatcher.c
-│       ├── handlers/
-│       │   ├── handler_alu.c        # 算术逻辑 handlers
-│       │   ├── handler_mem.c        # 内存操作 handlers
-│       │   ├── handler_flow.c       # 控制流 handlers
-│       │   ├── handler_api.c        # API 调用 handlers
-│       │   └── handler_special.c    # 特殊 handlers
-│       ├── vm_context.h
-│       └── flags_emu.c              # EFLAGS 模拟
-│
-├── llvm_pass/                       # 可选：源码保护 LLVM Pass
-│   ├── CMakeLists.txt
-│   ├── CipherShellPass.cpp
-│   ├── Flattening.cpp
-│   ├── BogusFlow.cpp
-│   ├── InstrSubstitution.cpp
-│   └── StringEncryption.cpp
-│
-├── third_party/                     # 第三方库
-│   ├── zydis/                       # 反汇编引擎
-│   ├── toml++/                      # TOML 解析
-│   └── chacha20/                    # 加密库（精简实现）
-│
-└── tests/                           # 测试
-    ├── test_pe_parser.cpp
-    ├── test_vm_correctness.cpp       # VM 正确性测试（关键！）
-    ├── test_transforms.cpp
-    ├── test_antidebug.cpp
-    ├── samples/                      # 测试用 PE 样本
-    │   ├── hello_world.exe
-    │   ├── gui_app.exe
-    │   ├── test_dll.dll
-    │   └── cpp_complex.exe
-    └── scripts/
-        ├── verify_no_signature.py    # 自动签名检测验证
-        └── benchmark.py              # 性能基准测试
+├─ CMakeLists.txt
+├─ cmake/
+│  ├─ dependencies.cmake
+│  └─ toolchains/
+├─ third_party/
+│  ├─ zydis/
+│  └─ manifest.json
+├─ packer/
+│  ├─ main.cpp
+│  ├─ pe_parser/
+│  │  ├─ pe_parser.*
+│  │  ├─ pe_emitter.*
+│  │  └─ pe_rebuilder.*
+│  ├─ analysis/
+│  │  ├─ zydis_decoder.*
+│  │  ├─ instruction_ir.*
+│  │  ├─ function_discovery.*
+│  │  ├─ cfg_builder.*
+│  │  └─ dataflow.*
+│  ├─ config/
+│  │  ├─ config_parser.*
+│  │  ├─ protection_build_context.*
+│  │  └─ capability_checker.*
+│  ├─ vm/
+│  │  ├─ vm_schema.*
+│  │  ├─ translator.*
+│  │  ├─ vm_section_emitter.*
+│  │  ├─ vm_runtime_builder.*
+│  │  ├─ trampoline_patcher.*
+│  │  ├─ native_bridge_builder.*
+│  │  └─ vm_verifier.*
+│  └─ transforms/
+│     ├─ string_protection.*
+│     ├─ import_protection.*
+│     ├─ section_encryption.*
+│     ├─ cfg_flattening.*
+│     └─ integrity.*
+├─ runtime/
+│  ├─ x86/
+│  ├─ x64/
+│  ├─ bridge/
+│  └─ common/
+├─ config/
+│  ├─ default.toml
+│  ├─ full_example.toml
+│  └─ vm_test.toml
+├─ tests/
+│  ├─ compile/
+│  ├─ samples/
+│  ├─ static/
+│  └─ manual/
+└─ docs/
+   ├─ cipher-shell-design.md
+   ├─ metadata-format.md
+   ├─ vm-isa.md
+   └─ manual-runtime-test.md
 ```
 
-### 5.2 Stub 编译要求
+### 12.2 依赖要求
 
-```
-Stub 编译约束（MSVC 示例）：
+| 依赖 | 用途 | 要求 |
+|---|---|---|
+| Zydis | 唯一 x86/x64 指令解码器 | 固定版本/commit，静态链接，不依赖系统安装 |
+| CMake | 构建 | 支持全新 build tree 配置 |
+| MSVC | Windows x86/x64 构建 | 明确最低工具集版本 |
+| NASM/ML64 | runtime/bridge 汇编 | 构建脚本自动检测 |
+| TOML parser | 配置 | 固定版本，统一 schema |
+| 密码学实现 | 数据/bytecode 保护 | 经过审查的实现，不自创密码算法 |
 
-cl /c /O1 /GS- /Zl /nologo
-   /DWIN32_LEAN_AND_MEAN
-   /D_NO_CRT
-   runtime.c
+### 12.3 标准构建命令
 
-link /NODEFAULTLIB
-     /ENTRY:StubEntry
-     /SUBSYSTEM:CONSOLE
-     /SECTION:.text,ERW
-     /MERGE:.rdata=.text
-     /MERGE:.data=.text
-     stub.obj
-
-含义：
-  /GS-              禁用 stack cookie（依赖 CRT）
-  /Zl               不嵌入默认库名
-  /NODEFAULTLIB      不链接任何默认库
-  /ENTRY:StubEntry   自定义入口点
-  /MERGE             合并 section，减小体积
-  
-NASM 编译：
-  nasm -f win32 stage0.asm -o stage0.obj     (x86)
-  nasm -f win64 stage0.asm -o stage0.obj     (x64)
+```powershell
+cd D:\vscode\CipherShell
+cmake -S . -B build
+cmake --build build --config Release
+git diff --check
 ```
 
-### 5.3 依赖清单
-
-| 依赖 | 版本 | 用途 | 许可证 |
-|------|------|------|--------|
-| Zydis | ≥4.0 | x86/x64 反汇编 | MIT |
-| toml++ | ≥3.0 | 配置文件解析 | MIT |
-| 自研 ChaCha20 | — | 对称加密（精简实现，不依赖 OpenSSL） | — |
-| NASM | ≥2.16 | 汇编器 | BSD-2 |
-| CMake | ≥3.20 | 构建系统 | BSD-3 |
-| LLVM | ≥15.0 | 可选：源码保护 Pass | Apache-2.0 |
+编码 AI 不运行任何生成 exe。
 
 ---
 
-## 六、开发路线图
+## 13. 验证与验收策略
 
-### Phase 1 — 基础框架（预计 4-6 周）
+### 13.1 AI/编码侧允许执行
 
-```
-里程碑：能对简单 EXE 进行 L1 保护并正确运行
+- CMake configure。
+- Release/Debug 编译。
+- 静态库级检查。
+- PE 静态解析。
+- 生成测试样本源码、配置与命令。
+- `git diff --check`。
 
-任务：
-  □ 实现 PE Parser（完整解析所有 Data Directory）
-  □ 实现 PE Rebuilder（能无损重建未修改的 PE）
-  □ 实现 Section 加密 + 对应的 Stub 解密
-  □ 实现 PEB 遍历获取 kernel32 基址（x86 + x64）
-  □ 实现基础 API hash resolve（LoadLibrary + GetProcAddress）
-  □ 实现导入表重建
-  □ 实现重定位修复
-  □ 端到端测试：加壳 hello_world.exe → 正常运行
+### 13.2 AI/编码侧禁止执行
 
-验收标准：
-  - 加壳后的 EXE 功能完全正常
-  - DIE / PEiD 不识别为任何已知壳
-  - IDA 中原始代码段显示为加密数据
-```
+- 原始 EXE。
+- 加壳 EXE。
+- 测试 EXE。
+- 任何受保护产物。
 
-### Phase 2 — 反调试 + 字符串/导入混淆（预计 3-4 周）
+### 13.3 用户手动运行验证
 
-```
-里程碑：L1 保护完整实装
+最终功能验收由用户执行，至少覆盖：
 
-任务：
-  □ 实现字符串扫描与加密
-  □ 实现导入表混淆（Strategy C: 混合模式）
-  □ 实现反调试检测矩阵（至少 8 种检测手段）
-  □ 实现隐式响应（密钥投毒）
-  □ 实现 PE 头擦除
-  □ 实现 Rich Header / Debug Directory 清除
-  □ 配置文件系统（TOML）
+- x64 / x86。
+- EXE / DLL。
+- Debug-like / optimized 编译结果。
+- GPR、部分寄存器、memory、flags、JCC。
+- CALL/native bridge/import bridge。
+- stack alignment 与 shadow space。
+- exceptions/unwind。
+- CFG Guard / ASLR / DEP。
+- section encryption、string on-demand、import resolver。
 
-验收标准：
-  - x64dbg 附加后程序行为异常（但不立即退出）
-  - 字符串窗口 (IDA Shift+F12) 无法看到原始字符串
-  - 导入表不反映真实 API 依赖
-```
+运行成功后不能只看“程序没崩”，还要验证：
 
-### Phase 3 — 控制流混淆（预计 4-5 周）
-
-```
-里程碑：L2/L3 保护实装
-
-任务：
-  □ 集成 Zydis 反汇编引擎
-  □ 实现 CFG 构建器
-  □ 实现控制流平坦化
-  □ 实现不透明谓词库（至少 10 种不同类型）
-  □ 实现虚假控制流注入
-  □ 实现常量拆分
-  □ 实现垃圾代码生成器（基于活跃变量分析）
-  □ 函数级保护等级标注
-
-验收标准：
-  - IDA 反编译器输出严重膨胀，可读性极差
-  - 控制流图极度复杂化
-  - 功能正确性不受影响
-```
-
-### Phase 4 — VM 引擎 Mirage（预计 8-12 周）— 核心
-
-```
-里程碑：L4 保护实装
-
-任务：
-  □ 设计并实现 VM 上下文结构
-  □ 实现 Dispatcher（三种模式）
-  □ 实现完整的 Handler 集（约 60 个）
-  □ 实现精确的 EFLAGS 模拟
-  □ 实现 x86→bytecode 转译器（覆盖常用指令子集）
-  □ 实现 VMENTER/VMEXIT 上下文切换
-  □ 实现 bytecode 滚动加密
-  □ 实现变异引擎（opcode随机化 + 寄存器映射随机化 + handler变异）
-  □ 大量正确性测试（算术、逻辑、分支、循环、函数调用、异常处理）
-
-验收标准：
-  - 虚拟化后的函数计算结果与原始完全一致
-  - 同一程序两次加壳产出完全不同的二进制
-  - x64dbg 中 VM dispatcher 难以追踪
-  - 无已知壳签名匹配
-```
-
-### Phase 5 — 高级特性 + DLL 支持（预计 4-6 周）
-
-```
-里程碑：L5 保护 + DLL 加壳 + 性能控制
-
-任务：
-  □ 实现 VM 嵌套（双层不同 ISA）
-  □ 实现 Nanomite 技术
-  □ 实现完整 DLL 加壳（导出表保持、重定位、TLS）
-  □ 实现 x64 异常处理兼容（.pdata / RtlAddFunctionTable）
-  □ 实现热点分析与自动建议
-  □ 实现性能 benchmark 框架
-  □ 假 Handler 注入
-  □ Handler 内联反调试检查
-
-验收标准：
-  - DLL 加壳后可被正常 LoadLibrary 加载
-  - 导出函数可被正常调用
-  - L5 保护下 IDA + x64dbg 组合分析极度困难
-```
-
-### Phase 6 — 源码模式 + 打磨（预计 4-6 周，可选）
-
-```
-里程碑：LLVM Pass 实装 + GUI + 文档
-
-任务：
-  □ 实现 LLVM Pass: 控制流平坦化
-  □ 实现 LLVM Pass: 虚假控制流
-  □ 实现 LLVM Pass: 指令替换
-  □ 实现 LLVM Pass: 字符串加密
-  □ 编写集成指南（如何在 CMake 项目中使用）
-  □ 可选：简单的 GUI 前端（Qt / ImGui）
-  □ 完善文档和使用手册
-
-验收标准：
-  - LLVM Pass 能在 clang 编译流程中正常工作
-  - 源码保护 + 二进制保护可叠加使用
-```
+- 目标函数确实进入 VM。
+- enter_count 增加。
+- last_opcode 更新。
+- 返回值与原程序一致。
+- native body 已按策略破坏。
+- 未发生静默 native fallback。
 
 ---
 
-## 七、测试策略
+## 14. 当前代码状态基线（2026-07-10）
 
-### 7.1 正确性测试（最高优先级）
+本节记录当前实现事实，避免把设计目标误认为已完成能力。
 
-```
-测试用例矩阵：
+### 14.1 已存在的能力
 
-1. 基础功能测试
-   - Hello World (console)
-   - MessageBox (GUI)
-   - 文件 I/O 操作
-   - 网络操作 (Winsock)
-   - 多线程程序
-   - C++ 异常处理
-   - SEH 异常处理
-   - TLS 使用
-   - DLL 加载 (LoadLibrary)
-   - DLL 被加载 (导出函数调用)
+- PE 解析与基础重建框架。
+- ProtectionBuildContext、CapabilityChecker 雏形。
+- VM metadata、record、reverse opcode map、register map。
+- x64 runtime interpreter emitter。
+- trampoline 与函数入口 patch。
+- x64 rel32/absolute 跳转策略的基础实现。
+- VM trace slot 与 runtime error code。
+- bytecode 静态 decoder/verifier。
+- 基础 VM handler：MOV、LEA、ADD、SUB、AND、OR、XOR、CMP、TEST、JMP、常用 JCC、RET。
+- memory load/store 的基础 operand 描述。
+- 不支持 CALL/PUSH/POP 时 fail-closed。
+- 编译通过与静态检查流程。
 
-2. 编译器覆盖
-   - MSVC Debug/Release (x86/x64)
-   - MinGW GCC (x86/x64)
-   - Clang/LLVM (x86/x64)
-   - 不同优化等级 (/Od, /O1, /O2, /Ox)
+### 14.2 当前尚未达到最终架构的部分
 
-3. 保护等级覆盖
-   - 每个测试用例 × 每个保护等级 (L1-L5) = 完整矩阵
+- 正式生产解码路径仍有手写 ModRM/SIB/REX 解析；必须一次性替换为 Zydis + Unified IR。
+- runtime 仍以大量手写机器码 emitter 维护，尚未达到可审查的独立汇编/runtime blob 结构。
+- CALL/native bridge/import bridge 未闭环。
+- VM stack、PUSH/POP、shadow space 未闭环。
+- 部分寄存器、高 8 位寄存器、完整 PF/AF 语义未闭环。
+- memory arithmetic 尚未完整覆盖。
+- SSE/AVX/x87、CMOV/SETcc、异常/unwind 未闭环。
+- x86 runtime 与 x86 trampoline 尚未达到与 x64 对等能力。
+- import protection 仍缺 runtime resolver/callsite rewrite 完整闭环。
+- on-demand string protection 尚未闭环。
+- PEEmitter/PERebuilder 仍需完成所有 Directory 的统一边界。
+- 配置与 CLI 仍存在等级导向和旧字段遗留。
+- 未由用户完成运行时验证。
 
-4. VM 正确性专项
-   - 整数算术溢出边界
-   - EFLAGS 精确性 (CMC, STC 等边缘指令)
-   - 64位操作 (x64 模式)
-   - 调用约定正确性 (stdcall, cdecl, fastcall, x64 ABI)
-   - 栈平衡验证
-```
-
-### 7.2 安全性测试
-
-```
-1. 签名扫描
-   - DIE (Detect It Easy) 全签名库扫描
-   - YARA 规则匹配（收集 VMP/Themida/已知壳的公开 YARA 规则）
-   - 自动化：加壳后自动扫描，匹配到任何签名则 CI 失败
-
-2. 反调试验证
-   - x64dbg 附加测试
-   - WinDbg 附加测试
-   - Frida 注入测试
-   - Cheat Engine 附加测试
-   - Process Monitor 行为观察
-
-3. 反 dump 验证
-   - Scylla dump 尝试
-   - Process Dump 工具测试
-   - 验证 dump 后的文件不可运行
-
-4. 变异唯一性验证
-   - 同一输入加壳 100 次
-   - 验证 100 个输出两两之间无共同字节序列 > 16 字节
-```
-
-### 7.3 性能基准测试
-
-```
-基准测试程序：
-  - CPU 密集型：矩阵乘法、排序算法、加密运算
-  - I/O 密集型：文件读写、网络通信
-  - 混合型：游戏引擎核心循环模拟
-
-测量指标：
-  - 启动时间增加量
-  - 运行时 CPU 开销倍率
-  - 内存占用增加量
-  - 代码体积膨胀比
-
-输出格式：
-  保护等级 | 启动延迟 | CPU 开销 | 内存增加 | 体积膨胀
-  L1       | +12ms    | 1.03x   | +2MB    | 1.1x
-  L2       | +15ms    | 2.5x    | +5MB    | 2.3x
-  L3       | +18ms    | 6.1x    | +12MB   | 4.7x
-  L4       | +25ms    | 22x     | +20MB   | 3.2x
-  L5       | +40ms    | 75x     | +35MB   | 5.1x
-```
+以上未完成项不得通过 `partial`、native fallback、NOP 或文案描述伪装为已完成。
 
 ---
 
-## 八、风险与缓解
+## 15. 最终完成判定矩阵
 
-| 风险 | 影响 | 可能性 | 缓解措施 |
-|------|------|--------|---------|
-| EFLAGS 模拟不精确 | 虚拟化后程序逻辑错误 | 高 | 编写大量边界测试；VMEXIT 回退机制兜底 |
-| x64 支持复杂度 | x64 的 ABI 和异常处理更复杂 | 中 | 先做 x86 版本，x64 作为 Phase 4+ |
-| Windows 版本兼容性 | 反调试技术依赖未文档化结构 | 中 | 运行时检测 OS 版本，动态选择兼容的技术 |
-| 杀毒软件误报 | 加壳行为本身可能触发启发式检测 | 高 | 签名消除引擎 + 导入表伪装 + 行为模拟正常程序 |
-| 大型程序加壳后不稳定 | 复杂的 PE 结构（MFC、Qt 等）可能有特殊依赖 | 中 | 渐进式保护 + 充分的回归测试套件 |
-| 开发周期过长 | VM 引擎工程量巨大 | 高 | 严格按 Phase 推进，每个 Phase 有可交付成果 |
+CipherShell 只有同时满足以下条件，才可称为生产级完成：
+
+### 解码与分析
+
+- Zydis 是唯一正式解码器。
+- 生产目录无手写 ModRM/SIB/REX parser。
+- Unified IR 覆盖 operand action、width、部分寄存器、RIP-relative、branch target。
+- CFG 和 Translator 不通过 raw opcode 猜语义。
+
+### VM
+
+- x86/x64 runtime 完整。
+- 常见 GPR、memory、flags、JCC、stack、CALL、bridge、部分寄存器完整。
+- SSE/AVX/x87 有正式 handler 或正式 bridge。
+- runtime、metadata、bytecode 有版本与完整性验证。
+- trampoline、unwind、CFG Guard 全部闭环。
+- 原 native body 按策略处理。
+
+### PE
+
+- EXE/DLL、x86/x64 均支持。
+- Import/Export/TLS/Reloc/Exception/LoadConfig/CFG/Security/Overlay 正确。
+- PEEmitter 是唯一修改入口。
+- PERebuilder 只序列化。
+
+### 非 VM 保护
+
+- on-demand string 引用点改写闭环。
+- import resolver/callsite rewrite 闭环。
+- section encryption 与 loader 顺序闭环。
+- CFG 变换真实写入且通过验证。
+- integrity 独立可配置。
+
+### 配置与报告
+
+- 所有功能独立 enable/strength/scope/failure_policy。
+- L1-L5 只作为 preset。
+- 旧字段从默认配置与示例删除。
+- `applied` 必须由 verifier 决定。
+
+### 验证
+
+- 全新 build tree configure/build 通过。
+- 静态 verifiers 全部通过。
+- 用户完成运行验证，行为与原程序一致。
+- 不存在 NOP 替代、静默跳过、native fallback 或假 applied。
 
 ---
 
-## 九、术语表
+## 16. 风险与强制缓解措施
 
-| 术语 | 含义 |
-|------|------|
-| OEP | Original Entry Point，原始程序入口点 |
-| IAT | Import Address Table，导入地址表 |
-| RVA | Relative Virtual Address，相对虚拟地址 |
-| CFG | Control Flow Graph，控制流图 |
-| Stub | 嵌入加壳后 PE 中的运行时解密/加载代码 |
-| Handler | VM 中执行单条虚拟指令的函数 |
-| Dispatcher | VM 的指令分发循环 |
-| Bytecode | 自定义虚拟指令的二进制编码 |
-| Opaque Predicate | 不透明谓词，编译时已知结果但静态分析难以证明的条件 |
-| Nanomite | 用 INT3 替换条件跳转，通过异常处理器实现跳转逻辑的技术 |
-| VMEXIT/VMENTER | VM 执行与 Native 执行之间的切换点 |
-| Threaded Dispatch | Handler 末尾直接跳转到下一个 Handler 的分发方式，无集中调度器 |
-| Rolling Key | 滚动密钥，每次解密操作后密钥自身发生变化 |
-| Junk Code | 语义上无意义的代码，插入以增加分析难度 |
+| 风险 | 影响 | 强制措施 |
+|---|---|---|
+| 手写 x86/x64 decoder 误解码 | VM 语义错误且难定位 | 生产路径仅使用 Zydis，失败即拒绝 |
+| runtime 魔法字节难维护 | 编译通过但运行错误 | 独立汇编/runtime blob、fixup 表、版本化 |
+| flags/width 错误 | 条件分支与返回值错误 | operand-width-aware handler 与 verifier |
+| x64 unwind/CFG 未更新 | 运行崩溃或系统阻止 | PEEmitter 统一重写并由 CapabilityChecker 阻止遗漏 |
+| native bridge 不完整 | CALL 后栈或寄存器损坏 | 正式 ABI bridge，不允许隐式 fallback |
+| Rebuilder 覆盖 Emitter 修改 | 输出 PE 缺失 section/patch | Rebuilder serialization-only，前后结构比对 |
+| 配置字段漂移 | 用户以为功能已启用 | 单一 schema、unknown key error、旧字段弃用 |
+| 功能状态虚报 | 无法判断保护是否真实 | `applied` 仅由静态 verifier 生成 |
+| 随机变异破坏语义 | 构建不稳定 | 共享 schema、可重放 seed、静态解码验证 |
 
 ---
 
-## 十、参考文献与资源
+## 17. 术语
 
-1. Microsoft PE/COFF Specification — PE 格式权威文档
-2. 《加密与解密》（第四版）— 看雪论坛经典，壳技术系统讲解
-3. Zydis Documentation — 反汇编引擎 API
-4. "An Abstract Interpretation-Based Framework for Control Flow Flattening" — 平坦化的学术基础
-5. "Opaque Predicates: Past, Present, and Future" — 不透明谓词综述
-6. Tigress C Obfuscator — 学术级代码虚拟化参考
-7. 看雪论坛 VMP 分析系列 — 逆向视角的 VM 保护分析
-8. LLVM Developer Documentation — LLVM Pass 开发指南
+- **IR**：CipherShell 自己的指令/操作数中间表示。
+- **VM Bytecode**：由 native 指令转换出的 Mirage 指令流。
+- **VM Runtime**：嵌入目标 PE、负责执行 bytecode 的位置无关代码。
+- **Trampoline**：原函数入口与 VM runtime 之间的桥接代码。
+- **Native Bridge**：VM 调用未虚拟化 native 函数或 API 的正式 ABI 适配层。
+- **PEEmitter**：唯一允许修改内存 PE 结构的模块。
+- **PERebuilder**：将最终内存映像写出为文件的序列化模块。
+- **CapabilityChecker**：在修改前判断功能能否安全闭环。
+- **fail-closed**：无法保证正确时明确失败，不输出伪成功文件。
+- **preset**：一组模块化配置的快捷展开，不是独立架构等级。
 
 ---
 
-> **文档状态**：初版草案，后续随实现推进持续更新。
+## 18. 文档维护规则
+
+- 每次架构变更必须更新本文档和对应格式文档。
+- 代码实现与本文不一致时，先判断是代码缺陷还是设计需要修订，不能用临时代码事实反向合理化错误架构。
+- `codex_change.log` 记录代码变化；本文记录最终架构与当前实现差距。
+- 任何新增功能必须同步补充：配置 schema、CapabilityChecker、状态报告、静态 verifier、手动验证说明。
+- 不允许以“先实现简化版、以后再替换”为文档路线。
+
+---
+
+**结论**：CipherShell 的核心竞争力应集中在自研 VM 语义、runtime、bytecode、随机化、bridge、PE 正确性与验证体系；标准 x86/x64 指令解码由 Zydis 负责。所有模块直接按照最终生产架构实现，不保留临时双轨、fallback 或伪成功路径。

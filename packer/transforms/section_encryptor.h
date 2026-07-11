@@ -47,6 +47,8 @@ struct CS_ENCRYPT_CONFIG {
     BOOL        removeExecutePermission;// 加密后移除执行权限
     DWORD       keyDerivationRounds;    // 密钥派生轮数
     BOOL        usePerSectionKeys;      // 每个 section 使用独立密钥
+    WORD        excludeSectionsAtOrAfter;
+    BOOL        excludeRelocationTargets;
 
     // 构造函数 - 默认值
     CS_ENCRYPT_CONFIG() :
@@ -55,7 +57,9 @@ struct CS_ENCRYPT_CONFIG {
         encryptResources(FALSE),
         removeExecutePermission(TRUE),
         keyDerivationRounds(1000),
-        usePerSectionKeys(TRUE) {}
+        usePerSectionKeys(TRUE),
+        excludeSectionsAtOrAfter(0xFFFFu),
+        excludeRelocationTargets(TRUE) {}
 };
 
 // ============================================================================
@@ -95,7 +99,7 @@ public:
      * 生成随机加密密钥
      * @return 随机密钥
      */
-    CS_ENCRYPTION_KEY GenerateRandomKey();
+    bool GenerateRandomKey(CS_ENCRYPTION_KEY& key);
 
     /**
      * 从主密钥派生 section 密钥

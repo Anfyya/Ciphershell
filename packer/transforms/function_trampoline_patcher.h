@@ -2,9 +2,11 @@
 #define CS_FUNCTION_TRAMPOLINE_PATCHER_H
 
 #include "vm_runtime_builder.h"
+#include "../analysis/instruction_ir.h"
 #include "../pe_parser/pe_parser.h"
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace CipherShell {
@@ -12,16 +14,22 @@ namespace CipherShell {
 enum class FunctionPatchKind {
     None,
     NearRel32,
-    X64AbsoluteR11
+    X64AbsoluteIndirect
 };
 
 struct FunctionPatchResult {
     bool success = false;
     uint32_t functionRVA = 0;
+    uint32_t patchRVA = 0;
     uint32_t trampolineRVA = 0;
     uint32_t patchedBytes = 0;
+    uint32_t entryPatchBytes = 0;
     FunctionPatchKind patchKind = FunctionPatchKind::None;
     bool verified = false;
+    bool preservedEndbr = false;
+    bool nativeBodyDestroyed = false;
+    uint32_t destroyedBytes = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> destroyedRanges;
     std::string error;
 };
 
@@ -31,7 +39,12 @@ public:
         CS_PE_IMAGE* image,
         const std::vector<VMTrampolineRecord>& trampolines,
         const std::vector<VMFunctionRecord>& records,
+        const std::vector<Function>& functions,
         bool destroyNativeBody);
+    static bool VerifyAppliedPatch(
+        const CS_PE_IMAGE* image,
+        const FunctionPatchResult& result,
+        std::string& error);
 
 private:
     static bool BuildEntryPatch(

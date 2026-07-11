@@ -38,6 +38,21 @@ public:
     bool PatchBytes(uint32_t rva, const std::vector<uint8_t>& bytes, std::string* error = nullptr);
     bool FillBytes(uint32_t rva, uint32_t size, uint8_t value, std::string* error = nullptr);
     bool SetSectionCharacteristics(uint32_t sectionIndex, uint32_t characteristics, std::string* error = nullptr);
+    bool RebuildExceptionDirectory(
+        const std::vector<CS_RUNTIME_FUNCTION>& additionalEntries,
+        const char sectionName[8],
+        PEAppendSectionResult* sectionResult = nullptr,
+        std::string* error = nullptr);
+    bool RebuildGuardCFFunctionTable(
+        const std::vector<uint32_t>& additionalFunctionRVAs,
+        const char sectionName[8],
+        PEAppendSectionResult* sectionResult = nullptr,
+        std::string* error = nullptr);
+    bool RebuildBaseRelocationDirectory(
+        const std::vector<CS_RELOC_ENTRY>& additionalEntries,
+        const char sectionName[8],
+        PEAppendSectionResult* sectionResult = nullptr,
+        std::string* error = nullptr);
 
 private:
     uint32_t AlignUp(uint32_t value, uint32_t alignment) const;

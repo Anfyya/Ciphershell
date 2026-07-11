@@ -46,18 +46,18 @@ NanomiteResult NanomiteInjector::Inject(
             NanomiteEntry entry;
             entry.id = GenerateId();
             entry.address = instr.address;
-            entry.originalOpcode = instr.bytes[0];
-            entry.isConditional = instr.isConditional;
+            entry.originalOpcode = instr.rawBytes[0];
+            entry.isConditional = instr.IsConditionalBranch();
 
-            if (instr.isConditional) {
+            if (instr.IsConditionalBranch()) {
                 // 条件跳转：两个可能的目标
                 entry.conditionType = AnalyzeCondition(instr);
-                entry.targetTrue = instr.targetAddress;
+                entry.targetTrue = instr.branchTargetRVA;
                 entry.targetFalse = instr.address + instr.length;
             } else {
                 // 无条件跳转
                 entry.conditionType = 0xFF;  // 总是跳转
-                entry.targetTrue = instr.targetAddress;
+                entry.targetTrue = instr.branchTargetRVA;
                 entry.targetFalse = instr.address + instr.length;
             }
 
@@ -215,25 +215,35 @@ void NanomiteInjector::Cleanup(NanomiteResult& result) {
 // ============================================================================
 
 uint8_t NanomiteInjector::AnalyzeCondition(const Instruction& instr) {
-    // 根据跳转指令类型返回条件编码
-    uint8_t opcode = instr.bytes[0];
-
-    // 条件跳转 0x70-0x7F
-    if (opcode >= 0x70 && opcode <= 0x7F) {
-        return opcode - 0x70;
+    switch (instr.branchKind) {
+        case BranchKind::Overflow: return 0x0;
+        case BranchKind::NotOverflow: return 0x1;
+        case BranchKind::Below: return 0x2;
+        case BranchKind::AboveOrEqual: return 0x3;
+        case BranchKind::Equal: return 0x4;
+        case BranchKind::NotEqual: return 0x5;
+        case BranchKind::BelowOrEqual: return 0x6;
+        case BranchKind::Above: return 0x7;
+        case BranchKind::Sign: return 0x8;
+        case BranchKind::NotSign: return 0x9;
+        case BranchKind::Parity: return 0xA;
+        case BranchKind::NotParity: return 0xB;
+        case BranchKind::Less: return 0xC;
+        case BranchKind::GreaterOrEqual: return 0xD;
+        case BranchKind::LessOrEqual: return 0xE;
+        case BranchKind::Greater: return 0xF;
+        default: return 0xFF;
     }
-
-    return 0xFF;
 }
 
 bool NanomiteInjector::ShouldReplace(const Instruction& instr, const NanomiteConfig& config) {
-    if (instr.mnemonic.empty()) return false;
+    if (instr.mnemonic == InstructionMnemonic::Invalid) return false;
 
     // 条件跳转
-    if (instr.isConditional && config.replaceConditionalJumps) {
+    if (instr.IsConditionalBranch() && config.replaceConditionalJumps) {
         // 检查跳转距离
-        if (instr.hasTarget) {
-            int64_t distance = (int64_t)instr.targetAddress - (int64_t)instr.address;
+        if (instr.hasBranchTarget) {
+            int64_t distance = (int64_t)instr.branchTargetRVA - (int64_t)instr.address;
             if (distance < 0) distance = -distance;
             if (distance < config.minJumpDistance) return false;
         }
@@ -241,7 +251,7 @@ bool NanomiteInjector::ShouldReplace(const Instruction& instr, const NanomiteCon
     }
 
     // 无条件跳转
-    if (!instr.isConditional && instr.isBranch && config.replaceUnconditionalJumps) {
+    if (!instr.IsConditionalBranch() && instr.IsBranch() && config.replaceUnconditionalJumps) {
         return true;
     }
 

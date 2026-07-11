@@ -1,1178 +1,1281 @@
-﻿/**
- * CipherShell x86/x64 鈫?Mirage Bytecode 杞瘧鍣?- 瀹炵幇
- */
-
 #include "translator.h"
-#include "../../third_party/chacha20.h"
-#include <cstring>
-#include <cstdlib>
-#include <ctime>
+
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <iomanip>
-#include <random>
+#include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 
 namespace CipherShell {
+namespace {
 
-// ============================================================================
-// 鏋勯€?鏋愭瀯
-// ============================================================================
+uint8_t WidthBytes(uint16_t widthBits) {
+    if (widthBits == 8 || widthBits == 16 || widthBits == 32 || widthBits == 64 ||
+        widthBits == 128 || widthBits == 256 || widthBits == 512) {
+        return static_cast<uint8_t>(widthBits / 8);
+    }
+    return 0;
+}
 
-struct DecodedModRM {
-    bool ok = false;
-    uint8_t opcode = 0;
-    uint8_t rex = 0;
-    bool rexW = false;
-    bool operand16 = false;
-    uint32_t opcodeOffset = 0;
-    uint8_t mod = 0;
-    uint8_t reg = 0;
-    uint8_t rm = VM_REG_INVALID;
-    uint8_t index = VM_REG_INVALID;
-    uint8_t scale = 1;
-    bool hasBase = false;
-    bool hasIndex = false;
-    bool memory = false;
-    bool ripRelative = false;
-    int64_t disp = 0;
-    uint32_t immOffset = 0;
+bool IsImmediate(const OperandIR* operand) {
+    return operand && operand->type == OperandType::Immediate;
+}
+
+bool IsRegister(const OperandIR* operand) {
+    return operand && operand->type == OperandType::Register;
+}
+
+bool IsMemory(const OperandIR* operand) {
+    return operand && operand->type == OperandType::Memory;
+}
+
+bool OperandWrites(OperandAction action) {
+    return action == OperandAction::Write || action == OperandAction::ReadWrite ||
+        action == OperandAction::ConditionalWrite ||
+        action == OperandAction::ConditionalReadWrite;
+}
+
+bool IsExtendedRegisterClass(RegisterClass registerClass) {
+    return registerClass == RegisterClass::Vector || registerClass == RegisterClass::X87 ||
+        registerClass == RegisterClass::Mmx;
+}
+
+uint32_t AlignUpValue(uint32_t value, uint32_t alignment) {
+    return alignment ? (value + alignment - 1u) & ~(alignment - 1u) : value;
+}
+
+void InitializeInstruction(BytecodeInstr& instruction) {
+    std::memset(&instruction, 0, sizeof(instruction));
+    instruction.dst = VM_REG_INVALID;
+    instruction.src = VM_REG_INVALID;
+    instruction.extra = VM_REG_INVALID;
+    instruction.memBase = VM_REG_INVALID;
+    instruction.memIndex = VM_REG_INVALID;
+    instruction.memScale = 1;
+    instruction.memoryKind = VM_MEMORY_NATIVE;
+}
+
+struct BinaryOpcodes {
+    uint8_t rr;
+    uint8_t rc;
+    uint8_t rm;
+    uint8_t mr;
 };
 
-static std::string FormatInstructionBytes(const Instruction& instr) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (uint32_t i = 0; i < instr.length; i++) {
-        if (i) oss << ' ';
-        oss << std::setw(2) << static_cast<unsigned>(instr.bytes[i]);
+bool OpcodesForBinary(InstructionMnemonic mnemonic, BinaryOpcodes& opcodes) {
+    switch (mnemonic) {
+        case InstructionMnemonic::Add: opcodes = {VM_ADD_RR, VM_ADD_RC, VM_ADD_RM, VM_ADD_MR}; return true;
+        case InstructionMnemonic::Adc: opcodes = {VM_ADC_RR, VM_ADC_RC, VM_ADC_RM, VM_ADC_MR}; return true;
+        case InstructionMnemonic::Sub: opcodes = {VM_SUB_RR, VM_SUB_RC, VM_SUB_RM, VM_SUB_MR}; return true;
+        case InstructionMnemonic::Sbb: opcodes = {VM_SBB_RR, VM_SBB_RC, VM_SBB_RM, VM_SBB_MR}; return true;
+        case InstructionMnemonic::And: opcodes = {VM_AND_RR, VM_AND_RC, VM_AND_RM, VM_AND_MR}; return true;
+        case InstructionMnemonic::Or: opcodes = {VM_OR_RR, VM_OR_RC, VM_OR_RM, VM_OR_MR}; return true;
+        case InstructionMnemonic::Xor: opcodes = {VM_XOR_RR, VM_XOR_RC, VM_XOR_RM, VM_XOR_MR}; return true;
+        case InstructionMnemonic::Cmp: opcodes = {VM_CMP_RR, VM_CMP_RC, VM_CMP_RM, VM_CMP_MR}; return true;
+        case InstructionMnemonic::Test: opcodes = {VM_TEST_RR, VM_TEST_RC, VM_TEST_RM, VM_TEST_MR}; return true;
+        default: return false;
     }
-    return oss.str();
 }
 
-static uint8_t MemoryWidthForOpcode(const DecodedModRM& d, uint8_t opcode) {
-    if (opcode == 0x88 || opcode == 0x8A) return 1;
-    if (d.operand16) return 2;
-    return d.rexW ? 8 : 4;
-}
+} // namespace
 
-static bool IsSupportedMemoryWidth(uint8_t width) {
-    return width == 1 || width == 2 || width == 4 || width == 8;
-}
-
-static uint8_t RegisterWidthForOperand(const DecodedModRM& d) {
-    if (d.operand16) return 2;
-    return d.rexW ? 8 : 4;
-}
-
-static bool IsSupportedRegisterWidth(uint8_t width) {
-    return width == 2 || width == 4 || width == 8;
-}
-
-static DecodedModRM DecodeModRMInstr(const Instruction& instr) {
-    DecodedModRM d;
-    uint32_t pos = 0;
-
-    while (pos < instr.length) {
-        uint8_t b = instr.bytes[pos];
-        if (b == 0x66) {
-            d.operand16 = true;
-            pos++;
-            continue;
-        }
-        if (b == 0x67) {
-            return d; // 32-bit addressing in x64 is not expressible by the current VM memory model.
-        }
-        if ((b & 0xF0) == 0x40) {
-            d.rex = b;
-            d.rexW = (b & 0x08) != 0;
-            pos++;
-            continue;
-        }
-        break;
-    }
-
-    d.opcodeOffset = pos;
-    if (pos >= instr.length) return d;
-    d.opcode = instr.bytes[pos++];
-    if (d.opcode == 0x0F) {
-        if (pos >= instr.length) return d;
-        d.opcode = instr.bytes[pos++];
-    }
-    if (pos >= instr.length) return d;
-
-    uint8_t modrm = instr.bytes[pos++];
-    d.mod = (modrm >> 6) & 3;
-    d.reg = static_cast<uint8_t>(((modrm >> 3) & 7) | ((d.rex & 0x04) ? 8 : 0));
-    uint8_t rmLow = modrm & 7;
-    d.rm = static_cast<uint8_t>(rmLow | ((d.rex & 0x01) ? 8 : 0));
-    d.memory = d.mod != 3;
-
-    if (d.memory && rmLow == 4) {
-        if (pos >= instr.length) return d;
-        uint8_t sib = instr.bytes[pos++];
-        d.scale = static_cast<uint8_t>(1u << ((sib >> 6) & 3));
-
-        uint8_t indexLow = (sib >> 3) & 7;
-        if (indexLow != 4) {
-            d.hasIndex = true;
-            d.index = static_cast<uint8_t>(indexLow | ((d.rex & 0x02) ? 8 : 0));
-        }
-
-        uint8_t baseLow = sib & 7;
-        if (d.mod == 0 && baseLow == 5) {
-            d.hasBase = false;
-            d.rm = VM_REG_INVALID;
-            if (pos + 4 > instr.length) return d;
-            d.disp = *reinterpret_cast<const int32_t*>(instr.bytes + pos);
-            pos += 4;
-        } else {
-            d.hasBase = true;
-            d.rm = static_cast<uint8_t>(baseLow | ((d.rex & 0x01) ? 8 : 0));
-        }
-    } else if (d.memory && d.mod == 0 && rmLow == 5) {
-        if (pos + 4 > instr.length) return d;
-        d.hasBase = false;
-        d.rm = VM_REG_INVALID;
-        d.disp = *reinterpret_cast<const int32_t*>(instr.bytes + pos);
-        d.ripRelative = true;
-        pos += 4;
-    } else if (d.memory) {
-        d.hasBase = true;
-    }
-
-    if (d.mod == 1) {
-        if (pos + 1 > instr.length) return d;
-        d.disp = static_cast<int8_t>(instr.bytes[pos]);
-        pos += 1;
-    } else if (d.mod == 2) {
-        if (pos + 4 > instr.length) return d;
-        d.disp = *reinterpret_cast<const int32_t*>(instr.bytes + pos);
-        pos += 4;
-    }
-
-    d.immOffset = pos;
-    d.ok = true;
-    return d;
-}
-Translator::Translator() 
-    : m_nextVirtualReg(0)
-    , m_initialized(false)
-{
-    srand((unsigned int)time(nullptr));
-}
-
-Translator::~Translator() {}
-
-// ============================================================================
-// 鍏叡鎺ュ彛
-// ============================================================================
+Translator::Translator() = default;
+Translator::~Translator() = default;
 
 bool Translator::Initialize(const TranslationConfig& config) {
+    if (config.virtualRegisterCount < 16 || config.virtualRegisterCount > 32) return false;
     m_config = config;
     m_lastFailures.clear();
-
-    // 鍒濆鍖栧瘎瀛樺櫒鏄犲皠
-    for (uint8_t i = 0; i < 16; i++) {
-        if (config.enableRegisterRemapping) {
-            // 闅忔満鏄犲皠
-            m_registerMap[i] = static_cast<uint8_t>(i % config.virtualRegisterCount);
-        } else {
-            m_registerMap[i] = i;
-        }
-    }
-
-    // 鐢熸垚 opcode 鏄犲皠
-    m_opcodeMap = GenerateOpcodeMap();
-
     m_initialized = true;
     return true;
 }
 
-TranslationResult Translator::TranslateFunction(const Function& func) {
-    TranslationResult result{};
-    result.totalSize = 0;
-    result.registerCount = m_config.virtualRegisterCount;
-    result.success = false;
-    m_lastFailures.clear();
+std::unordered_map<uint8_t, uint8_t> Translator::GetRegisterMap() const { return m_registerMap; }
+std::unordered_map<uint8_t, uint8_t> Translator::GetOpcodeMap() const { return m_opcodeMap; }
+void Translator::SetOpcodeMap(const std::unordered_map<uint8_t, uint8_t>& map) { m_opcodeMap = map; }
+void Translator::SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& map) { m_registerMap = map; }
+const std::vector<TranslationFailure>& Translator::GetLastFailures() const { return m_lastFailures; }
 
-    if (!m_initialized) {
-        TranslationFailure failure{};
-        failure.address = func.entryAddress;
-        failure.mnemonic = "<translator>";
-        failure.reason = "translator not initialized";
-        m_lastFailures.push_back(failure);
-        result.failures = m_lastFailures;
-        return result;
+std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
+    std::unordered_map<uint8_t, uint8_t> result;
+    std::array<uint8_t, 256> values{};
+    for (uint32_t i = 0; i < values.size(); ++i) values[i] = static_cast<uint8_t>(i);
+    uint32_t state = 0xC51F4E31u ^ m_config.virtualRegisterCount;
+    for (size_t i = values.size() - 1; i > 0; --i) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        std::swap(values[i], values[state % (i + 1)]);
     }
-
-    result.success = true;
-    uint32_t currentOffset = 0;
-    std::vector<uint32_t> instrOffsets;
-
-    for (const auto& block : func.blocks) {
-        result.addrMap[block.startAddress] = currentOffset;
-
-        for (const auto& instr : block.instructions) {
-            result.addrMap[instr.address] = currentOffset;
-
-            BytecodeInstr vmInstr{};
-            if (!TranslateInstruction(instr, vmInstr)) {
-                result.success = false;
-                result.failures = m_lastFailures;
-                result.instructions.clear();
-                result.totalSize = 0;
-                return result;
-            }
-
-            instrOffsets.push_back(currentOffset);
-            result.instructions.push_back(vmInstr);
-            currentOffset += CalculateEncodedSize(vmInstr);
-
-            if (m_config.enableJunkInsertion && (rand() % 100) < (int)m_config.junkRatio) {
-                BytecodeInstr junk = GenerateJunkInstruction();
-                instrOffsets.push_back(currentOffset);
-                result.instructions.push_back(junk);
-                currentOffset += CalculateEncodedSize(junk);
-            }
-        }
-    }
-
-    for (auto& vmInstr : result.instructions) {
-        if (vmInstr.isJump) {
-            auto targetIt = result.addrMap.find(vmInstr.jumpTarget);
-            if (targetIt == result.addrMap.end()) {
-                result.success = false;
-                TranslationFailure failure{};
-                failure.address = func.entryAddress;
-                failure.mnemonic = "<control-flow>";
-                failure.reason = "jump/call target is outside translated function or not block-aligned";
-                m_lastFailures.push_back(failure);
-                result.failures = m_lastFailures;
-                result.instructions.clear();
-                result.totalSize = 0;
-                return result;
-            }
-            vmInstr.immediate = targetIt->second;
-        }
-    }
-
-    result.totalSize = currentOffset;
-    result.failures = m_lastFailures;
+    for (uint32_t i = 0; i < values.size(); ++i) result[static_cast<uint8_t>(i)] = values[i];
     return result;
 }
-TranslationResult Translator::TranslateBlock(const BasicBlock& block, uint32_t baseOffset) {
-    TranslationResult result{};
-    result.totalSize = baseOffset;
-    result.registerCount = m_config.virtualRegisterCount;
-    result.success = false;
-    m_lastFailures.clear();
 
-    if (!m_initialized) {
+std::vector<const OperandIR*> Translator::SemanticOperands(const InstructionIR& instruction) const {
+    std::vector<const OperandIR*> result;
+    for (const auto& operand : instruction.operands) {
+        if (operand.visibility == OperandVisibility::Explicit && operand.type != OperandType::None) {
+            result.push_back(&operand);
+        }
+    }
+    return result;
+}
+
+uint8_t Translator::MapRegisterFamily(uint8_t family) const {
+    if (family >= 16) return VM_REG_INVALID;
+    auto mapped = m_registerMap.find(family);
+    if (mapped == m_registerMap.end() || mapped->second >= m_config.virtualRegisterCount) {
+        return VM_REG_INVALID;
+    }
+    return mapped->second;
+}
+
+bool Translator::EncodeRegisterOperand(
+    const InstructionIR& instruction,
+    const OperandIR& operand,
+    uint8_t& vmRegister,
+    uint8_t& bitOffset,
+    uint16_t& flags,
+    bool destination)
+{
+    if (operand.type != OperandType::Register ||
+        operand.regInfo.registerClass != RegisterClass::GeneralPurpose ||
+        operand.regInfo.family >= 16) {
+        return FailInstruction(instruction, "operand is not a supported general-purpose register");
+    }
+    vmRegister = MapRegisterFamily(operand.regInfo.family);
+    if (vmRegister == VM_REG_INVALID) {
+        return FailInstruction(instruction, "native register has no injective VM register mapping");
+    }
+    bitOffset = operand.regInfo.bitOffset;
+    if (bitOffset != 0 && bitOffset != 8) {
+        return FailInstruction(instruction, "unsupported partial-register bit offset");
+    }
+    if (destination && operand.regInfo.zeroExtendsOnWrite) flags |= VM_OPERAND_DST_ZERO_EXTEND;
+    return true;
+}
+
+bool Translator::EncodeMemoryOperand(
+    const InstructionIR& instruction,
+    const OperandIR& operand,
+    BytecodeInstr& output)
+{
+    if (operand.type != OperandType::Memory) {
+        return FailInstruction(instruction, "expected memory operand");
+    }
+    const MemoryOperandIR& memory = operand.memory;
+    if (memory.segment != RegisterId::None && memory.segment != RegisterId::DS &&
+        memory.segment != RegisterId::SS) {
+        return FailInstruction(instruction, "FS/GS or non-default segment memory requires a dedicated segment bridge");
+    }
+    output.memBase = VM_REG_INVALID;
+    output.memIndex = VM_REG_INVALID;
+    output.memScale = memory.hasIndex ? memory.scale : 1;
+    output.memWidth = WidthBytes(memory.width ? memory.width : operand.width);
+    if (output.memWidth == 0 || output.memWidth > 8) {
+        return FailInstruction(instruction, "memory width is outside scalar VM range");
+    }
+
+    if (memory.isImageAddress) {
+        if (memory.resolvedRVA == 0) {
+            return FailInstruction(instruction, "RIP-relative memory operand has no resolved RVA");
+        }
+        output.memoryKind = VM_MEMORY_IMAGE_RVA;
+        output.memDisp = static_cast<int64_t>(memory.resolvedRVA);
+        return true;
+    }
+
+    output.memoryKind = VM_MEMORY_NATIVE;
+    output.memDisp = memory.displacement;
+    if (memory.hasBase) {
+        if (memory.baseInfo.registerClass != RegisterClass::GeneralPurpose) {
+            return FailInstruction(instruction, "memory base is not a general-purpose register");
+        }
+        output.memBase = MapRegisterFamily(memory.baseInfo.family);
+        if (output.memBase == VM_REG_INVALID) {
+            return FailInstruction(instruction, "memory base register has no VM mapping");
+        }
+    }
+    if (memory.hasIndex) {
+        if (memory.indexInfo.registerClass != RegisterClass::GeneralPurpose) {
+            return FailInstruction(instruction, "memory index is not a general-purpose register");
+        }
+        output.memIndex = MapRegisterFamily(memory.indexInfo.family);
+        if (output.memIndex == VM_REG_INVALID) {
+            return FailInstruction(instruction, "memory index register has no VM mapping");
+        }
+    }
+    if (!(output.memScale == 1 || output.memScale == 2 ||
+          output.memScale == 4 || output.memScale == 8)) {
+        return FailInstruction(instruction, "invalid memory index scale");
+    }
+    return true;
+}
+
+bool Translator::TranslateMove(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2) return FailInstruction(instruction, "MOV requires two semantic operands");
+    const OperandIR& dst = *operands[0];
+    const OperandIR& src = *operands[1];
+
+    if (IsRegister(&dst) && IsRegister(&src)) {
+        output.opcode = VM_MOV_RR;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset, output.flags, true) ||
+            !EncodeRegisterOperand(instruction, src, output.src, output.srcBitOffset, output.flags, false)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+    } else if (IsRegister(&dst) && IsImmediate(&src)) {
+        output.opcode = VM_MOV_RC;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset, output.flags, true)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+        output.immediate = src.immediate;
+        output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+        if (src.immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+    } else if (IsRegister(&dst) && IsMemory(&src)) {
+        output.opcode = VM_MOV_RM;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset, output.flags, true) ||
+            !EncodeMemoryOperand(instruction, src, output)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+        output.flags |= VM_OPERAND_SOURCE_MEMORY;
+    } else if (IsMemory(&dst) && IsRegister(&src)) {
+        output.opcode = VM_MOV_MR;
+        if (!EncodeRegisterOperand(instruction, src, output.src, output.srcBitOffset, output.flags, false) ||
+            !EncodeMemoryOperand(instruction, dst, output)) return false;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY;
+    } else if (IsMemory(&dst) && IsImmediate(&src)) {
+        output.opcode = VM_MOV_MC;
+        if (!EncodeMemoryOperand(instruction, dst, output)) return false;
+        output.immediate = src.immediate;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY | VM_OPERAND_SOURCE_IMMEDIATE;
+        if (src.immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+    } else {
+        return FailInstruction(instruction, "unsupported MOV operand combination");
+    }
+    return output.operandWidth != 0 || FailInstruction(instruction, "MOV has invalid operand width");
+}
+
+bool Translator::TranslateMoveExtend(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2 || !IsRegister(operands[0])) {
+        return FailInstruction(instruction, "MOVZX/MOVSX requires register destination and one source");
+    }
+    const OperandIR& dst = *operands[0];
+    const OperandIR& src = *operands[1];
+    if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset, output.flags, true)) return false;
+    output.operandWidth = WidthBytes(dst.width);
+    output.aux = WidthBytes(src.width);
+    if (output.operandWidth == 0 || output.aux == 0 || output.aux >= output.operandWidth) {
+        return FailInstruction(instruction, "invalid extending-move widths");
+    }
+
+    const bool sign = instruction.mnemonic == InstructionMnemonic::Movsx ||
+                      instruction.mnemonic == InstructionMnemonic::Movsxd;
+    if (IsRegister(&src)) {
+        output.opcode = static_cast<uint8_t>(instruction.mnemonic == InstructionMnemonic::Movsxd
+            ? VM_MOVSXD_RR : (sign ? VM_MOVSX_RR : VM_MOVZX_RR));
+        if (!EncodeRegisterOperand(instruction, src, output.src, output.srcBitOffset, output.flags, false)) return false;
+    } else if (IsMemory(&src)) {
+        output.opcode = static_cast<uint8_t>(instruction.mnemonic == InstructionMnemonic::Movsxd
+            ? VM_MOVSXD_RM : (sign ? VM_MOVSX_RM : VM_MOVZX_RM));
+        if (!EncodeMemoryOperand(instruction, src, output)) return false;
+        output.flags |= VM_OPERAND_SOURCE_MEMORY;
+    } else {
+        return FailInstruction(instruction, "extending move source must be register or memory");
+    }
+    if (sign) output.flags |= VM_OPERAND_SRC_SIGNED;
+    return true;
+}
+
+bool Translator::TranslateLea(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2 || !IsRegister(operands[0]) || !IsMemory(operands[1])) {
+        return FailInstruction(instruction, "LEA requires register and memory operands");
+    }
+    output.opcode = VM_LEA;
+    if (!EncodeRegisterOperand(instruction, *operands[0], output.dst, output.dstBitOffset, output.flags, true) ||
+        !EncodeMemoryOperand(instruction, *operands[1], output)) return false;
+    output.operandWidth = WidthBytes(operands[0]->width);
+    output.memWidth = 0;
+    return output.operandWidth != 0 || FailInstruction(instruction, "invalid LEA destination width");
+}
+
+bool Translator::TranslateXchg(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2) return FailInstruction(instruction, "XCHG requires two operands");
+    if (IsRegister(operands[0]) && IsRegister(operands[1])) {
+        output.opcode = VM_XCHG;
+        if (!EncodeRegisterOperand(instruction, *operands[0], output.dst, output.dstBitOffset, output.flags, true) ||
+            !EncodeRegisterOperand(instruction, *operands[1], output.src, output.srcBitOffset, output.flags, false)) return false;
+        output.operandWidth = WidthBytes(operands[0]->width);
+        return true;
+    }
+    const OperandIR* reg = IsRegister(operands[0]) ? operands[0] : operands[1];
+    const OperandIR* mem = IsMemory(operands[0]) ? operands[0] : operands[1];
+    if (!reg || !mem) return FailInstruction(instruction, "XCHG requires register/register or register/memory");
+    output.opcode = VM_XCHG_RM;
+    if (!EncodeRegisterOperand(instruction, *reg, output.dst, output.dstBitOffset, output.flags, true) ||
+        !EncodeMemoryOperand(instruction, *mem, output)) return false;
+    output.operandWidth = output.memWidth;
+    output.flags |= VM_OPERAND_SOURCE_MEMORY;
+    return true;
+}
+
+bool Translator::TranslateBinary(const InstructionIR& instruction, BytecodeInstr& output) {
+    BinaryOpcodes opcodes{};
+    if (!OpcodesForBinary(instruction.mnemonic, opcodes)) {
+        return FailInstruction(instruction, "binary operation has no VM opcode family");
+    }
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2) return FailInstruction(instruction, "binary operation requires two operands");
+    const OperandIR& dst = *operands[0];
+    const OperandIR& src = *operands[1];
+    const bool writesDestination = instruction.mnemonic != InstructionMnemonic::Cmp &&
+        instruction.mnemonic != InstructionMnemonic::Test;
+
+    if (IsRegister(&dst) && IsRegister(&src)) {
+        output.opcode = opcodes.rr;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset,
+                output.flags, writesDestination) ||
+            !EncodeRegisterOperand(instruction, src, output.src, output.srcBitOffset, output.flags, false)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+    } else if (IsRegister(&dst) && IsImmediate(&src)) {
+        output.opcode = opcodes.rc;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset,
+                output.flags, writesDestination)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+        output.immediate = src.immediate;
+        output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+        if (src.immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+    } else if (IsRegister(&dst) && IsMemory(&src)) {
+        output.opcode = opcodes.rm;
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset,
+                output.flags, writesDestination) ||
+            !EncodeMemoryOperand(instruction, src, output)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+        output.flags |= VM_OPERAND_SOURCE_MEMORY;
+    } else if (IsMemory(&dst) && (IsRegister(&src) || IsImmediate(&src))) {
+        output.opcode = opcodes.mr;
+        if (!EncodeMemoryOperand(instruction, dst, output)) return false;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY;
+        if (IsRegister(&src)) {
+            if (!EncodeRegisterOperand(instruction, src, output.src, output.srcBitOffset, output.flags, false)) return false;
+        } else {
+            output.immediate = src.immediate;
+            output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+            if (src.immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+        }
+    } else {
+        return FailInstruction(instruction, "unsupported binary operand combination");
+    }
+    return output.operandWidth != 0 || FailInstruction(instruction, "binary operation has invalid width");
+}
+
+bool Translator::TranslateUnary(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 1) return FailInstruction(instruction, "unary operation requires one operand");
+    const OperandIR& operand = *operands[0];
+    uint8_t regOpcode = 0;
+    uint8_t memOpcode = 0;
+    switch (instruction.mnemonic) {
+        case InstructionMnemonic::Not: regOpcode = VM_NOT_R; memOpcode = VM_NOT_R; break;
+        case InstructionMnemonic::Neg: regOpcode = VM_NEG_R; memOpcode = VM_NEG_M; break;
+        case InstructionMnemonic::Inc: regOpcode = VM_INC_R; memOpcode = VM_INC_M; break;
+        case InstructionMnemonic::Dec: regOpcode = VM_DEC_R; memOpcode = VM_DEC_M; break;
+        default: return FailInstruction(instruction, "unsupported unary mnemonic");
+    }
+    if (IsRegister(&operand)) {
+        output.opcode = regOpcode;
+        if (!EncodeRegisterOperand(instruction, operand, output.dst, output.dstBitOffset, output.flags, true)) return false;
+        output.operandWidth = WidthBytes(operand.width);
+    } else if (IsMemory(&operand)) {
+        output.opcode = memOpcode;
+        if (!EncodeMemoryOperand(instruction, operand, output)) return false;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY;
+    } else {
+        return FailInstruction(instruction, "unary operand must be register or memory");
+    }
+    return output.operandWidth != 0 || FailInstruction(instruction, "unary operation has invalid width");
+}
+
+bool Translator::TranslateShiftRotate(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2) return FailInstruction(instruction, "shift/rotate requires destination and count");
+    const OperandIR& dst = *operands[0];
+    const OperandIR& count = *operands[1];
+    const bool immediate = IsImmediate(&count);
+    if (!immediate && !IsRegister(&count)) return FailInstruction(instruction, "shift count must be register or immediate");
+
+    auto choose = [&](uint8_t rr, uint8_t rc, uint8_t mr, uint8_t mc) {
+        output.opcode = IsMemory(&dst) ? (immediate ? mc : mr) : (immediate ? rc : rr);
+    };
+    switch (instruction.mnemonic) {
+        case InstructionMnemonic::Shl: case InstructionMnemonic::Sal:
+            choose(VM_SHL_RR, VM_SHL_RC, VM_SHL_MR, VM_SHL_MC); break;
+        case InstructionMnemonic::Shr:
+            choose(VM_SHR_RR, VM_SHR_RC, VM_SHR_MR, VM_SHR_MC); break;
+        case InstructionMnemonic::Sar:
+            choose(VM_SAR_RR, VM_SAR_RC, VM_SAR_MR, VM_SAR_MC); break;
+        case InstructionMnemonic::Rol:
+            choose(VM_ROL_RR, VM_ROL_RC, VM_ROL_MR, VM_ROL_MC); break;
+        case InstructionMnemonic::Ror:
+            choose(VM_ROR_RR, VM_ROR_RC, VM_ROR_MR, VM_ROR_MC); break;
+        default: return FailInstruction(instruction, "unsupported shift/rotate mnemonic");
+    }
+
+    if (IsRegister(&dst)) {
+        if (!EncodeRegisterOperand(instruction, dst, output.dst, output.dstBitOffset, output.flags, true)) return false;
+        output.operandWidth = WidthBytes(dst.width);
+    } else if (IsMemory(&dst)) {
+        if (!EncodeMemoryOperand(instruction, dst, output)) return false;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY;
+    } else {
+        return FailInstruction(instruction, "shift/rotate destination must be register or memory");
+    }
+    if (immediate) {
+        output.immediate = count.immediate;
+        output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+    } else if (!EncodeRegisterOperand(instruction, count, output.src, output.srcBitOffset, output.flags, false)) {
+        return false;
+    }
+    return true;
+}
+
+bool Translator::TranslateMultiplyDivide(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.empty() || operands.size() > 3) {
+        return FailInstruction(instruction, "multiply/divide operand count is unsupported");
+    }
+    if (instruction.mnemonic == InstructionMnemonic::Mul ||
+        instruction.mnemonic == InstructionMnemonic::Div ||
+        instruction.mnemonic == InstructionMnemonic::Idiv ||
+        (instruction.mnemonic == InstructionMnemonic::Imul && operands.size() == 1)) {
+        if (operands.size() != 1) return FailInstruction(instruction, "implicit-accumulator operation requires one visible operand");
+        output.opcode = static_cast<uint8_t>(instruction.mnemonic == InstructionMnemonic::Mul ? VM_MUL_RR :
+            (instruction.mnemonic == InstructionMnemonic::Div ? VM_DIV_RR :
+             instruction.mnemonic == InstructionMnemonic::Idiv ? VM_IDIV_RR : VM_IMUL_RR));
+        output.flags |= VM_OPERAND_IMPLICIT_ACCUMULATOR;
+        const OperandIR& source = *operands[0];
+        output.operandWidth = WidthBytes(source.width);
+        if (IsRegister(&source)) {
+            if (!EncodeRegisterOperand(instruction, source, output.src, output.srcBitOffset, output.flags, false)) return false;
+        } else if (IsMemory(&source)) {
+            if (!EncodeMemoryOperand(instruction, source, output)) return false;
+            output.flags |= VM_OPERAND_SOURCE_MEMORY;
+        } else return FailInstruction(instruction, "multiply/divide source must be register or memory");
+        return true;
+    }
+
+    output.opcode = static_cast<uint8_t>(operands.size() == 3 ? VM_IMUL_RRC : VM_IMUL_RR);
+    if (!IsRegister(operands[0]) ||
+        !EncodeRegisterOperand(instruction, *operands[0], output.dst, output.dstBitOffset, output.flags, true)) return false;
+    output.operandWidth = WidthBytes(operands[0]->width);
+    const OperandIR* source = operands.size() == 1 ? operands[0] : operands[1];
+    if (IsRegister(source)) {
+        if (!EncodeRegisterOperand(instruction, *source, output.src, output.srcBitOffset, output.flags, false)) return false;
+    } else if (IsMemory(source)) {
+        if (!EncodeMemoryOperand(instruction, *source, output)) return false;
+        output.flags |= VM_OPERAND_SOURCE_MEMORY;
+    } else return FailInstruction(instruction, "IMUL source must be register or memory");
+    if (operands.size() == 3) {
+        if (!IsImmediate(operands[2])) return FailInstruction(instruction, "three-operand IMUL requires immediate third operand");
+        output.immediate = operands[2]->immediate;
+        if (operands[2]->immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+    }
+    return true;
+}
+
+bool Translator::TranslateStack(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 1) return FailInstruction(instruction, "PUSH/POP requires one operand");
+    const OperandIR& operand = *operands[0];
+    output.operandWidth = WidthBytes(operand.width ? operand.width : instruction.stackWidth);
+    if (output.operandWidth == 0) return FailInstruction(instruction, "invalid stack operand width");
+    if (instruction.mnemonic == InstructionMnemonic::Push) {
+        if (IsRegister(&operand)) {
+            output.opcode = VM_PUSH_R;
+            return EncodeRegisterOperand(instruction, operand, output.src, output.srcBitOffset, output.flags, false);
+        }
+        if (IsImmediate(&operand)) {
+            output.opcode = VM_PUSH_C;
+            output.immediate = operand.immediate;
+            output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+            if (operand.immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+            return true;
+        }
+        if (IsMemory(&operand)) {
+            output.opcode = VM_PUSH_MEM;
+            output.flags |= VM_OPERAND_SOURCE_MEMORY;
+            return EncodeMemoryOperand(instruction, operand, output);
+        }
+    } else if (instruction.mnemonic == InstructionMnemonic::Pop) {
+        if (IsRegister(&operand)) {
+            output.opcode = VM_POP_R;
+            return EncodeRegisterOperand(instruction, operand, output.dst, output.dstBitOffset, output.flags, true);
+        }
+        if (IsMemory(&operand)) {
+            output.opcode = VM_POP_MEM;
+            output.flags |= VM_OPERAND_DEST_MEMORY;
+            return EncodeMemoryOperand(instruction, operand, output);
+        }
+    }
+    return FailInstruction(instruction, "unsupported PUSH/POP operand");
+}
+
+VM_CONDITION Translator::MapCondition(BranchKind kind) const {
+    switch (kind) {
+        case BranchKind::Overflow: return VM_CONDITION_O;
+        case BranchKind::NotOverflow: return VM_CONDITION_NO;
+        case BranchKind::Below: return VM_CONDITION_B;
+        case BranchKind::AboveOrEqual: return VM_CONDITION_AE;
+        case BranchKind::Equal: return VM_CONDITION_E;
+        case BranchKind::NotEqual: return VM_CONDITION_NE;
+        case BranchKind::BelowOrEqual: return VM_CONDITION_BE;
+        case BranchKind::Above: return VM_CONDITION_A;
+        case BranchKind::Sign: return VM_CONDITION_S;
+        case BranchKind::NotSign: return VM_CONDITION_NS;
+        case BranchKind::Parity: return VM_CONDITION_P;
+        case BranchKind::NotParity: return VM_CONDITION_NP;
+        case BranchKind::Less: return VM_CONDITION_L;
+        case BranchKind::GreaterOrEqual: return VM_CONDITION_GE;
+        case BranchKind::LessOrEqual: return VM_CONDITION_LE;
+        case BranchKind::Greater: return VM_CONDITION_G;
+        default: return VM_CONDITION_ALWAYS;
+    }
+}
+
+uint8_t Translator::OpcodeForCondition(BranchKind kind) const {
+    switch (kind) {
+        case BranchKind::Overflow: return VM_JO;
+        case BranchKind::NotOverflow: return VM_JNO;
+        case BranchKind::Below: return VM_JB;
+        case BranchKind::AboveOrEqual: return VM_JAE;
+        case BranchKind::Equal: return VM_JZ;
+        case BranchKind::NotEqual: return VM_JNZ;
+        case BranchKind::BelowOrEqual: return VM_JBE;
+        case BranchKind::Above: return VM_JA;
+        case BranchKind::Sign: return VM_JS;
+        case BranchKind::NotSign: return VM_JNS;
+        case BranchKind::Parity: return VM_JP;
+        case BranchKind::NotParity: return VM_JNP;
+        case BranchKind::Less: return VM_JL;
+        case BranchKind::GreaterOrEqual: return VM_JGE;
+        case BranchKind::LessOrEqual: return VM_JLE;
+        case BranchKind::Greater: return VM_JG;
+        default: return 0;
+    }
+}
+
+bool Translator::TranslateBranch(const InstructionIR& instruction, BytecodeInstr& output) {
+    if (instruction.isIndirectBranch) {
+        return FailInstruction(instruction,
+            "indirect JMP requires a verified native-target to bytecode-boundary map");
+    }
+    if (!instruction.hasBranchTarget) return FailInstruction(instruction, "branch has no absolute target RVA");
+    output.opcode = instruction.branchKind == BranchKind::Unconditional
+        ? VM_JMP : OpcodeForCondition(instruction.branchKind);
+    if (output.opcode == 0) return FailInstruction(instruction, "branch condition has no VM mapping");
+    output.condition = static_cast<uint8_t>(MapCondition(instruction.branchKind));
+    output.branchTargetOffset = instruction.branchTargetRVA;
+    return true;
+}
+
+bool Translator::TranslateCall(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    const auto stackBytes = m_nativeCallStackBytes.find(instruction.address);
+    const uint32_t nativeStackBytes = stackBytes == m_nativeCallStackBytes.end()
+        ? 0u : stackBytes->second;
+    if (nativeStackBytes > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES) {
+        return FailInstruction(instruction, "native CALL stack arguments exceed bridge capacity");
+    }
+    const uint32_t abi = instruction.machineMode == MachineMode::X64
+        ? VM_ABI_WIN64 : static_cast<uint32_t>(m_config.x86CallAbi);
+    output.aux = VM_CALL_AUX_ENCODE(abi, nativeStackBytes);
+    if (instruction.isIndirectBranch) {
+        if (operands.size() != 1) return FailInstruction(instruction, "indirect CALL requires one target operand");
+        if (IsRegister(operands[0])) {
+            output.opcode = VM_CALL_INDIRECT_R;
+            output.flags |= VM_OPERAND_NATIVE_BRIDGE;
+            return EncodeRegisterOperand(instruction, *operands[0], output.src, output.srcBitOffset, output.flags, false);
+        }
+        if (IsMemory(operands[0])) {
+            if (operands[0]->memory.isImageAddress &&
+                m_config.importThunkRVAs.count(operands[0]->memory.resolvedRVA) != 0) {
+                output.opcode = VM_CALL_IMPORT;
+                output.immediate = operands[0]->memory.resolvedRVA;
+                output.flags |= VM_OPERAND_TARGET_IS_IMPORT | VM_OPERAND_NATIVE_BRIDGE;
+                return true;
+            }
+            output.opcode = VM_CALL_INDIRECT_M;
+            output.flags |= VM_OPERAND_SOURCE_MEMORY | VM_OPERAND_NATIVE_BRIDGE;
+            return EncodeMemoryOperand(instruction, *operands[0], output);
+        }
+        return FailInstruction(instruction, "indirect CALL target must be register or memory");
+    }
+    if (!instruction.hasBranchTarget) return FailInstruction(instruction, "direct CALL has no target RVA");
+    if (instruction.branchTargetRVA >= m_functionStart && instruction.branchTargetRVA < m_functionEnd) {
+        output.opcode = VM_CALL_VM;
+        output.aux = 0;
+        output.branchTargetOffset = instruction.branchTargetRVA;
+        output.immediate = instruction.rva + instruction.length;
+    } else {
+        output.opcode = VM_CALL_NATIVE;
+        output.immediate = instruction.branchTargetRVA;
+        output.flags |= VM_OPERAND_NATIVE_BRIDGE;
+    }
+    return true;
+}
+
+bool Translator::TranslateRet(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() > 1) return FailInstruction(instruction, "RET has invalid operand count");
+    output.opcode = VM_RET_VM;
+    if (!operands.empty()) {
+        if (!IsImmediate(operands[0]) || operands[0]->immediate > 0xFFFFu) {
+            return FailInstruction(instruction, "RET stack cleanup is outside uint16 range");
+        }
+        output.aux = static_cast<uint32_t>(operands[0]->immediate);
+    }
+    if (instruction.machineMode == MachineMode::X64 && output.aux != 0) {
+        return FailInstruction(instruction, "x64 RET with immediate stack cleanup is outside the Windows x64 ABI");
+    }
+    return true;
+}
+
+bool Translator::TranslateConditionalData(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    output.condition = static_cast<uint8_t>(MapCondition(instruction.branchKind));
+    if (output.condition == VM_CONDITION_ALWAYS) {
+        return FailInstruction(instruction, "CMOV/SET condition is not represented in IR");
+    }
+    if (instruction.mnemonic == InstructionMnemonic::Cmov) {
+        if (operands.size() != 2 || !IsRegister(operands[0])) return FailInstruction(instruction, "CMOV requires register destination");
+        if (!EncodeRegisterOperand(instruction, *operands[0], output.dst, output.dstBitOffset, output.flags, true)) return false;
+        output.operandWidth = WidthBytes(operands[0]->width);
+        if (IsRegister(operands[1])) {
+            output.opcode = VM_CMOV_RR;
+            return EncodeRegisterOperand(instruction, *operands[1], output.src, output.srcBitOffset, output.flags, false);
+        }
+        if (IsMemory(operands[1])) {
+            output.opcode = VM_CMOV_RM;
+            output.flags |= VM_OPERAND_SOURCE_MEMORY;
+            return EncodeMemoryOperand(instruction, *operands[1], output);
+        }
+        return FailInstruction(instruction, "CMOV source must be register or memory");
+    }
+    if (instruction.mnemonic == InstructionMnemonic::Setcc) {
+        if (operands.size() != 1) return FailInstruction(instruction, "SETcc requires one destination");
+        output.operandWidth = 1;
+        if (IsRegister(operands[0])) {
+            output.opcode = VM_SET_R;
+            return EncodeRegisterOperand(instruction, *operands[0], output.dst, output.dstBitOffset, output.flags, true);
+        }
+        if (IsMemory(operands[0])) {
+            output.opcode = VM_SET_M;
+            output.flags |= VM_OPERAND_DEST_MEMORY;
+            return EncodeMemoryOperand(instruction, *operands[0], output);
+        }
+        return FailInstruction(instruction, "SETcc destination must be register or memory");
+    }
+    return FailInstruction(instruction, "unsupported conditional data instruction");
+}
+
+bool Translator::TranslateBitOperation(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    if (operands.size() != 2 || (!IsRegister(operands[0]) && !IsMemory(operands[0])) ||
+        (!IsRegister(operands[1]) && !IsImmediate(operands[1]))) {
+        return FailInstruction(instruction, "BT/BTS/BTR requires register-or-memory base and register-or-immediate index");
+    }
+    output.opcode = static_cast<uint8_t>(instruction.mnemonic == InstructionMnemonic::Bt ? VM_BT_RR :
+        (instruction.mnemonic == InstructionMnemonic::Bts ? VM_BTS_RR : VM_BTR_RR));
+    if (IsRegister(operands[0])) {
+        if (!EncodeRegisterOperand(instruction, *operands[0], output.dst,
+                output.dstBitOffset, output.flags,
+                instruction.mnemonic != InstructionMnemonic::Bt)) return false;
+        output.operandWidth = WidthBytes(operands[0]->width);
+    } else {
+        if (!EncodeMemoryOperand(instruction, *operands[0], output)) return false;
+        output.operandWidth = output.memWidth;
+        output.flags |= VM_OPERAND_DEST_MEMORY;
+        if (instruction.hasLockPrefix) {
+            if (instruction.mnemonic == InstructionMnemonic::Bt) {
+                return FailInstruction(instruction, "LOCK prefix is invalid for BT");
+            }
+            output.flags |= VM_OPERAND_ATOMIC;
+        }
+    }
+    if (IsRegister(operands[1])) {
+        if (!EncodeRegisterOperand(instruction, *operands[1], output.src,
+                output.srcBitOffset, output.flags, false)) return false;
+    } else {
+        output.immediate = operands[1]->immediate;
+        output.flags |= VM_OPERAND_SOURCE_IMMEDIATE;
+        if (operands[1]->immediateSigned) output.flags |= VM_OPERAND_IMMEDIATE_SIGNED;
+    }
+    return output.operandWidth == 2 || output.operandWidth == 4 || output.operandWidth == 8
+        ? true : FailInstruction(instruction, "BT/BTS/BTR width must be 16, 32, or 64 bits");
+}
+
+bool Translator::TranslateImplicitScalar(const InstructionIR& instruction, BytecodeInstr& output) {
+    const auto operands = SemanticOperands(instruction);
+    const auto implicitWidth = [&]() -> uint8_t {
+        uint8_t width = WidthBytes(instruction.operandWidth);
+        if (width) return width;
+        if (instruction.mnemonicText == "cwd" || instruction.mnemonicText == "cbw" ||
+            instruction.mnemonicText == "pushf" || instruction.mnemonicText == "popf") return 2;
+        if (instruction.mnemonicText == "cdq" || instruction.mnemonicText == "cwde" ||
+            instruction.mnemonicText == "pushfd" || instruction.mnemonicText == "popfd") return 4;
+        if (instruction.mnemonicText == "cqo" || instruction.mnemonicText == "cdqe" ||
+            instruction.mnemonicText == "pushfq" || instruction.mnemonicText == "popfq") return 8;
+        return instruction.machineMode == MachineMode::X64 ? 8 : 4;
+    };
+    switch (instruction.mnemonic) {
+        case InstructionMnemonic::PushFlags:
+            if (!operands.empty()) return FailInstruction(instruction, "PUSHF has explicit operands");
+            output.opcode = VM_PUSHF;
+            output.operandWidth = implicitWidth();
+            return true;
+        case InstructionMnemonic::PopFlags:
+            if (!operands.empty()) return FailInstruction(instruction, "POPF has explicit operands");
+            output.opcode = VM_POPF;
+            output.operandWidth = implicitWidth();
+            return true;
+        case InstructionMnemonic::Leave:
+            if (!operands.empty()) return FailInstruction(instruction, "LEAVE has explicit operands");
+            output.opcode = VM_LEAVE;
+            output.operandWidth = instruction.machineMode == MachineMode::X64 ? 8 : 4;
+            return true;
+        case InstructionMnemonic::SignExtendAccumulator:
+            if (!operands.empty()) return FailInstruction(instruction, "CWD/CDQ/CQO has explicit operands");
+            output.opcode = VM_SIGN_EXTEND_ACC;
+            output.operandWidth = implicitWidth();
+            return output.operandWidth == 2 || output.operandWidth == 4 || output.operandWidth == 8;
+        case InstructionMnemonic::ExtendAccumulator:
+            if (!operands.empty()) return FailInstruction(instruction, "CBW/CWDE/CDQE has explicit operands");
+            output.opcode = VM_EXTEND_ACC;
+            output.operandWidth = implicitWidth();
+            return output.operandWidth == 2 || output.operandWidth == 4 || output.operandWidth == 8;
+        case InstructionMnemonic::Clc: output.opcode = VM_CLC; break;
+        case InstructionMnemonic::Stc: output.opcode = VM_STC; break;
+        case InstructionMnemonic::Cmc: output.opcode = VM_CMC; break;
+        case InstructionMnemonic::Lahf: output.opcode = VM_LAHF; output.operandWidth = 1; break;
+        case InstructionMnemonic::Sahf: output.opcode = VM_SAHF; output.operandWidth = 1; break;
+        default: return FailInstruction(instruction, "unknown implicit scalar instruction");
+    }
+    return operands.empty() || FailInstruction(instruction, "implicit scalar instruction has explicit operands");
+}
+
+bool Translator::TranslateInstruction(const InstructionIR& instruction, BytecodeInstr& output) {
+    InitializeInstruction(output);
+    if (instruction.hasLockPrefix && instruction.mnemonic != InstructionMnemonic::Xchg &&
+        instruction.mnemonic != InstructionMnemonic::Bts &&
+        instruction.mnemonic != InstructionMnemonic::Btr) {
+        return FailInstruction(instruction,
+            "LOCK-prefixed instruction has no atomic VM handler");
+    }
+    switch (instruction.mnemonic) {
+        case InstructionMnemonic::Nop: output.opcode = VM_NOP; return true;
+        case InstructionMnemonic::Mov: return TranslateMove(instruction, output);
+        case InstructionMnemonic::Movzx:
+        case InstructionMnemonic::Movsx:
+        case InstructionMnemonic::Movsxd: return TranslateMoveExtend(instruction, output);
+        case InstructionMnemonic::Lea: return TranslateLea(instruction, output);
+        case InstructionMnemonic::Xchg: return TranslateXchg(instruction, output);
+        case InstructionMnemonic::Add: case InstructionMnemonic::Adc:
+        case InstructionMnemonic::Sub: case InstructionMnemonic::Sbb:
+        case InstructionMnemonic::And: case InstructionMnemonic::Or:
+        case InstructionMnemonic::Xor: case InstructionMnemonic::Cmp:
+        case InstructionMnemonic::Test: return TranslateBinary(instruction, output);
+        case InstructionMnemonic::Not: case InstructionMnemonic::Neg:
+        case InstructionMnemonic::Inc: case InstructionMnemonic::Dec:
+            return TranslateUnary(instruction, output);
+        case InstructionMnemonic::Shl: case InstructionMnemonic::Sal:
+        case InstructionMnemonic::Shr: case InstructionMnemonic::Sar:
+        case InstructionMnemonic::Rol: case InstructionMnemonic::Ror:
+            return TranslateShiftRotate(instruction, output);
+        case InstructionMnemonic::Mul: case InstructionMnemonic::Imul:
+        case InstructionMnemonic::Div: case InstructionMnemonic::Idiv:
+            return TranslateMultiplyDivide(instruction, output);
+        case InstructionMnemonic::Push: case InstructionMnemonic::Pop:
+            return TranslateStack(instruction, output);
+        case InstructionMnemonic::PushFlags: case InstructionMnemonic::PopFlags:
+        case InstructionMnemonic::Leave:
+        case InstructionMnemonic::SignExtendAccumulator:
+        case InstructionMnemonic::ExtendAccumulator:
+        case InstructionMnemonic::Clc: case InstructionMnemonic::Stc:
+        case InstructionMnemonic::Cmc: case InstructionMnemonic::Lahf:
+        case InstructionMnemonic::Sahf:
+            return TranslateImplicitScalar(instruction, output);
+        case InstructionMnemonic::Bt: case InstructionMnemonic::Bts:
+        case InstructionMnemonic::Btr:
+            return TranslateBitOperation(instruction, output);
+        case InstructionMnemonic::Bswap: {
+            const auto operands = SemanticOperands(instruction);
+            if (operands.size() != 1 || !IsRegister(operands[0]) ||
+                !EncodeRegisterOperand(instruction, *operands[0], output.dst,
+                    output.dstBitOffset, output.flags, true)) {
+                return FailInstruction(instruction, "BSWAP requires one general-purpose register");
+            }
+            output.opcode = VM_BSWAP;
+            output.operandWidth = WidthBytes(operands[0]->width);
+            return output.operandWidth == 4 || output.operandWidth == 8
+                ? true : FailInstruction(instruction, "BSWAP width must be 32 or 64 bits");
+        }
+        case InstructionMnemonic::Jmp: case InstructionMnemonic::Jo:
+        case InstructionMnemonic::Jno: case InstructionMnemonic::Jb:
+        case InstructionMnemonic::Jae: case InstructionMnemonic::Jz:
+        case InstructionMnemonic::Jnz: case InstructionMnemonic::Jbe:
+        case InstructionMnemonic::Ja: case InstructionMnemonic::Js:
+        case InstructionMnemonic::Jns: case InstructionMnemonic::Jp:
+        case InstructionMnemonic::Jnp: case InstructionMnemonic::Jl:
+        case InstructionMnemonic::Jge: case InstructionMnemonic::Jle:
+        case InstructionMnemonic::Jg: return TranslateBranch(instruction, output);
+        case InstructionMnemonic::Call: return TranslateCall(instruction, output);
+        case InstructionMnemonic::Ret: return TranslateRet(instruction, output);
+        case InstructionMnemonic::Cmov: case InstructionMnemonic::Setcc:
+            return TranslateConditionalData(instruction, output);
+        case InstructionMnemonic::Simd:
+            return TranslateExtendedBridge(instruction, output);
+        case InstructionMnemonic::FloatingPoint:
+            return TranslateExtendedBridge(instruction, output);
+        default:
+            return FailInstruction(instruction, "instruction mnemonic is outside production VM ISA");
+    }
+}
+
+bool Translator::TranslateExtendedBridge(
+    const InstructionIR& instruction,
+    BytecodeInstr& output)
+{
+    const bool x87 = instruction.instructionSet == InstructionSetClass::X87 ||
+        instruction.mnemonic == InstructionMnemonic::FloatingPoint;
+    const bool avx = instruction.instructionSet == InstructionSetClass::Avx;
+    if ((x87 && !m_config.enableX87Bridge) || (!x87 && !m_config.enableSimdBridge)) {
+        return FailInstruction(instruction, x87
+            ? "x87 native bridge is disabled by configuration"
+            : "SIMD native bridge is disabled by configuration");
+    }
+    if (instruction.instructionSet == InstructionSetClass::Avx512 ||
+        instruction.encoding == InstructionEncoding::Evex ||
+        instruction.encoding == InstructionEncoding::Mvex) {
+        return FailInstruction(instruction, "AVX-512/EVEX state is outside the production bridge contract");
+    }
+    if (instruction.instructionSet == InstructionSetClass::UnsupportedExtended ||
+        instruction.encoding == InstructionEncoding::Xop ||
+        instruction.encoding == InstructionEncoding::ThreeDNow) {
+        return FailInstruction(instruction, "XOP/3DNow/MMX-only instruction is outside the production bridge contract");
+    }
+    if (instruction.hasLockPrefix || instruction.IsBranch() || instruction.IsCall() ||
+        instruction.IsReturn() || instruction.length == 0 || instruction.length > instruction.rawBytes.size()) {
+        return FailInstruction(instruction, "extended-state bridge received an unsafe instruction category");
+    }
+
+    std::array<bool, 16> usedGprs{};
+    bool hasExtendedSemantics = x87 || avx || instruction.instructionSet == InstructionSetClass::Sse;
+    bool hasRipRelativeMemory = false;
+    for (const auto& operand : instruction.operands) {
+        if (operand.type == OperandType::Register) {
+            const RegisterClass cls = operand.regInfo.registerClass;
+            hasExtendedSemantics = hasExtendedSemantics || IsExtendedRegisterClass(cls);
+            if (cls == RegisterClass::GeneralPurpose && operand.regInfo.family < usedGprs.size()) {
+                if ((operand.regInfo.family == 4 || operand.regInfo.family == 5) &&
+                    OperandWrites(operand.action)) {
+                    return FailInstruction(instruction,
+                        "native extended-state bridge cannot write RSP/ESP or RBP/EBP");
+                }
+                usedGprs[operand.regInfo.family] = true;
+            } else if (cls == RegisterClass::Mask || cls == RegisterClass::Control ||
+                       cls == RegisterClass::Debug || cls == RegisterClass::Other) {
+                return FailInstruction(instruction, "bridge operand uses an unsupported architectural register class");
+            }
+        } else if (operand.type == OperandType::Memory) {
+            if (operand.memory.hasBase &&
+                operand.memory.baseInfo.registerClass == RegisterClass::GeneralPurpose &&
+                operand.memory.baseInfo.family < usedGprs.size()) {
+                usedGprs[operand.memory.baseInfo.family] = true;
+            }
+            if (operand.memory.hasIndex &&
+                operand.memory.indexInfo.registerClass == RegisterClass::GeneralPurpose &&
+                operand.memory.indexInfo.family < usedGprs.size()) {
+                usedGprs[operand.memory.indexInfo.family] = true;
+            }
+            hasRipRelativeMemory = hasRipRelativeMemory || operand.memory.isRipRelative;
+        } else if (operand.type == OperandType::Pointer) {
+            return FailInstruction(instruction, "far pointer operands are not bridgeable");
+        }
+    }
+    if (!hasExtendedSemantics) {
+        return FailInstruction(instruction, "unsupported scalar instruction cannot use the SIMD/x87 bridge");
+    }
+    if (hasRipRelativeMemory &&
+        (instruction.displacementSize != 4 || instruction.displacementOffset > instruction.length ||
+         4u > instruction.length - instruction.displacementOffset)) {
+        return FailInstruction(instruction, "RIP-relative bridge instruction has no relocatable disp32 field");
+    }
+
+    static constexpr uint8_t kX64HiddenCandidates[] = {11, 10, 9, 8, 2, 1, 0};
+    static constexpr uint8_t kX86HiddenCandidates[] = {2, 1, 0};
+    const uint8_t* candidates = instruction.machineMode == MachineMode::X64
+        ? kX64HiddenCandidates : kX86HiddenCandidates;
+    const size_t candidateCount = instruction.machineMode == MachineMode::X64
+        ? std::size(kX64HiddenCandidates) : std::size(kX86HiddenCandidates);
+    uint8_t hidden = 0xFF;
+    for (size_t i = 0; i < candidateCount; ++i) {
+        if (!usedGprs[candidates[i]]) {
+            hidden = candidates[i];
+            break;
+        }
+    }
+    if (hidden == 0xFF) {
+        return FailInstruction(instruction, "bridge instruction consumes every volatile hidden-state register");
+    }
+
+    output.opcode = static_cast<uint8_t>(x87 ? VM_BRIDGE_X87 : VM_BRIDGE_SIMD);
+    output.immediate = instruction.rva;
+    output.flags = VM_OPERAND_NATIVE_BRIDGE;
+    output.aux = hidden | (avx ? VM_BRIDGE_AUX_AVX : 0u) |
+        (x87 ? VM_BRIDGE_AUX_X87 : 0u);
+    return true;
+}
+
+bool Translator::FinalizeControlFlow(TranslationResult& result) {
+    for (auto& instruction : result.instructions) {
+        const auto* descriptor = VMSchema::Lookup(instruction.opcode);
+        if (!descriptor) return false;
+        if (descriptor->branch) {
+            const uint32_t targetRva = instruction.branchTargetOffset;
+            auto target = result.addrMap.find(targetRva);
+            if (target == result.addrMap.end()) {
+                TranslationFailure failure{};
+                failure.address = targetRva;
+                failure.mnemonic = descriptor->name;
+                failure.reason = "VM branch target is not an instruction boundary in the function";
+                m_lastFailures.push_back(std::move(failure));
+                return false;
+            }
+            instruction.branchTargetOffset = target->second;
+        }
+    }
+    return true;
+}
+
+void Translator::AnalyzeNativeCallStackArguments(const Function& function) {
+    m_nativeCallStackBytes.clear();
+    for (const auto& block : function.blocks) {
+        uint32_t pushedBytes = 0;
+        uint32_t writtenArgumentBytes = 0;
+        for (const auto& instruction : block.instructions) {
+            if (instruction.machineMode == MachineMode::X86 &&
+                instruction.mnemonic == InstructionMnemonic::Push) {
+                uint32_t width = instruction.stackWidth == 16 ? 2u : 4u;
+                pushedBytes = (std::min)(
+                    VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 1u, pushedBytes + width);
+            }
+            for (const auto& operand : instruction.operands) {
+                if (operand.type != OperandType::Memory || !OperandWrites(operand.action) ||
+                    !operand.memory.hasBase ||
+                    operand.memory.baseInfo.registerClass != RegisterClass::GeneralPurpose ||
+                    operand.memory.baseInfo.family != 4 || operand.memory.displacement < 0) continue;
+                const uint32_t width = WidthBytes(
+                    operand.memory.width ? operand.memory.width : operand.width);
+                if (width == 0) continue;
+                if (operand.memory.displacement >
+                        VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 0x20u) {
+                    writtenArgumentBytes = VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 1u;
+                    continue;
+                }
+                const uint32_t displacement = static_cast<uint32_t>(operand.memory.displacement);
+                if (instruction.machineMode == MachineMode::X64) {
+                    if (displacement < 0x20u) continue;
+                    writtenArgumentBytes = (std::max)(writtenArgumentBytes,
+                        displacement - 0x20u + width);
+                } else {
+                    writtenArgumentBytes = (std::max)(writtenArgumentBytes,
+                        displacement + width);
+                }
+            }
+            if (instruction.IsCall()) {
+                uint32_t bytes = instruction.machineMode == MachineMode::X64
+                    ? AlignUpValue(writtenArgumentBytes, 8)
+                    : AlignUpValue((std::max)(pushedBytes, writtenArgumentBytes), 2);
+                m_nativeCallStackBytes[instruction.address] = bytes;
+                pushedBytes = 0;
+                writtenArgumentBytes = 0;
+            } else if (instruction.IsBranch() || instruction.IsReturn()) {
+                pushedBytes = 0;
+                writtenArgumentBytes = 0;
+            }
+        }
+    }
+}
+
+bool Translator::ValidateFlagDataflow(
+    const Function& function,
+    uint32_t& terminalReturnStackCleanup) {
+    if (function.blocks.empty()) return false;
+    terminalReturnStackCleanup = 0;
+    bool sawTerminalReturn = false;
+    std::map<uint64_t, const InstructionIR*> instructions;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            instructions[instruction.address] = &instruction;
+        }
+    }
+    if (instructions.find(function.entryAddress) == instructions.end()) return false;
+
+    struct FlowKey {
+        uint64_t address;
+        std::vector<uint64_t> returns;
+        bool operator<(const FlowKey& other) const {
+            if (address != other.address) return address < other.address;
+            return returns < other.returns;
+        }
+    };
+    struct FlowState {
+        FlowKey key;
+        uint64_t undefined;
+    };
+    std::vector<FlowState> worklist = {{{function.entryAddress, {}}, 0}};
+    std::map<FlowKey, uint64_t> mergedStates;
+
+    auto enqueue = [&](const FlowKey& key, uint64_t undefined) {
+        auto found = mergedStates.find(key);
+        if (found == mergedStates.end()) {
+            mergedStates.emplace(key, undefined);
+            worklist.push_back({key, undefined});
+        } else {
+            const uint64_t merged = found->second | undefined;
+            if (merged != found->second) {
+                found->second = merged;
+                worklist.push_back({key, merged});
+            }
+        }
+    };
+    mergedStates.emplace(worklist.front().key, 0);
+
+    while (!worklist.empty()) {
+        FlowState state = std::move(worklist.back());
+        worklist.pop_back();
+        auto current = instructions.find(state.key.address);
+        if (current == instructions.end()) {
+            TranslationFailure failure{};
+            failure.address = state.key.address;
+            failure.mnemonic = "cfg";
+            failure.reason = "reachable flow target is not an instruction boundary";
+            m_lastFailures.push_back(std::move(failure));
+            return false;
+        }
+        const InstructionIR& instruction = *current->second;
+        uint64_t undefined = state.undefined;
+        if ((instruction.flagsRead & undefined) != 0) {
+            FailInstruction(instruction,
+                "instruction reads flags that are undefined on a reachable predecessor path");
+            return false;
+        }
+        undefined &= ~(instruction.flagsWritten | instruction.flagsUndefined);
+        undefined |= instruction.flagsUndefined;
+        const uint64_t fallthrough = instruction.address + instruction.length;
+
+        if (instruction.IsReturn()) {
+            if (!state.key.returns.empty()) {
+                FlowKey returned = state.key;
+                returned.address = returned.returns.back();
+                returned.returns.pop_back();
+                enqueue(returned, undefined);
+            } else {
+                const auto operands = SemanticOperands(instruction);
+                uint32_t cleanup = 0;
+                if (operands.size() > 1 ||
+                    (!operands.empty() &&
+                        (operands[0]->type != OperandType::Immediate ||
+                         operands[0]->immediate > 0xFFFFu))) {
+                    FailInstruction(instruction, "terminal RET has an invalid stack cleanup operand");
+                    return false;
+                }
+                if (!operands.empty()) cleanup = static_cast<uint32_t>(operands[0]->immediate);
+                if (instruction.machineMode == MachineMode::X64 && cleanup != 0) {
+                    FailInstruction(instruction,
+                        "x64 terminal RET uses callee stack cleanup outside the Windows x64 ABI");
+                    return false;
+                }
+                if (!sawTerminalReturn) {
+                    terminalReturnStackCleanup = cleanup;
+                    sawTerminalReturn = true;
+                } else if (terminalReturnStackCleanup != cleanup) {
+                    FailInstruction(instruction,
+                        "reachable terminal RET paths use inconsistent stack cleanup values");
+                    return false;
+                }
+            }
+        } else if (instruction.IsCall()) {
+            FlowKey called = state.key;
+            if (!instruction.isIndirectBranch && instruction.hasBranchTarget &&
+                instructions.find(instruction.branchTargetRVA) != instructions.end()) {
+                if (called.returns.size() >= VM_MAX_INTERNAL_CALL_DEPTH) {
+                    FailInstruction(instruction, "internal CALL depth exceeds runtime bound");
+                    return false;
+                }
+                called.returns.push_back(fallthrough);
+                called.address = instruction.branchTargetRVA;
+            } else {
+                called.address = fallthrough;
+            }
+            enqueue(called, undefined);
+        } else if (instruction.IsBranch()) {
+            if (instruction.isIndirectBranch || !instruction.hasBranchTarget) {
+                FailInstruction(instruction, "indirect or unresolved branch is not statically verifiable");
+                return false;
+            }
+            FlowKey branch = state.key;
+            branch.address = instruction.branchTargetRVA;
+            enqueue(branch, undefined);
+            if (instruction.IsConditionalBranch()) {
+                FlowKey next = state.key;
+                next.address = fallthrough;
+                enqueue(next, undefined);
+            }
+        } else {
+            FlowKey next = state.key;
+            next.address = fallthrough;
+            enqueue(next, undefined);
+        }
+        if (mergedStates.size() > 1000000u) {
+            FailInstruction(instruction, "flag dataflow state space exceeds verification bound");
+            return false;
+        }
+    }
+    if (!sawTerminalReturn) {
         TranslationFailure failure{};
-        failure.address = block.startAddress;
-        failure.mnemonic = "<translator>";
-        failure.reason = "translator not initialized";
-        m_lastFailures.push_back(failure);
+        failure.address = function.entryAddress;
+        failure.mnemonic = "ret";
+        failure.reason = "function has no reachable terminal RET";
+        m_lastFailures.push_back(std::move(failure));
+        return false;
+    }
+    return true;
+}
+
+TranslationResult Translator::TranslateFunction(const Function& function) {
+    TranslationResult result{};
+    result.registerCount = m_config.virtualRegisterCount;
+    m_lastFailures.clear();
+    if (!m_initialized || function.blocks.empty() || function.size == 0) {
+        result.failures = m_lastFailures;
+        return result;
+    }
+    m_functionStart = function.entryAddress;
+    m_functionEnd = function.entryAddress + function.size;
+    AnalyzeNativeCallStackArguments(function);
+    if (!ValidateFlagDataflow(function, result.returnStackCleanup)) {
         result.failures = m_lastFailures;
         return result;
     }
 
-    result.success = true;
-    uint32_t currentOffset = baseOffset;
+    std::vector<const InstructionIR*> ordered;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) ordered.push_back(&instruction);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const InstructionIR* lhs, const InstructionIR* rhs) {
+        return lhs->address < rhs->address;
+    });
+    ordered.erase(std::unique(ordered.begin(), ordered.end(), [](const InstructionIR* lhs, const InstructionIR* rhs) {
+        return lhs->address == rhs->address;
+    }), ordered.end());
 
-    for (const auto& instr : block.instructions) {
-        result.addrMap[instr.address] = currentOffset;
-
-        BytecodeInstr vmInstr{};
-        if (!TranslateInstruction(instr, vmInstr)) {
-            result.success = false;
+    for (const InstructionIR* instruction : ordered) {
+        if (!instruction || instruction->length == 0) {
             result.failures = m_lastFailures;
-            result.instructions.clear();
-            result.totalSize = 0;
             return result;
         }
-
-        result.instructions.push_back(vmInstr);
-        currentOffset += CalculateEncodedSize(vmInstr);
+        BytecodeInstr bytecodeInstruction{};
+        if (!TranslateInstruction(*instruction, bytecodeInstruction)) {
+            result.failures = m_lastFailures;
+            return result;
+        }
+        std::string schemaReason;
+        const bool bridge = bytecodeInstruction.opcode == VM_BRIDGE_SIMD ||
+            bytecodeInstruction.opcode == VM_BRIDGE_X87;
+        if (!bridge && !VMSchema::ValidateInstruction(
+                bytecodeInstruction, m_config.virtualRegisterCount, schemaReason)) {
+            FailInstruction(*instruction, "schema validation failed: " + schemaReason);
+            result.failures = m_lastFailures;
+            return result;
+        }
+        const uint32_t offset = static_cast<uint32_t>(result.instructions.size() * VMSchema::InstructionSize());
+        result.addrMap[instruction->address] = offset;
+        result.instructions.push_back(bytecodeInstruction);
+        if (bridge) {
+            VMBridgeRequest request{};
+            request.instructionIndex = static_cast<uint32_t>(result.instructions.size() - 1u);
+            request.functionRVA = static_cast<uint32_t>(function.entryAddress);
+            request.instruction = *instruction;
+            request.hiddenNativeRegister = static_cast<uint8_t>(bytecodeInstruction.aux &
+                VM_BRIDGE_AUX_HIDDEN_REGISTER_MASK);
+            request.usesAvx = (bytecodeInstruction.aux & VM_BRIDGE_AUX_AVX) != 0;
+            request.usesX87 = (bytecodeInstruction.aux & VM_BRIDGE_AUX_X87) != 0;
+            result.usesSimd = result.usesSimd || !request.usesX87;
+            result.usesAvx = result.usesAvx || request.usesAvx;
+            result.usesX87 = result.usesX87 || request.usesX87;
+            result.bridgeRequests.push_back(std::move(request));
+        }
     }
 
-    result.totalSize = currentOffset - baseOffset;
+    if (!FinalizeControlFlow(result)) {
+        result.failures = m_lastFailures;
+        return result;
+    }
+    result.totalSize = static_cast<uint32_t>(result.instructions.size() * VMSchema::InstructionSize());
+    result.success = !result.instructions.empty();
     result.failures = m_lastFailures;
     return result;
 }
-std::vector<uint8_t> Translator::GenerateBytecode(
-    const TranslationResult& result,
-    const uint8_t* key,
-    const uint8_t* nonce)
-{
+
+TranslationResult Translator::TranslateBlock(const BasicBlock& block, uint32_t) {
+    Function function{};
+    function.entryAddress = block.startAddress;
+    function.size = static_cast<uint32_t>(block.endAddress - block.startAddress);
+    function.blocks.push_back(block);
+    return TranslateFunction(function);
+}
+
+std::vector<uint8_t> Translator::GenerateBytecode(const TranslationResult& result) {
+    if (!result.success) return {};
     std::vector<uint8_t> bytecode;
-    if (!result.success) return bytecode;
-
-    // 缂栫爜姣忔潯鎸囦护
-    for (const auto& instr : result.instructions) {
-        EncodeInstruction(instr, bytecode);
+    bytecode.reserve(result.instructions.size() * VMSchema::InstructionSize());
+    for (const auto& instruction : result.instructions) {
+        std::string reason;
+        if (!VMSchema::ValidateInstruction(instruction, m_config.virtualRegisterCount, reason)) return {};
+        VMSchema::Encode(instruction, m_opcodeMap, bytecode);
     }
-
-    // 鍔犲瘑瀛楄妭鐮?
-    if (key) {
-        EncryptBytecode(bytecode, key, nonce);
-    }
-
-    return bytecode;
+    return bytecode.size() == result.instructions.size() * VMSchema::InstructionSize()
+        ? bytecode : std::vector<uint8_t>{};
 }
 
-std::unordered_map<uint8_t, uint8_t> Translator::GetRegisterMap() const {
-    return m_registerMap;
+std::string Translator::FormatInstructionBytes(const InstructionIR& instruction) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (uint8_t i = 0; i < instruction.length && i < instruction.rawBytes.size(); ++i) {
+        if (i) oss << ' ';
+        oss << std::setw(2) << static_cast<unsigned>(instruction.rawBytes[i]);
+    }
+    return oss.str();
 }
 
-const std::vector<TranslationFailure>& Translator::GetLastFailures() const {
-    return m_lastFailures;
-}
-std::unordered_map<uint8_t, uint8_t> Translator::GetOpcodeMap() const {
-    return m_opcodeMap;
-}
-void Translator::SetOpcodeMap(const std::unordered_map<uint8_t, uint8_t>& opcodeMap) {
-    if (!opcodeMap.empty()) m_opcodeMap = opcodeMap;
-}
-
-void Translator::SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& registerMap) {
-    if (!registerMap.empty()) m_registerMap = registerMap;
-}
-std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
-    std::unordered_map<uint8_t, uint8_t> opcodeMap;
-
-    // 鏍囧噯 opcode 鍒楄〃
-    uint8_t standardOpcodes[] = {
-        VM_NOP, VM_MOV_RR, VM_MOV_RC, VM_MOV_RM, VM_MOV_MR, VM_LEA,
-        VM_PUSH_R, VM_PUSH_C, VM_POP_R, VM_PUSHAD, VM_POPAD,
-        VM_ADD_RR, VM_ADD_RC, VM_SUB_RR, VM_SUB_RC,
-        VM_AND_RR, VM_AND_RC, VM_OR_RR, VM_OR_RC, VM_XOR_RR, VM_XOR_RC, VM_NOT_R,
-        VM_CMP_RR, VM_CMP_RC, VM_TEST_RR, VM_TEST_RC,
-        VM_JMP, VM_JZ, VM_JNZ, VM_JA, VM_JB, VM_JAE, VM_JBE, VM_JG, VM_JGE, VM_JL, VM_JLE,
-        VM_CALL_VM, VM_RET_VM, VM_CALL_NATIVE, VM_VMEXIT
-    };
-
-    int count = sizeof(standardOpcodes) / sizeof(standardOpcodes[0]);
-
-    // 鐢熸垚闅忔満鏄犲皠
-    std::vector<uint8_t> randomOpcodes;
-    for (int i = 0; i < 256; i++) {
-        randomOpcodes.push_back((uint8_t)i);
-    }
-
-    // 鎵撲贡
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(randomOpcodes.begin(), randomOpcodes.end(), g);
-
-    for (int i = 0; i < count; i++) {
-        opcodeMap[standardOpcodes[i]] = randomOpcodes[i];
-    }
-
-    return opcodeMap;
-}
-
-// ============================================================================
-// 鎸囦护缈昏瘧
-// ============================================================================
-
-bool Translator::TranslateInstruction(const Instruction& instr, BytecodeInstr& outInstr) {
-    outInstr.memBaseReg = VM_REG_INVALID;
-    outInstr.memIndexReg = VM_REG_INVALID;
-    outInstr.memScale = 1;
-    outInstr.memWidth = 8;
-    outInstr.operandWidth = 8;
-    if (instr.mnemonic.empty()) return FailInstruction(instr, "empty or undecoded instruction");
-
-    if (instr.mnemonic == "mov") return TranslateMov(instr, outInstr);
-    if (instr.mnemonic == "add") return TranslateAdd(instr, outInstr);
-    if (instr.mnemonic == "sub") return TranslateSub(instr, outInstr);
-    if (instr.mnemonic == "cmp") return TranslateCmp(instr, outInstr);
-    if (instr.mnemonic == "and") return TranslateAnd(instr, outInstr);
-    if (instr.mnemonic == "or") return TranslateOr(instr, outInstr);
-    if (instr.mnemonic == "test") return TranslateTest(instr, outInstr);
-    if (instr.mnemonic == "lea") return TranslateLea(instr, outInstr);
-    if (instr.mnemonic == "push") return TranslatePush(instr, outInstr);
-    if (instr.mnemonic == "pop") return TranslatePop(instr, outInstr);
-    if (instr.mnemonic == "call") return TranslateCall(instr, outInstr);
-    if (instr.mnemonic == "ret") return TranslateRet(instr, outInstr);
-    if (instr.mnemonic == "nop") return TranslateNop(instr, outInstr);
-
-    if (instr.mnemonic == "xor") {
-        DecodedModRM m = DecodeModRMInstr(instr);
-        if (!m.ok) return FailInstruction(instr, "invalid XOR ModRM");
-        if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: XOR memory form requires native bridge");
-        if (m.opcode == 0x31 || m.opcode == 0x33) {
-            if ((m.opcode == 0x31 && m.rm == 4) || (m.opcode == 0x33 && m.reg == 4)) return FailInstruction(instr, "XOR into RSP requires VM/native stack mapping");
-            outInstr.opcode = VM_XOR_RR;
-            outInstr.operandWidth = RegisterWidthForOperand(m);
-            if (!IsSupportedRegisterWidth(outInstr.operandWidth)) return FailInstruction(instr, "unsupported XOR operand width");
-            if (m.opcode == 0x31) {
-                outInstr.regDst = MapRegister(m.rm);
-                outInstr.regSrc = MapRegister(m.reg);
-            } else {
-                outInstr.regDst = MapRegister(m.reg);
-                outInstr.regSrc = MapRegister(m.rm);
-            }
-            return true;
-        }
-        if (m.opcode == 0x83 && m.immOffset < instr.length && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 6) {
-            if (m.rm == 4) return FailInstruction(instr, "XOR into RSP requires VM/native stack mapping");
-            outInstr.opcode = VM_XOR_RC;
-            outInstr.regDst = MapRegister(m.rm);
-            outInstr.operandWidth = RegisterWidthForOperand(m);
-            if (!IsSupportedRegisterWidth(outInstr.operandWidth)) return FailInstruction(instr, "unsupported XOR operand width");
-            outInstr.immediate = static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]));
-            return true;
-        }
-        return FailInstruction(instr, "unsupported XOR encoding");
-    }
-    if (instr.mnemonic == "int3") {
-        outInstr.opcode = VM_INT3;
-        return true;
-    }
-
-    if (IsJumpInstruction(instr.mnemonic)) {
-        return TranslateJump(instr, outInstr);
-    }
-
-    return FailInstruction(instr, "unsupported instruction mnemonic");
-}
-bool Translator::TranslateMov(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    uint32_t opPos = m.ok ? m.opcodeOffset : (((instr.bytes[0] & 0xF0) == 0x40 && instr.length > 1) ? 1 : 0);
-    uint8_t opcode = m.ok ? m.opcode : instr.bytes[opPos];
-    uint8_t rex = 0;
-    if (opPos > 0 && (instr.bytes[opPos - 1] & 0xF0) == 0x40) rex = instr.bytes[opPos - 1];
-
-    if (opcode >= 0xB8 && opcode <= 0xBF) {
-        uint8_t reg = static_cast<uint8_t>((opcode - 0xB8) | ((rex & 0x01) ? 8 : 0));
-        outInstr.opcode = VM_MOV_RC;
-        outInstr.regDst = MapRegister(reg);
-        outInstr.operandWidth = (rex & 0x08) ? 8 : 4;
-        if ((rex & 0x08) && instr.length >= opPos + 9) {
-            outInstr.immediate = *reinterpret_cast<const uint64_t*>(instr.bytes + opPos + 1);
-        } else if (instr.length >= opPos + 5) {
-            outInstr.immediate = *reinterpret_cast<const uint32_t*>(instr.bytes + opPos + 1);
-        } else {
-            return FailInstruction(instr, "truncated MOV immediate");
-        }
-        return true;
-    }
-
-    if (!m.ok) return FailInstruction(instr, "invalid MOV ModRM");
-
-    auto fillMemory = [&](uint8_t width) -> bool {
-        if (!IsSupportedMemoryWidth(width)) return false;
-        outInstr.memBaseReg = m.hasBase ? MapRegister(m.rm) : VM_REG_INVALID;
-        outInstr.memIndexReg = m.hasIndex ? MapRegister(m.index) : VM_REG_INVALID;
-        outInstr.memScale = m.scale;
-        outInstr.memWidth = width;
-        outInstr.memoryKind = m.ripRelative ? 1u : 0u;
-        outInstr.isRipRelative = m.ripRelative;
-        outInstr.memDisp = m.ripRelative
-            ? static_cast<int64_t>(instr.address + instr.length + m.disp)
-            : m.disp;
-        return true;
-    };
-
-    if (opcode == 0x8B || opcode == 0x8A) {
-        if (m.reg == 4) return FailInstruction(instr, "MOV into RSP requires VM/native stack mapping");
-        uint8_t width = MemoryWidthForOpcode(m, opcode);
-        if (m.memory) {
-            if (!fillMemory(width)) return FailInstruction(instr, "unsupported MOV memory width");
-            outInstr.opcode = VM_MOV_RM;
-            outInstr.regDst = MapRegister(m.reg);
-            outInstr.regSrc = 0;
-        } else {
-            if (width != 4 && width != 8) return FailInstruction(instr, "partial-register MOV is not safe for VM register mapping");
-            outInstr.opcode = VM_MOV_RR;
-            outInstr.regDst = MapRegister(m.reg);
-            outInstr.regSrc = MapRegister(m.rm);
-            outInstr.operandWidth = width;
-        }
-        return true;
-    }
-
-    if (opcode == 0x89 || opcode == 0x88) {
-        if (!m.memory && m.rm == 4) return FailInstruction(instr, "MOV into RSP requires VM/native stack mapping");
-        uint8_t width = MemoryWidthForOpcode(m, opcode);
-        if (m.memory) {
-            if (!fillMemory(width)) return FailInstruction(instr, "unsupported MOV memory width");
-            outInstr.opcode = VM_MOV_MR;
-            outInstr.regDst = 0;
-            outInstr.regSrc = MapRegister(m.reg);
-        } else {
-            if (width != 4 && width != 8) return FailInstruction(instr, "partial-register MOV is not safe for VM register mapping");
-            outInstr.opcode = VM_MOV_RR;
-            outInstr.regDst = MapRegister(m.rm);
-            outInstr.regSrc = MapRegister(m.reg);
-            outInstr.operandWidth = width;
-        }
-        return true;
-    }
-
-    return FailInstruction(instr, "unsupported MOV encoding");
-}
-bool Translator::TranslateAdd(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid ADD ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: ADD memory form requires native bridge");
-    uint8_t width = RegisterWidthForOperand(m);
-    if (!IsSupportedRegisterWidth(width)) return FailInstruction(instr, "unsupported ADD operand width");
-
-    if (m.opcode == 0x03 || m.opcode == 0x01) {
-        uint8_t dst = (m.opcode == 0x03) ? m.reg : m.rm;
-        uint8_t src = (m.opcode == 0x03) ? m.rm : m.reg;
-        if (dst == 4) return FailInstruction(instr, "ADD into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_ADD_RR;
-        outInstr.regDst = MapRegister(dst);
-        outInstr.regSrc = MapRegister(src);
-        outInstr.operandWidth = width;
-        return true;
-    }
-    if ((m.opcode == 0x83 || m.opcode == 0x81) && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 0 && m.immOffset < instr.length) {
-        if (m.rm == 4) return FailInstruction(instr, "ADD into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_ADD_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = width;
-        outInstr.immediate = (m.opcode == 0x83)
-            ? static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported ADD encoding");
-}
-
-bool Translator::TranslateSub(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid SUB ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: SUB memory form requires native bridge");
-    uint8_t width = RegisterWidthForOperand(m);
-    if (!IsSupportedRegisterWidth(width)) return FailInstruction(instr, "unsupported SUB operand width");
-
-    if (m.opcode == 0x2B || m.opcode == 0x29) {
-        uint8_t dst = (m.opcode == 0x2B) ? m.reg : m.rm;
-        uint8_t src = (m.opcode == 0x2B) ? m.rm : m.reg;
-        if (dst == 4) return FailInstruction(instr, "SUB into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_SUB_RR;
-        outInstr.regDst = MapRegister(dst);
-        outInstr.regSrc = MapRegister(src);
-        outInstr.operandWidth = width;
-        return true;
-    }
-    if ((m.opcode == 0x83 || m.opcode == 0x81) && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 5 && m.immOffset < instr.length) {
-        if (m.rm == 4) return FailInstruction(instr, "SUB into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_SUB_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = width;
-        outInstr.immediate = (m.opcode == 0x83)
-            ? static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported SUB encoding");
-}
-
-bool Translator::TranslateCmp(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid CMP ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: CMP memory form requires native bridge");
-    uint8_t width = RegisterWidthForOperand(m);
-    if (!IsSupportedRegisterWidth(width)) return FailInstruction(instr, "unsupported CMP operand width");
-
-    if (m.opcode == 0x3B || m.opcode == 0x39) {
-        uint8_t lhs = (m.opcode == 0x3B) ? m.reg : m.rm;
-        uint8_t rhs = (m.opcode == 0x3B) ? m.rm : m.reg;
-        outInstr.opcode = VM_CMP_RR;
-        outInstr.regDst = MapRegister(lhs);
-        outInstr.regSrc = MapRegister(rhs);
-        outInstr.operandWidth = width;
-        return true;
-    }
-    if ((m.opcode == 0x83 || m.opcode == 0x81) && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 7 && m.immOffset < instr.length) {
-        outInstr.opcode = VM_CMP_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = width;
-        outInstr.immediate = (m.opcode == 0x83)
-            ? static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported CMP encoding");
-}
-
-bool Translator::TranslateAnd(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid AND ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: AND memory form requires native bridge");
-    uint8_t width = RegisterWidthForOperand(m);
-    if (!IsSupportedRegisterWidth(width)) return FailInstruction(instr, "unsupported AND operand width");
-    if (m.opcode == 0x23 || m.opcode == 0x21) {
-        uint8_t dst = (m.opcode == 0x23) ? m.reg : m.rm;
-        uint8_t src = (m.opcode == 0x23) ? m.rm : m.reg;
-        if (dst == 4) return FailInstruction(instr, "AND into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_AND_RR;
-        outInstr.regDst = MapRegister(dst);
-        outInstr.regSrc = MapRegister(src);
-        outInstr.operandWidth = width;
-        return true;
-    }
-    if ((m.opcode == 0x83 || m.opcode == 0x81) && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 4 && m.immOffset < instr.length) {
-        if (m.rm == 4) return FailInstruction(instr, "AND into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_AND_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = width;
-        outInstr.immediate = (m.opcode == 0x83)
-            ? static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported AND encoding");
-}
-
-bool Translator::TranslateOr(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid OR ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: OR memory form requires native bridge");
-    uint8_t width = RegisterWidthForOperand(m);
-    if (!IsSupportedRegisterWidth(width)) return FailInstruction(instr, "unsupported OR operand width");
-    if (m.opcode == 0x0B || m.opcode == 0x09) {
-        uint8_t dst = (m.opcode == 0x0B) ? m.reg : m.rm;
-        uint8_t src = (m.opcode == 0x0B) ? m.rm : m.reg;
-        if (dst == 4) return FailInstruction(instr, "OR into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_OR_RR;
-        outInstr.regDst = MapRegister(dst);
-        outInstr.regSrc = MapRegister(src);
-        outInstr.operandWidth = width;
-        return true;
-    }
-    if ((m.opcode == 0x83 || m.opcode == 0x81) && ((instr.bytes[m.opcodeOffset + 1] >> 3) & 7) == 1 && m.immOffset < instr.length) {
-        if (m.rm == 4) return FailInstruction(instr, "OR into RSP requires VM/native stack mapping");
-        outInstr.opcode = VM_OR_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = width;
-        outInstr.immediate = (m.opcode == 0x83)
-            ? static_cast<int64_t>(static_cast<int8_t>(instr.bytes[m.immOffset]))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported OR encoding");
-}
-
-bool Translator::TranslateTest(const Instruction& instr, BytecodeInstr& outInstr) {
-    uint32_t opPos = 0;
-    bool operand16 = false;
-    while (opPos < instr.length) {
-        uint8_t b = instr.bytes[opPos];
-        if (b == 0x66) {
-            operand16 = true;
-            opPos++;
-            continue;
-        }
-        if ((b & 0xF0) == 0x40) {
-            opPos++;
-            continue;
-        }
-        break;
-    }
-    if (opPos >= instr.length) return FailInstruction(instr, "empty_instruction_bytes");
-
-    uint8_t opcode = instr.bytes[opPos];
-    if (opcode == 0xA8) {
-        if (opPos + 2 > instr.length) return FailInstruction(instr, "truncated TEST imm8");
-        outInstr.opcode = VM_TEST_RC;
-        outInstr.regDst = MapRegister(0);
-        outInstr.operandWidth = 1;
-        outInstr.immediate = instr.bytes[opPos + 1];
-        return true;
-    }
-    if (opcode == 0xA9) {
-        uint32_t immSize = operand16 ? 2u : 4u;
-        if (opPos + 1 + immSize > instr.length) return FailInstruction(instr, "truncated TEST imm32");
-        outInstr.opcode = VM_TEST_RC;
-        outInstr.regDst = MapRegister(0);
-        outInstr.operandWidth = static_cast<uint8_t>(immSize);
-        outInstr.immediate = (immSize == 2)
-            ? static_cast<uint64_t>(*reinterpret_cast<const uint16_t*>(instr.bytes + opPos + 1))
-            : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + opPos + 1));
-        return true;
-    }
-
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok) return FailInstruction(instr, "invalid TEST ModRM");
-    if (m.memory || m.ripRelative) return FailInstruction(instr, "memory_arithmetic_not_supported: TEST memory form requires native bridge");
-
-    if (m.opcode == 0x85) {
-        outInstr.opcode = VM_TEST_RR;
-        outInstr.regDst = MapRegister(m.reg);
-        outInstr.regSrc = MapRegister(m.rm);
-        outInstr.operandWidth = RegisterWidthForOperand(m);
-        return true;
-    }
-
-    if ((m.opcode == 0xF6 || m.opcode == 0xF7) && ((m.reg & 7u) == 0u)) {
-        uint32_t immSize = (m.opcode == 0xF6) ? 1u : (m.operand16 ? 2u : 4u);
-        if (m.immOffset + immSize > instr.length) return FailInstruction(instr, "truncated TEST immediate");
-        outInstr.opcode = VM_TEST_RC;
-        outInstr.regDst = MapRegister(m.rm);
-        outInstr.operandWidth = (m.opcode == 0xF6) ? 1 : RegisterWidthForOperand(m);
-        if (immSize == 1) {
-            outInstr.immediate = instr.bytes[m.immOffset];
-        } else if (immSize == 2) {
-            outInstr.immediate = static_cast<uint64_t>(*reinterpret_cast<const uint16_t*>(instr.bytes + m.immOffset));
-        } else {
-            outInstr.immediate = m.rexW
-                ? static_cast<uint64_t>(static_cast<int64_t>(*reinterpret_cast<const int32_t*>(instr.bytes + m.immOffset)))
-                : static_cast<uint64_t>(*reinterpret_cast<const uint32_t*>(instr.bytes + m.immOffset));
-        }
-        return true;
-    }
-
-    return FailInstruction(instr, "unsupported TEST encoding");
-}
-
-bool Translator::TranslateLea(const Instruction& instr, BytecodeInstr& outInstr) {
-    DecodedModRM m = DecodeModRMInstr(instr);
-    if (!m.ok || !m.memory) return FailInstruction(instr, "LEA requires memory addressing operand");
-    if (!IsSupportedMemoryWidth(8)) return FailInstruction(instr, "unsupported LEA address width");
-
-    outInstr.opcode = VM_LEA;
-    outInstr.regDst = MapRegister(m.reg);
-    outInstr.regSrc = 0;
-    outInstr.memBaseReg = m.hasBase ? MapRegister(m.rm) : VM_REG_INVALID;
-    outInstr.memIndexReg = m.hasIndex ? MapRegister(m.index) : VM_REG_INVALID;
-    outInstr.memScale = m.scale;
-    outInstr.memWidth = RegisterWidthForOperand(m);
-    outInstr.memoryKind = m.ripRelative ? 1u : 0u;
-    outInstr.isRipRelative = m.ripRelative;
-    outInstr.memDisp = m.ripRelative
-        ? static_cast<int64_t>(instr.address + instr.length + m.disp)
-        : m.disp;
-    return true;
-}
-bool Translator::TranslatePush(const Instruction& instr, BytecodeInstr& outInstr) {
-    uint32_t opPos = 0;
-    uint8_t rex = 0;
-    if (instr.length > 1 && (instr.bytes[0] & 0xF0) == 0x40) {
-        rex = instr.bytes[0];
-        opPos = 1;
-    }
-    if (opPos >= instr.length) return FailInstruction(instr, "truncated PUSH");
-    uint8_t opcode = instr.bytes[opPos];
-    if (opcode >= 0x50 && opcode <= 0x57) {
-        uint8_t reg = static_cast<uint8_t>((opcode - 0x50) | ((rex & 0x01) ? 8 : 0));
-        outInstr.opcode = VM_PUSH_R;
-        outInstr.regDst = MapRegister(reg);
-        outInstr.operandWidth = 8;
-        return true;
-    }
-    if (opcode == 0x68 && opPos + 5 <= instr.length) {
-        outInstr.opcode = VM_PUSH_C;
-        outInstr.regDst = 0;
-        outInstr.operandWidth = 8;
-        outInstr.immediate = static_cast<uint64_t>(static_cast<int64_t>(*reinterpret_cast<const int32_t*>(instr.bytes + opPos + 1)));
-        return true;
-    }
-    if (opcode == 0x6A && opPos + 2 <= instr.length) {
-        outInstr.opcode = VM_PUSH_C;
-        outInstr.regDst = 0;
-        outInstr.operandWidth = 8;
-        outInstr.immediate = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(instr.bytes[opPos + 1])));
-        return true;
-    }
-    return FailInstruction(instr, "unsupported PUSH encoding");
-}
-bool Translator::TranslatePop(const Instruction& instr, BytecodeInstr& outInstr) {
-    uint32_t opPos = 0;
-    uint8_t rex = 0;
-    if (instr.length > 1 && (instr.bytes[0] & 0xF0) == 0x40) {
-        rex = instr.bytes[0];
-        opPos = 1;
-    }
-    if (opPos >= instr.length) return FailInstruction(instr, "truncated POP");
-    uint8_t opcode = instr.bytes[opPos];
-    if (opcode >= 0x58 && opcode <= 0x5F) {
-        uint8_t reg = static_cast<uint8_t>((opcode - 0x58) | ((rex & 0x01) ? 8 : 0));
-        outInstr.opcode = VM_POP_R;
-        outInstr.regDst = MapRegister(reg);
-        outInstr.operandWidth = 8;
-        return true;
-    }
-    return FailInstruction(instr, "unsupported POP encoding");
-}
-bool Translator::TranslateJump(const Instruction& instr, BytecodeInstr& outInstr) {
-    if (!instr.hasTarget) return FailInstruction(instr, "jump instruction has no decoded target");
-
-    if (instr.bytes[0] == 0xEB || instr.bytes[0] == 0xE9) {
-        outInstr.opcode = VM_JMP;
-        outInstr.jumpTarget = static_cast<uint32_t>(instr.targetAddress);
-        outInstr.isJump = true;
-        return true;
-    }
-
-    uint8_t cond = 0xFF;
-    if (instr.bytes[0] >= 0x70 && instr.bytes[0] <= 0x7F) {
-        cond = instr.bytes[0] - 0x70;
-    } else if (instr.bytes[0] == 0x0F && instr.bytes[1] >= 0x80 && instr.bytes[1] <= 0x8F) {
-        cond = instr.bytes[1] - 0x80;
-    }
-
-    if (cond != 0xFF) {
-        switch (cond) {
-            case 0x0: outInstr.opcode = VM_JO;  break;
-            case 0x1: outInstr.opcode = VM_JNO; break;
-            case 0x2: outInstr.opcode = VM_JB;  break;
-            case 0x3: outInstr.opcode = VM_JAE; break;
-            case 0x4: outInstr.opcode = VM_JZ;  break;
-            case 0x5: outInstr.opcode = VM_JNZ; break;
-            case 0x6: outInstr.opcode = VM_JBE; break;
-            case 0x7: outInstr.opcode = VM_JA;  break;
-            case 0x8: outInstr.opcode = VM_JS;  break;
-            case 0x9: outInstr.opcode = VM_JNS; break;
-            case 0xA: return FailInstruction(instr, "JP/JPE requires parity flag bridge that is not implemented");
-            case 0xB: return FailInstruction(instr, "JNP/JPO requires parity flag bridge that is not implemented");
-            case 0xC: outInstr.opcode = VM_JL;  break;
-            case 0xD: outInstr.opcode = VM_JGE; break;
-            case 0xE: outInstr.opcode = VM_JLE; break;
-            case 0xF: outInstr.opcode = VM_JG;  break;
-        }
-        outInstr.jumpTarget = static_cast<uint32_t>(instr.targetAddress);
-        outInstr.isJump = true;
-        return true;
-    }
-
-    return FailInstruction(instr, "unsupported jump encoding");
-}
-bool Translator::TranslateCall(const Instruction& instr, BytecodeInstr& outInstr) {
-    if (instr.isIndirect || !instr.hasTarget) {
-        return FailInstruction(instr, "indirect CALL requires annotated native bridge target");
-    }
-    if (instr.targetAddress > 0xFFFFFFFFULL) {
-        return FailInstruction(instr, "CALL target RVA is outside 32-bit PE RVA range");
-    }
-    outInstr.opcode = VM_CALL_NATIVE;
-    outInstr.immediate = static_cast<uint32_t>(instr.targetAddress);
-    outInstr.operandWidth = 8;
-    return true;
-}
-bool Translator::TranslateRet(const Instruction& instr, BytecodeInstr& outInstr) {
-    // RET
-    if (instr.bytes[0] == 0xC3) {
-        outInstr.opcode = VM_RET_VM;
-        return true;
-    }
-    // RET imm16
-    if (instr.bytes[0] == 0xC2) {
-        outInstr.opcode = VM_RET_VM;
-        outInstr.immediate = *(uint16_t*)(instr.bytes + 1);
-        return true;
-    }
-
-    outInstr.opcode = VM_RET_VM;
-    return true;
-}
-
-bool Translator::TranslateNop(const Instruction& instr, BytecodeInstr& outInstr) {
-    outInstr.opcode = VM_NOP;
-    return true;
-}
-
-// ============================================================================
-// 鍐呴儴瀹炵幇
-// ============================================================================
-
-uint8_t Translator::MapRegister(uint8_t x86Reg) {
-    auto it = m_registerMap.find(x86Reg);
-    if (it != m_registerMap.end()) {
-        return it->second;
-    }
-    return x86Reg % m_config.virtualRegisterCount;
-}
-
-void Translator::EncodeInstruction(const BytecodeInstr& instr, std::vector<uint8_t>& bytecode) {
-    // 濡傛灉鍚敤浜?opcode 闅忔満鍖栵紝鏄犲皠 opcode
-    uint8_t encodedOpcode = instr.opcode;
-    if (m_config.enableOpcodeRandomization) {
-        auto it = m_opcodeMap.find(instr.opcode);
-        if (it != m_opcodeMap.end()) {
-            encodedOpcode = it->second;
-        }
-    }
-
-    // 缂栫爜 opcode
-    EncodeOpcode(encodedOpcode, bytecode);
-
-    // 鏍规嵁鎸囦护绫诲瀷缂栫爜鎿嶄綔鏁?
-    switch (instr.opcode) {
-        case VM_NOP:
-            break;
-
-        case VM_MOV_RR:
-        case VM_ADD_RR:
-        case VM_SUB_RR:
-        case VM_AND_RR:
-        case VM_OR_RR:
-        case VM_XOR_RR:
-        case VM_CMP_RR:
-        case VM_TEST_RR:
-        case VM_SHL_RR:
-        case VM_SHR_RR:
-        case VM_SAR_RR:
-        case VM_ADC_RR:
-        case VM_SBB_RR:
-        case VM_XCHG:
-            EncodeRegister(instr.regDst, bytecode);
-            EncodeRegister(instr.regSrc, bytecode);
-            bytecode.push_back(instr.operandWidth);
-            break;
-
-        case VM_MOV_RC:
-        case VM_ADD_RC:
-        case VM_SUB_RC:
-        case VM_AND_RC:
-        case VM_OR_RC:
-        case VM_XOR_RC:
-        case VM_CMP_RC:
-        case VM_TEST_RC:
-        case VM_PUSH_C:
-            EncodeRegister(instr.regDst, bytecode);
-            EncodeImmediate64(instr.immediate, bytecode);
-            bytecode.push_back(instr.operandWidth);
-            break;
-
-        case VM_PUSH_R:
-        case VM_POP_R:
-        case VM_INC_R:
-        case VM_DEC_R:
-        case VM_NEG_R:
-        case VM_NOT_R:
-            EncodeRegister(instr.regDst, bytecode);
-            bytecode.push_back(instr.operandWidth);
-            break;
-
-        case VM_MOV_RM:
-        case VM_MOV_MR:
-        case VM_LEA:
-            EncodeRegister(instr.regDst, bytecode);
-            EncodeRegister(instr.regSrc, bytecode);
-            bytecode.push_back(instr.memBaseReg);
-            bytecode.push_back(instr.memIndexReg);
-            bytecode.push_back(instr.memScale);
-            bytecode.push_back(instr.memWidth);
-            bytecode.push_back(instr.memoryKind);
-            EncodeImmediate64(static_cast<uint64_t>(instr.memDisp), bytecode);
-            break;
-
-        case VM_JMP:
-        case VM_JZ:
-        case VM_JNZ:
-        case VM_JA:
-        case VM_JB:
-        case VM_JAE:
-        case VM_JBE:
-        case VM_JG:
-        case VM_JL:
-        case VM_JGE:
-        case VM_JLE:
-        case VM_JO:
-        case VM_JNO:
-        case VM_JS:
-        case VM_JNS:
-        case VM_CALL_VM:
-            EncodeImmediate32((uint32_t)instr.immediate, bytecode);
-            break;
-
-        case VM_PUSHAD:
-        case VM_POPAD:
-        case VM_PUSHF:
-        case VM_POPF:
-        case VM_RET_VM:
-        case VM_VMEXIT:
-            break;
-
-        case VM_CALL_NATIVE:
-            EncodeImmediate32((uint32_t)instr.immediate, bytecode);
-            break;
-
-        case VM_INT3:
-            break;
-
-        default:
-            break;
-    }
-}
-
-void Translator::EncodeOpcode(uint8_t opcode, std::vector<uint8_t>& bytecode) {
-    bytecode.push_back(opcode);
-}
-
-void Translator::EncodeRegister(uint8_t reg, std::vector<uint8_t>& bytecode) {
-    bytecode.push_back(reg);
-}
-
-void Translator::EncodeImmediate32(uint32_t imm, std::vector<uint8_t>& bytecode) {
-    bytecode.push_back((uint8_t)(imm));
-    bytecode.push_back((uint8_t)(imm >> 8));
-    bytecode.push_back((uint8_t)(imm >> 16));
-    bytecode.push_back((uint8_t)(imm >> 24));
-}
-
-void Translator::EncodeImmediate64(uint64_t imm, std::vector<uint8_t>& bytecode) {
-    for (int i = 0; i < 8; i++) {
-        bytecode.push_back((uint8_t)(imm >> (i * 8)));
-    }
-}
-
-void Translator::EncryptBytecode(std::vector<uint8_t>& bytecode, const uint8_t* key, const uint8_t* nonce) {
-    if (!key || bytecode.empty()) return;
-
-    // 浣跨敤婊氬姩瀵嗛挜鍔犲瘑
-    uint32_t rollingKey = 0;
-    for (int i = 0; i < 4; i++) {
-        rollingKey |= ((uint32_t)key[i]) << (i * 8);
-    }
-
-    for (size_t i = 0; i < bytecode.size(); i++) {
-        uint8_t keyByte = (uint8_t)(rollingKey & 0xFF);
-        bytecode[i] ^= keyByte;
-
-        // 鏇存柊婊氬姩瀵嗛挜
-        rollingKey = (rollingKey >> 8) | (rollingKey << 24);
-        rollingKey ^= (uint32_t)bytecode[i];
-    }
-}
-
-BytecodeInstr Translator::GenerateJunkInstruction() {
-    BytecodeInstr junk;
-    memset(&junk, 0, sizeof(junk));
-    junk.opcode = VM_NOP;
-    return junk;
-}
-
-bool Translator::FailInstruction(const Instruction& instr, const std::string& reason) {
+bool Translator::FailInstruction(const InstructionIR& instruction, const std::string& reason) {
     TranslationFailure failure{};
-    failure.address = instr.address;
-    failure.mnemonic = instr.mnemonic.empty() ? "<unknown>" : instr.mnemonic;
-    failure.bytes = FormatInstructionBytes(instr);
-    if (instr.length == 0) {
-        failure.reason = (reason == "empty_instruction_bytes")
-            ? "empty_instruction_bytes"
-            : "empty_instruction_bytes: " + reason;
-    } else {
-        failure.reason = reason;
-    }
-    m_lastFailures.push_back(failure);
+    failure.address = instruction.address;
+    failure.mnemonic = instruction.mnemonicText.empty()
+        ? InstructionMnemonicName(instruction.mnemonic) : instruction.mnemonicText;
+    failure.bytes = FormatInstructionBytes(instruction);
+    failure.reason = reason;
+    m_lastFailures.push_back(std::move(failure));
     return false;
-}uint8_t Translator::GetOpcodeForInstruction(const std::string& mnemonic) {
-    if (mnemonic == "mov") return VM_MOV_RR;
-    if (mnemonic == "add") return VM_ADD_RR;
-    if (mnemonic == "sub") return VM_SUB_RR;
-    if (mnemonic == "and") return VM_AND_RR;
-    if (mnemonic == "or")  return VM_OR_RR;
-    if (mnemonic == "xor") return VM_XOR_RR;
-    if (mnemonic == "cmp") return VM_CMP_RR;
-    if (mnemonic == "push") return VM_PUSH_R;
-    if (mnemonic == "pop") return VM_POP_R;
-    if (mnemonic == "call") return VM_CALL_VM;
-    if (mnemonic == "ret") return VM_RET_VM;
-    if (mnemonic == "nop") return VM_NOP;
-    if (mnemonic == "int3") return VM_INT3;
-    return 0xFF;
-}
-
-bool Translator::IsJumpInstruction(const std::string& mnemonic) {
-    return (mnemonic[0] == 'j' || mnemonic == "jmp" || mnemonic == "call");
-}
-
-// BUG 1 淇杈呭姪锛氭牴鎹寚浠ょ被鍨嬭绠楃紪鐮佸悗鐨勫疄闄呭瓧鑺傞暱搴?
-uint32_t Translator::CalculateEncodedSize(const BytecodeInstr& instr) {
-    switch (instr.opcode) {
-        // 鏃犳搷浣滄暟锛氫粎 opcode (1 瀛楄妭)
-        case VM_NOP:
-        case VM_PUSHAD:
-        case VM_POPAD:
-        case VM_PUSHF:
-        case VM_POPF:
-        case VM_RET_VM:
-        case VM_VMEXIT:
-        case VM_INT3:
-            return 1;
-
-        // 鍙屽瘎瀛樺櫒鎿嶄綔鏁帮細opcode + regDst + regSrc (3 瀛楄妭)
-        case VM_MOV_RR:
-        case VM_ADD_RR:
-        case VM_SUB_RR:
-        case VM_AND_RR:
-        case VM_OR_RR:
-        case VM_XOR_RR:
-        case VM_CMP_RR:
-        case VM_TEST_RR:
-        case VM_SHL_RR:
-        case VM_SHR_RR:
-        case VM_SAR_RR:
-        case VM_ADC_RR:
-        case VM_SBB_RR:
-        case VM_XCHG:
-            return 4;
-
-        // Register + immediate: opcode + reg + imm64 + width (11 bytes)
-        case VM_MOV_RC:
-        case VM_ADD_RC:
-        case VM_SUB_RC:
-        case VM_AND_RC:
-        case VM_OR_RC:
-        case VM_XOR_RC:
-        case VM_CMP_RC:
-        case VM_TEST_RC:
-        case VM_PUSH_C:
-            return 11;
-
-        // Single register operand: opcode + reg + width (3 bytes)
-        case VM_PUSH_R:
-        case VM_POP_R:
-        case VM_INC_R:
-        case VM_DEC_R:
-        case VM_NEG_R:
-        case VM_NOT_R:
-            return 3;
-
-        // Memory operands: opcode + dst + src + base + index + scale + width + kind + disp64.
-        case VM_MOV_RM:
-        case VM_MOV_MR:
-        case VM_LEA:
-            return 16;
-
-        // 璺宠浆/璋冪敤锛堢珛鍗虫暟32锛夛細opcode + imm32 (5 瀛楄妭)
-        case VM_JMP:
-        case VM_JZ:
-        case VM_JNZ:
-        case VM_JA:
-        case VM_JB:
-        case VM_JAE:
-        case VM_JBE:
-        case VM_JG:
-        case VM_JL:
-        case VM_JGE:
-        case VM_JLE:
-        case VM_JO:
-        case VM_JNO:
-        case VM_JS:
-        case VM_JNS:
-        case VM_CALL_VM:
-            return 5;
-
-        // CALL_NATIVE锛歰pcode + dllHash(imm32) + funcHash(imm32) (9 瀛楄妭)
-        case VM_CALL_NATIVE:
-            return 5;
-
-        default:
-            return 1;  // 瀹夊叏榛樿鍊?
-    }
 }
 
 } // namespace CipherShell
-
-
-
-
-

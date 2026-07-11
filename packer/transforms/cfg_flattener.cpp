@@ -244,11 +244,11 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
         for (size_t j = 0; j < instrCount; j++) {
             const auto& instr = blk.originalBlock.instructions[j];
             // 跳过末尾的分支指令（条件跳转、无条件跳转），保留 call 和 ret
-            if (j == instrCount - 1 && instr.isBranch) {
+            if (j == instrCount - 1 && instr.IsBranch()) {
                 continue;  // 剔除原始跳转，由下方 dispatcher 跳转替代
             }
             for (size_t b = 0; b < instr.length; b++) {
-                code[off++] = instr.bytes[b];
+                code[off++] = instr.rawBytes[b];
             }
         }
 
@@ -259,14 +259,25 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
             uint8_t condCode = 0x84;  // 默认 JE
             if (!blk.originalBlock.instructions.empty()) {
                 const auto& lastInstr = blk.originalBlock.instructions.back();
-                if (lastInstr.isBranch && lastInstr.isConditional) {
-                    uint8_t firstByte = lastInstr.bytes[0];
-                    if (firstByte >= 0x70 && firstByte <= 0x7F) {
-                        // 短条件跳转 0x7X -> 近条件跳转 0x0F 0x8X
-                        condCode = 0x80 + (firstByte - 0x70);
-                    } else if (firstByte == 0x0F && lastInstr.length >= 2) {
-                        // 已经是近条件跳转 0F 8X，直接使用第二字节
-                        condCode = lastInstr.bytes[1];
+                if (lastInstr.IsConditionalBranch()) {
+                    switch (lastInstr.branchKind) {
+                        case BranchKind::Overflow: condCode = 0x80; break;
+                        case BranchKind::NotOverflow: condCode = 0x81; break;
+                        case BranchKind::Below: condCode = 0x82; break;
+                        case BranchKind::AboveOrEqual: condCode = 0x83; break;
+                        case BranchKind::Equal: condCode = 0x84; break;
+                        case BranchKind::NotEqual: condCode = 0x85; break;
+                        case BranchKind::BelowOrEqual: condCode = 0x86; break;
+                        case BranchKind::Above: condCode = 0x87; break;
+                        case BranchKind::Sign: condCode = 0x88; break;
+                        case BranchKind::NotSign: condCode = 0x89; break;
+                        case BranchKind::Parity: condCode = 0x8A; break;
+                        case BranchKind::NotParity: condCode = 0x8B; break;
+                        case BranchKind::Less: condCode = 0x8C; break;
+                        case BranchKind::GreaterOrEqual: condCode = 0x8D; break;
+                        case BranchKind::LessOrEqual: condCode = 0x8E; break;
+                        case BranchKind::Greater: condCode = 0x8F; break;
+                        default: return {};
                     }
                 }
             }

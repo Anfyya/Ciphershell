@@ -69,7 +69,7 @@ ControlFlowGraph CFGBuilder::Build(const std::vector<BasicBlock>& blocks) {
                 // 检查是否是条件分支
                 if (!blocks[i].instructions.empty()) {
                     const auto& lastInstr = blocks[i].instructions.back();
-                    edge.isConditional = lastInstr.isConditional;
+                    edge.isConditional = lastInstr.IsConditionalBranch();
                 }
 
                 cfg.edges.push_back(edge);

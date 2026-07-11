@@ -1,162 +1,549 @@
-﻿#include "vm_section_emitter.h"
+#include "vm_section_emitter.h"
+
 #include "../pe_parser/pe_emitter.h"
+#include "../vm/vm_schema.h"
+#include "../../runtime/common/vm_crypto.h"
 #include <algorithm>
+#include <bcrypt.h>
+#include <cstddef>
 #include <cstring>
-#include <ctime>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace CipherShell {
-
 namespace {
-uint8_t BytecodeMask(uint32_t cookie, uint32_t offset) {
-    uint8_t cookieByte = static_cast<uint8_t>(cookie >> ((offset & 3u) * 8u));
-    return static_cast<uint8_t>(cookieByte ^ static_cast<uint8_t>((offset * 131u) & 0xFFu));
+
+constexpr uint32_t kKnownHeaderFlags = VM_METADATA_FLAG_AUTHENTICATED |
+    VM_METADATA_FLAG_BYTECODE_CHACHA20 |
+    VM_METADATA_FLAG_NATIVE_BODY_DESTROYED |
+    VM_METADATA_FLAG_CFG_VERIFIED |
+    VM_METADATA_FLAG_UNWIND_VERIFIED |
+    VM_METADATA_FLAG_CFG_ENABLED;
+constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
+    VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
+    VM_RECORD_FLAG_UNWIND_VERIFIED |
+    VM_RECORD_FLAG_CFG_VERIFIED |
+    VM_RECORD_FLAG_USES_SIMD |
+    VM_RECORD_FLAG_USES_AVX |
+    VM_RECORD_FLAG_USES_X87;
+
+bool SecureRandom(void* destination, size_t size) {
+    if (!destination || size == 0 || size > std::numeric_limits<ULONG>::max()) return false;
+    return BCryptGenRandom(nullptr, static_cast<PUCHAR>(destination), static_cast<ULONG>(size),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 }
-uint32_t RotL32(uint32_t v, unsigned c) {
-    c &= 31;
-    return (v << c) | (v >> ((32 - c) & 31));
+
+void EncodeMasterKey(
+    const uint8_t masterKey[32],
+    const uint8_t runtimeKeyShare[VM_RUNTIME_KEY_SHARE_SIZE],
+    const uint8_t buildId[16],
+    uint32_t cookie,
+    uint8_t encoded[32])
+{
+    for (uint32_t i = 0; i < 32; ++i) {
+        const uint8_t cookieByte = static_cast<uint8_t>(cookie >> ((i & 3u) * 8u));
+        encoded[i] = masterKey[i] ^ runtimeKeyShare[i] ^ buildId[i & 15u] ^
+            cookieByte ^ static_cast<uint8_t>(i * 0x5Bu);
+    }
 }
-constexpr uint32_t kVMRuntimeVersion = 0x00010005u;
-constexpr uint32_t kVMRuntimeFlagsDebugTrace = 0x00000001u;
+
+void DecodeMasterKey(
+    const VM_METADATA_HEADER& header,
+    const uint8_t runtimeKeyShare[VM_RUNTIME_KEY_SHARE_SIZE],
+    uint8_t masterKey[32]) {
+    EncodeMasterKey(header.encodedMasterKey, runtimeKeyShare,
+        header.buildId, header.cookie, masterKey);
 }
+
+uint32_t NextLayoutPadding(uint32_t& state, uint32_t minimum, uint32_t maximum) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return minimum + state % (maximum - minimum + 1u);
+}
+
+bool VaToImageRva(uint64_t imageBase, uint64_t va, uint32_t& rva) {
+    if (va == 0) { rva = 0; return true; }
+    if (va < imageBase || va - imageBase > std::numeric_limits<uint32_t>::max()) return false;
+    rva = static_cast<uint32_t>(va - imageBase);
+    return true;
+}
+
+uint64_t ComputeMetadataTag(
+    const uint8_t* metadata,
+    size_t authenticatedSize,
+    const uint8_t masterKey[32])
+{
+    const size_t tagOffset = offsetof(VM_METADATA_HEADER, metadataTag);
+    const uint64_t zero = 0;
+    VM_SIPHASH24_CONTEXT context{};
+    vm_siphash24_init(&context, masterKey);
+    vm_siphash24_update(&context, metadata, tagOffset);
+    vm_siphash24_update(&context, reinterpret_cast<const uint8_t*>(&zero), sizeof(zero));
+    const size_t afterTag = tagOffset + sizeof(uint64_t);
+    if (authenticatedSize > afterTag) {
+        vm_siphash24_update(&context, metadata + afterTag, authenticatedSize - afterTag);
+    }
+    return vm_siphash24_final(&context);
+}
+
+bool BuildReverseOpcodeMap(
+    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+    uint8_t reverse[VM_OPCODE_MAP_SIZE],
+    std::string& error)
+{
+    if (opcodeMap.size() != VM_OPCODE_MAP_SIZE) {
+        error = "VM_EMIT: opcode map must be a complete 256-entry permutation";
+        return false;
+    }
+    std::array<uint8_t, VM_OPCODE_MAP_SIZE> seen{};
+    for (const auto& item : opcodeMap) {
+        if (seen[item.second]) {
+            error = "VM_EMIT: opcode map is not injective";
+            return false;
+        }
+        seen[item.second] = 1;
+        reverse[item.second] = item.first;
+    }
+    return true;
+}
+
+bool BuildRegisterMap(
+    const std::unordered_map<uint8_t, uint8_t>& registerMap,
+    uint8_t output[VM_REGISTER_MAP_SIZE],
+    std::string& error)
+{
+    for (uint32_t i = 0; i < VM_REGISTER_MAP_SIZE; ++i) output[i] = VM_REGISTER_INVALID;
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> seen{};
+    for (uint8_t native = 0; native < 16; ++native) {
+        auto mapped = registerMap.find(native);
+        if (mapped == registerMap.end() || mapped->second >= VM_REGISTER_MAP_SIZE || seen[mapped->second]) {
+            error = "VM_EMIT: register map is missing, out of range, or not injective";
+            return false;
+        }
+        output[native] = mapped->second;
+        seen[mapped->second] = 1;
+    }
+    return true;
+}
+
+} // namespace
 
 uint32_t VMSectionEmitter::AlignUp(uint32_t value, uint32_t alignment) {
     if (alignment == 0) return value;
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
-void VMSectionEmitter::AppendU32(std::vector<uint8_t>& out, uint32_t value) {
-    out.push_back(static_cast<uint8_t>(value));
-    out.push_back(static_cast<uint8_t>(value >> 8));
-    out.push_back(static_cast<uint8_t>(value >> 16));
-    out.push_back(static_cast<uint8_t>(value >> 24));
+    return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
 VMEmitResult VMSectionEmitter::Emit(
     CS_PE_IMAGE* image,
     const std::vector<uint8_t>& bytecode,
-    const std::vector<VMFunctionRecord>& records,
+    const std::vector<VMFunctionRecord>& inputRecords,
     const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     const std::unordered_map<uint8_t, uint8_t>& registerMap,
     uint32_t runtimeEntryRVA,
     const char sectionName[8])
 {
     VMEmitResult result{};
-    if (!image || !image->isValid) {
+    if (!image || !image->isValid || !image->rawData) {
         result.error = "VM_EMIT: invalid PE image";
         return result;
     }
-    if (bytecode.empty() || records.empty()) {
-        result.error = "VM_EMIT: empty bytecode or function record table";
+    if (bytecode.empty() || inputRecords.empty() ||
+        bytecode.size() > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: empty or oversized bytecode/record table";
         return result;
     }
 
-    uint32_t cookie = static_cast<uint32_t>(time(nullptr)) ^ static_cast<uint32_t>(bytecode.size() * 0x45D9F3Bu);
-    cookie ^= static_cast<uint32_t>(records.size() * 0x9E3779B9u);
-    cookie ^= runtimeEntryRVA * 0x85EBCA6Bu;
-    if (cookie == 0) cookie = 0xA5C35A3Cu;
+    uint8_t reverseOpcode[VM_OPCODE_MAP_SIZE]{};
+    uint8_t encodedRegisterMap[VM_REGISTER_MAP_SIZE]{};
+    if (!BuildReverseOpcodeMap(opcodeMap, reverseOpcode, result.error) ||
+        !BuildRegisterMap(registerMap, encodedRegisterMap, result.error)) return result;
 
-    std::vector<uint8_t> section;
-    section.reserve(0x100 + records.size() * 32 + bytecode.size());
+    VM_METADATA_HEADER header{};
+    uint8_t masterKey[32]{};
+    std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> runtimeKeyShare{};
+    if (!SecureRandom(&header.cookie, sizeof(header.cookie)) ||
+        !SecureRandom(header.buildId, sizeof(header.buildId)) ||
+        !SecureRandom(masterKey, sizeof(masterKey)) ||
+        !SecureRandom(runtimeKeyShare.data(), runtimeKeyShare.size()) ||
+        !SecureRandom(&header.layoutSeed, sizeof(header.layoutSeed))) {
+        result.error = "VM_EMIT: BCryptGenRandom failed";
+        return result;
+    }
+    if (header.cookie == 0) header.cookie = 1;
 
-    const uint32_t headerSize = 72;
-    const uint32_t recordOffset = headerSize;
-    const uint32_t recordSize = 28;
-    const uint32_t opcodeMapOffset = recordOffset + static_cast<uint32_t>(records.size() * recordSize);
-    const uint32_t opcodeMapSize = 256;
-    const uint32_t registerMapOffset = opcodeMapOffset + opcodeMapSize;
-    const uint32_t registerMapSize = 32;
-    const uint32_t bytecodeOffset = registerMapOffset + registerMapSize;
+    header.headerSize = sizeof(VM_METADATA_HEADER);
+    header.metadataVersion = VM_METADATA_VERSION;
+    header.schemaVersion = VMSchema::Version();
+    header.runtimeVersion = VM_RUNTIME_VERSION;
+    header.keyEncodingVersion = VM_KEY_ENCODING_VERSION;
+    header.architecture = image->is64Bit ? VM_ARCH_X64 : VM_ARCH_X86;
+    header.flags = VM_METADATA_FLAG_AUTHENTICATED | VM_METADATA_FLAG_BYTECODE_CHACHA20;
+    if (image->loadConfig.hasCFG) header.flags |= VM_METADATA_FLAG_CFG_ENABLED;
+    header.recordCount = static_cast<uint32_t>(inputRecords.size());
+    header.recordSize = sizeof(VM_FUNCTION_RECORD);
+    header.opcodeMapSize = VM_OPCODE_MAP_SIZE;
+    header.registerMapSize = VM_REGISTER_MAP_SIZE;
+    header.imageSize = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SizeOfImage
+        : image->ntHeaders32->OptionalHeader.SizeOfImage;
+    const uint64_t imageBase = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.ImageBase
+        : image->ntHeaders32->OptionalHeader.ImageBase;
+    if (!VaToImageRva(imageBase, image->loadConfig.guardCFCheckFunctionPointer,
+            header.guardCFCheckPointerRVA) ||
+        !VaToImageRva(imageBase, image->loadConfig.guardCFDispatchFunctionPointer,
+            header.guardCFDispatchPointerRVA)) {
+        result.error = "VM_EMIT: CFG check/dispatch pointer is outside the image";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    if (image->loadConfig.hasCFG &&
+        ((image->is64Bit && header.guardCFDispatchPointerRVA == 0) ||
+         (!image->is64Bit && header.guardCFCheckPointerRVA == 0))) {
+        result.error = "VM_EMIT: CFG image has no architecture-specific Guard call target";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
 
-    std::vector<uint8_t> encodedBytecode = bytecode;
-    for (const auto& record : records) {
-        if (record.bytecodeOffset > encodedBytecode.size() ||
-            record.bytecodeSize > encodedBytecode.size() - record.bytecodeOffset) {
-            result.error = "VM_EMIT: function bytecode range is outside bytecode blob";
+    uint32_t layoutState = header.layoutSeed ? header.layoutSeed : 0xC51F3A79u;
+    const uint64_t recordsSize = static_cast<uint64_t>(inputRecords.size()) * sizeof(VM_FUNCTION_RECORD);
+    header.recordOffset = AlignUp(header.headerSize +
+        NextLayoutPadding(layoutState, 16, 127), 16);
+    if (recordsSize > std::numeric_limits<uint32_t>::max() ||
+        recordsSize > std::numeric_limits<uint32_t>::max() - header.recordOffset) {
+        result.error = "VM_EMIT: record table exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    const uint64_t reverseOffset = static_cast<uint64_t>(header.recordOffset) + recordsSize +
+        NextLayoutPadding(layoutState, 16, 127);
+    if (reverseOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: opcode map offset exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.reverseOpcodeMapOffset = AlignUp(static_cast<uint32_t>(reverseOffset), 16);
+    const uint64_t registerOffset = static_cast<uint64_t>(header.reverseOpcodeMapOffset) +
+        VM_OPCODE_MAP_SIZE + NextLayoutPadding(layoutState, 16, 127);
+    if (registerOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: register map offset exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.registerMapOffset = AlignUp(static_cast<uint32_t>(registerOffset), 16);
+    const uint64_t bytecodeOffset = static_cast<uint64_t>(header.registerMapOffset) +
+        VM_REGISTER_MAP_SIZE + NextLayoutPadding(layoutState, 16, 127);
+    if (bytecodeOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: randomized metadata layout exceeds uint32 RVA range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.bytecodeOffset = AlignUp(static_cast<uint32_t>(bytecodeOffset), 64);
+    header.bytecodeSize = static_cast<uint32_t>(bytecode.size());
+    const uint64_t totalSize = static_cast<uint64_t>(header.bytecodeOffset) +
+        header.bytecodeSize + NextLayoutPadding(layoutState, 16, 127);
+    if (totalSize > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: randomized metadata section exceeds uint32 size";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.totalSize = static_cast<uint32_t>(totalSize);
+    header.runtimeEntryRVA = runtimeEntryRVA;
+    EncodeMasterKey(masterKey, runtimeKeyShare.data(), header.buildId,
+        header.cookie, header.encodedMasterKey);
+
+    result.records = inputRecords;
+    std::vector<uint8_t> encryptedBytecode = bytecode;
+    std::unordered_set<uint32_t> functionRVAs;
+    for (auto& record : result.records) {
+        if (!functionRVAs.insert(record.functionRVA).second) {
+            result.error = "VM_EMIT: duplicate function RVA";
+            std::memset(masterKey, 0, sizeof(masterKey));
             return result;
         }
-        for (uint32_t i = 0; i < record.bytecodeSize; i++) {
-            uint32_t pos = record.bytecodeOffset + i;
-            encodedBytecode[pos] ^= BytecodeMask(cookie, i);
+        if (record.bytecodeOffset > encryptedBytecode.size() ||
+            record.bytecodeSize > encryptedBytecode.size() - record.bytecodeOffset ||
+            record.bytecodeSize == 0 || record.bytecodeSize % VMSchema::InstructionSize() != 0) {
+            result.error = "VM_EMIT: function bytecode range violates fixed schema";
+            std::memset(masterKey, 0, sizeof(masterKey));
+            return result;
         }
+        record.opcodeMapOffset = header.reverseOpcodeMapOffset;
+        record.registerMapOffset = header.registerMapOffset;
+        if (!SecureRandom(record.nonce, sizeof(record.nonce))) {
+            result.error = "VM_EMIT: record nonce generation failed";
+            std::memset(masterKey, 0, sizeof(masterKey));
+            return result;
+        }
+        uint8_t recordKey[32]{};
+        vm_derive_record_key(masterKey, header.buildId, record.functionRVA, recordKey);
+        vm_chacha20_xor(
+            bytecode.data() + record.bytecodeOffset,
+            encryptedBytecode.data() + record.bytecodeOffset,
+            record.bytecodeSize,
+            recordKey,
+            record.nonce,
+            1,
+            0);
+        record.bytecodeTag = vm_siphash24(
+            encryptedBytecode.data() + record.bytecodeOffset,
+            record.bytecodeSize,
+            recordKey + 16);
+        std::memset(recordKey, 0, sizeof(recordKey));
     }
 
-    AppendU32(section, cookie);
-    AppendU32(section, static_cast<uint32_t>(records.size()) ^ cookie);
-    AppendU32(section, recordOffset ^ RotL32(cookie, 3));
-    AppendU32(section, opcodeMapOffset ^ RotL32(cookie, 7));
-    AppendU32(section, registerMapOffset ^ RotL32(cookie, 11));
-    AppendU32(section, bytecodeOffset ^ RotL32(cookie, 17));
-    AppendU32(section, static_cast<uint32_t>(bytecode.size()) ^ RotL32(cookie, 19));
-    AppendU32(section, runtimeEntryRVA ^ RotL32(cookie, 23));
-    AppendU32(section, kVMRuntimeVersion ^ RotL32(cookie, 5));
-    AppendU32(section, kVMRuntimeFlagsDebugTrace ^ RotL32(cookie, 13));
-    AppendU32(section, 0u); // enter_count
-    AppendU32(section, 0u); // last_function_rva
-    AppendU32(section, 0u); // last_opcode
-    AppendU32(section, 0u); // last_error_code
-    AppendU32(section, 0u); // last_bytecode_offset
-    AppendU32(section, 0u); // last_ret_value_low32
-    AppendU32(section, 0u); // reserved_trace0
-    AppendU32(section, 0u); // reserved_trace1
-    for (const auto& record : records) {
-        AppendU32(section, record.functionRVA ^ cookie);
-        AppendU32(section, record.functionSize ^ RotL32(cookie, 1));
-        AppendU32(section, record.bytecodeOffset ^ RotL32(cookie, 5));
-        AppendU32(section, record.bytecodeSize ^ RotL32(cookie, 9));
-        AppendU32(section, record.opcodeMapOffset ^ RotL32(cookie, 13));
-        AppendU32(section, record.registerMapOffset ^ RotL32(cookie, 15));
-        AppendU32(section, record.flags ^ RotL32(cookie, 21));
+    std::vector<uint8_t> section(header.totalSize, 0);
+    if (!SecureRandom(section.data(), section.size())) {
+        result.error = "VM_EMIT: randomized metadata padding generation failed";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
     }
+    std::memcpy(section.data(), &header, sizeof(header));
+    std::memcpy(section.data() + header.recordOffset, result.records.data(),
+        result.records.size() * sizeof(VM_FUNCTION_RECORD));
+    std::memcpy(section.data() + header.reverseOpcodeMapOffset, reverseOpcode, sizeof(reverseOpcode));
+    std::memcpy(section.data() + header.registerMapOffset, encodedRegisterMap, sizeof(encodedRegisterMap));
+    std::memcpy(section.data() + header.bytecodeOffset, encryptedBytecode.data(), encryptedBytecode.size());
 
-    uint8_t reverseOpcode[256];
-    for (uint32_t i = 0; i < 256; i++) reverseOpcode[i] = static_cast<uint8_t>(i);
-    for (const auto& kv : opcodeMap) reverseOpcode[kv.second] = kv.first;
-    section.insert(section.end(), reverseOpcode, reverseOpcode + 256);
+    header.metadataTag = ComputeMetadataTag(section.data(), header.totalSize, masterKey);
+    std::memcpy(section.data(), &header, sizeof(header));
+    std::memset(masterKey, 0, sizeof(masterKey));
 
-    uint8_t regMap[32];
-    for (uint32_t i = 0; i < 32; i++) regMap[i] = static_cast<uint8_t>(i);
-    for (const auto& kv : registerMap) {
-        if (kv.first < 32) regMap[kv.first] = kv.second;
-    }
-    section.insert(section.end(), regMap, regMap + 32);
-    section.insert(section.end(), encodedBytecode.begin(), encodedBytecode.end());
-
-    char name[8] = {'.','c','s','v','m',0,0,0};
-    if (sectionName) memcpy(name, sectionName, 8);
-
+    char name[8] = {'.', 'c', 's', 'v', 'm', 0, 0, 0};
+    if (sectionName) std::memcpy(name, sectionName, sizeof(name));
     PEEmitter emitter(image);
-    auto append = emitter.AppendSection(name, section, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
-    if (!append.success) {
-        result.error = "VM_EMIT: " + append.error;
+    auto appended = emitter.AppendSection(
+        name, section, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+    if (!appended.success) {
+        result.error = "VM_EMIT: " + appended.error;
         return result;
     }
 
-    result.sectionRVA = append.rva;
-    result.sectionRawOffset = append.rawOffset;
-    result.sectionSize = append.rawSize;
-    result.metadataRVA = append.rva;
-    result.bytecodeRVA = append.rva + bytecodeOffset;
-    result.trampolineRVA = runtimeEntryRVA;
     result.success = true;
+    result.sectionRVA = appended.rva;
+    result.sectionRawOffset = appended.rawOffset;
+    result.sectionSize = appended.rawSize;
+    result.metadataRVA = appended.rva;
+    result.metadataSize = header.totalSize;
+    result.bytecodeRVA = appended.rva + header.bytecodeOffset;
+    result.trampolineRVA = runtimeEntryRVA;
+    result.architecture = header.architecture;
+    result.schemaVersion = header.schemaVersion;
+    std::copy(std::begin(header.buildId), std::end(header.buildId), result.buildId.begin());
+    result.runtimeKeyShare = runtimeKeyShare;
     return result;
 }
 
-bool VMSectionEmitter::PatchRuntimeEntry(CS_PE_IMAGE* image, uint32_t metadataRVA, uint32_t runtimeEntryRVA, std::string* error) {
+bool VMSectionEmitter::VerifyMetadata(
+    const uint8_t* metadata,
+    size_t availableSize,
+    const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    std::string& error)
+{
+    if (!metadata || availableSize < sizeof(VM_METADATA_HEADER)) {
+        error = "metadata header is truncated";
+        return false;
+    }
+    VM_METADATA_HEADER header{};
+    std::memcpy(&header, metadata, sizeof(header));
+    if (header.headerSize != sizeof(VM_METADATA_HEADER) ||
+        header.recordSize != sizeof(VM_FUNCTION_RECORD) ||
+        header.metadataVersion != VM_METADATA_VERSION ||
+        header.schemaVersion != VMSchema::Version() ||
+        header.runtimeVersion != VM_RUNTIME_VERSION ||
+        header.keyEncodingVersion != VM_KEY_ENCODING_VERSION ||
+        (header.architecture != VM_ARCH_X86 && header.architecture != VM_ARCH_X64) ||
+        (header.flags & ~kKnownHeaderFlags) != 0 ||
+        header.opcodeMapSize != VM_OPCODE_MAP_SIZE ||
+        header.registerMapSize != VM_REGISTER_MAP_SIZE) {
+        error = "metadata version or fixed structure size mismatch";
+        return false;
+    }
+    if (header.totalSize > availableSize || header.totalSize < header.bytecodeOffset ||
+        header.bytecodeOffset > header.totalSize ||
+        header.bytecodeSize > header.totalSize - header.bytecodeOffset ||
+        header.recordCount == 0 ||
+        header.recordOffset < header.headerSize ||
+        header.recordOffset > header.reverseOpcodeMapOffset ||
+        header.recordCount > (header.reverseOpcodeMapOffset - header.recordOffset) / header.recordSize ||
+        header.reverseOpcodeMapOffset > header.registerMapOffset ||
+        VM_OPCODE_MAP_SIZE > header.registerMapOffset - header.reverseOpcodeMapOffset ||
+        header.registerMapOffset > header.bytecodeOffset ||
+        VM_REGISTER_MAP_SIZE > header.bytecodeOffset - header.registerMapOffset ||
+        header.layoutSeed == 0 || header.imageSize == 0 ||
+        ((header.runtimeBaseRVA == 0 || header.runtimeEntryRVA == 0 || header.runtimeSize == 0) &&
+            (header.runtimeBaseRVA != 0 || header.runtimeEntryRVA != 0 || header.runtimeSize != 0)) ||
+        (header.runtimeBaseRVA != 0 &&
+            (header.runtimeBaseRVA >= header.imageSize ||
+             header.runtimeSize > header.imageSize - header.runtimeBaseRVA ||
+             header.runtimeEntryRVA < header.runtimeBaseRVA ||
+             header.runtimeEntryRVA - header.runtimeBaseRVA >= header.runtimeSize))) {
+        error = "metadata range validation failed";
+        return false;
+    }
+    uint8_t masterKey[32]{};
+    DecodeMasterKey(header, runtimeKeyShare.data(), masterKey);
+    const uint64_t expected = ComputeMetadataTag(metadata, header.totalSize, masterKey);
+    if (!vm_constant_time_equal64(expected, header.metadataTag)) {
+        std::memset(masterKey, 0, sizeof(masterKey));
+        error = "metadata authentication failed";
+        return false;
+    }
+    const auto* records = reinterpret_cast<const VM_FUNCTION_RECORD*>(
+        metadata + header.recordOffset);
+    std::unordered_set<uint32_t> functionRVAs;
+    for (uint32_t i = 0; i < header.recordCount; ++i) {
+        const auto& record = records[i];
+        if (!functionRVAs.insert(record.functionRVA).second ||
+            record.functionRVA == 0 || record.functionSize < 5 ||
+            record.bytecodeSize == 0 ||
+            record.bytecodeSize % VM_INSTRUCTION_SIZE != 0 ||
+            record.bytecodeOffset > header.bytecodeSize ||
+            record.bytecodeSize > header.bytecodeSize - record.bytecodeOffset ||
+            record.opcodeMapOffset != header.reverseOpcodeMapOffset ||
+            record.registerMapOffset != header.registerMapOffset ||
+            (record.flags & ~kKnownRecordFlags) != 0 ||
+            record.guestStackSize < 0x4000u || record.guestStackSize > 0x70000u ||
+            (record.guestStackSize & 0x0FFFu) != 0 ||
+            ((header.architecture == VM_ARCH_X64) !=
+                ((record.flags & VM_RECORD_FLAG_X64) != 0)) ||
+            (header.architecture == VM_ARCH_X64 && record.returnStackCleanup != 0) ||
+            record.returnStackCleanup > 0xFFFFu ||
+            ((record.flags & VM_RECORD_FLAG_USES_AVX) != 0 &&
+                (record.flags & VM_RECORD_FLAG_USES_SIMD) == 0) ||
+            ((record.trampolineRVA == 0) != (record.trampolineSize == 0)) ||
+            (header.runtimeBaseRVA != 0 &&
+                (record.trampolineRVA == 0 || record.trampolineSize == 0))) {
+            std::memset(masterKey, 0, sizeof(masterKey));
+            error = "metadata function record contract failed";
+            return false;
+        }
+        uint8_t recordKey[32]{};
+        vm_derive_record_key(masterKey, header.buildId, record.functionRVA, recordKey);
+        const uint8_t* ciphertext = metadata + header.bytecodeOffset + record.bytecodeOffset;
+        const uint64_t bytecodeTag = vm_siphash24(
+            ciphertext, record.bytecodeSize, recordKey + 16);
+        std::memset(recordKey, 0, sizeof(recordKey));
+        if (!vm_constant_time_equal64(bytecodeTag, record.bytecodeTag)) {
+            std::memset(masterKey, 0, sizeof(masterKey));
+            error = "metadata record bytecode authentication failed";
+            return false;
+        }
+    }
+    std::memset(masterKey, 0, sizeof(masterKey));
+    std::array<uint8_t, VM_OPCODE_MAP_SIZE> opcodeSeen{};
+    const uint8_t* reverse = metadata + header.reverseOpcodeMapOffset;
+    for (uint32_t i = 0; i < VM_OPCODE_MAP_SIZE; ++i) {
+        if (opcodeSeen[reverse[i]]) {
+            error = "reverse opcode map is not a permutation";
+            return false;
+        }
+        opcodeSeen[reverse[i]] = 1;
+    }
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerSeen{};
+    const uint8_t* registers = metadata + header.registerMapOffset;
+    for (uint32_t i = 0; i < 16; ++i) {
+        if (registers[i] >= VM_REGISTER_MAP_SIZE || registerSeen[registers[i]]) {
+            error = "native register map is out of range or not injective";
+            return false;
+        }
+        registerSeen[registers[i]] = 1;
+    }
+    return true;
+}
+
+bool VMSectionEmitter::PatchLinkage(
+    CS_PE_IMAGE* image,
+    uint32_t metadataRVA,
+    uint32_t runtimeBaseRVA,
+    uint32_t runtimeEntryRVA,
+    uint32_t runtimeSize,
+    const std::vector<VMTrampolineRecord>& trampolines,
+    const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    uint32_t verifiedFlags,
+    std::string* error)
+{
     PEEmitter emitter(image);
     if (!emitter.IsValid()) {
         if (error) *error = "invalid PE image";
         return false;
     }
-    uint32_t metadataOffset = emitter.RvaToOffset(metadataRVA);
-    if (metadataOffset == 0 || metadataOffset + 32 > image->rawSize) {
+    const uint32_t imageSize = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SizeOfImage
+        : image->ntHeaders32->OptionalHeader.SizeOfImage;
+    if (runtimeBaseRVA == 0 || runtimeEntryRVA < runtimeBaseRVA || runtimeSize == 0 ||
+        runtimeBaseRVA >= imageSize || runtimeSize > imageSize - runtimeBaseRVA ||
+        runtimeEntryRVA - runtimeBaseRVA >= runtimeSize) {
+        if (error) *error = "runtime base/entry/size linkage is outside the final image";
+        return false;
+    }
+    const uint32_t metadataOffset = emitter.RvaToOffset(metadataRVA);
+    if (metadataOffset == 0 || metadataOffset + sizeof(VM_METADATA_HEADER) > image->rawSize) {
         if (error) *error = "metadata RVA is outside file data";
         return false;
     }
-    uint32_t cookie = *reinterpret_cast<uint32_t*>(image->rawData + metadataOffset);
-    uint32_t encoded = runtimeEntryRVA ^ RotL32(cookie, 23);
-    std::vector<uint8_t> patch;
-    AppendU32(patch, encoded);
-    return emitter.PatchBytes(metadataRVA + 28, patch, error);
-}
-} // namespace CipherShell
+    const uint8_t* rawMetadata = image->rawData + metadataOffset;
+    VM_METADATA_HEADER header{};
+    std::memcpy(&header, rawMetadata, sizeof(header));
+    if (header.totalSize > image->rawSize - metadataOffset || header.bytecodeOffset > header.totalSize) {
+        if (error) *error = "metadata linkage range is invalid";
+        return false;
+    }
+    std::string initialVerificationError;
+    if (!VerifyMetadata(rawMetadata, header.totalSize,
+            runtimeKeyShare, initialVerificationError)) {
+        if (error) *error = "metadata is invalid before linkage patch: " + initialVerificationError;
+        return false;
+    }
+    std::vector<uint8_t> updated(rawMetadata, rawMetadata + header.totalSize);
+    auto* mutableHeader = reinterpret_cast<VM_METADATA_HEADER*>(updated.data());
+    mutableHeader->runtimeBaseRVA = runtimeBaseRVA;
+    mutableHeader->runtimeEntryRVA = runtimeEntryRVA;
+    mutableHeader->runtimeSize = runtimeSize;
+    mutableHeader->imageSize = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SizeOfImage
+        : image->ntHeaders32->OptionalHeader.SizeOfImage;
+    mutableHeader->flags |= verifiedFlags;
 
+    std::unordered_map<uint32_t, VMTrampolineRecord> byFunction;
+    for (const auto& trampoline : trampolines) byFunction[trampoline.functionRVA] = trampoline;
+    auto* records = reinterpret_cast<VM_FUNCTION_RECORD*>(updated.data() + mutableHeader->recordOffset);
+    for (uint32_t i = 0; i < mutableHeader->recordCount; ++i) {
+        auto found = byFunction.find(records[i].functionRVA);
+        if (!trampolines.empty() && found == byFunction.end()) {
+            if (error) *error = "metadata record has no matching trampoline";
+            return false;
+        }
+        if (found != byFunction.end()) {
+            records[i].trampolineRVA = found->second.trampolineRVA;
+            records[i].trampolineSize = found->second.trampolineSize;
+        }
+        if (verifiedFlags & VM_METADATA_FLAG_NATIVE_BODY_DESTROYED)
+            records[i].flags |= VM_RECORD_FLAG_NATIVE_BODY_DESTROYED;
+        if (verifiedFlags & VM_METADATA_FLAG_UNWIND_VERIFIED)
+            records[i].flags |= VM_RECORD_FLAG_UNWIND_VERIFIED;
+        if (verifiedFlags & VM_METADATA_FLAG_CFG_VERIFIED)
+            records[i].flags |= VM_RECORD_FLAG_CFG_VERIFIED;
+    }
+
+    uint8_t masterKey[32]{};
+    DecodeMasterKey(*mutableHeader, runtimeKeyShare.data(), masterKey);
+    mutableHeader->metadataTag = 0;
+    mutableHeader->metadataTag = ComputeMetadataTag(updated.data(), updated.size(), masterKey);
+    std::memset(masterKey, 0, sizeof(masterKey));
+    if (!emitter.PatchBytes(metadataRVA, updated, error)) return false;
+
+    std::string verificationError;
+    if (!VerifyMetadata(image->rawData + metadataOffset, header.totalSize,
+            runtimeKeyShare, verificationError)) {
+        if (error) *error = verificationError;
+        return false;
+    }
+    return true;
+}
+
+} // namespace CipherShell

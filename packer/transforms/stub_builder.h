@@ -67,7 +67,8 @@ public:
     bool EmbedStub(
         CS_PE_IMAGE* image,
         const std::vector<CS_ENCRYPTED_SECTION>& encryptedSections,
-        DWORD oepRVA
+        DWORD oepRVA,
+        bool preservePEHeaders = false
     );
 
 private:

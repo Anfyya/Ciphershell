@@ -3,11 +3,35 @@
  */
 
 #include "pe_parser.h"
+#include <cstddef>
 #include "pe_utils.h"
 #include <cstring>
 #include <algorithm>
 
 namespace CipherShell {
+
+namespace {
+bool IsPowerOfTwo(uint32_t value) {
+    return value != 0 && (value & (value - 1u)) == 0;
+}
+
+bool ReadAsciiStringAtOffset(
+    const CS_PE_IMAGE* image,
+    uint32_t offset,
+    std::string& value,
+    uint32_t maxLength = 0x8000)
+{
+    if (!image || !image->rawData || offset >= image->rawSize) return false;
+    const uint32_t available = image->rawSize - offset;
+    const uint32_t limit = (std::min)(available, maxLength);
+    const char* begin = reinterpret_cast<const char*>(image->rawData + offset);
+    const void* terminator = std::memchr(begin, 0, limit);
+    if (!terminator) return false;
+    const char* end = static_cast<const char*>(terminator);
+    value.assign(begin, end);
+    return true;
+}
+}
 
 // ============================================================================
 // 鏋勯€?鏋愭瀯
@@ -36,7 +60,7 @@ CS_PE_IMAGE* PEParser::LoadFromFile(const std::string& filePath) {
         return nullptr;
     }
 
-    // 鍒嗛厤缂撳啿鍖?    BYTE* buffer = new(std::nothrow) BYTE[fileSize];
+    BYTE* buffer = new(std::nothrow) BYTE[fileSize];
     if (!buffer) {
         CloseHandle(hFile);
         return nullptr;
@@ -74,7 +98,7 @@ CS_PE_IMAGE* PEParser::LoadFromBuffer(BYTE* buffer, DWORD size) {
         return nullptr;
     }
 
-    // 鍒濆鍖?鈥?new CS_PE_IMAGE() 宸茬粡闆跺垵濮嬪寲 POD 骞舵瀯閫?string/vector锛?    // 缁濅笉鑳界敤 memset锛屼細鐮村潖 std::string/std::vector 鍐呴儴鐘舵€?    image->rawData = buffer;
+    image->rawData = buffer;
     image->rawSize = size;
     image->isValid = FALSE;
 
@@ -84,7 +108,7 @@ CS_PE_IMAGE* PEParser::LoadFromBuffer(BYTE* buffer, DWORD size) {
         return image;
     }
 
-    // 瑙ｆ瀽澶?    if (!ParseHeaders(image)) {
+    if (!ParseHeaders(image)) {
         return image;
     }
 
@@ -120,52 +144,104 @@ void PEParser::FreeImage(CS_PE_IMAGE* image) {
 // ============================================================================
 
 bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
-    // DOS Header
-    image->dosHeader = (PIMAGE_DOS_HEADER)image->rawData;
-
-    // NT Headers
-    DWORD ntOffset = image->dosHeader->e_lfanew;
-    if (!CheckBounds(image, ntOffset, sizeof(IMAGE_NT_HEADERS64))) {
-        SetError(image, "Invalid NT Headers offset");
+    image->dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(image->rawData);
+    if (image->dosHeader->e_lfanew < 0) {
+        SetError(image, "Negative NT headers offset");
         return false;
     }
 
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(image->rawData + ntOffset);
+    const DWORD ntOffset = static_cast<DWORD>(image->dosHeader->e_lfanew);
+    const DWORD ntPrefixSize = sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+    if (!CheckBounds(image, ntOffset, ntPrefixSize)) {
+        SetError(image, "Invalid NT headers offset");
+        return false;
+    }
 
-    // 妫€鏌ョ鍚?    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+    const DWORD signature = *reinterpret_cast<const DWORD*>(image->rawData + ntOffset);
+    if (signature != IMAGE_NT_SIGNATURE) {
         SetError(image, "Invalid PE signature");
         return false;
     }
 
-    // 鍒ゆ柇 x86/x64
-    if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+    PIMAGE_FILE_HEADER fileHeader = reinterpret_cast<PIMAGE_FILE_HEADER>(
+        image->rawData + ntOffset + sizeof(DWORD));
+    const DWORD optionalOffset = ntOffset + ntPrefixSize;
+    if (!CheckBounds(image, optionalOffset, fileHeader->SizeOfOptionalHeader)) {
+        SetError(image, "Optional header exceeds file bounds");
+        return false;
+    }
+    if (fileHeader->NumberOfSections == 0 || fileHeader->NumberOfSections > 96) {
+        SetError(image, "Invalid section count");
+        return false;
+    }
+
+    if (fileHeader->Machine == IMAGE_FILE_MACHINE_AMD64) {
+        if (fileHeader->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+            SetError(image, "Truncated PE32+ optional header");
+            return false;
+        }
         image->is64Bit = TRUE;
-        image->ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
-    } else if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_I386) {
+        image->ntHeaders64 = reinterpret_cast<PIMAGE_NT_HEADERS64>(image->rawData + ntOffset);
+        image->ntHeaders32 = nullptr;
+        if (image->ntHeaders64->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+            SetError(image, "Invalid PE32+ optional header magic");
+            return false;
+        }
+    } else if (fileHeader->Machine == IMAGE_FILE_MACHINE_I386) {
+        if (fileHeader->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)) {
+            SetError(image, "Truncated PE32 optional header");
+            return false;
+        }
         image->is64Bit = FALSE;
-        image->ntHeaders32 = (PIMAGE_NT_HEADERS32)ntHeaders;
-        // BUG1淇锛?2浣峆E涓嶈兘璁剧疆ntHeaders64鎸囬拡锛屼袱鑰呯粨鏋勪綋甯冨眬涓嶅悓
-        // IMAGE_NT_HEADERS32.OptionalHeader 涓?IMAGE_NT_HEADERS64.OptionalHeader 瀛楁鍋忕Щ涓嶅悓
-        // 鐢╪tHeaders64璇诲彇32浣峆E浼氬鑷碔mageBase銆丼izeOfImage銆丒ntryPoint绛夊瓧娈甸敊浣?        image->ntHeaders64 = nullptr;
+        image->ntHeaders32 = reinterpret_cast<PIMAGE_NT_HEADERS32>(image->rawData + ntOffset);
+        image->ntHeaders64 = nullptr;
+        if (image->ntHeaders32->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            SetError(image, "Invalid PE32 optional header magic");
+            return false;
+        }
     } else {
         SetError(image, "Unsupported machine type");
         return false;
     }
 
-    // Section Headers
-    image->numSections = ntHeaders->FileHeader.NumberOfSections;
-    if (image->is64Bit) {
-        image->sections = IMAGE_FIRST_SECTION(image->ntHeaders64);
-    } else {
-        image->sections = IMAGE_FIRST_SECTION(image->ntHeaders32);
-    }
-
-    // 楠岃瘉 section 澶翠笉瓒婄晫
-    DWORD sectionEnd = (DWORD)((BYTE*)image->sections - image->rawData) +
-                       image->numSections * sizeof(IMAGE_SECTION_HEADER);
-    if (!CheckBounds(image, 0, sectionEnd)) {
+    const DWORD sectionOffset = optionalOffset + fileHeader->SizeOfOptionalHeader;
+    const uint64_t sectionBytes = static_cast<uint64_t>(fileHeader->NumberOfSections) *
+        sizeof(IMAGE_SECTION_HEADER);
+    if (sectionBytes > 0xFFFFFFFFull ||
+        !CheckBounds(image, sectionOffset, static_cast<DWORD>(sectionBytes))) {
         SetError(image, "Section headers exceed file bounds");
         return false;
+    }
+
+    image->numSections = fileHeader->NumberOfSections;
+    image->sections = reinterpret_cast<PIMAGE_SECTION_HEADER>(image->rawData + sectionOffset);
+
+    const DWORD fileAlignment = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.FileAlignment
+        : image->ntHeaders32->OptionalHeader.FileAlignment;
+    const DWORD sectionAlignment = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SectionAlignment
+        : image->ntHeaders32->OptionalHeader.SectionAlignment;
+    if (!IsPowerOfTwo(fileAlignment) || !IsPowerOfTwo(sectionAlignment) ||
+        sectionAlignment < fileAlignment) {
+        SetError(image, "Invalid PE alignment values");
+        return false;
+    }
+
+    for (WORD i = 0; i < image->numSections; i++) {
+        const IMAGE_SECTION_HEADER& section = image->sections[i];
+        if (section.SizeOfRawData != 0 &&
+            !CheckBounds(image, section.PointerToRawData, section.SizeOfRawData)) {
+            SetError(image, "Section raw data exceeds file bounds");
+            return false;
+        }
+        const uint64_t virtualEnd = static_cast<uint64_t>(section.VirtualAddress) +
+            (std::max)(static_cast<uint32_t>(section.Misc.VirtualSize),
+                       static_cast<uint32_t>(section.SizeOfRawData));
+        if (virtualEnd > 0x100000000ull) {
+            SetError(image, "Section virtual range overflows RVA space");
+            return false;
+        }
     }
 
     return true;
@@ -176,43 +252,19 @@ bool PEParser::ParseHeaders(CS_PE_IMAGE* image) {
 // ============================================================================
 
 bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
-    // 瀵煎叆琛?    if (!ParseImportTable(image)) {
-        // 瀵煎叆琛ㄨВ鏋愬け璐ヤ笉鏄嚧鍛介敊璇紝鍙兘娌℃湁瀵煎叆琛?    }
+    (void)ParseImportTable(image);
+    (void)ParseExportTable(image);
+    (void)ParseRelocationTable(image);
+    (void)ParseResourceTable(image);
+    (void)ParseTLS(image);
 
-    // 瀵煎嚭琛?    if (!ParseExportTable(image)) {
-        // 瀵煎嚭琛ㄥ彲鑳戒笉瀛樺湪
-    }
-
-    // 閲嶅畾浣嶈〃
-    if (!ParseRelocationTable(image)) {
-        // 閲嶅畾浣嶈〃鍙兘涓嶅瓨鍦紙EXE 閫氬父鏈夛紝DLL 蹇呴』鏈夛級
-    }
-
-    // 璧勬簮琛?    if (!ParseResourceTable(image)) {
-        // 璧勬簮鍙兘涓嶅瓨鍦?    }
-
-    // TLS
-    if (!ParseTLS(image)) {
-        // TLS 鍙兘涓嶅瓨鍦?    }
-
-    // 寮傚父澶勭悊琛?(x64)
     if (image->is64Bit) {
-        if (!ParseExceptionTable(image)) {
-            // 寮傚父琛ㄥ彲鑳戒笉瀛樺湪
-        }
+        (void)ParseExceptionTable(image);
     }
 
-    // Load Config
-    if (!ParseLoadConfig(image)) {
-        // Load Config 鍙兘涓嶅瓨鍦?    }
-
-    // Debug 鐩綍
-    if (!ParseDebugDirectory(image)) {
-        // Debug 淇℃伅鍙兘涓嶅瓨鍦?    }
-
-    // 寤惰繜瀵煎叆
-    if (!ParseDelayImports(image)) {
-        // 寤惰繜瀵煎叆鍙兘涓嶅瓨鍦?    }
+    (void)ParseLoadConfig(image);
+    (void)ParseDebugDirectory(image);
+    (void)ParseDelayImports(image);
 
     return true;
 }
@@ -237,7 +289,7 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // 閬嶅巻瀵煎叆鎻忚堪绗?    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(image->rawData + importOffset);
+    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(image->rawData + importOffset);
 
     while (importDesc->Name != 0) {
         CS_IMPORT_DLL importDll;
@@ -252,7 +304,7 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
         importDll.originalFirstThunkRVA = importDesc->OriginalFirstThunk;
         importDll.firstThunkRVA = importDesc->FirstThunk;
 
-        // 瑙ｆ瀽 ILT锛圛mport Lookup Table锛?        DWORD iltOffset = RVAToOffset(image, importDesc->OriginalFirstThunk);
+        DWORD iltOffset = RVAToOffset(image, importDesc->OriginalFirstThunk);
         DWORD iatOffset = RVAToOffset(image, importDesc->FirstThunk);
 
         if (iltOffset == 0) {
@@ -393,7 +445,7 @@ bool PEParser::ParseExportTable(CS_PE_IMAGE* image) {
         func.functionRVA = functions[i];
         func.name = ordinalToName[i];
 
-        // 妫€鏌ユ槸鍚︽槸杞彂鍣?        if (functions[i] >= exportDir.VirtualAddress &&
+        if (functions[i] >= exportDir.VirtualAddress &&
             functions[i] < exportDir.VirtualAddress + exportDir.Size) {
             func.isForwarded = true;
             DWORD forwarderOffset = RVAToOffset(image, functions[i]);
@@ -453,7 +505,7 @@ bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
             WORD type = entry >> 12;
             WORD offset = entry & 0xFFF;
 
-            // 璺宠繃濉厖椤?            if (type == IMAGE_REL_BASED_ABSOLUTE) {
+            if (type == IMAGE_REL_BASED_ABSOLUTE) {
                 continue;
             }
 
@@ -487,12 +539,12 @@ bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // 璧勬簮琛ㄨВ鏋愯緝澶嶆潅锛岃繖閲屽彧鍋氬熀鏈獙璇?    // 瀹屾暣瀹炵幇灏嗗湪鍚庣画鐗堟湰涓坊鍔?    DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
+    DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
     if (resourceOffset == 0) {
         return false;
     }
 
-    // 鏍囪璧勬簮琛ㄥ瓨鍦?    return true;
+    return true;
 }
 
 // ============================================================================
@@ -607,29 +659,93 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     }
 
     DWORD loadConfigOffset = RVAToOffset(image, loadConfigDir.VirtualAddress);
-    if (loadConfigOffset == 0) {
+    if (loadConfigOffset == 0 || loadConfigOffset >= image->rawSize) {
         return false;
     }
 
-    // Load Config 缁撴瀯澶у皬闅忕増鏈彉鍖栵紝杩欓噷鍙鍙栧叕鍏遍儴鍒?    if (image->is64Bit) {
-        if (loadConfigDir.Size >= sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)) {
+    image->loadConfig.directoryRVA = loadConfigDir.VirtualAddress;
+    image->loadConfig.directorySize = loadConfigDir.Size;
+    const size_t available = (std::min)(
+        static_cast<size_t>(loadConfigDir.Size),
+        static_cast<size_t>(image->rawSize - loadConfigOffset));
+    auto hasField = [available](size_t offset, size_t size) {
+        return offset <= available && size <= available - offset;
+    };
+
+    if (image->is64Bit) {
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags), sizeof(DWORD))) {
             PIMAGE_LOAD_CONFIG_DIRECTORY64 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY64)(image->rawData + loadConfigOffset);
-            image->loadConfig.securityCookie = lc->SecurityCookie;
-            image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
-            image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(lc->SecurityCookie)))
+                image->loadConfig.securityCookie = lc->SecurityCookie;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
+                image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
+                image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
+                image->loadConfig.guardCFFunctionTable = lc->GuardCFFunctionTable;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
+                image->loadConfig.guardCFFunctionCount = lc->GuardCFFunctionCount;
             image->loadConfig.guardFlags = lc->GuardFlags;
             image->loadConfig.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            image->loadConfig.hasRFGuard = (lc->GuardFlags &
+                (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
+                 IMAGE_GUARD_RF_STRICT)) != 0;
             image->loadConfig.valid = TRUE;
         }
     } else {
-        if (loadConfigDir.Size >= sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32)) {
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardFlags), sizeof(DWORD))) {
             PIMAGE_LOAD_CONFIG_DIRECTORY32 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY32)(image->rawData + loadConfigOffset);
-            image->loadConfig.securityCookie = lc->SecurityCookie;
-            image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
-            image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SecurityCookie), sizeof(lc->SecurityCookie)))
+                image->loadConfig.securityCookie = lc->SecurityCookie;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
+                image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
+                image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
+                image->loadConfig.guardCFFunctionTable = lc->GuardCFFunctionTable;
+            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
+                image->loadConfig.guardCFFunctionCount = lc->GuardCFFunctionCount;
             image->loadConfig.guardFlags = lc->GuardFlags;
             image->loadConfig.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            image->loadConfig.hasRFGuard = (lc->GuardFlags &
+                (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
+                 IMAGE_GUARD_RF_STRICT)) != 0;
             image->loadConfig.valid = TRUE;
+        }
+    }
+
+    if (image->loadConfig.valid && image->loadConfig.guardCFFunctionTable != 0 &&
+        image->loadConfig.guardCFFunctionCount != 0) {
+        constexpr DWORD kGuardTableSizeMask = 0xF0000000u;
+        constexpr DWORD kGuardTableSizeShift = 28u;
+        const DWORD extraBytes = (image->loadConfig.guardFlags & kGuardTableSizeMask) >>
+            kGuardTableSizeShift;
+        const DWORD entrySize = sizeof(DWORD) + extraBytes;
+        image->loadConfig.guardTableEntrySize = entrySize;
+        const uint64_t imageBase = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.ImageBase
+            : image->ntHeaders32->OptionalHeader.ImageBase;
+        if (image->loadConfig.guardCFFunctionTable < imageBase ||
+            image->loadConfig.guardCFFunctionTable - imageBase > 0xFFFFFFFFULL ||
+            image->loadConfig.guardCFFunctionCount > 0x1000000ULL) {
+            image->loadConfig.valid = FALSE;
+            return false;
+        }
+        const DWORD tableRVA = static_cast<DWORD>(
+            image->loadConfig.guardCFFunctionTable - imageBase);
+        const DWORD tableOffset = RVAToOffset(image, tableRVA);
+        const uint64_t tableBytes = image->loadConfig.guardCFFunctionCount * entrySize;
+        if (tableOffset == 0 || tableBytes > image->rawSize - tableOffset) {
+            image->loadConfig.valid = FALSE;
+            return false;
+        }
+        image->loadConfig.guardFunctionRVAs.reserve(
+            static_cast<size_t>(image->loadConfig.guardCFFunctionCount));
+        for (uint64_t i = 0; i < image->loadConfig.guardCFFunctionCount; ++i) {
+            DWORD functionRVA = 0;
+            std::memcpy(&functionRVA,
+                image->rawData + tableOffset + static_cast<size_t>(i * entrySize), sizeof(functionRVA));
+            image->loadConfig.guardFunctionRVAs.push_back(functionRVA);
         }
     }
 
@@ -694,7 +810,7 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
     }
 
     // 寤惰繜瀵煎叆浣跨敤 IMAGE_DELAYLOAD_DESCRIPTOR 缁撴瀯
-    // 杩欓噷鍙仛鍩烘湰鏍囪锛屽畬鏁村疄鐜板悗缁坊鍔?    return true;
+    return true;
 }
 
 // ============================================================================
@@ -705,10 +821,16 @@ bool PEParser::ParseRichHeader(CS_PE_IMAGE* image) {
     // Rich Header 鍦?DOS Header 鍜?PE 绛惧悕涔嬮棿
     // 鎼滅储 "Rich" 鏍囪
     DWORD richSignature = 0x68636952;  // "Rich"
-
-    for (DWORD i = sizeof(IMAGE_DOS_HEADER); i < image->dosHeader->e_lfanew; i += 4) {
-        DWORD* ptr = (DWORD*)(image->rawData + i);
-        if (*ptr == richSignature) {
+    if (!image || !image->rawData || !image->dosHeader ||
+        image->dosHeader->e_lfanew <= static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+        static_cast<uint64_t>(image->dosHeader->e_lfanew) > image->rawSize) {
+        return false;
+    }
+    const DWORD end = static_cast<DWORD>(image->dosHeader->e_lfanew);
+    for (DWORD i = sizeof(IMAGE_DOS_HEADER); i <= end - sizeof(DWORD); i += 4) {
+        DWORD value = 0;
+        std::memcpy(&value, image->rawData + i, sizeof(value));
+        if (value == richSignature) {
             image->hasRichHeader = TRUE;
             image->richHeaderOffset = i;
             return true;
@@ -737,7 +859,7 @@ bool PEParser::DetectDotNet(CS_PE_IMAGE* image) {
 // Overlay 妫€娴?// ============================================================================
 
 bool PEParser::DetectOverlay(CS_PE_IMAGE* image) {
-    // 鎵惧埌鏈€鍚庝竴涓?section 鐨勭粨鏉熶綅缃?    DWORD lastSectionEnd = 0;
+    DWORD lastSectionEnd = 0;
     for (WORD i = 0; i < image->numSections; i++) {
         DWORD sectionEnd = image->sections[i].PointerToRawData + image->sections[i].SizeOfRawData;
         if (sectionEnd > lastSectionEnd) {
@@ -772,15 +894,17 @@ bool PEParser::IsValidPE(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // 鑾峰彇 NT Headers 鍋忕Щ
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)image->rawData;
-    if (dosHeader->e_lfanew + sizeof(IMAGE_NT_HEADERS32) > image->rawSize) {
+    PIMAGE_DOS_HEADER dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(image->rawData);
+    if (dosHeader->e_lfanew < 0) {
         return false;
     }
-
-    // 妫€鏌?PE 绛惧悕
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(image->rawData + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
+    const DWORD ntOffset = static_cast<DWORD>(dosHeader->e_lfanew);
+    if (!CheckBounds(image, ntOffset, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER))) {
+        return false;
+    }
+    DWORD signature = 0;
+    std::memcpy(&signature, image->rawData + ntOffset, sizeof(signature));
+    if (signature != IMAGE_NT_SIGNATURE) {
         return false;
     }
 

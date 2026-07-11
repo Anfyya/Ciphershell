@@ -169,13 +169,6 @@ MutatedISA VMNester::MutateISA(const MutatedISA& baseISA, uint32_t level) {
     // 使用对应层的变异引擎生成新的 ISA
     mutated = m_mutators[level].GenerateMutatedISA();
 
-    // 确保与外层不同
-    mutated.dispatchMode = (baseISA.dispatchMode + 1) % 4;
-
-    // 不同的栈布局
-    mutated.stackBase = baseISA.stackBase ^ 0x12345678;
-    mutated.stackSize = baseISA.stackSize + level * 0x1000;
-
     return mutated;
 }
 

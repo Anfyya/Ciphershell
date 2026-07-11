@@ -192,13 +192,35 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
     uint32_t pattern = rand() % 10;  // 扩展到 10 种模式
     uint64_t addr = deadBlock.startAddress;
 
-    auto addInstr = [&](const char* mnem, std::initializer_list<uint8_t> bytes) {
+    auto addInstr = [&](const char* text, std::initializer_list<uint8_t> bytes) {
         Instruction instr{};  // 值初始化，替代 memset
         instr.address = addr;
+        instr.rva = static_cast<uint32_t>(addr);
         instr.length = (uint8_t)bytes.size();
         int i = 0;
-        for (uint8_t b : bytes) instr.bytes[i++] = b;
-        instr.mnemonic = mnem;
+        for (uint8_t b : bytes) instr.rawBytes[i++] = b;
+        const std::string mnemonic(text);
+        if (mnemonic == "nop") instr.mnemonic = InstructionMnemonic::Nop;
+        else if (mnemonic == "mov") instr.mnemonic = InstructionMnemonic::Mov;
+        else if (mnemonic == "lea") instr.mnemonic = InstructionMnemonic::Lea;
+        else if (mnemonic == "xchg") instr.mnemonic = InstructionMnemonic::Xchg;
+        else if (mnemonic == "add") instr.mnemonic = InstructionMnemonic::Add;
+        else if (mnemonic == "sub") instr.mnemonic = InstructionMnemonic::Sub;
+        else if (mnemonic == "and") instr.mnemonic = InstructionMnemonic::And;
+        else if (mnemonic == "xor") instr.mnemonic = InstructionMnemonic::Xor;
+        else if (mnemonic == "not") instr.mnemonic = InstructionMnemonic::Not;
+        else if (mnemonic == "dec") instr.mnemonic = InstructionMnemonic::Dec;
+        else if (mnemonic == "shl") instr.mnemonic = InstructionMnemonic::Shl;
+        else if (mnemonic == "shr") instr.mnemonic = InstructionMnemonic::Shr;
+        else if (mnemonic == "ror") instr.mnemonic = InstructionMnemonic::Ror;
+        else if (mnemonic == "imul") instr.mnemonic = InstructionMnemonic::Imul;
+        else if (mnemonic == "idiv") instr.mnemonic = InstructionMnemonic::Idiv;
+        else if (mnemonic == "cmp") instr.mnemonic = InstructionMnemonic::Cmp;
+        else if (mnemonic == "push") instr.mnemonic = InstructionMnemonic::Push;
+        else if (mnemonic == "pop") instr.mnemonic = InstructionMnemonic::Pop;
+        else if (mnemonic == "setz") instr.mnemonic = InstructionMnemonic::Setcc;
+        else instr.mnemonic = InstructionMnemonic::Unsupported;
+        instr.mnemonicText = text;
         deadBlock.instructions.push_back(instr);
         deadBlock.instructionCount++;
         addr += instr.length;
@@ -207,8 +229,8 @@ BasicBlock BogusFlowInjector::GenerateDeadCode() {
     switch (pattern) {
         case 0:
             // 模拟循环计数器
-            addInstr("push", {0x51});                          // push ecx
-            addInstr("mov",  {0xB9, 0x0A, 0x00, 0x00, 0x00}); // mov ecx, 10
+            addInstr("push", {0x51});
+            addInstr("mov", {0xB9, 0x0A, 0x00, 0x00, 0x00});
             addInstr("dec",  {0x49});                          // dec ecx
             addInstr("lea",  {0x8D, 0x04, 0x09});              // lea eax, [ecx+ecx]
             addInstr("xor",  {0x31, 0xD2});                    // xor edx, edx
@@ -354,8 +376,9 @@ BasicBlock BogusFlowInjector::MutateBlock(const BasicBlock& block) {
         Instruction nop{};  // 值初始化，不用 memset（Instruction 含 std::string）
         nop.address = mutated.startAddress;
         nop.length = 1;
-        nop.bytes[0] = 0x90;
-        nop.mnemonic = "nop";
+        nop.rawBytes[0] = 0x90;
+        nop.mnemonic = InstructionMnemonic::Nop;
+        nop.mnemonicText = "nop";
         mutated.instructions.insert(mutated.instructions.begin(), nop);
         mutated.instructionCount++;
     }
@@ -372,13 +395,13 @@ void BogusFlowInjector::RemapRegisters(BasicBlock& block) {
     for (auto& instr : block.instructions) {
         for (uint32_t i = 0; i < instr.length; i++) {
             if (i + 1 < instr.length) {
-                if (instr.bytes[i] == 0x31 || instr.bytes[i] == 0x33) {
-                    uint8_t modrm = instr.bytes[i + 1];
+                if (instr.rawBytes[i] == 0x31 || instr.rawBytes[i] == 0x33) {
+                    uint8_t modrm = instr.rawBytes[i + 1];
                     uint8_t reg = (modrm >> 3) & 7;
                     uint8_t rm = modrm & 7;
                     if (reg == 0) reg = 1; else if (reg == 1) reg = 0;
                     if (rm == 0) rm = 1; else if (rm == 1) rm = 0;
-                    instr.bytes[i + 1] = (modrm & 0xC0) | (reg << 3) | rm;
+                    instr.rawBytes[i + 1] = (modrm & 0xC0) | (reg << 3) | rm;
                 }
             }
         }
@@ -396,9 +419,10 @@ void BogusFlowInjector::RearrangeInstructions(BasicBlock& block) {
         Instruction xchg{};  // 值初始化，不用 memset（Instruction 含 std::string）
         xchg.address = block.startAddress;
         xchg.length = 2;
-        xchg.bytes[0] = 0x87;
-        xchg.bytes[1] = 0xC0;
-        xchg.mnemonic = "xchg";
+        xchg.rawBytes[0] = 0x87;
+        xchg.rawBytes[1] = 0xC0;
+        xchg.mnemonic = InstructionMnemonic::Xchg;
+        xchg.mnemonicText = "xchg";
         block.instructions.insert(block.instructions.begin(), xchg);
         block.instructionCount++;
     }

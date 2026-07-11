@@ -41,12 +41,17 @@ struct VMConfig {
     bool enabledSet;
     int strength;
     std::vector<std::string> targetFunctions;
+    std::vector<uint32_t> targetRVAs;
     int registerCount;
     int stackSize;
-    std::string opcodeWidth;
+    bool opcodeRandomization;
     bool handlerMutation;
-    std::string bytecodeEncryption;
+    bool bytecodeEncryption;
+    std::string nativeBodyPolicy;
+    std::string x86CallAbi;
     bool embedJunkHandlers;
+    bool simdBridge;
+    bool x87Bridge;
 
     VMConfig() :
         enabled(false),
@@ -54,10 +59,14 @@ struct VMConfig {
         strength(0),
         registerCount(24),
         stackSize(0x20000),
-        opcodeWidth("variable"),
-        handlerMutation(true),
-        bytecodeEncryption("rolling"),
-        embedJunkHandlers(true) {}
+        opcodeRandomization(true),
+        handlerMutation(false),
+        bytecodeEncryption(true),
+        nativeBodyPolicy("destroy"),
+        x86CallAbi("auto"),
+        embedJunkHandlers(false),
+        simdBridge(true),
+        x87Bridge(true) {}
 };
 
 struct StringEncryptionConfig {
@@ -197,6 +206,7 @@ public:
     const std::vector<std::string>& GetWarnings() const { return m_warnings; }
 
 private:
+    bool ValidateProductionSyntax(const std::string& content);
     void ParseGlobalSection(const std::string& content, GlobalConfig& config);
     void ParseVMSection(const std::string& content, VMConfig& config);
     void ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config);
@@ -215,6 +225,7 @@ private:
     double ParseDouble(const std::string& value);
     std::string ParseString(const std::string& value);
     std::vector<std::string> ParseStringArray(const std::string& value);
+    std::vector<uint32_t> ParseUint32Array(const std::string& value);
 
     std::string m_lastError;
     std::vector<std::string> m_warnings;

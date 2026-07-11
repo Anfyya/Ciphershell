@@ -1,5 +1,11 @@
 #include "protection_build_context.h"
-#include <ctime>
+
+#include "../../runtime/common/vm_crypto.h"
+#include <windows.h>
+#include <bcrypt.h>
+#include <cstring>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace CipherShell {
 
@@ -9,16 +15,20 @@ void CopyName(char out[8], const char* in) {
     for (int i = 0; i < 8 && in[i]; i++) out[i] = in[i];
 }
 
-void MakeSectionName(char out[8], uint32_t seed, uint32_t salt) {
+void MakeSectionName(char out[8], const std::array<uint8_t, 32>& seed, uint32_t salt) {
     static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
     out[0] = '.';
-    uint32_t x = seed ^ (salt * 0x9E3779B9u);
+    uint8_t message[8] = {
+        static_cast<uint8_t>(salt), static_cast<uint8_t>(salt >> 8),
+        static_cast<uint8_t>(salt >> 16), static_cast<uint8_t>(salt >> 24),
+        'C', 'S', 'V', 'M'
+    };
+    uint64_t stream = vm_siphash24(message, sizeof(message), seed.data());
     for (int i = 1; i < 8; i++) {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        out[i] = alphabet[x % (sizeof(alphabet) - 1)];
+        out[i] = alphabet[stream % (sizeof(alphabet) - 1)];
+        stream /= sizeof(alphabet) - 1;
     }
+    std::memset(message, 0, sizeof(message));
 }
 
 FeatureSwitch PresetFeature(bool enabled, int strength, const char* mode = "") {
@@ -39,7 +49,8 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     ctx.quickLevel = config.global.protectionLevel > 0 ? config.global.protectionLevel : cliLevel;
     ctx.debugNames = verbose;
     ctx.randomizeSectionNames = config.global.randomizeSections;
-    ctx.isaSeed = static_cast<uint32_t>(time(nullptr)) ^ static_cast<uint32_t>(ctx.quickLevel * 0x45D9F3Bu);
+    ctx.entropyReady = BCryptGenRandom(nullptr, ctx.isaSeed.data(),
+        static_cast<ULONG>(ctx.isaSeed.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
 
     ctx.sectionEncryption = PresetFeature(ctx.quickLevel >= 1, 50 + ctx.quickLevel * 8, "startup");
     ctx.stringEncryption = PresetFeature(ctx.quickLevel >= 2 && config.global.stringEncryption, 60, "startup");
@@ -52,6 +63,7 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     if (config.vm.enabledSet) ctx.vm.enabled = config.vm.enabled;
     if (config.vm.strength > 0) ctx.vm.strength = config.vm.strength;
     if (!config.vm.targetFunctions.empty()) ctx.vm.targetFunctions = config.vm.targetFunctions;
+    if (!config.vm.targetRVAs.empty()) ctx.vm.targetRVAs = config.vm.targetRVAs;
 
     if (config.stringEncryption.enabledSet) ctx.stringEncryption.enabled = config.stringEncryption.enabled;
     if (config.stringEncryption.strength > 0) ctx.stringEncryption.strength = config.stringEncryption.strength;
@@ -64,6 +76,16 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     if (config.importProtection.enabledSet) ctx.importProtection.enabled = config.importProtection.enabled;
     if (config.importProtection.strength > 0) ctx.importProtection.strength = config.importProtection.strength;
 
+    if (config.sectionEncryption.enabledSet) {
+        ctx.sectionEncryption.enabled = config.sectionEncryption.enabled;
+    }
+    if (config.sectionEncryption.strength > 0) {
+        ctx.sectionEncryption.strength = config.sectionEncryption.strength;
+    }
+    if (!config.sectionEncryption.mode.empty()) {
+        ctx.sectionEncryption.mode = config.sectionEncryption.mode;
+    }
+
     if (config.controlFlow.enabledSet) ctx.controlFlow.enabled = config.controlFlow.enabled;
     if (config.controlFlow.strength > 0) ctx.controlFlow.strength = config.controlFlow.strength;
     if (config.controlFlow.flatteningEnabledSet) ctx.flattening.enabled = config.controlFlow.flatteningEnabled;
@@ -75,9 +97,19 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     if (ctx.randomizeSectionNames && !ctx.debugNames) {
         MakeSectionName(ctx.vmSectionName, ctx.isaSeed, 0xC0DEu);
         MakeSectionName(ctx.vmRuntimeSectionName, ctx.isaSeed, 0x51A7u);
+        MakeSectionName(ctx.vmUnwindSectionName, ctx.isaSeed, 0xDA7Au);
+        MakeSectionName(ctx.vmBridgeSectionName, ctx.isaSeed, 0xB21Du);
+        MakeSectionName(ctx.vmBridgeUnwindSectionName, ctx.isaSeed, 0xB117u);
+        MakeSectionName(ctx.vmGuardSectionName, ctx.isaSeed, 0x6CF7u);
+        MakeSectionName(ctx.vmRelocSectionName, ctx.isaSeed, 0x2E10u);
     } else {
         CopyName(ctx.vmSectionName, ".csvm");
         CopyName(ctx.vmRuntimeSectionName, ".csvx");
+        CopyName(ctx.vmUnwindSectionName, ".cspdt");
+        CopyName(ctx.vmBridgeSectionName, ".csvbr");
+        CopyName(ctx.vmBridgeUnwindSectionName, ".csbuw");
+        CopyName(ctx.vmGuardSectionName, ".csgft");
+        CopyName(ctx.vmRelocSectionName, ".csrlc");
     }
 
     return ctx;

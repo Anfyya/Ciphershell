@@ -114,6 +114,9 @@ public:
      */
     BYTE* GenerateDecryptFunction(bool is64Bit, DWORD* funcSize);
 
+    bool HasError() const { return !m_lastError.empty(); }
+    const std::string& GetLastError() const { return m_lastError; }
+
 private:
     // 字符串检测
     bool IsPrintableString(const BYTE* data, DWORD length, bool& isWide);
@@ -127,7 +130,9 @@ private:
     DWORD AlignValue(DWORD value, DWORD alignment);
 
     // 随机数
-    void GenerateRandomBytes(uint8_t* buffer, DWORD length);
+    bool GenerateRandomBytes(uint8_t* buffer, DWORD length);
+
+    std::string m_lastError;
 };
 
 } // namespace CipherShell

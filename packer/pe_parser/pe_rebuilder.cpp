@@ -30,9 +30,9 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         return nullptr;
     }
 
-    // 绠€鍗曟柟娉曪細澶嶅埗鏁翠釜鍘熷鏂囦欢锛岀劧鍚庝慨鏀?    DWORD totalSize = image->rawSize + 0x10000;  // 棰濆绌洪棿
+    DWORD totalSize = image->rawSize;
 
-    // 鍒嗛厤杈撳嚭缂撳啿鍖?    BYTE* output = new(std::nothrow) BYTE[totalSize];
+    BYTE* output = new(std::nothrow) BYTE[totalSize];
     if (!output) {
         return nullptr;
     }
@@ -50,7 +50,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
 
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(output + static_cast<DWORD>(dosHeader->e_lfanew));
 
-    // 娓呴櫎鏃堕棿鎴?    if (config.zeroTimestamps) {
+    if (config.zeroTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = 0;
     }
 
@@ -67,7 +67,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         }
     }
 
-    // 娓呴櫎鏍￠獙鍜?    if (!config.preserveChecksum) {
+    if (!config.preserveChecksum) {
         if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             ((PIMAGE_NT_HEADERS64)ntHeaders)->OptionalHeader.CheckSum = 0;
         } else {
@@ -159,13 +159,13 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         }
     }
 
-    // 澶勭悊鏃堕棿鎴筹紙淇敼杈撳嚭缂撳啿鍖猴紝涓嶆槸鍘熷闀滃儚锛?    if (config.zeroTimestamps) {
+    if (config.zeroTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = 0;
     } else if (config.randomizeTimestamps) {
         ntHeaders->FileHeader.TimeDateStamp = GenerateRandomDWORD();
     }
 
-    // 澶勭悊璋冭瘯淇℃伅锛堜慨鏀硅緭鍑虹紦鍐插尯锛?    if (!config.preserveDebugInfo) {
+    if (!config.preserveDebugInfo) {
         if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
             ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
@@ -177,7 +177,7 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         }
     }
 
-    // 澶勭悊鏍￠獙鍜?    if (!config.preserveChecksum) {
+    if (!config.preserveChecksum) {
         if (image->is64Bit && ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 ntHeaders64 = (PIMAGE_NT_HEADERS64)ntHeaders;
             ntHeaders64->OptionalHeader.CheckSum = 0;
@@ -205,7 +205,7 @@ bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REB
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
-        // 瀹夊叏妫€鏌?        if (section->SizeOfRawData == 0) continue;
+        if (section->SizeOfRawData == 0) continue;
         if (section->PointerToRawData == 0) continue;
         if (section->PointerToRawData + section->SizeOfRawData > image->rawSize) continue;
 
@@ -217,7 +217,7 @@ bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REB
                    copySize);
         }
 
-        // 鏇存柊 section 澶翠腑鐨勫亸绉?        DWORD sectionHeaderOffset = dosHeader->e_lfanew +
+        DWORD sectionHeaderOffset = dosHeader->e_lfanew +
             sizeof(DWORD) +  // PE signature
             sizeof(IMAGE_FILE_HEADER) +
             ntHeaders->FileHeader.SizeOfOptionalHeader +
@@ -249,7 +249,7 @@ bool PERebuilder::RebuildOverlay(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
         return true;
     }
 
-    // 鎵惧埌鏈€鍚庝竴涓?section 鐨勭粨鏉熶綅缃?    DWORD lastSectionEnd = 0;
+    DWORD lastSectionEnd = 0;
     for (WORD i = 0; i < image->numSections; i++) {
         DWORD sectionEnd = image->sections[i].PointerToRawData + image->sections[i].SizeOfRawData;
         if (sectionEnd > lastSectionEnd) {
@@ -319,9 +319,9 @@ bool PERebuilder::UpdateChecksum(BYTE* peData, DWORD actualFileSize) {
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peData + static_cast<DWORD>(dosHeader->e_lfanew));
 
     // BUG3淇锛氫娇鐢ㄥ疄闄呮枃浠剁紦鍐插尯澶у皬鑰岄潪 SizeOfImage锛堝唴瀛樻槧鍍忓ぇ灏忥級
-    // SizeOfImage 鏄?PE 鏄犲皠鍒板唴瀛樺悗鐨勫ぇ灏忥紙鎸?SectionAlignment 瀵归綈锛夛紝閫氬父杩滃ぇ浜庢枃浠跺ぇ灏?    // 鐢?SizeOfImage 璁＄畻鏍￠獙鍜屼細璇诲彇瓒呭嚭鏂囦欢鏁版嵁鑼冨洿鐨勫唴瀛橈紝瀵艰嚧鏍￠獙鍜岄敊璇?    DWORD checksum = CalculateChecksum(peData, actualFileSize);
+    DWORD checksum = CalculateChecksum(peData, actualFileSize);
 
-    // 鏇存柊鏍￠獙鍜?    if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
+    if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
         ((PIMAGE_NT_HEADERS64)ntHeaders)->OptionalHeader.CheckSum = checksum;
     } else {
         ((PIMAGE_NT_HEADERS32)ntHeaders)->OptionalHeader.CheckSum = checksum;

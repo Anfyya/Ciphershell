@@ -1,810 +1,910 @@
-﻿#include "vm_runtime_builder.h"
+#include "vm_runtime_builder.h"
+
 #include "../pe_parser/pe_emitter.h"
+#include "../../runtime/common/vm_metadata.h"
+#include "../../runtime/common/vm_runtime_core.h"
+#include "vm_runtime_x64_image.h"
+#include "vm_runtime_x86_image.h"
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
-#include <utility>
-#include <vector>
+#include <unordered_set>
 
 namespace CipherShell {
-
-void VMRuntimeBuilder::Emit8(std::vector<uint8_t>& out, uint8_t value) { out.push_back(value); }
-void VMRuntimeBuilder::Emit32(std::vector<uint8_t>& out, uint32_t value) {
-    out.push_back(static_cast<uint8_t>(value));
-    out.push_back(static_cast<uint8_t>(value >> 8));
-    out.push_back(static_cast<uint8_t>(value >> 16));
-    out.push_back(static_cast<uint8_t>(value >> 24));
-}
-size_t VMRuntimeBuilder::Emit32Placeholder(std::vector<uint8_t>& out) {
-    size_t pos = out.size();
-    Emit32(out, 0);
-    return pos;
-}
-void VMRuntimeBuilder::Patch32(std::vector<uint8_t>& out, size_t pos, uint32_t value) {
-    for (int i = 0; i < 4; i++) out[pos + i] = static_cast<uint8_t>(value >> (i * 8));
-}
-void VMRuntimeBuilder::PatchRel32(std::vector<uint8_t>& out, size_t immPos, size_t target) {
-    int32_t disp = static_cast<int32_t>(static_cast<int64_t>(target) - static_cast<int64_t>(immPos + 4));
-    Patch32(out, immPos, static_cast<uint32_t>(disp));
-}
-
 namespace {
-constexpr uint32_t kVmRegs = 0x000;
-constexpr uint32_t kFlagZF = 0x100;
-constexpr uint32_t kFlagSF = 0x101;
-constexpr uint32_t kFlagCF = 0x102;
-constexpr uint32_t kFlagOF = 0x103;
-constexpr uint32_t kMemScale = 0x104;
-constexpr uint32_t kMemWidth = 0x105;
-constexpr uint32_t kMemKind = 0x106;
-constexpr uint32_t kMemIndexRaw = 0x107;
-constexpr uint32_t kOperandWidth = 0x108;
-constexpr uint32_t kBytecodeSize = 0x110;
-constexpr uint32_t kMetadataVa = 0x118;
-constexpr uint32_t kVmStack = 0x180;
-constexpr uint32_t kVmStackSize = 0x400;
-constexpr uint32_t kLocalSize = 0x600;
-constexpr uint32_t kTraceEnterCount = 40;
-constexpr uint32_t kTraceLastFunctionRva = 44;
-constexpr uint32_t kTraceLastOpcode = 48;
-constexpr uint32_t kTraceLastErrorCode = 52;
-constexpr uint32_t kTraceLastBytecodeOffset = 56;
-constexpr uint32_t kTraceLastRetValueLow32 = 60;
-constexpr uint32_t kVMRuntimeVersion = 0x00010005u;
-constexpr uint32_t kSaveBase = kLocalSize;
-constexpr uint32_t kSavedRflags = kLocalSize + 120;
-constexpr uint32_t kOrigRsp = kLocalSize + 0x80;
 
-enum VMRuntimeError : uint32_t {
-    VM_ERR_METADATA_INVALID = 1,
-    VM_ERR_RECORD_NOT_FOUND = 2,
-    VM_ERR_BYTECODE_RANGE = 3,
-    VM_ERR_OPCODE_UNSUPPORTED = 4,
-    VM_ERR_REGISTER_MAP_INVALID = 5,
-    VM_ERR_MEMORY_ADDR_INVALID = 6,
-    VM_ERR_HANDLER_BUG = 7,
-    VM_ERR_RET_WITHOUT_CONTEXT = 8
+struct RuntimeRelocation {
+    uint32_t offset = 0;
+    uint16_t type = 0;
 };
 
-struct Label {
-    size_t pos = static_cast<size_t>(-1);
-    std::vector<size_t> rel32Fixups;
+struct MappedRuntimeImage {
+    std::vector<uint8_t> bytes;
+    std::vector<RuntimeRelocation> relocations;
+    std::vector<VMRuntimeFunctionEntry> unwindEntries;
+    uint64_t preferredBase = 0;
+    uint32_t entryRVA = 0;
+    uint32_t headersSize = 0;
+    bool is64Bit = false;
 };
 
-class X64Emitter {
+bool RangeValid(size_t offset, size_t size, size_t total) {
+    return offset <= total && size <= total - offset;
+}
+
+constexpr std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> kRuntimeKeyMarker = {
+    0x43,0x53,0x56,0x4D,0x4B,0x45,0x59,0x33,
+    0x91,0x2D,0xE7,0x54,0xA8,0x6B,0xC0,0x1F,
+    0x37,0xD2,0x4A,0xB9,0x65,0x0E,0x83,0xFC,
+    0x18,0xA1,0x5D,0x72,0xCE,0x39,0xB4,0x06
+};
+
+bool PatchRuntimeKeyShare(
+    MappedRuntimeImage& runtime,
+    const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    std::string& error)
+{
+    size_t match = 0;
+    uint32_t matches = 0;
+    for (size_t offset = 0; offset + kRuntimeKeyMarker.size() <= runtime.bytes.size(); ++offset) {
+        if (std::memcmp(runtime.bytes.data() + offset,
+                kRuntimeKeyMarker.data(), kRuntimeKeyMarker.size()) == 0) {
+            match = offset;
+            ++matches;
+        }
+    }
+    if (matches != 1) {
+        error = "runtime key-share marker is missing or not unique";
+        return false;
+    }
+    const bool allZero = std::all_of(runtimeKeyShare.begin(), runtimeKeyShare.end(),
+        [](uint8_t value) { return value == 0; });
+    if (allZero) {
+        error = "runtime key share is all zero";
+        return false;
+    }
+    std::copy(runtimeKeyShare.begin(), runtimeKeyShare.end(), runtime.bytes.begin() + match);
+    return true;
+}
+
+uint32_t AlignUp(uint32_t value, uint32_t alignment) {
+    if (alignment == 0) return value;
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+class CodeBuffer {
 public:
-    std::vector<uint8_t> code;
+    std::vector<uint8_t> bytes;
 
-    void U8(uint8_t v) { code.push_back(v); }
-    void U32(uint32_t v) {
-        code.push_back(static_cast<uint8_t>(v));
-        code.push_back(static_cast<uint8_t>(v >> 8));
-        code.push_back(static_cast<uint8_t>(v >> 16));
-        code.push_back(static_cast<uint8_t>(v >> 24));
+    void U8(uint8_t value) { bytes.push_back(value); }
+    void U16(uint16_t value) { U8(static_cast<uint8_t>(value)); U8(static_cast<uint8_t>(value >> 8)); }
+    void U32(uint32_t value) {
+        for (unsigned i = 0; i < 4; ++i) U8(static_cast<uint8_t>(value >> (i * 8)));
     }
-    void Bytes(std::initializer_list<uint8_t> bs) { code.insert(code.end(), bs.begin(), bs.end()); }
-
-    void Bind(Label& l) {
-        l.pos = code.size();
-        for (size_t p : l.rel32Fixups) PatchRel32(p, l.pos);
-        l.rel32Fixups.clear();
-    }
-    void Rel32(Label& l) {
-        size_t p = code.size();
-        U32(0);
-        if (l.pos == static_cast<size_t>(-1)) l.rel32Fixups.push_back(p);
-        else PatchRel32(p, l.pos);
-    }
-    void Jmp(Label& l) { U8(0xE9); Rel32(l); }
-    void Call(Label& l) { U8(0xE8); Rel32(l); }
-    void Jcc(uint8_t cc, Label& l) { U8(0x0F); U8(static_cast<uint8_t>(0x80 | (cc & 0x0F))); Rel32(l); }
-
-    void MovRdxFromFrame(uint32_t disp) { Bytes({0x48, 0x8B, 0x95}); U32(disp); }
-    void MovFrameFromRdx(uint32_t disp) { Bytes({0x48, 0x89, 0x95}); U32(disp); }
-    void LeaRdxFrame(uint32_t disp) { Bytes({0x48, 0x8D, 0x95}); U32(disp); }
-
-private:
-    void PatchRel32(size_t immPos, size_t target) {
-        int64_t rel64 = static_cast<int64_t>(target) - static_cast<int64_t>(immPos + 4);
-        int32_t rel = static_cast<int32_t>(rel64);
-        for (int i = 0; i < 4; i++) code[immPos + i] = static_cast<uint8_t>(static_cast<uint32_t>(rel) >> (i * 8));
-    }
+    void Raw(std::initializer_list<uint8_t> values) { bytes.insert(bytes.end(), values.begin(), values.end()); }
+    size_t Offset() const { return bytes.size(); }
 };
 
-uint32_t SaveSlotForNativeReg(uint8_t reg) {
-    switch (reg) {
-        case 0:  return kSaveBase + 112; // RAX: return value slot.
-        case 1:  return kSaveBase + 104; // RCX: first integer argument slot.
-        case 2:  return kSaveBase + 96;  // RDX: second integer argument slot.
-        case 3:  return kSaveBase + 88;  // RBX: non-volatile user context slot.
-        case 5:  return kSaveBase + 80;  // RBP: non-volatile frame pointer slot.
-        case 6:  return kSaveBase + 72;  // RSI: non-volatile source index slot.
-        case 7:  return kSaveBase + 64;  // RDI: non-volatile destination index slot.
-        case 8:  return kSaveBase + 56;  // R8: third integer argument slot.
-        case 9:  return kSaveBase + 48;  // R9: fourth integer argument slot.
-        case 10: return kSaveBase + 40;  // R10: trampoline functionRVA carrier slot.
-        case 11: return kSaveBase + 32;  // R11: volatile scratch slot.
-        case 12: return kSaveBase + 24;  // R12: non-volatile context slot.
-        case 13: return kSaveBase + 16;  // R13: non-volatile context slot.
-        case 14: return kSaveBase + 8;   // R14: non-volatile context slot.
-        case 15: return kSaveBase + 0;   // R15: non-volatile context slot.
-        default: return 0;
+class X64TrampolineAssembler : public CodeBuffer {
+public:
+    void Endbr() { Raw({0xF3, 0x0F, 0x1E, 0xFA}); }
+    void PushFlags() { U8(0x9C); }
+    void PopFlags() { U8(0x9D); }
+    void PushReg(uint8_t reg) {
+        if (reg >= 8) U8(0x41);
+        U8(static_cast<uint8_t>(0x50 + (reg & 7u)));
     }
+    void PopReg(uint8_t reg) {
+        if (reg >= 8) U8(0x41);
+        U8(static_cast<uint8_t>(0x58 + (reg & 7u)));
+    }
+    void SubRsp(uint32_t value) { Raw({0x48, 0x81, 0xEC}); U32(value); }
+    void AddRsp(uint32_t value) { Raw({0x48, 0x81, 0xC4}); U32(value); }
+    void ProbeStack(uint32_t value) {
+        // The caller-provided x64 shadow space remains addressable while RSP is
+        // unchanged.  Keep the probe unwind-neutral so a guard-page exception
+        // cannot expose transient pushes to the system unwinder.
+        Raw({0x48, 0x89, 0x44, 0x24, 0x08});
+        Raw({0x48, 0x89, 0x4C, 0x24, 0x10});
+        PushFlags();
+        PopReg(0);
+        Raw({0x48, 0x89, 0x44, 0x24, 0x18});
+        Raw({0x48, 0x89, 0xE0});
+        Raw({0x48, 0x2D}); U32(value);
+        Raw({0x48, 0x89, 0xE1});
+        const size_t loop = Offset();
+        Raw({0x48, 0x81, 0xE9}); U32(0x1000u);
+        Raw({0xF6, 0x01, 0x00});
+        Raw({0x48, 0x39, 0xC1});
+        U8(0x77);
+        const size_t branch = Offset();
+        U8(static_cast<uint8_t>(static_cast<int8_t>(
+            static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1))));
+    }
+    void StoreReg(uint8_t reg, int32_t displacement) {
+        U8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0x00)));
+        U8(0x89);
+        U8(static_cast<uint8_t>(0x84 | ((reg & 7u) << 3)));
+        U8(0x24);
+        U32(static_cast<uint32_t>(displacement));
+    }
+    void LoadReg(uint8_t reg, int32_t displacement) {
+        U8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0x00)));
+        U8(0x8B);
+        U8(static_cast<uint8_t>(0x84 | ((reg & 7u) << 3)));
+        U8(0x24);
+        U32(static_cast<uint32_t>(displacement));
+    }
+    void StoreXmm(uint8_t xmm, uint32_t displacement) {
+        U8(0xF3);
+        if (xmm >= 8) U8(0x44);
+        Raw({0x0F, 0x7F});
+        U8(static_cast<uint8_t>(0x84 | ((xmm & 7u) << 3)));
+        U8(0x24);
+        U32(displacement);
+    }
+    void LoadXmm(uint8_t xmm, uint32_t displacement) {
+        U8(0xF3);
+        if (xmm >= 8) U8(0x44);
+        Raw({0x0F, 0x6F});
+        U8(static_cast<uint8_t>(0x84 | ((xmm & 7u) << 3)));
+        U8(0x24);
+        U32(displacement);
+    }
+    void LeaRcxRsp(uint32_t displacement) { Raw({0x48, 0x8D, 0x8C, 0x24}); U32(displacement); }
+    void LeaRaxRsp(uint32_t displacement) { Raw({0x48, 0x8D, 0x84, 0x24}); U32(displacement); }
+    void LeaR10Rsp(uint32_t displacement) { Raw({0x4C, 0x8D, 0x94, 0x24}); U32(displacement); }
+    void AddRaxImm(uint32_t value) { Raw({0x48, 0x05}); U32(value); }
+    void AndRaxImm(uint32_t value) { Raw({0x48, 0x25}); U32(value); }
+    void MovEaxImm(uint32_t value) { U8(0xB8); U32(value); }
+    void XorEdxEdx() { Raw({0x31, 0xD2}); }
+    void MovEdxImm(uint32_t value) { U8(0xBA); U32(value); }
+    void MovR8dImm(uint32_t value) { Raw({0x41, 0xB8}); U32(value); }
+    void LoadImageBaseR9() {
+        Raw({0x65, 0x4C, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00});
+        Raw({0x4D, 0x8B, 0x49, 0x10});
+    }
+    void AddR8R9() { Raw({0x4D, 0x01, 0xC8}); }
+    void StoreRaxRsp(uint32_t displacement) { Raw({0x48, 0x89, 0x84, 0x24}); U32(displacement); }
+    void LoadRaxRsp(uint32_t displacement) { Raw({0x48, 0x8B, 0x84, 0x24}); U32(displacement); }
+    void LoadR10Rsp(uint32_t displacement) { Raw({0x4C, 0x8B, 0x94, 0x24}); U32(displacement); }
+    void StoreImm32Rax(uint32_t displacement, uint32_t value) {
+        Raw({0xC7, 0x80}); U32(displacement); U32(value);
+    }
+    void FxsaveRax() { Raw({0x48, 0x0F, 0xAE, 0x00}); }
+    void FxrstorR10() { Raw({0x49, 0x0F, 0xAE, 0x0A}); }
+    void XsaveR10() { Raw({0x49, 0x0F, 0xAE, 0x22}); }
+    void XrstorR10() { Raw({0x49, 0x0F, 0xAE, 0x2A}); }
+    void PushFlagsToRax() { Raw({0x9C, 0x58}); }
+    void PushMemoryRsp(int32_t displacement) {
+        Raw({0xFF, 0xB4, 0x24});
+        U32(static_cast<uint32_t>(displacement));
+    }
+    void CallRelative(uint32_t instructionRVA, uint32_t targetRVA) {
+        U8(0xE8);
+        const int64_t relative = static_cast<int64_t>(targetRVA) -
+            static_cast<int64_t>(instructionRVA + bytes.size() + 4);
+        U32(static_cast<uint32_t>(static_cast<int32_t>(relative)));
+    }
+    void FailHardIfEaxNonZero() { Raw({0x85, 0xC0, 0x74, 0x03, 0xCC, 0x0F, 0x0B}); }
+    void Ret() { U8(0xC3); }
+};
+
+struct UnwindOperation {
+    uint8_t codeOffset = 0;
+    uint8_t unwindOp = 0;
+    uint8_t opInfo = 0;
+    uint16_t extra = 0;
+};
+
+struct BuiltX64Trampoline {
+    std::vector<uint8_t> code;
+    std::vector<uint8_t> unwindInfo;
+};
+
+struct SavedRegister {
+    uint8_t number;
+    uint32_t offset;
+};
+
+std::vector<uint8_t> BuildUnwindInfo(
+    uint8_t prologSize,
+    const std::vector<UnwindOperation>& operations)
+{
+    CodeBuffer output;
+    output.U8(0x01); // UNW_VERSION=1, no handler flags.
+    output.U8(prologSize);
+    output.U8(static_cast<uint8_t>(operations.size() * 2));
+    output.U8(0x00); // No frame register.
+    for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
+        output.U8(it->codeOffset);
+        output.U8(static_cast<uint8_t>((it->opInfo << 4) | (it->unwindOp & 0x0F)));
+        output.U16(it->extra);
+    }
+    while (output.bytes.size() % 4 != 0) output.U8(0);
+    return output.bytes;
 }
 
-void EmitReadRegMapToEcx(X64Emitter& e, uint8_t nativeReg) {
-    e.Bytes({0x41, 0x0F, 0xB6, 0x48, nativeReg});
-    e.Bytes({0x83, 0xE1, 0x1F});
+class X86TrampolineAssembler : public CodeBuffer {
+public:
+    void Endbr() { Raw({0xF3, 0x0F, 0x1E, 0xFB}); }
+    void PushFlags() { U8(0x9C); }
+    void PopFlags() { U8(0x9D); }
+    void PushAll() { U8(0x60); }
+    void PopAll() { U8(0x61); }
+    void SubEsp(uint32_t value) { Raw({0x81, 0xEC}); U32(value); }
+    void AddEsp(uint32_t value) { Raw({0x81, 0xC4}); U32(value); }
+    void ProbeStack(uint32_t value) {
+        PushFlags();
+        PushReg(0);
+        PushReg(1);
+        Raw({0x8B, 0xC4});
+        U8(0x2D); U32(value);
+        Raw({0x8B, 0xCC});
+        const size_t loop = Offset();
+        Raw({0x81, 0xE9}); U32(0x1000u);
+        Raw({0xF6, 0x01, 0x00});
+        Raw({0x3B, 0xC8});
+        U8(0x77);
+        const size_t branch = Offset();
+        U8(static_cast<uint8_t>(static_cast<int8_t>(
+            static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1))));
+        PopReg(1);
+        PopReg(0);
+        PopFlags();
+    }
+    void LoadEaxRsp(uint32_t displacement) { Raw({0x8B, 0x84, 0x24}); U32(displacement); }
+    void StoreEaxRsp(uint32_t displacement) { Raw({0x89, 0x84, 0x24}); U32(displacement); }
+    void StoreXmm(uint8_t xmm, uint32_t displacement) {
+        Raw({0xF3, 0x0F, 0x7F});
+        U8(static_cast<uint8_t>(0x84 | ((xmm & 7u) << 3)));
+        U8(0x24);
+        U32(displacement);
+    }
+    void LoadXmm(uint8_t xmm, uint32_t displacement) {
+        Raw({0xF3, 0x0F, 0x6F});
+        U8(static_cast<uint8_t>(0x84 | ((xmm & 7u) << 3)));
+        U8(0x24);
+        U32(displacement);
+    }
+    void MovEdxEsp() { Raw({0x8B, 0xD4}); }
+    void MovEcxEsp() { Raw({0x8B, 0xCC}); }
+    void AddEcxImm(uint32_t value) { Raw({0x81, 0xC1}); U32(value); }
+    void AndEcxImm(uint32_t value) { Raw({0x81, 0xE1}); U32(value); }
+    void AddEdxImm(uint32_t value) { Raw({0x81, 0xC2}); U32(value); }
+    void AndEdxImm(uint32_t value) { Raw({0x81, 0xE2}); U32(value); }
+    void MovEaxImm(uint32_t value) { U8(0xB8); U32(value); }
+    void XorEdxEdx() { Raw({0x31, 0xD2}); }
+    void StoreImm32Ecx(uint32_t displacement, uint32_t value) {
+        Raw({0xC7, 0x81}); U32(displacement); U32(value);
+    }
+    void FxsaveEcx() { Raw({0x0F, 0xAE, 0x01}); }
+    void FxrstorEcx() { Raw({0x0F, 0xAE, 0x09}); }
+    void XsaveEcx() { Raw({0x0F, 0xAE, 0x21}); }
+    void XrstorEcx() { Raw({0x0F, 0xAE, 0x29}); }
+    void LeaEaxEsp(uint32_t displacement) { Raw({0x8D, 0x84, 0x24}); U32(displacement); }
+    void LoadImageBaseEcx() {
+        Raw({0x64, 0x8B, 0x0D, 0x30, 0x00, 0x00, 0x00});
+        Raw({0x8B, 0x49, 0x08});
+    }
+    void MovEbxImm(uint32_t value) { U8(0xBB); U32(value); }
+    void AddEbxEcx() { Raw({0x03, 0xD9}); }
+    void PushReg(uint8_t reg) { U8(static_cast<uint8_t>(0x50 + (reg & 7u))); }
+    void PopReg(uint8_t reg) { U8(static_cast<uint8_t>(0x58 + (reg & 7u))); }
+    void PushImm(uint32_t value) { U8(0x68); U32(value); }
+    void CallRelative(uint32_t instructionRVA, uint32_t targetRVA) {
+        U8(0xE8);
+        const int64_t relative = static_cast<int64_t>(targetRVA) -
+            static_cast<int64_t>(instructionRVA + bytes.size() + 4);
+        U32(static_cast<uint32_t>(static_cast<int32_t>(relative)));
+    }
+    void FailHardIfEaxNonZero() { Raw({0x85, 0xC0, 0x74, 0x03, 0xCC, 0x0F, 0x0B}); }
+    void Ret(uint16_t cleanup) { if (cleanup) { U8(0xC2); U16(cleanup); } else U8(0xC3); }
+};
+
+bool ParseRuntimeImage(
+    const uint8_t* file,
+    size_t fileSize,
+    bool expect64Bit,
+    MappedRuntimeImage& output,
+    std::string& error)
+{
+    if (!file || fileSize < sizeof(IMAGE_DOS_HEADER)) {
+        error = "runtime blob DOS header is truncated";
+        return false;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(file);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        !RangeValid(static_cast<size_t>(dos->e_lfanew), sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER), fileSize)) {
+        error = "runtime blob has invalid DOS/NT header";
+        return false;
+    }
+    const uint8_t* ntBase = file + dos->e_lfanew;
+    if (*reinterpret_cast<const DWORD*>(ntBase) != IMAGE_NT_SIGNATURE) {
+        error = "runtime blob NT signature mismatch";
+        return false;
+    }
+    const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(ntBase + sizeof(DWORD));
+    const uint8_t* optionalBase = reinterpret_cast<const uint8_t*>(fileHeader + 1);
+    if (!RangeValid(static_cast<size_t>(optionalBase - file), fileHeader->SizeOfOptionalHeader, fileSize)) {
+        error = "runtime optional header is truncated";
+        return false;
+    }
+    const WORD magic = *reinterpret_cast<const WORD*>(optionalBase);
+    output.is64Bit = magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    if (output.is64Bit != expect64Bit ||
+        (!output.is64Bit && magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)) {
+        error = "runtime blob architecture mismatch";
+        return false;
+    }
+
+    uint32_t sizeOfImage = 0;
+    uint32_t sizeOfHeaders = 0;
+    IMAGE_DATA_DIRECTORY importDirectory{};
+    IMAGE_DATA_DIRECTORY relocationDirectory{};
+    IMAGE_DATA_DIRECTORY exceptionDirectory{};
+    if (output.is64Bit) {
+        const auto* optional = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(optionalBase);
+        sizeOfImage = optional->SizeOfImage;
+        sizeOfHeaders = optional->SizeOfHeaders;
+        output.preferredBase = optional->ImageBase;
+        output.entryRVA = optional->AddressOfEntryPoint;
+        importDirectory = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        relocationDirectory = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        exceptionDirectory = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    } else {
+        const auto* optional = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(optionalBase);
+        sizeOfImage = optional->SizeOfImage;
+        sizeOfHeaders = optional->SizeOfHeaders;
+        output.preferredBase = optional->ImageBase;
+        output.entryRVA = optional->AddressOfEntryPoint;
+        importDirectory = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        relocationDirectory = optional->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    }
+    if (sizeOfImage == 0 || sizeOfImage > 16u * 1024u * 1024u || output.entryRVA >= sizeOfImage) {
+        error = "runtime mapped image size or entry RVA is invalid";
+        return false;
+    }
+    if (importDirectory.VirtualAddress != 0 || importDirectory.Size != 0) {
+        error = "runtime blob unexpectedly contains imports";
+        return false;
+    }
+
+    output.bytes.assign(sizeOfImage, 0);
+    output.headersSize = sizeOfHeaders;
+    const size_t headerBytes = (std::min)(static_cast<size_t>(sizeOfHeaders), fileSize);
+    std::memcpy(output.bytes.data(), file, headerBytes);
+    const uint8_t* sectionBase = optionalBase + fileHeader->SizeOfOptionalHeader;
+    if (!RangeValid(static_cast<size_t>(sectionBase - file),
+        static_cast<size_t>(fileHeader->NumberOfSections) * sizeof(IMAGE_SECTION_HEADER), fileSize)) {
+        error = "runtime section table is truncated";
+        return false;
+    }
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(sectionBase);
+    for (WORD i = 0; i < fileHeader->NumberOfSections; ++i) {
+        const auto& section = sections[i];
+        const uint32_t virtualSize = section.Misc.VirtualSize ? section.Misc.VirtualSize : section.SizeOfRawData;
+        if (section.VirtualAddress > sizeOfImage || virtualSize > sizeOfImage - section.VirtualAddress ||
+            !RangeValid(section.PointerToRawData, section.SizeOfRawData, fileSize)) {
+            error = "runtime section range is invalid";
+            return false;
+        }
+        if ((section.Characteristics & IMAGE_SCN_MEM_WRITE) && virtualSize != 0) {
+            error = "runtime blob contains writable static state";
+            return false;
+        }
+        const uint32_t copySize = (std::min)(static_cast<uint32_t>(section.SizeOfRawData), virtualSize);
+        if (copySize) std::memcpy(output.bytes.data() + section.VirtualAddress,
+            file + section.PointerToRawData, copySize);
+    }
+
+    if (relocationDirectory.VirtualAddress && relocationDirectory.Size) {
+        if (relocationDirectory.VirtualAddress > output.bytes.size() ||
+            relocationDirectory.Size > output.bytes.size() - relocationDirectory.VirtualAddress) {
+            error = "runtime relocation directory is outside mapped image";
+            return false;
+        }
+        uint32_t cursor = relocationDirectory.VirtualAddress;
+        const uint32_t end = cursor + relocationDirectory.Size;
+        while (cursor < end) {
+            if (end - cursor < sizeof(IMAGE_BASE_RELOCATION)) {
+                error = "runtime relocation block is truncated";
+                return false;
+            }
+            const auto* block = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(output.bytes.data() + cursor);
+            if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) || block->SizeOfBlock > end - cursor) {
+                error = "runtime relocation block size is invalid";
+                return false;
+            }
+            const uint32_t entryCount = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            const WORD* entries = reinterpret_cast<const WORD*>(block + 1);
+            for (uint32_t i = 0; i < entryCount; ++i) {
+                RuntimeRelocation relocation{};
+                relocation.type = entries[i] >> 12;
+                relocation.offset = block->VirtualAddress + (entries[i] & 0x0FFFu);
+                if (relocation.type != IMAGE_REL_BASED_ABSOLUTE) output.relocations.push_back(relocation);
+            }
+            cursor += block->SizeOfBlock;
+        }
+    }
+
+    if (output.is64Bit && exceptionDirectory.VirtualAddress && exceptionDirectory.Size) {
+        if (exceptionDirectory.VirtualAddress > output.bytes.size() ||
+            exceptionDirectory.Size > output.bytes.size() - exceptionDirectory.VirtualAddress ||
+            exceptionDirectory.Size % sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) != 0) {
+            error = "runtime exception directory is invalid";
+            return false;
+        }
+        const auto* entries = reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(
+            output.bytes.data() + exceptionDirectory.VirtualAddress);
+        const uint32_t count = exceptionDirectory.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+        for (uint32_t i = 0; i < count; ++i) {
+            VMRuntimeFunctionEntry entry{};
+            entry.beginRVA = entries[i].BeginAddress;
+            entry.endRVA = entries[i].EndAddress;
+            entry.unwindRVA = entries[i].UnwindData;
+            if (entry.beginRVA >= entry.endRVA || entry.endRVA > output.bytes.size() ||
+                entry.unwindRVA >= output.bytes.size()) {
+                error = "runtime unwind entry is outside mapped image";
+                return false;
+            }
+            output.unwindEntries.push_back(entry);
+        }
+    }
+    if (output.headersSize > output.bytes.size()) {
+        error = "runtime mapped header size exceeds image size";
+        return false;
+    }
+    std::fill(output.bytes.begin(), output.bytes.begin() + output.headersSize,
+        static_cast<uint8_t>(0));
+    return true;
 }
 
-void EmitStoreVmRegFromRdxToEcx(X64Emitter& e) { e.Bytes({0x49, 0x89, 0x14, 0xCF}); }
-void EmitLoadVmRegToRdxFromEcx(X64Emitter& e) { e.Bytes({0x49, 0x8B, 0x14, 0xCF}); }
-void EmitLoadVmRegToRdxFromEbx(X64Emitter& e) { e.Bytes({0x49, 0x8B, 0x14, 0xDF}); }
-void EmitLoadVmRegToRaxFromEbx(X64Emitter& e) { e.Bytes({0x49, 0x8B, 0x04, 0xDF}); }
-void EmitStoreVmRegFromRaxToEbx(X64Emitter& e) { e.Bytes({0x49, 0x89, 0x04, 0xDF}); }
-void EmitStoreVmRegFromRdxToEbx(X64Emitter& e) { e.Bytes({0x49, 0x89, 0x14, 0xDF}); }
-
-void EmitSetccToFrame(X64Emitter& e, uint8_t cc, uint32_t disp) {
-    e.U8(0x0F);
-    e.U8(static_cast<uint8_t>(0x90 | (cc & 0x0F)));
-    e.U8(0x85);
-    e.U32(disp);
+bool ApplyRuntimeRelocations(
+    MappedRuntimeImage& runtime,
+    uint64_t newBase,
+    std::string& error)
+{
+    const int64_t delta = static_cast<int64_t>(newBase - runtime.preferredBase);
+    for (const auto& relocation : runtime.relocations) {
+        if (runtime.is64Bit && relocation.type == IMAGE_REL_BASED_DIR64) {
+            if (!RangeValid(relocation.offset, sizeof(uint64_t), runtime.bytes.size())) {
+                error = "x64 runtime relocation target is outside mapped image";
+                return false;
+            }
+            uint64_t value = 0;
+            std::memcpy(&value, runtime.bytes.data() + relocation.offset, sizeof(value));
+            value = static_cast<uint64_t>(static_cast<int64_t>(value) + delta);
+            std::memcpy(runtime.bytes.data() + relocation.offset, &value, sizeof(value));
+        } else if (!runtime.is64Bit && relocation.type == IMAGE_REL_BASED_HIGHLOW) {
+            if (!RangeValid(relocation.offset, sizeof(uint32_t), runtime.bytes.size())) {
+                error = "x86 runtime relocation target is outside mapped image";
+                return false;
+            }
+            uint32_t value = 0;
+            std::memcpy(&value, runtime.bytes.data() + relocation.offset, sizeof(value));
+            value = static_cast<uint32_t>(static_cast<int64_t>(value) + delta);
+            std::memcpy(runtime.bytes.data() + relocation.offset, &value, sizeof(value));
+        } else {
+            error = "runtime relocation type is unsupported for target architecture";
+            return false;
+        }
+    }
+    return true;
 }
 
-void EmitSetFrameByte(X64Emitter& e, uint32_t disp, uint8_t value) {
-    e.Bytes({0xC6, 0x85});
-    e.U32(disp);
-    e.U8(value);
-}
+BuiltX64Trampoline BuildX64Trampoline(
+    uint32_t trampolineOffset,
+    uint32_t runtimeEntryOffset,
+    uint32_t functionRVA,
+    uint32_t metadataRVA,
+    uint32_t guestStackSize,
+    bool usesAvx)
+{
+    constexpr uint32_t kFrameOffset = 0x40;
+    constexpr uint32_t kXmmOffset = 0xD0;
+    constexpr uint32_t kExtendedStorageOffset = 0x200;
+    constexpr uint32_t kExtendedPointerSlot = 0x30;
+    constexpr uint32_t kHostStackAllocation = 0x598;
+    const uint32_t kStackAllocation = kHostStackAllocation + guestStackSize;
+    constexpr uint32_t kFrameR15 = kFrameOffset + 0;
+    constexpr uint32_t kFrameR14 = kFrameOffset + 8;
+    constexpr uint32_t kFrameR13 = kFrameOffset + 16;
+    constexpr uint32_t kFrameR12 = kFrameOffset + 24;
+    constexpr uint32_t kFrameR11 = kFrameOffset + 32;
+    constexpr uint32_t kFrameR10 = kFrameOffset + 40;
+    constexpr uint32_t kFrameR9 = kFrameOffset + 48;
+    constexpr uint32_t kFrameR8 = kFrameOffset + 56;
+    constexpr uint32_t kFrameRdi = kFrameOffset + 64;
+    constexpr uint32_t kFrameRsi = kFrameOffset + 72;
+    constexpr uint32_t kFrameRbp = kFrameOffset + 80;
+    constexpr uint32_t kFrameRbx = kFrameOffset + 88;
+    constexpr uint32_t kFrameRdx = kFrameOffset + 96;
+    constexpr uint32_t kFrameRcx = kFrameOffset + 104;
+    constexpr uint32_t kFrameRax = kFrameOffset + 112;
+    constexpr uint32_t kFrameRflags = kFrameOffset + 120;
+    constexpr uint32_t kFrameReturnAddress = kFrameOffset + 128;
+    constexpr uint32_t kFrameOriginalRsp = kFrameOffset + 136;
 
-void EmitSetArithmeticFlags(X64Emitter& e) {
-    EmitSetccToFrame(e, 0x4, kFlagZF);
-    EmitSetccToFrame(e, 0x8, kFlagSF);
-    EmitSetccToFrame(e, 0x2, kFlagCF);
-    EmitSetccToFrame(e, 0x0, kFlagOF);
-}
+    X64TrampolineAssembler assembler;
+    std::vector<UnwindOperation> unwindOperations;
 
-void EmitSetLogicFlags(X64Emitter& e) {
-    EmitSetccToFrame(e, 0x4, kFlagZF);
-    EmitSetccToFrame(e, 0x8, kFlagSF);
-    EmitSetFrameByte(e, kFlagCF, 0);
-    EmitSetFrameByte(e, kFlagOF, 0);
-}
+    assembler.Endbr();
+    assembler.ProbeStack(kStackAllocation);
+    assembler.SubRsp(kStackAllocation);
+    unwindOperations.push_back({
+        static_cast<uint8_t>(assembler.Offset()), 1, 0,
+        static_cast<uint16_t>(kStackAllocation / 8)
+    });
 
-void EmitInitFlagFromRdx(X64Emitter& e, uint8_t bit, uint32_t disp) {
-    e.Bytes({0x48, 0x0F, 0xBA, 0xE2, bit});
-    EmitSetccToFrame(e, 0x2, disp);
-}
-
-void EmitFetchDstToEbx(X64Emitter& e, Label& fetchReg) {
-    e.Call(fetchReg);
-    e.Bytes({0x8B, 0xD9});
-}
-
-void EmitFetchOperandWidth(X64Emitter& e, Label& fetchByte);
-void EmitMaskRaxByOperandWidth(X64Emitter& e);
-void EmitMaskRdxByOperandWidth(X64Emitter& e);
-
-void EmitInitNativeReg(X64Emitter& e, uint8_t nativeReg) {
-    EmitReadRegMapToEcx(e, nativeReg);
-    if (nativeReg == 4) e.LeaRdxFrame(kVmStack + kVmStackSize);
-    else e.MovRdxFromFrame(SaveSlotForNativeReg(nativeReg));
-    EmitStoreVmRegFromRdxToEcx(e);
-}
-
-void EmitWriteBackNativeReg(X64Emitter& e, uint8_t nativeReg) {
-    if (nativeReg == 4) return;
-    EmitReadRegMapToEcx(e, nativeReg);
-    EmitLoadVmRegToRdxFromEcx(e);
-    e.MovFrameFromRdx(SaveSlotForNativeReg(nativeReg));
-}
-
-void EmitCommitFlagsToSavedRflags(X64Emitter& e) {
-    Label zf0, sf0, cf0, of0;
-    e.MovRdxFromFrame(kSavedRflags);
-    e.Bytes({0x48, 0x81, 0xE2}); e.U32(0xFFFFF73Eu); // clear CF/ZF/SF/OF, preserve all other bits.
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagCF); e.U8(0x00); e.Jcc(0x4, cf0);
-    e.Bytes({0x48, 0x81, 0xCA}); e.U32(0x00000001u);
-    e.Bind(cf0);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagZF); e.U8(0x00); e.Jcc(0x4, zf0);
-    e.Bytes({0x48, 0x81, 0xCA}); e.U32(0x00000040u);
-    e.Bind(zf0);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagSF); e.U8(0x00); e.Jcc(0x4, sf0);
-    e.Bytes({0x48, 0x81, 0xCA}); e.U32(0x00000080u);
-    e.Bind(sf0);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagOF); e.U8(0x00); e.Jcc(0x4, of0);
-    e.Bytes({0x48, 0x81, 0xCA}); e.U32(0x00000800u);
-    e.Bind(of0);
-    e.MovFrameFromRdx(kSavedRflags);
-}
-
-void EmitBinaryRR(X64Emitter& e, Label& fetchReg, Label& fetchByte, uint8_t op1, uint8_t op2, bool logicFlags) {
-    EmitFetchDstToEbx(e, fetchReg);
-    e.Call(fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRaxFromEbx(e);
-    EmitLoadVmRegToRdxFromEcx(e);
-    EmitMaskRaxByOperandWidth(e);
-    EmitMaskRdxByOperandWidth(e);
-    e.Bytes({0x48, op1, op2});
-    EmitMaskRaxByOperandWidth(e);
-    EmitStoreVmRegFromRaxToEbx(e);
-    if (logicFlags) EmitSetLogicFlags(e); else EmitSetArithmeticFlags(e);
-}
-
-void EmitBinaryRC(X64Emitter& e, Label& fetchReg, Label& fetchImm64, Label& fetchByte, uint8_t op1, uint8_t op2, bool logicFlags) {
-    EmitFetchDstToEbx(e, fetchReg);
-    e.Call(fetchImm64);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRdxFromEbx(e);
-    EmitMaskRdxByOperandWidth(e);
-    EmitMaskRaxByOperandWidth(e);
-    e.Bytes({0x48, op1, op2});
-    EmitMaskRdxByOperandWidth(e);
-    EmitStoreVmRegFromRdxToEbx(e);
-    if (logicFlags) EmitSetLogicFlags(e); else EmitSetArithmeticFlags(e);
-}
-
-void EmitMoveEsiEax(X64Emitter& e) { e.Bytes({0x8B, 0xF0}); }
-
-void EmitConditionalJumpByFlag(X64Emitter& e, Label& fetchImm32, uint32_t flagDisp, bool takeWhenSet, Label& dispatch) {
-    Label skip;
-    e.Call(fetchImm32);
-    e.Bytes({0x80, 0xBD}); e.U32(flagDisp); e.U8(0x00);
-    e.Jcc(takeWhenSet ? 0x4 : 0x5, skip);
-    EmitMoveEsiEax(e);
-    e.Bind(skip);
-    e.Jmp(dispatch);
-}
-void EmitFetchOperandWidth(X64Emitter& e, Label& fetchByte) {
-    e.Call(fetchByte);
-    e.Bytes({0x88, 0x85});
-    e.U32(kOperandWidth);
-}
-
-void EmitMaskRaxByOperandWidth(X64Emitter& e) {
-    Label w4, w2, w1, done;
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x08); e.Jcc(0x4, done);
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x04); e.Jcc(0x4, w4);
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x02); e.Jcc(0x4, w2);
-    e.Jmp(w1);
-    e.Bind(w4); e.Bytes({0x89, 0xC0}); e.Jmp(done);
-    e.Bind(w2); e.Bytes({0x0F, 0xB7, 0xC0}); e.Jmp(done);
-    e.Bind(w1); e.Bytes({0x0F, 0xB6, 0xC0});
-    e.Bind(done);
-}
-
-void EmitMaskRdxByOperandWidth(X64Emitter& e) {
-    Label w4, w2, w1, done;
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x08); e.Jcc(0x4, done);
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x04); e.Jcc(0x4, w4);
-    e.Bytes({0x80, 0xBD}); e.U32(kOperandWidth); e.U8(0x02); e.Jcc(0x4, w2);
-    e.Jmp(w1);
-    e.Bind(w4); e.Bytes({0x89, 0xD2}); e.Jmp(done);
-    e.Bind(w2); e.Bytes({0x0F, 0xB7, 0xD2}); e.Jmp(done);
-    e.Bind(w1); e.Bytes({0x0F, 0xB6, 0xD2});
-    e.Bind(done);
-}
-}
-
-std::vector<uint8_t> VMRuntimeBuilder::BuildX64RuntimeInterpreter(uint32_t metadataRVA) {
-    (void)metadataRVA;
-    X64Emitter e;
-    e.code.reserve(4096);
-
-    Label runtimeFail, failMetadataInvalid, failRecordNotFound, failBytecodeRange, failOpcodeUnsupported;
-    Label failRegisterMapInvalid, failMemoryAddrInvalid, failHandlerBug, failRetWithoutContext;
-    Label restore, writeback, dispatch, foundRecord, recordLoop;
-    Label fetchByte, fetchReg, fetchImm32, fetchImm64, fetchOpcode, fetchMemAddress;
-    Label memNoBase, memNoIndex, memScaleCheck4, memScaleCheck8, memScaleDone, memNoImageBase;
-    Label opNop, opMovRR, opMovRC, opMovRM, opMovMR, opLea, opPushR, opPushC, opPopR, opCallNative;
-    Label opAddRR, opAddRC, opSubRR, opSubRC, opAndRR, opAndRC, opOrRR, opOrRC, opXorRR, opXorRC;
-    Label opCmpRR, opCmpRC, opTestRR, opTestRC;
-    Label opJmp, opJz, opJnz, opJa, opJae, opJb, opJbe, opJg, opJge, opJl, opJle, opRet;
-    Label movRmW2, movRmW4, movRmW8, movRmStore;
-    Label movMrW2, movMrW4, movMrW8, movMrDone;
-    Label jccSkip1, jccSkip2, jccTake1, jccTake2, jccSkip3, jccSkip4, jccSkip5, jccSkip6;
-
-    auto emitRuntimeFailCode = [&](VMRuntimeError code) {
-        e.U8(0xBF); e.U32(static_cast<uint32_t>(code));
-        e.Jmp(runtimeFail);
+    const SavedRegister nonvolatileGprs[] = {
+        {15, kFrameR15}, {14, kFrameR14}, {13, kFrameR13}, {12, kFrameR12},
+        {7, kFrameRdi}, {6, kFrameRsi}, {5, kFrameRbp}, {3, kFrameRbx}
     };
-
-    e.Bytes({0x9C, 0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57});
-    e.Bytes({0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});
-    e.Bytes({0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57});
-    e.Bytes({0x48, 0x81, 0xEC}); e.U32(kLocalSize);
-    e.Bytes({0x48, 0x89, 0xE5});
-
-    e.Bytes({0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00});
-    e.Bytes({0x48, 0x8B, 0x58, 0x10});
-    e.Bytes({0x41, 0x8B, 0xC3});
-    e.Bytes({0x48, 0x01, 0xD8});
-    e.Bytes({0x49, 0x89, 0xC4});
-    e.Bytes({0x4C, 0x89, 0xA5}); e.U32(kMetadataVa);
-    e.Bytes({0x41, 0xFF, 0x44, 0x24}); e.U8(static_cast<uint8_t>(kTraceEnterCount));
-    e.Bytes({0x45, 0x89, 0x54, 0x24}); e.U8(static_cast<uint8_t>(kTraceLastFunctionRva));
-    e.Bytes({0x41, 0xC7, 0x44, 0x24}); e.U8(static_cast<uint8_t>(kTraceLastErrorCode)); e.U32(0);
-
-    e.Bytes({0x41, 0x8B, 0x04, 0x24});
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x05, 0x41, 0x33, 0x54, 0x24, 0x20});
-    e.Bytes({0x81, 0xFA}); e.U32(kVMRuntimeVersion); e.Jcc(0x5, failMetadataInvalid);
-    e.Bytes({0x41, 0x8B, 0x4C, 0x24, 0x04});
-    e.Bytes({0x31, 0xC1});
-
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x03, 0x41, 0x33, 0x54, 0x24, 0x08});
-    e.Bytes({0x4D, 0x89, 0xE5, 0x49, 0x01, 0xD5});
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x07, 0x41, 0x33, 0x54, 0x24, 0x0C});
-    e.Bytes({0x4D, 0x89, 0xE1, 0x49, 0x01, 0xD1});
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x0B, 0x41, 0x33, 0x54, 0x24, 0x10});
-    e.Bytes({0x4D, 0x89, 0xE0, 0x49, 0x01, 0xD0});
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x11, 0x41, 0x33, 0x54, 0x24, 0x14});
-    e.Bytes({0x4D, 0x89, 0xE6, 0x49, 0x01, 0xD6});
-
-    e.Bind(recordLoop);
-    e.Bytes({0x85, 0xC9}); e.Jcc(0x4, failRecordNotFound);
-    e.Bytes({0x41, 0x8B, 0x55, 0x00});
-    e.Bytes({0x31, 0xC2});
-    e.Bytes({0x44, 0x39, 0xD2});
-    e.Jcc(0x4, foundRecord);
-    e.Bytes({0x49, 0x83, 0xC5, 0x1C});
-    e.Bytes({0xFF, 0xC9});
-    e.Jmp(recordLoop);
-
-    e.Bind(foundRecord);
-    e.Bytes({0x8B, 0xD0, 0xC1, 0xC2, 0x05, 0x41, 0x33, 0x55, 0x08});
-    e.Bytes({0x49, 0x01, 0xD6});
-    e.Bytes({0x8B, 0xF8, 0xC1, 0xC7, 0x09, 0x41, 0x33, 0x7D, 0x0C});
-    e.Bytes({0x48, 0x89, 0xBD}); e.U32(kBytecodeSize);
-    e.Bytes({0x41, 0x89, 0xC3});
-    e.Bytes({0x49, 0x89, 0xDC}); // r12 = image base, so RBX can be used as VM dst scratch.
-
-    e.Bytes({0x4C, 0x8D, 0xBD}); e.U32(kVmRegs);
-    e.Bytes({0x31, 0xC0, 0xB9, 0x20, 0x00, 0x00, 0x00});
-    e.Bytes({0x48, 0x8D, 0xBD}); e.U32(kVmRegs);
-    e.Bytes({0xF3, 0x48, 0xAB});
-
-    const uint8_t nativeRegsInit[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
-    for (uint8_t r : nativeRegsInit) EmitInitNativeReg(e, r);
-    e.MovRdxFromFrame(kSavedRflags);
-    EmitInitFlagFromRdx(e, 6, kFlagZF);
-    EmitInitFlagFromRdx(e, 7, kFlagSF);
-    EmitInitFlagFromRdx(e, 0, kFlagCF);
-    EmitInitFlagFromRdx(e, 11, kFlagOF);
-    e.Bytes({0x48, 0x31, 0xF6});
-    e.Jmp(dispatch);
-
-    e.Bind(fetchByte);
-    e.Bytes({0x48, 0x3B, 0xB5}); e.U32(kBytecodeSize);
-    e.Jcc(0x3, failBytecodeRange);
-    e.Bytes({0x41, 0x0F, 0xB6, 0x04, 0x36});
-    e.Bytes({0x8B, 0xCE, 0x83, 0xE1, 0x03});
-    e.Bytes({0x44, 0x89, 0xDA});
-    e.Bytes({0xC1, 0xE1, 0x03, 0xD3, 0xEA});
-    e.Bytes({0x30, 0xD0});
-    e.Bytes({0x8B, 0xCE, 0x69, 0xC9, 0x83, 0x00, 0x00, 0x00});
-    e.Bytes({0x30, 0xC8});
-    e.Bytes({0x48, 0xFF, 0xC6});
-    e.U8(0xC3);
-
-    e.Bind(fetchReg);
-    e.Call(fetchByte);
-    e.Bytes({0x0F, 0xB6, 0xC8});
-    e.Bytes({0x83, 0xF9, 0x1F}); e.Jcc(0x7, failRegisterMapInvalid);
-    e.U8(0xC3);
-
-    e.Bind(fetchImm32);
-    e.Bytes({0x45, 0x31, 0xD2});
-    const uint8_t imm32Shifts[] = {0,8,16,24};
-    for (uint8_t shift : imm32Shifts) {
-        e.Call(fetchByte);
-        e.Bytes({0x0F, 0xB6, 0xC0});
-        if (shift) e.Bytes({0xC1, 0xE0, shift});
-        e.Bytes({0x41, 0x09, 0xC2});
+    for (const auto& saved : nonvolatileGprs) {
+        assembler.StoreReg(saved.number, static_cast<int32_t>(saved.offset));
+        unwindOperations.push_back({
+            static_cast<uint8_t>(assembler.Offset()), 4, saved.number,
+            static_cast<uint16_t>(saved.offset / 8)
+        });
     }
-    e.Bytes({0x44, 0x89, 0xD0, 0xC3});
-
-    e.Bind(fetchImm64);
-    e.Bytes({0x4D, 0x31, 0xD2});
-    const uint8_t imm64Shifts[] = {0,8,16,24,32,40,48,56};
-    for (uint8_t shift : imm64Shifts) {
-        e.Call(fetchByte);
-        e.Bytes({0x48, 0x0F, 0xB6, 0xC0});
-        if (shift) e.Bytes({0x48, 0xC1, 0xE0, shift});
-        e.Bytes({0x49, 0x09, 0xC2});
+    for (uint8_t xmm = 6; xmm < 16; ++xmm) {
+        const uint32_t offset = kXmmOffset + xmm * 16;
+        assembler.StoreXmm(xmm, offset);
+        unwindOperations.push_back({
+            static_cast<uint8_t>(assembler.Offset()), 8, xmm,
+            static_cast<uint16_t>(offset / 16)
+        });
     }
-    e.Bytes({0x4C, 0x89, 0xD0, 0xC3});
+    if (assembler.Offset() > 0xFFu) return {};
+    const uint8_t prologSize = static_cast<uint8_t>(assembler.Offset());
 
-    e.Bind(fetchOpcode);
-    e.Call(fetchByte);
-    e.Bytes({0x0F, 0xB6, 0xC0});
-    e.Bytes({0x41, 0x0F, 0xB6, 0x04, 0x01});
-    e.U8(0xC3);
-
-    e.Bind(fetchMemAddress);
-    e.Call(fetchByte); e.Bytes({0x0F, 0xB6, 0xF8});
-    e.Call(fetchByte); e.Bytes({0x88, 0x85}); e.U32(kMemIndexRaw);
-    e.Call(fetchByte); e.Bytes({0x88, 0x85}); e.U32(kMemScale);
-    e.Call(fetchByte); e.Bytes({0x88, 0x85}); e.U32(kMemWidth);
-    e.Call(fetchByte); e.Bytes({0x88, 0x85}); e.U32(kMemKind);
-    e.Call(fetchImm64);
-    e.Bytes({0x81, 0xFF}); e.U32(0x000000FFu); e.Jcc(0x4, memNoBase);
-    e.Bytes({0x83, 0xE7, 0x1F});
-    e.Bytes({0x49, 0x8B, 0x14, 0xFF});
-    e.Bytes({0x48, 0x01, 0xD0});
-    e.Bind(memNoBase);
-    e.Bytes({0x0F, 0xB6, 0x95}); e.U32(kMemIndexRaw);
-    e.Bytes({0x81, 0xFA}); e.U32(0x000000FFu); e.Jcc(0x4, memNoIndex);
-    e.Bytes({0x83, 0xE2, 0x1F});
-    e.Bytes({0x49, 0x8B, 0x14, 0xD7});
-    e.Bytes({0x80, 0xBD}); e.U32(kMemScale); e.U8(0x02); e.Jcc(0x5, memScaleCheck4);
-    e.Bytes({0x48, 0xD1, 0xE2}); e.Jmp(memScaleDone);
-    e.Bind(memScaleCheck4);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemScale); e.U8(0x04); e.Jcc(0x5, memScaleCheck8);
-    e.Bytes({0x48, 0xC1, 0xE2, 0x02}); e.Jmp(memScaleDone);
-    e.Bind(memScaleCheck8);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemScale); e.U8(0x08); e.Jcc(0x5, memScaleDone);
-    e.Bytes({0x48, 0xC1, 0xE2, 0x03});
-    e.Bind(memScaleDone);
-    e.Bytes({0x48, 0x01, 0xD0});
-    e.Bind(memNoIndex);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemKind); e.U8(0x01); e.Jcc(0x5, memNoImageBase);
-    e.Bytes({0x4C, 0x01, 0xE0});
-    e.Bind(memNoImageBase);
-    e.U8(0xC3);
-
-    e.Bind(dispatch);
-    e.Call(fetchOpcode);
-    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
-    e.Bytes({0x41, 0x89, 0x45}); e.U8(static_cast<uint8_t>(kTraceLastOpcode));
-    e.Bytes({0x8B, 0xD6, 0x83, 0xEA, 0x01});
-    e.Bytes({0x41, 0x89, 0x55}); e.U8(static_cast<uint8_t>(kTraceLastBytecodeOffset));
-    const std::pair<uint8_t, Label*> opcodeTargets[] = {
-        {static_cast<uint8_t>(VM_NOP), &opNop}, {static_cast<uint8_t>(VM_MOV_RR), &opMovRR}, {static_cast<uint8_t>(VM_MOV_RC), &opMovRC},
-        {static_cast<uint8_t>(VM_MOV_RM), &opMovRM}, {static_cast<uint8_t>(VM_MOV_MR), &opMovMR}, {static_cast<uint8_t>(VM_LEA), &opLea},
-        {static_cast<uint8_t>(VM_PUSH_R), &opPushR}, {static_cast<uint8_t>(VM_PUSH_C), &opPushC}, {static_cast<uint8_t>(VM_POP_R), &opPopR},
-        {static_cast<uint8_t>(VM_CALL_NATIVE), &opCallNative},
-        {static_cast<uint8_t>(VM_ADD_RR), &opAddRR}, {static_cast<uint8_t>(VM_ADD_RC), &opAddRC}, {static_cast<uint8_t>(VM_SUB_RR), &opSubRR}, {static_cast<uint8_t>(VM_SUB_RC), &opSubRC},
-        {static_cast<uint8_t>(VM_AND_RR), &opAndRR}, {static_cast<uint8_t>(VM_AND_RC), &opAndRC}, {static_cast<uint8_t>(VM_OR_RR), &opOrRR}, {static_cast<uint8_t>(VM_OR_RC), &opOrRC},
-        {static_cast<uint8_t>(VM_XOR_RR), &opXorRR}, {static_cast<uint8_t>(VM_XOR_RC), &opXorRC},
-        {static_cast<uint8_t>(VM_CMP_RR), &opCmpRR}, {static_cast<uint8_t>(VM_CMP_RC), &opCmpRC}, {static_cast<uint8_t>(VM_TEST_RR), &opTestRR}, {static_cast<uint8_t>(VM_TEST_RC), &opTestRC},
-        {static_cast<uint8_t>(VM_JMP), &opJmp}, {static_cast<uint8_t>(VM_JZ), &opJz}, {static_cast<uint8_t>(VM_JNZ), &opJnz},
-        {static_cast<uint8_t>(VM_JA), &opJa}, {static_cast<uint8_t>(VM_JAE), &opJae}, {static_cast<uint8_t>(VM_JB), &opJb}, {static_cast<uint8_t>(VM_JBE), &opJbe},
-        {static_cast<uint8_t>(VM_JG), &opJg}, {static_cast<uint8_t>(VM_JGE), &opJge}, {static_cast<uint8_t>(VM_JL), &opJl}, {static_cast<uint8_t>(VM_JLE), &opJle},
-        {static_cast<uint8_t>(VM_RET_VM), &opRet}
+    const SavedRegister volatileGprs[] = {
+        {11, kFrameR11}, {10, kFrameR10}, {9, kFrameR9}, {8, kFrameR8},
+        {2, kFrameRdx}
     };
-    for (auto pair : opcodeTargets) {
-        e.Bytes({0x3C, pair.first});
-        e.Jcc(0x4, *pair.second);
+    for (const auto& saved : volatileGprs) {
+        assembler.StoreReg(saved.number, static_cast<int32_t>(saved.offset));
     }
-    e.Jmp(failOpcodeUnsupported);
+    assembler.LoadReg(1, static_cast<int32_t>(kStackAllocation + 0x10u));
+    assembler.StoreReg(1, static_cast<int32_t>(kFrameRcx));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x08u));
+    assembler.StoreReg(0, static_cast<int32_t>(kFrameRax));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x18u));
+    assembler.StoreReg(0, static_cast<int32_t>(kFrameRflags));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation));
+    assembler.StoreReg(0, static_cast<int32_t>(kFrameReturnAddress));
+    assembler.LeaRaxRsp(kStackAllocation);
+    assembler.StoreReg(0, static_cast<int32_t>(kFrameOriginalRsp));
+    assembler.LeaRaxRsp(kExtendedStorageOffset);
+    assembler.AddRaxImm(63);
+    assembler.AndRaxImm(0xFFFFFFC0u);
+    assembler.StoreRaxRsp(kExtendedPointerSlot);
+    assembler.StoreImm32Rax(VM_XSAVE_AREA_SIZE,
+        usesAvx ? VM_EXTENDED_STATE_FLAG_AVX : 0u);
+    if (usesAvx) {
+        assembler.LoadR10Rsp(kExtendedPointerSlot);
+        assembler.MovEaxImm(7);
+        assembler.XorEdxEdx();
+        assembler.XsaveR10();
+    } else {
+        assembler.FxsaveRax();
+    }
 
-    e.Bind(opNop); e.Jmp(dispatch);
+    assembler.LeaRcxRsp(kFrameOffset);
+    assembler.MovEdxImm(functionRVA);
+    assembler.LoadImageBaseR9();
+    assembler.MovR8dImm(metadataRVA);
+    assembler.AddR8R9();
+    assembler.LoadRaxRsp(kExtendedPointerSlot);
+    assembler.StoreRaxRsp(0x20);
+    assembler.CallRelative(trampolineOffset, runtimeEntryOffset);
+    assembler.FailHardIfEaxNonZero();
 
-    e.Bind(opMovRR);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRdxFromEcx(e); EmitMaskRdxByOperandWidth(e);
-    EmitStoreVmRegFromRdxToEbx(e); e.Jmp(dispatch);
+    assembler.LoadR10Rsp(kExtendedPointerSlot);
+    if (usesAvx) {
+        assembler.MovEaxImm(7);
+        assembler.XorEdxEdx();
+        assembler.XrstorR10();
+    } else {
+        assembler.FxrstorR10();
+    }
+    assembler.PushMemoryRsp(static_cast<int32_t>(kFrameRflags));
+    assembler.PopFlags();
+    const SavedRegister restoreGprs[] = {
+        {15, kFrameR15}, {14, kFrameR14}, {13, kFrameR13}, {12, kFrameR12},
+        {11, kFrameR11}, {10, kFrameR10}, {9, kFrameR9}, {8, kFrameR8},
+        {7, kFrameRdi}, {6, kFrameRsi}, {5, kFrameRbp}, {3, kFrameRbx},
+        {2, kFrameRdx}, {1, kFrameRcx}, {0, kFrameRax}
+    };
+    for (const auto& restored : restoreGprs) {
+        assembler.LoadReg(restored.number, static_cast<int32_t>(restored.offset));
+    }
+    assembler.AddRsp(kStackAllocation);
+    assembler.Ret();
 
-    e.Bind(opMovRC);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
-    EmitFetchOperandWidth(e, fetchByte); EmitMaskRaxByOperandWidth(e);
-    EmitStoreVmRegFromRaxToEbx(e); e.Jmp(dispatch);
-
-    e.Bind(opMovRM);
-    EmitFetchDstToEbx(e, fetchReg);
-    e.Call(fetchByte);
-    e.Call(fetchMemAddress);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x01); e.Jcc(0x5, movRmW2);
-    e.Bytes({0x0F, 0xB6, 0x10}); e.Jmp(movRmStore);
-    e.Bind(movRmW2);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x02); e.Jcc(0x5, movRmW4);
-    e.Bytes({0x0F, 0xB7, 0x10}); e.Jmp(movRmStore);
-    e.Bind(movRmW4);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x04); e.Jcc(0x5, movRmW8);
-    e.Bytes({0x8B, 0x10}); e.Jmp(movRmStore);
-    e.Bind(movRmW8);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, failMemoryAddrInvalid);
-    e.Bytes({0x48, 0x8B, 0x10});
-    e.Bind(movRmStore);
-    EmitStoreVmRegFromRdxToEbx(e); e.Jmp(dispatch);
-
-    e.Bind(opMovMR);
-    e.Call(fetchByte);
-    e.Call(fetchReg); e.Bytes({0x8B, 0xD9});
-    e.Call(fetchMemAddress);
-    EmitLoadVmRegToRdxFromEbx(e);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x01); e.Jcc(0x5, movMrW2);
-    e.Bytes({0x88, 0x10}); e.Jmp(movMrDone);
-    e.Bind(movMrW2);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x02); e.Jcc(0x5, movMrW4);
-    e.Bytes({0x66, 0x89, 0x10}); e.Jmp(movMrDone);
-    e.Bind(movMrW4);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x04); e.Jcc(0x5, movMrW8);
-    e.Bytes({0x89, 0x10}); e.Jmp(movMrDone);
-    e.Bind(movMrW8);
-    e.Bytes({0x80, 0xBD}); e.U32(kMemWidth); e.U8(0x08); e.Jcc(0x5, failMemoryAddrInvalid);
-    e.Bytes({0x48, 0x89, 0x10});
-    e.Bind(movMrDone); e.Jmp(dispatch);
-
-    e.Bind(opLea);
-    EmitFetchDstToEbx(e, fetchReg);
-    e.Call(fetchByte);
-    e.Call(fetchMemAddress);
-    e.Bytes({0x8A, 0x85}); e.U32(kMemWidth);
-    e.Bytes({0x88, 0x85}); e.U32(kOperandWidth);
-    EmitMaskRaxByOperandWidth(e);
-    EmitStoreVmRegFromRaxToEbx(e); e.Jmp(dispatch);
-
-    e.Bind(opPushR);
-    EmitFetchDstToEbx(e, fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRdxFromEbx(e);
-    EmitMaskRdxByOperandWidth(e);
-    e.Bytes({0x49, 0x89, 0xD3});                         // r11 = value
-    EmitReadRegMapToEcx(e, 4);
-    EmitLoadVmRegToRdxFromEcx(e);
-    e.Bytes({0x48, 0x83, 0xEA, 0x08});                   // sub rdx, 8
-    e.Bytes({0x48, 0x8B, 0xC2});                         // mov rax, rdx
-    EmitStoreVmRegFromRdxToEcx(e);
-    e.Bytes({0x4C, 0x89, 0x18});                         // mov [rax], r11
-    e.Jmp(dispatch);
-
-    e.Bind(opPushC);
-    e.Call(fetchReg);                                    // reserved operand slot
-    e.Call(fetchImm64);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitMaskRaxByOperandWidth(e);
-    e.Bytes({0x49, 0x89, 0xC3});                         // r11 = value
-    EmitReadRegMapToEcx(e, 4);
-    EmitLoadVmRegToRdxFromEcx(e);
-    e.Bytes({0x48, 0x83, 0xEA, 0x08});
-    e.Bytes({0x48, 0x8B, 0xC2});
-    EmitStoreVmRegFromRdxToEcx(e);
-    e.Bytes({0x4C, 0x89, 0x18});
-    e.Jmp(dispatch);
-
-    e.Bind(opPopR);
-    EmitFetchDstToEbx(e, fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitReadRegMapToEcx(e, 4);
-    EmitLoadVmRegToRdxFromEcx(e);
-    e.Bytes({0x48, 0x8B, 0xC2});                         // rax = rsp
-    e.Bytes({0x48, 0x8B, 0x10});                         // rdx = [rax]
-    e.Bytes({0x48, 0x83, 0xC0, 0x08});                   // add rax, 8
-    e.Bytes({0x48, 0x8B, 0xD0});                         // rdx = new rsp
-    EmitStoreVmRegFromRdxToEcx(e);
-    e.Bytes({0x48, 0x8B, 0x50, 0xF8});                   // rdx = popped value
-    EmitMaskRdxByOperandWidth(e);
-    EmitStoreVmRegFromRdxToEbx(e);
-    e.Jmp(dispatch);
-
-    e.Bind(opCallNative);
-    e.Call(fetchImm32);
-    e.Bytes({0x41, 0x89, 0xC3});                         // r11d = target RVA
-    e.Bytes({0x4D, 0x01, 0xE3});                         // r11 += image base
-    e.Bytes({0x41, 0x50, 0x41, 0x51});                   // save runtime r8/r9
-    EmitReadRegMapToEcx(e, 1); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x48, 0x89, 0xD1});
-    EmitReadRegMapToEcx(e, 8); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x49, 0x89, 0xD0});
-    EmitReadRegMapToEcx(e, 9); EmitLoadVmRegToRdxFromEcx(e); e.Bytes({0x49, 0x89, 0xD1});
-    EmitReadRegMapToEcx(e, 2); EmitLoadVmRegToRdxFromEcx(e);
-    e.Bytes({0x48, 0x83, 0xEC, 0x20});
-    e.Bytes({0x41, 0xFF, 0xD3});                         // call r11
-    e.Bytes({0x48, 0x83, 0xC4, 0x20});
-    e.Bytes({0x41, 0x59, 0x41, 0x58});                   // restore runtime r9/r8
-    EmitReadRegMapToEcx(e, 0);
-    e.Bytes({0x48, 0x89, 0xC2});
-    EmitStoreVmRegFromRdxToEcx(e);
-    e.Jmp(dispatch);
-    e.Bind(opAddRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x01, 0xD0, false); e.Jmp(dispatch);
-    e.Bind(opAddRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x01, 0xC2, false); e.Jmp(dispatch);
-    e.Bind(opSubRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x29, 0xD0, false); e.Jmp(dispatch);
-    e.Bind(opSubRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x29, 0xC2, false); e.Jmp(dispatch);
-    e.Bind(opAndRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x21, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opAndRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x21, 0xC2, true); e.Jmp(dispatch);
-    e.Bind(opOrRR);  EmitBinaryRR(e, fetchReg, fetchByte, 0x09, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opOrRC);  EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x09, 0xC2, true); e.Jmp(dispatch);
-    e.Bind(opXorRR); EmitBinaryRR(e, fetchReg, fetchByte, 0x31, 0xD0, true); e.Jmp(dispatch);
-    e.Bind(opXorRC); EmitBinaryRC(e, fetchReg, fetchImm64, fetchByte, 0x31, 0xC2, true); e.Jmp(dispatch);
-
-    e.Bind(opCmpRR);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRaxFromEbx(e); EmitLoadVmRegToRdxFromEcx(e);
-    EmitMaskRaxByOperandWidth(e); EmitMaskRdxByOperandWidth(e);
-    e.Bytes({0x48, 0x39, 0xD0}); EmitSetArithmeticFlags(e); e.Jmp(dispatch);
-
-    e.Bind(opCmpRC);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRdxFromEbx(e);
-    EmitMaskRdxByOperandWidth(e); EmitMaskRaxByOperandWidth(e);
-    e.Bytes({0x48, 0x39, 0xC2}); EmitSetArithmeticFlags(e); e.Jmp(dispatch);
-
-    e.Bind(opTestRR);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchReg);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRaxFromEbx(e); EmitLoadVmRegToRdxFromEcx(e);
-    EmitMaskRaxByOperandWidth(e); EmitMaskRdxByOperandWidth(e);
-    e.Bytes({0x48, 0x85, 0xD0}); EmitSetLogicFlags(e); e.Jmp(dispatch);
-
-    e.Bind(opTestRC);
-    EmitFetchDstToEbx(e, fetchReg); e.Call(fetchImm64);
-    EmitFetchOperandWidth(e, fetchByte);
-    EmitLoadVmRegToRdxFromEbx(e);
-    EmitMaskRdxByOperandWidth(e); EmitMaskRaxByOperandWidth(e);
-    e.Bytes({0x48, 0x85, 0xC2}); EmitSetLogicFlags(e); e.Jmp(dispatch);
-
-    e.Bind(opJmp);
-    e.Call(fetchImm32); EmitMoveEsiEax(e); e.Jmp(dispatch);
-    e.Bind(opJz);  EmitConditionalJumpByFlag(e, fetchImm32, kFlagZF, true, dispatch);
-    e.Bind(opJnz); EmitConditionalJumpByFlag(e, fetchImm32, kFlagZF, false, dispatch);
-    e.Bind(opJae); EmitConditionalJumpByFlag(e, fetchImm32, kFlagCF, false, dispatch);
-    e.Bind(opJb);  EmitConditionalJumpByFlag(e, fetchImm32, kFlagCF, true, dispatch);
-
-    e.Bind(opJa);
-    e.Call(fetchImm32);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagCF); e.U8(0x00); e.Jcc(0x5, jccSkip1);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagZF); e.U8(0x00); e.Jcc(0x5, jccSkip1);
-    EmitMoveEsiEax(e); e.Bind(jccSkip1); e.Jmp(dispatch);
-
-    e.Bind(opJbe);
-    e.Call(fetchImm32);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagCF); e.U8(0x00); e.Jcc(0x5, jccTake1);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagZF); e.U8(0x00); e.Jcc(0x4, jccSkip2);
-    e.Bind(jccTake1); EmitMoveEsiEax(e); e.Bind(jccSkip2); e.Jmp(dispatch);
-
-    e.Bind(opJg);
-    e.Call(fetchImm32);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagZF); e.U8(0x00); e.Jcc(0x5, jccSkip3);
-    e.Bytes({0x8A, 0x95}); e.U32(kFlagSF);
-    e.Bytes({0x3A, 0x95}); e.U32(kFlagOF);
-    e.Jcc(0x5, jccSkip3);
-    EmitMoveEsiEax(e); e.Bind(jccSkip3); e.Jmp(dispatch);
-
-    e.Bind(opJge);
-    e.Call(fetchImm32);
-    e.Bytes({0x8A, 0x95}); e.U32(kFlagSF);
-    e.Bytes({0x3A, 0x95}); e.U32(kFlagOF);
-    e.Jcc(0x5, jccSkip4);
-    EmitMoveEsiEax(e); e.Bind(jccSkip4); e.Jmp(dispatch);
-
-    e.Bind(opJl);
-    e.Call(fetchImm32);
-    e.Bytes({0x8A, 0x95}); e.U32(kFlagSF);
-    e.Bytes({0x3A, 0x95}); e.U32(kFlagOF);
-    e.Jcc(0x4, jccSkip5);
-    EmitMoveEsiEax(e); e.Bind(jccSkip5); e.Jmp(dispatch);
-
-    e.Bind(opJle);
-    e.Call(fetchImm32);
-    e.Bytes({0x80, 0xBD}); e.U32(kFlagZF); e.U8(0x00); e.Jcc(0x5, jccTake2);
-    e.Bytes({0x8A, 0x95}); e.U32(kFlagSF);
-    e.Bytes({0x3A, 0x95}); e.U32(kFlagOF);
-    e.Jcc(0x4, jccSkip6);
-    e.Bind(jccTake2); EmitMoveEsiEax(e); e.Bind(jccSkip6); e.Jmp(dispatch);
-
-    e.Bind(opRet);
-    e.Jmp(writeback);
-
-    e.Bind(writeback);
-    EmitReadRegMapToEcx(e, 0);
-    EmitLoadVmRegToRdxFromEcx(e);
-    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
-    e.Bytes({0x41, 0x89, 0x55}); e.U8(static_cast<uint8_t>(kTraceLastRetValueLow32));
-    EmitCommitFlagsToSavedRflags(e);
-    const uint8_t nativeRegsWriteback[] = {0,1,2,3,5,6,7,8,9,10,11,12,13,14,15};
-    for (uint8_t r : nativeRegsWriteback) EmitWriteBackNativeReg(e, r);
-    e.Jmp(restore);
-
-    e.Bind(failRecordNotFound);
-    emitRuntimeFailCode(VM_ERR_RECORD_NOT_FOUND);
-    e.Bind(failBytecodeRange);
-    emitRuntimeFailCode(VM_ERR_BYTECODE_RANGE);
-    e.Bind(failOpcodeUnsupported);
-    emitRuntimeFailCode(VM_ERR_OPCODE_UNSUPPORTED);
-    e.Bind(failMemoryAddrInvalid);
-    emitRuntimeFailCode(VM_ERR_MEMORY_ADDR_INVALID);
-    e.Bind(failHandlerBug);
-    emitRuntimeFailCode(VM_ERR_HANDLER_BUG);
-
-    e.Bind(runtimeFail);
-    e.Bytes({0x4C, 0x8B, 0xAD}); e.U32(kMetadataVa);
-    e.Bytes({0x41, 0x89, 0x7D}); e.U8(static_cast<uint8_t>(kTraceLastErrorCode));
-    e.U8(0xCC);
-    e.Bytes({0x0F, 0x0B});
-
-    e.Bind(restore);
-    e.Bytes({0x48, 0x81, 0xC4}); e.U32(kLocalSize);
-    e.Bytes({0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C});
-    e.Bytes({0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58});
-    e.Bytes({0x5F, 0x5E, 0x5D, 0x5B, 0x5A, 0x59, 0x58, 0x9D, 0xC3});
-
-    return e.code;
+    BuiltX64Trampoline result;
+    result.code = std::move(assembler.bytes);
+    result.unwindInfo = BuildUnwindInfo(prologSize, unwindOperations);
+    return result;
 }
 
-std::vector<uint8_t> VMRuntimeBuilder::BuildX64Trampoline(uint32_t functionRVA, uint32_t metadataRVA) {
-    std::vector<uint8_t> c;
-    c.reserve(32);
-    Emit8(c, 0x41); Emit8(c, 0xBA); Emit32(c, functionRVA);
-    Emit8(c, 0x41); Emit8(c, 0xBB); Emit32(c, metadataRVA);
-    Emit8(c, 0xE9); Emit32(c, 0);
-    return c;
+std::vector<uint8_t> BuildX86Trampoline(
+    uint32_t trampolineOffset,
+    uint32_t runtimeEntryOffset,
+    uint32_t functionRVA,
+    uint32_t metadataRVA,
+    uint16_t returnCleanup,
+    uint32_t guestStackSize,
+    bool usesAvx)
+{
+    constexpr uint32_t kHostAllocation = 0x500;
+    constexpr uint32_t kFrameOffset = 0x40;
+    constexpr uint32_t kExtendedStorageOffset = 0x100;
+    const uint32_t kStackAllocation = kHostAllocation + guestStackSize;
+    X86TrampolineAssembler assembler;
+    assembler.Endbr();
+    assembler.ProbeStack(kStackAllocation + sizeof(VM_NATIVE_FRAME_X86));
+    assembler.PushFlags();
+    assembler.PushAll();
+    assembler.SubEsp(kStackAllocation);
+    for (uint32_t offset = 0; offset < sizeof(VM_NATIVE_FRAME_X86); offset += 4) {
+        assembler.LoadEaxRsp(kStackAllocation + offset);
+        assembler.StoreEaxRsp(kFrameOffset + offset);
+    }
+    assembler.MovEcxEsp();
+    assembler.AddEcxImm(kExtendedStorageOffset + 63);
+    assembler.AndEcxImm(0xFFFFFFC0u);
+    assembler.StoreImm32Ecx(VM_XSAVE_AREA_SIZE,
+        usesAvx ? VM_EXTENDED_STATE_FLAG_AVX : 0u);
+    if (usesAvx) {
+        assembler.MovEaxImm(7);
+        assembler.XorEdxEdx();
+        assembler.XsaveEcx();
+    } else {
+        assembler.FxsaveEcx();
+    }
+    assembler.MovEdxEsp();
+    assembler.AddEdxImm(kExtendedStorageOffset + 63);
+    assembler.AndEdxImm(0xFFFFFFC0u);
+    assembler.LeaEaxEsp(kFrameOffset);
+    assembler.LoadImageBaseEcx();
+    assembler.MovEbxImm(metadataRVA);
+    assembler.AddEbxEcx();
+    assembler.PushReg(2); // Extended processor-state pointer in EDX.
+    assembler.PushReg(1); // Image base in ECX.
+    assembler.PushReg(3); // Metadata VA in EBX.
+    assembler.PushImm(functionRVA);
+    assembler.PushReg(0); // Native frame pointer in EAX.
+    assembler.CallRelative(trampolineOffset, runtimeEntryOffset);
+    assembler.AddEsp(20);
+    assembler.FailHardIfEaxNonZero();
+    assembler.MovEcxEsp();
+    assembler.AddEcxImm(kExtendedStorageOffset + 63);
+    assembler.AndEcxImm(0xFFFFFFC0u);
+    if (usesAvx) {
+        assembler.MovEaxImm(7);
+        assembler.XorEdxEdx();
+        assembler.XrstorEcx();
+    } else {
+        assembler.FxrstorEcx();
+    }
+    for (uint32_t offset = 0; offset < sizeof(VM_NATIVE_FRAME_X86); offset += 4) {
+        assembler.LoadEaxRsp(kFrameOffset + offset);
+        assembler.StoreEaxRsp(kStackAllocation + offset);
+    }
+    assembler.AddEsp(kStackAllocation);
+    assembler.PopAll();
+    assembler.PopFlags();
+    assembler.Ret(returnCleanup);
+    return assembler.bytes;
 }
+
+uint64_t GetImageBase(const CS_PE_IMAGE* image) {
+    return image->is64Bit ? image->ntHeaders64->OptionalHeader.ImageBase
+                          : image->ntHeaders32->OptionalHeader.ImageBase;
+}
+
+} // namespace
 
 VMRuntimeBuildResult VMRuntimeBuilder::Build(
     CS_PE_IMAGE* image,
     const std::vector<VMFunctionRecord>& records,
     uint32_t metadataRVA,
-    const char sectionName[8])
+    const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    const char sectionName[8],
+    const char unwindSectionName[8],
+    const char relocationSectionName[8])
 {
-    VMRuntimeBuildResult result;
-    if (!image || !image->isValid) {
-        result.error = "invalid PE image";
-        return result;
-    }
-    if (!image->is64Bit) {
-        result.error = "VM runtime builder currently supports x64 only";
-        return result;
-    }
-    if (records.empty()) {
-        result.error = "no VM function records";
+    VMRuntimeBuildResult result{};
+    if (!image || !image->isValid || !image->rawData || records.empty() || metadataRVA == 0) {
+        result.error = "VM_RUNTIME: invalid image, metadata, or record table";
         return result;
     }
 
-    std::vector<uint8_t> blob = BuildX64RuntimeInterpreter(metadataRVA);
-    uint32_t runtimeOffset = 0;
-    std::vector<uint32_t> trampolineOffsets;
-    trampolineOffsets.reserve(records.size());
-
-    for (const auto& record : records) {
-        while ((blob.size() & 0x0F) != 0) blob.push_back(0x90);
-        uint32_t trampOffset = static_cast<uint32_t>(blob.size());
-        auto tramp = BuildX64Trampoline(record.functionRVA, metadataRVA);
-        size_t relPos = tramp.size() - 4;
-        int64_t rel64 = static_cast<int64_t>(runtimeOffset) - static_cast<int64_t>(trampOffset + tramp.size());
-        if (rel64 < (std::numeric_limits<int32_t>::min)() || rel64 > (std::numeric_limits<int32_t>::max)()) {
-            result.error = "VM trampoline is out of rel32 range inside runtime section";
+    MappedRuntimeImage runtime;
+    const uint8_t* embedded = image->is64Bit ? kVMRuntimeX64Image : kVMRuntimeX86Image;
+    const size_t embeddedSize = image->is64Bit ? kVMRuntimeX64ImageSize : kVMRuntimeX86ImageSize;
+    if (!ParseRuntimeImage(embedded, embeddedSize, image->is64Bit != 0, runtime, result.error)) {
+        result.error = "VM_RUNTIME: " + result.error;
+        return result;
+    }
+    if (!PatchRuntimeKeyShare(runtime, runtimeKeyShare, result.error)) {
+        result.error = "VM_RUNTIME: " + result.error;
+        return result;
+    }
+    result.keySharePatched = true;
+    if (image->loadConfig.hasCFG) {
+        if (!image->loadConfig.valid ||
+            (image->is64Bit && image->loadConfig.guardCFDispatchFunctionPointer == 0) ||
+            (!image->is64Bit && image->loadConfig.guardCFCheckFunctionPointer == 0) ||
+            (image->loadConfig.guardCFFunctionCount !=
+                image->loadConfig.guardFunctionRVAs.size())) {
+            result.error = "VM_RUNTIME: CFG Load Config or Guard function table is incomplete";
             return result;
         }
-        Patch32(tramp, relPos, static_cast<uint32_t>(static_cast<int32_t>(rel64)));
-        blob.insert(blob.end(), tramp.begin(), tramp.end());
-        trampolineOffsets.push_back(trampOffset);
+    }
+    result.cfgVerified = true;
+
+    std::vector<uint8_t> blob = runtime.bytes;
+    const uint32_t runtimeImageSize = static_cast<uint32_t>(runtime.bytes.size());
+    std::unordered_set<uint32_t> functionRVAs;
+    for (const auto& record : records) {
+        if (!functionRVAs.insert(record.functionRVA).second || record.functionSize < 5 ||
+            record.guestStackSize < 0x4000u || record.guestStackSize > 0x70000u ||
+            (record.guestStackSize & 0x0FFFu) != 0 ||
+            record.guestStackSize + 0x598u > 0x7FFF8u) {
+            result.error = "VM_RUNTIME: function record or guest stack reserve is invalid";
+            return result;
+        }
+        const uint32_t trampolineOffset = AlignUp(static_cast<uint32_t>(blob.size()), 16);
+        blob.resize(trampolineOffset, 0x90);
+        std::vector<uint8_t> trampoline;
+        VMRuntimeFunctionEntry trampolineUnwind{};
+        if (image->is64Bit) {
+            BuiltX64Trampoline built = BuildX64Trampoline(trampolineOffset, runtime.entryRVA,
+                record.functionRVA, metadataRVA,
+                record.guestStackSize,
+                (record.flags & VM_RECORD_FLAG_USES_AVX) != 0);
+            if (built.code.empty() || built.unwindInfo.empty()) {
+                result.error = "VM_RUNTIME: x64 trampoline prolog exceeds unwind encoding limits";
+                return result;
+            }
+            trampoline = std::move(built.code);
+            const uint32_t unwindOffset = AlignUp(
+                trampolineOffset + static_cast<uint32_t>(trampoline.size()), 4);
+            blob.resize(unwindOffset, 0);
+            trampolineUnwind.beginRVA = trampolineOffset;
+            trampolineUnwind.endRVA = trampolineOffset + static_cast<uint32_t>(trampoline.size());
+            trampolineUnwind.unwindRVA = unwindOffset;
+            blob.insert(blob.end(), built.unwindInfo.begin(), built.unwindInfo.end());
+        } else {
+            if (record.returnStackCleanup > 0xFFFFu) {
+                result.error = "VM_RUNTIME: x86 RET cleanup exceeds uint16";
+                return result;
+            }
+            trampoline = BuildX86Trampoline(trampolineOffset, runtime.entryRVA,
+                record.functionRVA, metadataRVA,
+                static_cast<uint16_t>(record.returnStackCleanup),
+                record.guestStackSize,
+                (record.flags & VM_RECORD_FLAG_USES_AVX) != 0);
+        }
+        VMTrampolineRecord link{};
+        link.functionRVA = record.functionRVA;
+        link.trampolineRVA = trampolineOffset;
+        link.trampolineSize = static_cast<uint32_t>(trampoline.size());
+        result.trampolines.push_back(link);
+        if (image->is64Bit) {
+            std::copy(trampoline.begin(), trampoline.end(), blob.begin() + trampolineOffset);
+            result.unwindEntries.push_back(trampolineUnwind);
+        } else {
+            blob.insert(blob.end(), trampoline.begin(), trampoline.end());
+        }
     }
 
-    char name[8] = {'.','c','s','v','x',0,0,0};
-    if (sectionName) memcpy(name, sectionName, 8);
-
+    char name[8] = {'.', 'c', 's', 'v', 'r', 't', 0, 0};
+    if (sectionName) std::memcpy(name, sectionName, sizeof(name));
     PEEmitter emitter(image);
-    auto append = emitter.AppendSection(name, blob, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
-    if (!append.success) {
-        result.error = append.error;
+    auto appended = emitter.AppendSection(name, blob,
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    if (!appended.success) {
+        result.error = "VM_RUNTIME: " + appended.error;
         return result;
     }
 
-    result.success = true;
-    result.executionReady = true;
-    result.sectionRVA = append.rva;
-    result.sectionRawOffset = append.rawOffset;
-    result.sectionSize = append.rawSize;
-    result.runtimeEntryRVA = append.rva + runtimeOffset;
-    for (size_t i = 0; i < records.size(); i++) {
-        VMTrampolineRecord tr;
-        tr.functionRVA = records[i].functionRVA;
-        tr.trampolineRVA = append.rva + trampolineOffsets[i];
-        tr.trampolineSize = 17;
-        result.trampolines.push_back(tr);
+    const uint64_t mappedBase = GetImageBase(image) + appended.rva;
+    if (!image->is64Bit && mappedBase > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_RUNTIME: x86 runtime mapping exceeds the 32-bit address range";
+        return result;
     }
+    if (!ApplyRuntimeRelocations(runtime, mappedBase, result.error)) {
+        result.error = "VM_RUNTIME: " + result.error;
+        return result;
+    }
+    std::copy(runtime.bytes.begin(), runtime.bytes.end(), blob.begin());
+    if (!emitter.PatchBytes(appended.rva, blob, &result.error)) {
+        result.error = "VM_RUNTIME: unable to commit relocated blob: " + result.error;
+        return result;
+    }
+
+    if (!runtime.relocations.empty()) {
+        if (!relocationSectionName) {
+            result.error = "VM_RUNTIME: relocation section name is missing";
+            return result;
+        }
+        std::vector<CS_RELOC_ENTRY> targetRelocations;
+        targetRelocations.reserve(runtime.relocations.size());
+        for (const auto& relocation : runtime.relocations) {
+            CS_RELOC_ENTRY target{};
+            target.type = relocation.type;
+            target.fullRVA = static_cast<uint64_t>(appended.rva) + relocation.offset;
+            target.pageRVA = static_cast<uint32_t>(target.fullRVA) & ~0xFFFu;
+            target.offset = static_cast<uint16_t>(target.fullRVA & 0x0FFFu);
+            targetRelocations.push_back(target);
+        }
+        if (!emitter.RebuildBaseRelocationDirectory(targetRelocations,
+                relocationSectionName, nullptr, &result.error)) {
+            result.error = "VM_RUNTIME: unable to rebuild target relocation directory: " + result.error;
+            return result;
+        }
+        for (const auto& target : targetRelocations) {
+            const auto found = std::find_if(image->relocs.entries.begin(), image->relocs.entries.end(),
+                [&](const CS_RELOC_ENTRY& entry) {
+                    return entry.fullRVA == target.fullRVA && entry.type == target.type;
+                });
+            if (found == image->relocs.entries.end()) {
+                result.error = "VM_RUNTIME: target relocation verification failed";
+                return result;
+            }
+        }
+    }
+    result.relocationsVerified = true;
+
+    result.sectionRVA = appended.rva;
+    result.sectionRawOffset = image->sections[appended.sectionIndex].PointerToRawData;
+    result.sectionSize = image->sections[appended.sectionIndex].SizeOfRawData;
+    result.runtimeEntryRVA = appended.rva + runtime.entryRVA;
+    result.runtimeImageSize = runtimeImageSize;
+    result.architecture = image->is64Bit ? VM_ARCH_X64 : VM_ARCH_X86;
+    for (auto& trampoline : result.trampolines) trampoline.trampolineRVA += appended.rva;
+    for (auto& unwind : result.unwindEntries) {
+        unwind.beginRVA += appended.rva;
+        unwind.endRVA += appended.rva;
+        unwind.unwindRVA += appended.rva;
+    }
+    for (const auto& unwind : runtime.unwindEntries) {
+        VMRuntimeFunctionEntry adjusted = unwind;
+        adjusted.beginRVA += appended.rva;
+        adjusted.endRVA += appended.rva;
+        adjusted.unwindRVA += appended.rva;
+        result.unwindEntries.push_back(adjusted);
+    }
+
+    if (image->is64Bit) {
+        if (!unwindSectionName || result.unwindEntries.empty()) {
+            result.error = "VM_RUNTIME: x64 unwind section name or function entries are missing";
+            return result;
+        }
+        std::vector<CS_RUNTIME_FUNCTION> exceptionEntries;
+        exceptionEntries.reserve(result.unwindEntries.size());
+        for (const auto& unwind : result.unwindEntries) {
+            exceptionEntries.push_back({unwind.beginRVA, unwind.endRVA, unwind.unwindRVA});
+        }
+        if (!emitter.RebuildExceptionDirectory(
+                exceptionEntries, unwindSectionName, nullptr, &result.error)) {
+            result.error = "VM_RUNTIME: unable to rebuild x64 exception directory: " + result.error;
+            return result;
+        }
+    }
+
+    result.sectionRawOffset = image->sections[appended.sectionIndex].PointerToRawData;
+    result.sectionSize = image->sections[appended.sectionIndex].SizeOfRawData;
+
+    result.unwindVerified = true;
+    result.executionReady = true;
+    result.success = true;
     return result;
 }
 
 } // namespace CipherShell
-
-
-
-
-
-
-
-
-

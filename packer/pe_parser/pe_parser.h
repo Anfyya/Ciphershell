@@ -129,10 +129,16 @@ struct CS_EXCEPTION_TABLE {
 // ============================================================================
 
 struct CS_LOAD_CONFIG {
+    DWORD       directoryRVA;
+    DWORD       directorySize;
     DWORD64     securityCookie;
     DWORD64     guardCFCheckFunctionPointer;
     DWORD64     guardCFDispatchFunctionPointer;
+    DWORD64     guardCFFunctionTable;
+    DWORD64     guardCFFunctionCount;
     DWORD       guardFlags;
+    DWORD       guardTableEntrySize;
+    std::vector<DWORD> guardFunctionRVAs;
     bool        hasCFG;             // Control Flow Guard
     bool        hasRFGuard;         // Return Flow Guard
     bool        valid;

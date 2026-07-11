@@ -10,6 +10,8 @@
 #include <cctype>
 #include <regex>
 #include <iostream>
+#include <map>
+#include <set>
 
 namespace CipherShell {
 
@@ -55,6 +57,8 @@ CipherShellConfig ConfigParser::LoadFromString(const std::string& content) {
     m_lastError.clear();  // BUG 16 修复：清除之前的错误状态
     m_warnings.clear();
 
+    if (!ValidateProductionSyntax(content)) return config;
+
     // 解析各个配置段
     ParseGlobalSection(content, config.global);
     ParseVMSection(content, config.vm);
@@ -85,18 +89,53 @@ strip_debug_info = true           # 删除所有调试信息
 strip_rich_header = true          # 删除 Rich Header（编译器指纹）
 strip_timestamps = true           # 时间戳归零
 randomize_section_names = true    # Section 名称随机化
-anti_debug_mode = "implicit"      # "explicit" | "implicit" | "hybrid"
-string_encryption = true          # 全局字符串加密
-import_obfuscation = true         # 导入表混淆
-resource_encryption = false       # 资源加密（可能影响兼容性）
 
 [vm]
+enabled = false                   # 显式功能开关；L1-L5 只提供未显式设置时的 preset
+strength = 80
+target_functions = []             # 按导出名或 sub_RVA 通配选择
+target_rvas = []                  # 按函数入口 RVA 精确选择
 register_count = 24               # 虚拟寄存器数量（16-64）
 stack_size = 0x20000              # 虚拟栈大小
-opcode_width = "variable"         # "fixed_8" | "fixed_16" | "variable"
-handler_mutation = true           # Handler 代码变异
-bytecode_encryption = "rolling"   # "none" | "xor" | "rolling" | "aes_ctr"
-embed_junk_handlers = true        # 嵌入无意义的假 handler 干扰分析
+opcode_randomization = true       # 每次构建生成完整 opcode permutation
+handler_mutation = false          # 未接通 runtime 时必须保持关闭
+bytecode_encryption = true        # ChaCha20 加密 + SipHash 完整性认证
+native_body_policy = "destroy"    # 原 native 函数体销毁
+x86_call_abi = "auto"            # "auto" | "cdecl" | "stdcall" | "fastcall" | "thiscall"
+embed_junk_handlers = false       # 未接通 runtime 时必须保持关闭
+simd_bridge = true                # SSE2/SSE4/AVX/AVX2 严格指令桥
+x87_bridge = true                 # x87 严格指令桥
+
+[string_encryption]
+enabled = true
+strength = 60
+mode = "startup"
+ascii = true
+utf16 = true
+resources = false
+clear_after_use = false
+
+[import_protection]
+enabled = true
+strength = 50
+
+[section_encryption]
+enabled = true
+strength = 58
+mode = "startup"
+
+[control_flow]
+enabled = true
+strength = 55
+
+[control_flow.flattening]
+enabled = true
+strength = 55
+target_functions = []
+
+[control_flow.bogus]
+enabled = true
+strength = 50
 
 [anti_debug]
 timing_checks = true              # 时序检测
@@ -116,24 +155,6 @@ nanomite_patches = true           # INT3 Nanomite 技术
 [performance]
 auto_hotspot_analysis = true      # 自动分析热点函数并降低其保护等级
 max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自动降级）
-
-# 函数级精确控制
-[[function_overrides]]
-pattern = "main"                  # 函数名匹配（支持通配符）
-level = 5                         # 覆盖为最高保护
-
-[[function_overrides]]
-pattern = "render_*"              # 渲染相关函数
-level = 1                         # 性能敏感，仅做基础加密
-
-[[function_overrides]]
-pattern = "license_check*"        # 授权验证函数
-level = 5                         # 最高保护
-vm_nesting = 2                    # 双层 VM 嵌套
-
-[[function_overrides]]
-pattern = "crypto_*"              # 已有加密函数
-level = 2                         # 避免过度保护影响性能
 )";
 
     file.close();
@@ -143,6 +164,148 @@ level = 2                         # 避免过度保护影响性能
 // ============================================================================
 // 内部实现
 // ============================================================================
+
+bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
+    enum class ValueKind { Boolean, Integer, Number, String, StringArray, UintArray };
+    using KeySchema = std::map<std::string, ValueKind>;
+    static const std::map<std::string, KeySchema> schema = {
+        {"global", {
+            {"protection_level", ValueKind::Integer},
+            {"strip_debug_info", ValueKind::Boolean},
+            {"strip_rich_header", ValueKind::Boolean},
+            {"strip_timestamps", ValueKind::Boolean},
+            {"randomize_section_names", ValueKind::Boolean}
+        }},
+        {"vm", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
+            {"target_functions", ValueKind::StringArray}, {"target_rvas", ValueKind::UintArray},
+            {"register_count", ValueKind::Integer}, {"stack_size", ValueKind::Integer},
+            {"opcode_randomization", ValueKind::Boolean}, {"handler_mutation", ValueKind::Boolean},
+            {"bytecode_encryption", ValueKind::Boolean}, {"native_body_policy", ValueKind::String},
+            {"x86_call_abi", ValueKind::String}, {"embed_junk_handlers", ValueKind::Boolean},
+            {"simd_bridge", ValueKind::Boolean}, {"x87_bridge", ValueKind::Boolean}
+        }},
+        {"string_encryption", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
+            {"mode", ValueKind::String}, {"ascii", ValueKind::Boolean},
+            {"utf16", ValueKind::Boolean}, {"resources", ValueKind::Boolean},
+            {"clear_after_use", ValueKind::Boolean}
+        }},
+        {"import_protection", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer}
+        }},
+        {"section_encryption", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
+            {"mode", ValueKind::String}
+        }},
+        {"control_flow", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer}
+        }},
+        {"control_flow.flattening", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
+            {"target_functions", ValueKind::StringArray}
+        }},
+        {"control_flow.bogus", {
+            {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer}
+        }},
+        {"anti_debug", {
+            {"timing_checks", ValueKind::Boolean}, {"hardware_bp_detection", ValueKind::Boolean},
+            {"software_bp_detection", ValueKind::Boolean}, {"memory_integrity", ValueKind::Boolean},
+            {"debugger_window_scan", ValueKind::Boolean}, {"parent_process_check", ValueKind::Boolean},
+            {"thread_hiding", ValueKind::Boolean}, {"kernel_debugger_check", ValueKind::Boolean}
+        }},
+        {"anti_dump", {
+            {"erase_pe_header", ValueKind::Boolean},
+            {"section_permission_guard", ValueKind::Boolean},
+            {"nanomite_patches", ValueKind::Boolean}
+        }},
+        {"performance", {
+            {"auto_hotspot_analysis", ValueKind::Boolean},
+            {"max_vm_overhead_ratio", ValueKind::Number}
+        }}
+    };
+    const std::regex sectionPattern(R"(^\[([A-Za-z0-9_.]+)\]$)");
+    const std::regex keyPattern(R"(^([A-Za-z0-9_]+)\s*=\s*(.+)$)");
+    const std::regex booleanPattern(R"(^(true|false)$)");
+    const std::regex integerPattern(R"(^(0x[0-9A-Fa-f]+|[0-9]+)$)");
+    const std::regex numberPattern(R"(^([0-9]+(\.[0-9]+)?|\.[0-9]+)$)");
+    const std::regex stringPattern(R"RE(^"[^"\r\n]*"$)RE");
+    const std::regex stringArrayPattern(
+        R"RE(^\[\s*("[^"\r\n]*"\s*(,\s*"[^"\r\n]*"\s*)*)?\]$)RE");
+    const std::regex uintArrayPattern(
+        R"(^\[\s*((0x[0-9A-Fa-f]+|[0-9]+)\s*(,\s*(0x[0-9A-Fa-f]+|[0-9]+)\s*)*)?\]$)");
+
+    std::istringstream lines(content);
+    std::string line;
+    std::string currentSection;
+    std::set<std::string> seenSections;
+    std::set<std::pair<std::string, std::string>> seenKeys;
+    size_t lineNumber = 0;
+    while (std::getline(lines, line)) {
+        ++lineNumber;
+        bool quoted = false;
+        size_t comment = std::string::npos;
+        for (size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '"') quoted = !quoted;
+            else if (line[i] == '#' && !quoted) { comment = i; break; }
+        }
+        if (quoted) {
+            m_lastError = "配置第 " + std::to_string(lineNumber) + " 行存在未闭合字符串";
+            return false;
+        }
+        if (comment != std::string::npos) line.resize(comment);
+        line = Trim(line);
+        if (line.empty()) continue;
+
+        std::smatch match;
+        if (std::regex_match(line, match, sectionPattern)) {
+            currentSection = match[1].str();
+            if (schema.find(currentSection) == schema.end()) {
+                m_lastError = "配置第 " + std::to_string(lineNumber) +
+                    " 行包含未知 section: [" + currentSection + "]";
+                return false;
+            }
+            if (!seenSections.insert(currentSection).second) {
+                m_lastError = "配置第 " + std::to_string(lineNumber) +
+                    " 行重复定义 section: [" + currentSection + "]";
+                return false;
+            }
+            continue;
+        }
+        if (currentSection.empty() || !std::regex_match(line, match, keyPattern)) {
+            m_lastError = "配置第 " + std::to_string(lineNumber) + " 行不是有效键值";
+            return false;
+        }
+        const std::string key = match[1].str();
+        const std::string value = Trim(match[2].str());
+        const auto keyIt = schema.at(currentSection).find(key);
+        if (keyIt == schema.at(currentSection).end()) {
+            m_lastError = "配置第 " + std::to_string(lineNumber) + " 行包含未知字段: [" +
+                currentSection + "]." + key;
+            return false;
+        }
+        if (!seenKeys.emplace(currentSection, key).second) {
+            m_lastError = "配置第 " + std::to_string(lineNumber) + " 行重复定义字段: [" +
+                currentSection + "]." + key;
+            return false;
+        }
+        bool valid = false;
+        switch (keyIt->second) {
+            case ValueKind::Boolean: valid = std::regex_match(value, booleanPattern); break;
+            case ValueKind::Integer: valid = std::regex_match(value, integerPattern); break;
+            case ValueKind::Number: valid = std::regex_match(value, numberPattern); break;
+            case ValueKind::String: valid = std::regex_match(value, stringPattern); break;
+            case ValueKind::StringArray: valid = std::regex_match(value, stringArrayPattern); break;
+            case ValueKind::UintArray: valid = std::regex_match(value, uintArrayPattern); break;
+        }
+        if (!valid) {
+            m_lastError = "配置第 " + std::to_string(lineNumber) + " 行字段类型错误: [" +
+                currentSection + "]." + key;
+            return false;
+        }
+    }
+    return true;
+}
 
 void ConfigParser::ParseGlobalSection(const std::string& content, GlobalConfig& config) {
     std::string section = ExtractSection(content, "global");
@@ -186,24 +349,34 @@ void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) 
 
     std::regex regex_reg(R"(register_count\s*=\s*(\d+))");
     std::regex regex_stack(R"(stack_size\s*=\s*(0x[0-9a-fA-F]+|\d+))");
-    std::regex regex_opcode(R"RE(opcode_width\s*=\s*"([^"]+)")RE");
+    std::regex regex_opcode_randomization(R"RE(opcode_randomization\s*=\s*(true|false))RE");
     std::regex regex_mutation(R"(handler_mutation\s*=\s*(true|false))");
-    std::regex regex_encrypt(R"RE(bytecode_encryption\s*=\s*"([^"]+)")RE");
+    std::regex regex_encrypt(R"RE(bytecode_encryption\s*=\s*(true|false))RE");
+    std::regex regex_native_body(R"RE(native_body_policy\s*=\s*"([^"]+)")RE");
+    std::regex regex_x86_call_abi(R"RE(x86_call_abi\s*=\s*"([^"]+)")RE");
     std::regex regex_junk(R"(embed_junk_handlers\s*=\s*(true|false))");
     std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
     std::regex regex_strength(R"(strength\s*=\s*(\d+))");
     std::regex regex_targets(R"RE(target_functions\s*=\s*(\[[^\]]*\]))RE");
+    std::regex regex_target_rvas(R"RE(target_rvas\s*=\s*(\[[^\]]*\]))RE");
+    std::regex regex_simd_bridge(R"(simd_bridge\s*=\s*(true|false))");
+    std::regex regex_x87_bridge(R"(x87_bridge\s*=\s*(true|false))");
 
     std::smatch match;
     if (std::regex_search(section, match, regex_reg)) config.registerCount = ParseInt(match[1]);
     if (std::regex_search(section, match, regex_stack)) config.stackSize = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_opcode)) config.opcodeWidth = match[1];
+    if (std::regex_search(section, match, regex_opcode_randomization)) config.opcodeRandomization = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_mutation)) config.handlerMutation = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_encrypt)) config.bytecodeEncryption = match[1];
+    if (std::regex_search(section, match, regex_encrypt)) config.bytecodeEncryption = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_native_body)) config.nativeBodyPolicy = match[1];
+    if (std::regex_search(section, match, regex_x86_call_abi)) config.x86CallAbi = match[1];
     if (std::regex_search(section, match, regex_junk)) config.embedJunkHandlers = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
     if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
     if (std::regex_search(section, match, regex_targets)) config.targetFunctions = ParseStringArray(match[1]);
+    if (std::regex_search(section, match, regex_target_rvas)) config.targetRVAs = ParseUint32Array(match[1]);
+    if (std::regex_search(section, match, regex_simd_bridge)) config.simdBridge = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_x87_bridge)) config.x87Bridge = ParseBool(match[1]);
 }
 
 void ConfigParser::ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config) {
@@ -332,35 +505,9 @@ void ConfigParser::ParsePerformanceSection(const std::string& content, Performan
 
 void ConfigParser::ParseFunctionOverrides(const std::string& content, std::vector<FunctionOverride>& overrides) {
     const std::string marker = "[[function_overrides]]";
-    std::regex regex_pattern(R"RE(pattern\s*=\s*"([^"]+)")RE");
-    std::regex regex_level(R"(level\s*=\s*(\d+))");
-    std::regex regex_nesting(R"(vm_nesting\s*=\s*(\d+))");
-
-    size_t pos = 0;
-    while ((pos = content.find(marker, pos)) != std::string::npos) {
-        size_t blockStart = pos + marker.length();
-        size_t blockEnd = content.find("\n[", blockStart);
-        if (blockEnd == std::string::npos) {
-            blockEnd = content.length();
-        }
-
-        std::string block = content.substr(blockStart, blockEnd - blockStart);
-        FunctionOverride override{};
-        override.level = 0;
-        override.vmNesting = 0;
-
-        std::smatch match;
-        if (std::regex_search(block, match, regex_pattern)) override.pattern = match[1];
-        if (std::regex_search(block, match, regex_level)) override.level = ParseInt(match[1]);
-        if (std::regex_search(block, match, regex_nesting)) override.vmNesting = ParseInt(match[1]);
-
-        if (!override.pattern.empty()) {
-            if (override.level < 1) override.level = 1;
-            if (override.level > 5) override.level = 5;
-            overrides.push_back(override);
-        }
-
-        pos = blockEnd;
+    overrides.clear();
+    if (content.find(marker) != std::string::npos) {
+        m_lastError = "[[function_overrides]] is not part of the production schema; use [vm].target_functions/target_rvas";
     }
 }
 // ============================================================================
@@ -465,6 +612,40 @@ std::vector<std::string> ConfigParser::ParseStringArray(const std::string& value
         result.push_back(body.substr(pos + 1, close - pos - 1));
         pos = close + 1;
     }
+    return result;
+}
+
+std::vector<uint32_t> ConfigParser::ParseUint32Array(const std::string& value) {
+    std::vector<uint32_t> result;
+    const size_t begin = value.find('[');
+    const size_t end = value.rfind(']');
+    if (begin == std::string::npos || end == std::string::npos || end <= begin) {
+        m_lastError = "invalid uint32 array syntax";
+        return result;
+    }
+
+    std::stringstream stream(value.substr(begin + 1, end - begin - 1));
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        token = Trim(token);
+        if (token.empty()) continue;
+        try {
+            size_t consumed = 0;
+            const int base = token.size() > 2 && token[0] == '0' &&
+                (token[1] == 'x' || token[1] == 'X') ? 16 : 10;
+            const unsigned long long parsed = std::stoull(token, &consumed, base);
+            if (consumed != token.size() || parsed == 0 || parsed > 0xFFFFFFFFULL) {
+                m_lastError = "target_rvas contains an invalid nonzero uint32 RVA: " + token;
+                return {};
+            }
+            result.push_back(static_cast<uint32_t>(parsed));
+        } catch (...) {
+            m_lastError = "target_rvas contains an invalid RVA: " + token;
+            return {};
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
 } // namespace CipherShell
