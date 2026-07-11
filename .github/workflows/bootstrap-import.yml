@@ -1,0 +1,26 @@
+name: Bootstrap repository import
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    if: github.event.head_commit.message == 'Bootstrap full repository from bundle'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import the committed Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/Ciphershell.bundle
+          for part in .bootstrap/chunk-*.b64; do
+            base64 --decode "$part" >> /tmp/Ciphershell.bundle
+          done
+          git bundle verify /tmp/Ciphershell.bundle
+          git fetch /tmp/Ciphershell.bundle github-main:refs/remotes/bundle/github-main
+          git push --force origin refs/remotes/bundle/github-main:main
