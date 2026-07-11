@@ -33,6 +33,7 @@ struct CS_ENCRYPTED_SECTION {
     DWORD       originalRVA;        // 原始 RVA
     DWORD       originalSize;       // 原始大小
     DWORD       encryptedSize;      // 加密后大小（可能因对齐而不同）
+    DWORD       originalCharacteristics; // 运行时恢复 W^X 时使用的原始节权限
     CS_ENCRYPTION_KEY sectionKey;   // 每个 section 的独立密钥
 };
 

@@ -1,4 +1,4 @@
-﻿# CipherShell Packer CMakeLists.txt
+# CipherShell Packer CMakeLists.txt
 
 # ============================================================================
 # Packer 库
@@ -34,6 +34,7 @@ add_library(ciphershell_packer STATIC
 
     # Stub 构建器
     transforms/stub_builder.cpp
+    transforms/loader_import_builder.cpp
 
     # 转译器 — Phase 4
     vm/vm_schema.cpp

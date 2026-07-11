@@ -1,160 +1,106 @@
 # CipherShell
 
-**自研高强度代码保护壳**
+CipherShell 是面向 Windows PE32/PE32+ 的代码保护器。项目使用 Zydis 作为唯一正式 x86/x64 解码后端，自有统一指令 IR、CFG、x86/x64 → VM bytecode Translator、随机化 VM ISA、认证加密 metadata/bytecode、x86/x64 runtime、trampoline、native/SIMD/x87 bridge 和 PE 重建链路。
 
-## 项目概述
+> 当前仓库仍处于开发和静态验证阶段。编译通过不等同于所有目标程序均已完成运行验证；不支持或无法证明安全的函数会 fail-closed，而不是静默降级为 native 或 NOP。
 
-CipherShell 是一款自研的 Windows 可执行文件保护系统，定位为**高强度加密壳 / 代码保护器（Protector）**。
-
-### 核心特性
-
-- **零特征重叠**：与市面所有已知壳在二进制特征、VM 架构、section 命名、stub 签名上完全不同
-- **最大化反逆向**：多层嵌套保护架构，使静态分析和动态调试均极度困难
-- **可控的保护粒度**：用户自选函数级 / 基本块级 / 指令级保护，以及保护强度等级
-- **双模式输入**：支持导入编译后的 PE 文件（EXE/DLL），以及可选的源码级保护
-
-## 保护等级
-
-| 等级 | 名称 | 包含的保护措施 | 典型性能开销 | 适用场景 |
-|------|------|---------------|-------------|---------|
-| L1 | **Guard** | Section 加密 + 字符串加密 + 导入表混淆 + 基础反调试 | ~1.05x | 性能敏感的主循环 |
-| L2 | **Shield** | L1 + 控制流平坦化 + 常量拆分 | ~2-3x | 一般业务逻辑 |
-| L3 | **Armor** | L2 + 虚假控制流注入 + 不透明谓词 + 混合变异 | ~5-8x | 重要逻辑 |
-| L4 | **Fortress** | L3 + 单层代码虚拟化（VM）+ Handler 变异 | ~15-30x | 核心算法、授权验证 |
-| L5 | **Citadel** | L4 + 多层嵌套 VM + 全维度变异 + Nanomite + 完整性互锁 | ~50-100x+ | 最高价值代码 |
-
-## 构建说明
-
-### 环境要求
+## 构建环境
 
 - Windows 10/11
-- Visual Studio 2022 (MSVC)
+- Visual Studio 2022，安装“使用 C++ 的桌面开发”与 Windows 10/11 SDK
 - CMake 3.20+
 - NASM 2.16+
+- Git（需要递归获取 Zydis/Zycore 子模块）
 
-### 构建步骤
+## 克隆
 
-```bash
-# 克隆项目
-git clone https://github.com/yourusername/CipherShell.git
-cd CipherShell
-
-# 创建构建目录
-mkdir build
-cd build
-
-# 生成项目文件
-cmake .. -G "Visual Studio 17 2022" -A x64
-
-# 编译
-cmake --build . --config Release
+```powershell
+git clone --recursive https://github.com/Anfyya/Ciphershell.git
+cd Ciphershell
 ```
 
-### 使用方法
+已经普通克隆但缺少第三方子模块时：
 
-```bash
-# 基本用法
-ciphershell input.exe -o protected.exe
-
-# 指定保护等级
-ciphershell input.exe -o protected.exe -l 3
-
-# 使用配置文件
-ciphershell input.exe -o protected.exe -c config.toml
-
-# 显示详细信息
-ciphershell input.exe -o protected.exe -v
+```powershell
+git submodule update --init --recursive
 ```
 
-## 项目结构
+Zydis 固定为 `v4.1.0` 对应提交 `569320ad3c4856da13b9dbf1f0d9e20bda63870e`，其 Zycore 子模块由 Zydis 自己固定。
 
+## 使用 VS2022/MSVC 编译
+
+CMake 负责生成和维护 VS2022 工程，真正执行编译的仍是 Visual Studio 2022 自带的 MSVC。
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
-CipherShell/
+
+生成的解决方案位于 `build/CipherShell.sln`，也可以直接用 VS2022 打开。构建系统会从当前 CMake/VS2022 generator 自动发现 MSVC 与 Windows SDK，不依赖开发者机器上的固定绝对路径。
+
+## 基本用法
+
+```powershell
+.\build\bin\Release\ciphershell.exe input.exe -o protected.exe -c config\default.toml -v
+```
+
+配置以模块化开关为准；`--level` 仅是快捷 preset，不是核心架构。主要配置位于：
+
+- `config/default.toml`
+- `config/full_example.toml`
+
+## 关键架构
+
+```text
+PE32 / PE32+
+  → Zydis 解码
+  → CipherShell Instruction/Operand IR
+  → 函数发现与 CFG
+  → VM Translator
+  → 随机 opcode/register/handler 入口布局
+  → 认证加密 metadata + bytecode
+  → x86/x64 runtime + trampoline + bridge
+  → PEEmitter / PERebuilder
+  → 最终 PE 重新解析与静态复验
+```
+
+当前 VM 链路包含：
+
+- Zydis 唯一生产解码路径，无手写 ModRM/SIB/REX fallback
+- x86/x64 函数发现，包含 `.pdata`、OEP、exports、TLS、明确 RVA 与 direct-call roots
+- 随机构建种子、opcode/register permutation、handler slot/variant 变异与不可达 junk handler
+- 认证 metadata、按函数派生的 bytecode 密钥与完整性标签
+- x86/x64 runtime、CALL/RET、guest stack、native/import/indirect call bridge
+- SIMD/x87 严格指令桥与 x64 unwind/CFG 静态链接检查
+- VM 与 startup section encryption 的 W^X loader：临时 RW、恢复 RX/R、刷新 instruction cache，并在存在 TLS 时插入第一条 TLS callback
+- final output 重新解析后复验 metadata、bytecode、trampoline、patch、imports、unwind、CFG 与 W^X
+
+## 目录
+
+```text
+Ciphershell/
 ├── CMakeLists.txt
-├── README.md
-├── ciphershell.md                    # 设计文档
-│
-├── packer/                          # 加壳器主程序
-│   ├── main.cpp                     # 入口 + CLI 解析
-│   ├── pe_parser/                   # PE 解析器
-│   ├── transforms/                  # 变换引擎
-│   └── signature/                   # 签名消除
-│
-├── stub/                            # 运行时 Stub
-│   ├── stage0/                      # 初始解密器
-│   ├── stage1/                      # 运行时引擎
-│   └── vm/                          # Mirage VM 引擎
-│
-├── third_party/                     # 第三方库
-│   └── chacha20.h                   # ChaCha20 加密实现
-│
-└── tests/                           # 测试
-    ├── test_pe_parser.cpp           # PE 解析器测试
-    ├── test_vm_correctness.cpp      # VM 正确性测试
-    └── samples/                     # 测试样本
+├── ciphershell.md                 # 详细设计文档
+├── config/                        # 模块化配置
+├── packer/                        # PE 分析、变换、VM 生成与主程序
+├── runtime/                       # x86/x64 VM runtime 源码
+├── stub/                          # 启动与辅助 stub
+├── third_party/zydis/             # 固定版本 Git submodule
+├── tests/                         # 测试源码与静态分析脚本
+└── tools/                         # 辅助工具源码
 ```
 
-## 技术架构
+## 验证边界
 
-### 模块组成
+项目维护过程默认只进行：
 
-1. **PE 解析器**：自研 PE 解析器，支持 PE32/PE32+，完整解析所有 Data Directory
-2. **Section 加密器**：使用 ChaCha20 流密码加密代码段和数据段
-3. **导入表混淆**：API Hash 化 + 假导入表 + 延迟导入干扰
-4. **重定位修复器**：处理重定位表，支持多种重定位类型
-5. **Stub 生成器**：生成运行时解密/加载代码
-6. **VM 引擎 (Mirage)**：混合架构虚拟机，支持栈+寄存器模式
+- CMake configure
+- Release 编译
+- `git diff --check`
+- 静态反汇编和 PE 结构检查
 
-### 反调试技术
+加壳产物的实际运行由使用者在隔离测试环境中完成。任何静态检查未通过的 VM/loader 链路都不得标记为 `applied`。
 
-- 时序检测（RDTSC、QPC）
-- 状态检测（PEB、硬件断点）
-- 完整性检测（代码段 CRC、API 入口点扫描）
-- 隐式响应（密钥投毒、延迟炸弹）
+## 使用范围
 
-## 开发路线图
-
-- [x] Phase 1: 基础框架
-  - [x] PE Parser
-  - [x] PE Rebuilder
-  - [x] Section 加密
-  - [x] Stub Stage0
-  - [x] API Hash Resolve
-  - [x] 导入表重建
-  - [x] 重定位修复
-
-- [ ] Phase 2: 反调试 + 字符串/导入混淆
-  - [ ] 字符串加密
-  - [ ] 完整的导入表混淆
-  - [ ] 反调试检测矩阵
-  - [ ] 隐式响应机制
-
-- [ ] Phase 3: 控制流混淆
-  - [ ] Zydis 反汇编引擎集成
-  - [ ] CFG 构建器
-  - [ ] 控制流平坦化
-  - [ ] 不透明谓词库
-  - [ ] 虚假控制流注入
-
-- [ ] Phase 4: VM 引擎 Mirage
-  - [ ] VM 上下文结构
-  - [ ] Dispatcher（三种模式）
-  - [ ] Handler 集（约 60 个）
-  - [ ] EFLAGS 模拟
-  - [ ] x86→bytecode 转译器
-
-- [ ] Phase 5: 高级特性 + DLL 支持
-  - [ ] VM 嵌套
-  - [ ] Nanomite 技术
-  - [ ] DLL 加壳支持
-  - [ ] 热点分析
-
-## 许可证
-
-本项目仅供学习和研究使用，请勿用于非法用途。
-
-## 致谢
-
-- Zydis - x86/x64 反汇编引擎
-- toml++ - TOML 解析库
-- ChaCha20 - 流密码算法
+仅用于合法的软件保护、研究和学习。不得用于隐藏恶意代码、规避安全检测或侵犯他人软件权益。

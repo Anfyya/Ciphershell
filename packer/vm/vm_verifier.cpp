@@ -626,6 +626,12 @@ bool VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
     const std::vector<VMFunctionRecord>& expectedRecords,
     const std::vector<uint8_t>& expectedPlaintext,
     const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedSemanticToSlot,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedSlotToSemantic,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedVariants,
+    uint32_t expectedJunkHandlerCount,
+    bool expectedHandlerMutation,
+    bool expectedJunkHandlers,
     std::string& error)
 {
     PEEmitter emitter(image);
@@ -671,6 +677,37 @@ bool VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
         ((header.architecture == VM_ARCH_X64 && header.guardCFDispatchPointerRVA == 0) ||
          (header.architecture == VM_ARCH_X86 && header.guardCFCheckPointerRVA == 0))) {
         error = "CFG-enabled metadata has no architecture-specific Guard pointer";
+        return false;
+    }
+    if (header.handlerTableSize != VM_HANDLER_TABLE_SIZE ||
+        header.handlerVariantCount != VM_HANDLER_VARIANT_COUNT ||
+        header.junkHandlerCount != expectedJunkHandlerCount ||
+        expectedJunkHandlerCount > VM_HANDLER_USABLE_SLOT_COUNT) {
+        error = "emitted handler metadata differs from the build graph";
+        return false;
+    }
+    const auto rangeInsideMetadata = [&](uint32_t offset, uint32_t size) {
+        return offset <= header.totalSize && size <= header.totalSize - offset;
+    };
+    if (!rangeInsideMetadata(header.handlerSemanticMapOffset, VM_HANDLER_TABLE_SIZE) ||
+        !rangeInsideMetadata(header.handlerDescriptorOffset, VM_HANDLER_TABLE_SIZE) ||
+        !rangeInsideMetadata(header.handlerVariantOffset, VM_HANDLER_TABLE_SIZE)) {
+        error = "emitted handler tables are outside authenticated metadata";
+        return false;
+    }
+    const uint8_t* emittedSemanticToSlot = metadata + header.handlerSemanticMapOffset;
+    const uint8_t* emittedSlotToSemantic = metadata + header.handlerDescriptorOffset;
+    const uint8_t* emittedVariants = metadata + header.handlerVariantOffset;
+    if (!std::equal(expectedSemanticToSlot.begin(), expectedSemanticToSlot.end(), emittedSemanticToSlot) ||
+        !std::equal(expectedSlotToSemantic.begin(), expectedSlotToSemantic.end(), emittedSlotToSemantic) ||
+        !std::equal(expectedVariants.begin(), expectedVariants.end(), emittedVariants)) {
+        error = "emitted handler tables differ from MutationEngine output";
+        return false;
+    }
+    if (((header.flags & VM_METADATA_FLAG_HANDLER_MUTATED) != 0) != expectedHandlerMutation ||
+        ((header.flags & VM_METADATA_FLAG_JUNK_HANDLERS) != 0) != expectedJunkHandlers ||
+        expectedJunkHandlers != (expectedJunkHandlerCount != 0)) {
+        error = "emitted handler flags differ from the build graph";
         return false;
     }
 

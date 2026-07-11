@@ -60,11 +60,11 @@ struct VMConfig {
         registerCount(24),
         stackSize(0x20000),
         opcodeRandomization(true),
-        handlerMutation(false),
+        handlerMutation(true),
         bytecodeEncryption(true),
         nativeBodyPolicy("destroy"),
         x86CallAbi("auto"),
-        embedJunkHandlers(false),
+        embedJunkHandlers(true),
         simdBridge(true),
         x87Bridge(true) {}
 };

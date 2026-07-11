@@ -68,7 +68,6 @@ public:
     std::unordered_map<uint8_t, uint8_t> GetOpcodeMap() const;
     void SetOpcodeMap(const std::unordered_map<uint8_t, uint8_t>& opcodeMap);
     void SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& registerMap);
-    std::unordered_map<uint8_t, uint8_t> GenerateOpcodeMap();
     const std::vector<TranslationFailure>& GetLastFailures() const;
 
 private:

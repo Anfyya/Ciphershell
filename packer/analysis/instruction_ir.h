@@ -312,6 +312,7 @@ struct Function {
     uint64_t entryAddress = 0;
     uint32_t size = 0;
     std::string name;
+    std::string discoverySource;
     std::vector<BasicBlock> blocks;
     bool isLeaf = true;
     bool isRecursive = false;

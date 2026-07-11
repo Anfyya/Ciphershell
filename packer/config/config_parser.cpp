@@ -98,11 +98,11 @@ target_rvas = []                  # 按函数入口 RVA 精确选择
 register_count = 24               # 虚拟寄存器数量（16-64）
 stack_size = 0x20000              # 虚拟栈大小
 opcode_randomization = true       # 每次构建生成完整 opcode permutation
-handler_mutation = false          # 未接通 runtime 时必须保持关闭
+handler_mutation = true           # 生产构建默认启用 handler 入口布局与执行路径变异
 bytecode_encryption = true        # ChaCha20 加密 + SipHash 完整性认证
 native_body_policy = "destroy"    # 原 native 函数体销毁
 x86_call_abi = "auto"            # "auto" | "cdecl" | "stdcall" | "fastcall" | "thiscall"
-embed_junk_handlers = false       # 未接通 runtime 时必须保持关闭
+embed_junk_handlers = true        # 生成不可由合法 opcode 到达的垃圾 handler 槽
 simd_bridge = true                # SSE2/SSE4/AVX/AVX2 严格指令桥
 x87_bridge = true                 # x87 严格指令桥
 

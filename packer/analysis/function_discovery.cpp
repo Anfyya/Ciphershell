@@ -5,6 +5,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -148,7 +149,8 @@ void AssignFunctionNames(const CS_PE_IMAGE* image, std::vector<Function>& functi
 
 FunctionDiscoveryResult FunctionDiscovery::Discover(
     CS_PE_IMAGE* image,
-    Disassembler& disassembler) const
+    Disassembler& disassembler,
+    const std::vector<uint32_t>& explicitRoots) const
 {
     FunctionDiscoveryResult result{};
     if (!image || !image->isValid || !image->rawData) {
@@ -164,6 +166,38 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
         return result;
     }
 
+    std::map<uint32_t, std::string> rootSources;
+    auto addRoot = [&](uint32_t rva, const char* source) {
+        if (rva == 0 || !ExecutableSectionForRva(image, rva)) return;
+        auto inserted = rootSources.emplace(rva, source);
+        if (!inserted.second && std::string(source) == "explicit_rva") {
+            inserted.first->second = source;
+        }
+    };
+
+    addRoot(image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.AddressOfEntryPoint
+        : image->ntHeaders32->OptionalHeader.AddressOfEntryPoint, "oep");
+    for (const auto& exported : image->exports.functions) {
+        if (!exported.isForwarded && exported.functionRVA != 0) {
+            addRoot(exported.functionRVA, "export");
+        }
+    }
+    std::set<uint32_t> tlsRoots;
+    AddTlsRoots(image, tlsRoots);
+    for (uint32_t root : tlsRoots) addRoot(root, "tls");
+    for (uint32_t root : explicitRoots) {
+        if (root == 0 || !ExecutableSectionForRva(image, root)) {
+            result.issues.push_back({root,
+                "explicit target RVA is not a non-zero executable-section address"});
+            continue;
+        }
+        addRoot(root, "explicit_rva");
+    }
+
+    std::set<uint32_t> knownBoundaries;
+    for (const auto& root : rootSources) knownBoundaries.insert(root.first);
+
     if (image->is64Bit) {
         std::vector<CS_RUNTIME_FUNCTION> entries = image->exceptions.entries;
         std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
@@ -174,6 +208,8 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
                 result.error = "x64 runtime-function table contains an invalid range";
                 return result;
             }
+            knownBoundaries.insert(entry.beginAddress);
+            knownBoundaries.insert(entry.endAddress);
             const uint8_t* code = nullptr;
             uint32_t available = 0;
             std::string rangeError;
@@ -189,46 +225,129 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
                 continue;
             }
             function.boundaryTrusted = true;
+            function.discoverySource = "pdata";
             result.functions.push_back(std::move(function));
         }
-    } else {
-        std::set<uint32_t> roots;
-        roots.insert(image->ntHeaders32->OptionalHeader.AddressOfEntryPoint);
-        for (const auto& exported : image->exports.functions) {
-            if (!exported.isForwarded && exported.functionRVA != 0) roots.insert(exported.functionRVA);
-        }
-        AddTlsRoots(image, roots);
+    }
 
-        std::deque<uint32_t> pending(roots.begin(), roots.end());
-        std::unordered_set<uint32_t> queued(roots.begin(), roots.end());
-        std::unordered_set<uint32_t> decodedStarts;
-        while (!pending.empty()) {
-            const uint32_t root = pending.front();
-            pending.pop_front();
-            if (decodedStarts.count(root) != 0) continue;
-            const uint8_t* code = nullptr;
-            uint32_t available = 0;
-            std::string rangeError;
-            if (!RawRangeForFunction(image, root, 0, code, available, rangeError)) {
-                result.issues.push_back({root, rangeError});
-                continue;
-            }
-            Function function{};
-            if (!disassembler.AnalyzeFunctionRange(code, available, root, 0, false, function)) {
-                result.error = disassembler.GetLastError();
-                return result;
-            }
-            function.boundaryTrusted = true;
-            decodedStarts.insert(root);
-            for (const InstructionIR* instruction : Instructions(function)) {
-                if (!instruction->IsCall() || !instruction->hasBranchTarget ||
-                    !ExecutableSectionForRva(image, instruction->branchTargetRVA)) continue;
-                if (queued.insert(instruction->branchTargetRVA).second) {
-                    pending.push_back(instruction->branchTargetRVA);
-                }
-            }
-            result.functions.push_back(std::move(function));
+    auto containingFunction = [&](uint32_t rva) -> const Function* {
+        for (const auto& function : result.functions) {
+            const uint64_t begin = function.entryAddress;
+            const uint64_t end = begin + function.size;
+            if (rva >= begin && static_cast<uint64_t>(rva) < end) return &function;
         }
+        return nullptr;
+    };
+
+    std::deque<uint32_t> pending;
+    std::unordered_set<uint32_t> queued;
+    for (const auto& root : rootSources) {
+        pending.push_back(root.first);
+        queued.insert(root.first);
+    }
+    // Direct calls from trusted .pdata functions are also credible leaf roots.
+    for (const auto& function : result.functions) {
+        for (const InstructionIR* instruction : Instructions(function)) {
+            if (!instruction->IsCall() || !instruction->hasBranchTarget ||
+                !ExecutableSectionForRva(image, instruction->branchTargetRVA)) continue;
+            const uint32_t target = instruction->branchTargetRVA;
+            if (rootSources.emplace(target, "direct_call").second) knownBoundaries.insert(target);
+            if (queued.insert(target).second) pending.push_back(target);
+        }
+    }
+
+    std::unordered_set<uint32_t> decodedStarts;
+    for (const auto& function : result.functions) {
+        decodedStarts.insert(static_cast<uint32_t>(function.entryAddress));
+    }
+
+    while (!pending.empty()) {
+        const uint32_t root = pending.front();
+        pending.pop_front();
+        if (decodedStarts.count(root) != 0) continue;
+
+        if (const Function* owner = containingFunction(root)) {
+            if (owner->entryAddress != root) {
+                result.issues.push_back({root,
+                    "candidate root points into an existing trusted function interior"});
+            }
+            continue;
+        }
+
+        const IMAGE_SECTION_HEADER* section = ExecutableSectionForRva(image, root);
+        if (!section) {
+            result.issues.push_back({root, "function RVA is not in an executable section"});
+            continue;
+        }
+        const uint64_t sectionEnd64 = static_cast<uint64_t>(section->VirtualAddress) +
+            section->SizeOfRawData;
+        if (sectionEnd64 > std::numeric_limits<uint32_t>::max() || root >= sectionEnd64) {
+            result.issues.push_back({root, "function RVA has no file-backed executable bytes"});
+            continue;
+        }
+        uint32_t candidateLimit = static_cast<uint32_t>(sectionEnd64 - root);
+        const auto nextBoundary = knownBoundaries.upper_bound(root);
+        if (nextBoundary != knownBoundaries.end() && *nextBoundary < sectionEnd64) {
+            candidateLimit = (std::min)(candidateLimit, *nextBoundary - root);
+        }
+        if (candidateLimit < 1) {
+            result.issues.push_back({root, "function candidate has an empty bounded range"});
+            continue;
+        }
+
+        const uint8_t* code = nullptr;
+        uint32_t available = 0;
+        std::string rangeError;
+        if (!RawRangeForFunction(image, root, candidateLimit, code, available, rangeError)) {
+            result.issues.push_back({root, rangeError});
+            continue;
+        }
+        Function function{};
+        if (!disassembler.AnalyzeFunctionRange(code, available, root, 0,
+                image->is64Bit != 0, function)) {
+            result.issues.push_back({root, disassembler.GetLastError()});
+            continue;
+        }
+        if (function.size == 0 || function.blocks.empty() || function.decodedBytes == 0) {
+            result.issues.push_back({root, "recursive decoder produced an empty function"});
+            continue;
+        }
+        // For a boundary inferred without unwind/symbol metadata, every byte in
+        // the destroyed native range must belong to a decoded instruction.  A
+        // gap can be an inline table or adjacent data and is therefore rejected.
+        if (function.decodedBytes != function.size) {
+            result.issues.push_back({root,
+                "inferred function range contains undecoded gaps and is not safe to destroy"});
+            continue;
+        }
+
+        const uint64_t candidateEnd = static_cast<uint64_t>(root) + function.size;
+        bool overlaps = false;
+        for (const auto& existing : result.functions) {
+            const uint64_t existingBegin = existing.entryAddress;
+            const uint64_t existingEnd = existingBegin + existing.size;
+            if (candidateEnd <= existingBegin || root >= existingEnd) continue;
+            overlaps = true;
+            break;
+        }
+        if (overlaps) {
+            result.issues.push_back({root, "recursive function boundary overlaps a trusted function"});
+            continue;
+        }
+
+        function.boundaryTrusted = true;
+        const auto source = rootSources.find(root);
+        function.discoverySource = source != rootSources.end() ? source->second : "direct_call";
+        decodedStarts.insert(root);
+
+        for (const InstructionIR* instruction : Instructions(function)) {
+            if (!instruction->IsCall() || !instruction->hasBranchTarget ||
+                !ExecutableSectionForRva(image, instruction->branchTargetRVA)) continue;
+            const uint32_t target = instruction->branchTargetRVA;
+            if (rootSources.emplace(target, "direct_call").second) knownBoundaries.insert(target);
+            if (queued.insert(target).second) pending.push_back(target);
+        }
+        result.functions.push_back(std::move(function));
     }
 
     if (result.functions.empty()) {

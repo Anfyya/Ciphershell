@@ -102,11 +102,13 @@ struct CS_RESOURCE_TREE {
 // ============================================================================
 
 struct CS_TLS_INFO {
+    DWORD       directoryRVA;       // TLS directory RVA
     DWORD64     startAddress;       // TLS 数据起始地址
     DWORD64     endAddress;         // TLS 数据结束地址
     DWORD64     indexAddress;       // TLS 索引地址
     DWORD64     callbacksAddress;   // TLS 回调数组地址
     DWORD       callbackCount;      // 回调数量
+    std::vector<DWORD64> callbackAddresses; // 解析时保存，避免后续 section 加密破坏读取
     bool        valid;
 };
 

@@ -23,7 +23,10 @@ struct FunctionDiscoveryResult {
 
 class FunctionDiscovery {
 public:
-    FunctionDiscoveryResult Discover(CS_PE_IMAGE* image, Disassembler& disassembler) const;
+    FunctionDiscoveryResult Discover(
+        CS_PE_IMAGE* image,
+        Disassembler& disassembler,
+        const std::vector<uint32_t>& explicitRoots = {}) const;
 };
 
 } // namespace CipherShell

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell PE Parser - 瀹炵幇
  */
 
@@ -15,22 +15,7 @@ bool IsPowerOfTwo(uint32_t value) {
     return value != 0 && (value & (value - 1u)) == 0;
 }
 
-bool ReadAsciiStringAtOffset(
-    const CS_PE_IMAGE* image,
-    uint32_t offset,
-    std::string& value,
-    uint32_t maxLength = 0x8000)
-{
-    if (!image || !image->rawData || offset >= image->rawSize) return false;
-    const uint32_t available = image->rawSize - offset;
-    const uint32_t limit = (std::min)(available, maxLength);
-    const char* begin = reinterpret_cast<const char*>(image->rawData + offset);
-    const void* terminator = std::memchr(begin, 0, limit);
-    if (!terminator) return false;
-    const char* end = static_cast<const char*>(terminator);
-    value.assign(begin, end);
-    return true;
-}
+
 }
 
 // ============================================================================
@@ -568,6 +553,8 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
         return false;
     }
 
+    image->tls.directoryRVA = tlsDir.VirtualAddress;
+    image->tls.callbackAddresses.clear();
     if (image->is64Bit) {
         PIMAGE_TLS_DIRECTORY64 tlsDir64 = (PIMAGE_TLS_DIRECTORY64)(image->rawData + tlsOffset);
         image->tls.startAddress = tlsDir64->StartAddressOfRawData;
@@ -590,16 +577,26 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
             (image->is64Bit ? image->ntHeaders64->OptionalHeader.ImageBase :
                               image->ntHeaders32->OptionalHeader.ImageBase)));
 
-        if (callbackOffset != 0) {
-            DWORD count = 0;
-            if (image->is64Bit) {
-                DWORD64* callbacks = (DWORD64*)(image->rawData + callbackOffset);
-                while (callbacks[count] != 0) count++;
-            } else {
-                DWORD* callbacks = (DWORD*)(image->rawData + callbackOffset);
-                while (callbacks[count] != 0) count++;
+        if (callbackOffset != 0 && callbackOffset < image->rawSize) {
+            const DWORD pointerSize = image->is64Bit ? 8u : 4u;
+            const DWORD maxCallbacks = (image->rawSize - callbackOffset) / pointerSize;
+            bool terminated = false;
+            for (DWORD count = 0; count < maxCallbacks; ++count) {
+                DWORD64 callback = 0;
+                std::memcpy(&callback, image->rawData + callbackOffset + count * pointerSize,
+                    pointerSize);
+                if (callback == 0) {
+                    terminated = true;
+                    break;
+                }
+                image->tls.callbackAddresses.push_back(callback);
             }
-            image->tls.callbackCount = count;
+            if (!terminated) {
+                image->tls.callbackAddresses.clear();
+                image->tls.valid = FALSE;
+                return false;
+            }
+            image->tls.callbackCount = static_cast<DWORD>(image->tls.callbackAddresses.size());
         }
     }
 

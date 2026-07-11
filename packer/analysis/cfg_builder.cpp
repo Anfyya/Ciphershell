@@ -97,8 +97,6 @@ void CFGBuilder::ComputeDominatorTree(ControlFlowGraph& cfg) {
 
     if (cfg.nodes.empty()) return;
 
-    size_t n = cfg.nodes.size();
-
     // 第一步：计算逆后序（reverse postorder）
     std::vector<uint64_t> postOrder;
     std::unordered_set<uint64_t> dfsVisited;

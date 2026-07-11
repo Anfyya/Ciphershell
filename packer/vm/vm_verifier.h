@@ -34,6 +34,12 @@ public:
         const std::vector<VMFunctionRecord>& expectedRecords,
         const std::vector<uint8_t>& expectedPlaintext,
         const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedSemanticToSlot,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedSlotToSemantic,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& expectedVariants,
+        uint32_t expectedJunkHandlerCount,
+        bool expectedHandlerMutation,
+        bool expectedJunkHandlers,
         std::string& error);
 };
 

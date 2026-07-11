@@ -209,7 +209,7 @@ void StringEncryptorAdvanced::EraseString(EncryptedStringStorage& storage) {
         for (DWORD i = 0; i < storage.originalSize; i++) {
             p[i] = 0;
         }
-        delete[] storage.decryptedBuffer;
+        delete[] static_cast<BYTE*>(storage.decryptedBuffer);
         storage.decryptedBuffer = nullptr;
     }
     storage.erased = true;

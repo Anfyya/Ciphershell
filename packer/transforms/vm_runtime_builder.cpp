@@ -3,8 +3,15 @@
 #include "../pe_parser/pe_emitter.h"
 #include "../../runtime/common/vm_metadata.h"
 #include "../../runtime/common/vm_runtime_core.h"
+#ifdef _WIN32
 #include "vm_runtime_x64_image.h"
 #include "vm_runtime_x86_image.h"
+#else
+static const uint8_t kVMRuntimeX64Image[] = {0};
+static const size_t kVMRuntimeX64ImageSize = 0;
+static const uint8_t kVMRuntimeX86Image[] = {0};
+static const size_t kVMRuntimeX86ImageSize = 0;
+#endif
 #include <algorithm>
 #include <array>
 #include <cstring>

@@ -32,6 +32,12 @@ struct VMEmitResult {
     uint32_t schemaVersion = 0;
     std::array<uint8_t, 16> buildId{};
     std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> runtimeKeyShare{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> handlerSemanticToSlot{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> handlerSlotToSemantic{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> handlerVariants{};
+    uint32_t junkHandlerCount = 0;
+    bool handlerMutationEnabled = false;
+    bool junkHandlersEnabled = false;
     std::vector<VMFunctionRecord> records;
     std::string error;
 };
@@ -44,6 +50,12 @@ public:
         const std::vector<VMFunctionRecord>& records,
         const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
         const std::unordered_map<uint8_t, uint8_t>& registerMap,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerSemanticToSlot,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerSlotToSemantic,
+        const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerVariants,
+        uint32_t junkHandlerCount,
+        bool handlerMutationEnabled,
+        bool junkHandlersEnabled,
         uint32_t runtimeEntryRVA = 0,
         const char sectionName[8] = nullptr);
 

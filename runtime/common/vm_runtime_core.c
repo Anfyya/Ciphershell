@@ -17,6 +17,9 @@ typedef struct VM_EXECUTION_CONTEXT {
     const uint8_t* encryptedBytecode;
     const uint8_t* reverseOpcodeMap;
     const uint8_t* registerMap;
+    const uint8_t* handlerSemanticToSlot;
+    const uint8_t* handlerSlotToSemantic;
+    const uint8_t* handlerVariants;
     VM_EXTENDED_STATE* extendedState;
     uint8_t recordKey[32];
     uint32_t ip;
@@ -29,6 +32,10 @@ typedef struct VM_EXECUTION_CONTEXT {
     uintptr_t guestStackLow;
     uintptr_t guardTarget;
     uint32_t imageSize;
+    uint8_t currentHandlerSlot;
+    uint8_t currentHandlerVariant;
+    uint16_t handlerReserved;
+    volatile uint64_t mutationScratch;
 } VM_EXECUTION_CONTEXT;
 
 #if defined(_MSC_VER)
@@ -584,7 +591,9 @@ static uint32_t validate_metadata(
         VM_METADATA_FLAG_NATIVE_BODY_DESTROYED |
         VM_METADATA_FLAG_CFG_VERIFIED |
         VM_METADATA_FLAG_UNWIND_VERIFIED |
-        VM_METADATA_FLAG_CFG_ENABLED;
+        VM_METADATA_FLAG_CFG_ENABLED |
+        VM_METADATA_FLAG_HANDLER_MUTATED |
+        VM_METADATA_FLAG_JUNK_HANDLERS;
     uint32_t i;
     uint64_t expected;
     VM_SIPHASH24_CONTEXT hash;
@@ -610,6 +619,9 @@ static uint32_t validate_metadata(
             !(metadata->flags & VM_METADATA_FLAG_UNWIND_VERIFIED)) ||
         metadata->opcodeMapSize != VM_OPCODE_MAP_SIZE ||
         metadata->registerMapSize != VM_REGISTER_MAP_SIZE ||
+        metadata->handlerTableSize != VM_HANDLER_TABLE_SIZE ||
+        metadata->handlerVariantCount != VM_HANDLER_VARIANT_COUNT ||
+        metadata->junkHandlerCount > VM_HANDLER_USABLE_SLOT_COUNT ||
         metadata->layoutSeed == 0 || metadata->imageSize == 0 ||
         metadata->runtimeBaseRVA == 0 || metadata->runtimeBaseRVA >= metadata->imageSize ||
         metadata->runtimeSize == 0 ||
@@ -625,8 +637,14 @@ static uint32_t validate_metadata(
         metadata->recordCount > (metadata->reverseOpcodeMapOffset - metadata->recordOffset) / metadata->recordSize ||
         metadata->reverseOpcodeMapOffset > metadata->registerMapOffset ||
         metadata->opcodeMapSize > metadata->registerMapOffset - metadata->reverseOpcodeMapOffset ||
-        metadata->registerMapOffset > metadata->bytecodeOffset ||
-        metadata->registerMapSize > metadata->bytecodeOffset - metadata->registerMapOffset ||
+        metadata->registerMapOffset > metadata->handlerSemanticMapOffset ||
+        metadata->registerMapSize > metadata->handlerSemanticMapOffset - metadata->registerMapOffset ||
+        metadata->handlerSemanticMapOffset > metadata->handlerDescriptorOffset ||
+        metadata->handlerTableSize > metadata->handlerDescriptorOffset - metadata->handlerSemanticMapOffset ||
+        metadata->handlerDescriptorOffset > metadata->handlerVariantOffset ||
+        metadata->handlerTableSize > metadata->handlerVariantOffset - metadata->handlerDescriptorOffset ||
+        metadata->handlerVariantOffset > metadata->bytecodeOffset ||
+        metadata->handlerTableSize > metadata->bytecodeOffset - metadata->handlerVariantOffset ||
         metadata->bytecodeOffset > metadata->totalSize ||
         metadata->bytecodeSize > metadata->totalSize - metadata->bytecodeOffset) {
         return VM_ERR_METADATA_INVALID;
@@ -649,13 +667,57 @@ static uint32_t validate_metadata(
     {
         uint8_t seenOpcodes[256];
         uint8_t seenRegisters[VM_RUNTIME_REGISTER_COUNT];
+        uint8_t seenHandlerSlots[VM_HANDLER_TABLE_SIZE];
+        uint32_t junkCount = 0;
         const uint8_t* reverse = (const uint8_t*)metadata + metadata->reverseOpcodeMapOffset;
         const uint8_t* registers = (const uint8_t*)metadata + metadata->registerMapOffset;
-        for (i = 0; i < 256; ++i) seenOpcodes[i] = 0;
+        const uint8_t* semanticToSlot = (const uint8_t*)metadata + metadata->handlerSemanticMapOffset;
+        const uint8_t* slotToSemantic = (const uint8_t*)metadata + metadata->handlerDescriptorOffset;
+        const uint8_t* variants = (const uint8_t*)metadata + metadata->handlerVariantOffset;
+        for (i = 0; i < 256; ++i) {
+            seenOpcodes[i] = 0;
+            seenHandlerSlots[i] = 0;
+        }
         for (i = 0; i < VM_RUNTIME_REGISTER_COUNT; ++i) seenRegisters[i] = 0;
         for (i = 0; i < 256; ++i) {
             if (seenOpcodes[reverse[i]]) return VM_ERR_METADATA_INVALID;
             seenOpcodes[reverse[i]] = 1;
+            if (variants[i] >= VM_HANDLER_VARIANT_COUNT) return VM_ERR_METADATA_INVALID;
+            if (i >= VM_HANDLER_USABLE_SLOT_COUNT) {
+                if (slotToSemantic[i] != VM_HANDLER_INVALID || variants[i] != 0)
+                    return VM_ERR_METADATA_INVALID;
+                continue;
+            }
+            if (slotToSemantic[i] == VM_HANDLER_JUNK) {
+                ++junkCount;
+            } else if (slotToSemantic[i] != VM_HANDLER_INVALID) {
+                const uint8_t semantic = slotToSemantic[i];
+                if (semantic == VM_HANDLER_JUNK || semantic == VM_HANDLER_INVALID ||
+                    semanticToSlot[semantic] != i || seenHandlerSlots[i])
+                    return VM_ERR_METADATA_INVALID;
+                seenHandlerSlots[i] = 1;
+            }
+        }
+        for (i = 0; i < 256; ++i) {
+            const uint8_t slot = semanticToSlot[i];
+            if (slot == VM_HANDLER_INVALID) continue;
+            if (slot >= VM_HANDLER_USABLE_SLOT_COUNT ||
+                slotToSemantic[slot] != i || seenHandlerSlots[slot] == 0)
+                return VM_ERR_METADATA_INVALID;
+        }
+        if (junkCount != metadata->junkHandlerCount ||
+            (((metadata->flags & VM_METADATA_FLAG_JUNK_HANDLERS) != 0) != (junkCount != 0)))
+            return VM_ERR_METADATA_INVALID;
+        {
+            uint8_t mutated = 0;
+            for (i = 0; i < 256; ++i) {
+                if (semanticToSlot[i] != VM_HANDLER_INVALID && semanticToSlot[i] != i) {
+                    mutated = 1;
+                    break;
+                }
+            }
+            if (((metadata->flags & VM_METADATA_FLAG_HANDLER_MUTATED) != 0) != (mutated != 0))
+                return VM_ERR_METADATA_INVALID;
         }
         for (i = 0; i < 16; ++i) {
             if (registers[i] >= VM_RUNTIME_REGISTER_COUNT || seenRegisters[registers[i]])
@@ -729,6 +791,12 @@ static uint32_t validate_record(
         context->metadata->reverseOpcodeMapOffset;
     context->registerMap = (const uint8_t*)context->metadata +
         context->metadata->registerMapOffset;
+    context->handlerSemanticToSlot = (const uint8_t*)context->metadata +
+        context->metadata->handlerSemanticMapOffset;
+    context->handlerSlotToSemantic = (const uint8_t*)context->metadata +
+        context->metadata->handlerDescriptorOffset;
+    context->handlerVariants = (const uint8_t*)context->metadata +
+        context->metadata->handlerVariantOffset;
     expectedTag = vm_siphash24(context->encryptedBytecode,
         context->record->bytecodeSize, context->recordKey + 16);
     return vm_constant_time_equal64(expectedTag, context->record->bytecodeTag)
@@ -746,6 +814,19 @@ static uint32_t decode_instruction(
         (uint8_t*)instruction, sizeof(*instruction), context->recordKey,
         context->record->nonce, 1, context->ip);
     instruction->opcode = context->reverseOpcodeMap[instruction->opcode];
+    {
+        const uint8_t semantic = instruction->opcode;
+        const uint8_t slot = context->handlerSemanticToSlot[semantic];
+        uint8_t descriptor;
+        if (slot == VM_HANDLER_INVALID) return VM_ERR_OPCODE_UNSUPPORTED;
+        descriptor = context->handlerSlotToSemantic[slot];
+        if (descriptor != semantic) return VM_ERR_HANDLER_BUG;
+        context->currentHandlerSlot = slot;
+        context->currentHandlerVariant = context->handlerVariants[slot];
+        if (context->currentHandlerVariant >= VM_HANDLER_VARIANT_COUNT)
+            return VM_ERR_HANDLER_BUG;
+        instruction->opcode = descriptor;
+    }
     if (vm_schema_validate_instruction(instruction, VM_RUNTIME_REGISTER_COUNT) !=
             VM_SCHEMA_CONTRACT_OK) return VM_ERR_SCHEMA_MISMATCH;
     if (vm_schema_opcode_has_branch(instruction->opcode) &&
@@ -1510,6 +1591,104 @@ static uint32_t execute_instruction(
     return VM_ERR_NONE;
 }
 
+
+typedef uint32_t (*VM_HANDLER_ENTRY)(
+    VM_EXECUTION_CONTEXT*, const VM_BYTECODE_INSTRUCTION*, int*);
+
+static VM_NOINLINE uint32_t execute_handler_variant_0(
+    VM_EXECUTION_CONTEXT* context,
+    const VM_BYTECODE_INSTRUCTION* instruction,
+    int* finished)
+{
+    return execute_instruction(context, instruction, finished);
+}
+
+static VM_NOINLINE uint32_t execute_handler_variant_1(
+    VM_EXECUTION_CONTEXT* context,
+    const VM_BYTECODE_INSTRUCTION* instruction,
+    int* finished)
+{
+    volatile uint64_t barrier = context->mutationScratch ^
+        ((uint64_t)context->currentHandlerSlot << 40) ^
+        ((uint64_t)instruction->opcode << 8) ^ context->metadata->layoutSeed;
+    barrier += 0x9E3779B97F4A7C15ULL;
+    barrier -= 0x9E3779B97F4A7C15ULL;
+    context->mutationScratch = barrier;
+    return execute_instruction(context, instruction, finished);
+}
+
+static VM_NOINLINE uint32_t execute_handler_variant_2(
+    VM_EXECUTION_CONTEXT* context,
+    const VM_BYTECODE_INSTRUCTION* instruction,
+    int* finished)
+{
+    VM_BYTECODE_INSTRUCTION local = *instruction;
+    const uint64_t mask = ((uint64_t)context->metadata->layoutSeed << 32) |
+        (uint64_t)context->currentHandlerSlot;
+    local.immediate ^= mask;
+    local.immediate ^= mask;
+    return execute_instruction(context, &local, finished);
+}
+
+static VM_NOINLINE uint32_t execute_handler_variant_3(
+    VM_EXECUTION_CONTEXT* context,
+    const VM_BYTECODE_INSTRUCTION* instruction,
+    int* finished)
+{
+    volatile uintptr_t barrier = (uintptr_t)context ^ (uintptr_t)instruction ^
+        (uintptr_t)context->metadata->buildId[context->currentHandlerSlot & 15u];
+    if (barrier == ~(uintptr_t)0) return VM_ERR_HANDLER_BUG;
+    context->mutationScratch ^= (uint64_t)barrier;
+    context->mutationScratch ^= (uint64_t)barrier;
+    return execute_instruction(context, instruction, finished);
+}
+
+static VM_NOINLINE uint32_t junk_handler_0(
+    VM_EXECUTION_CONTEXT* context, const VM_BYTECODE_INSTRUCTION* instruction, int* finished)
+{
+    volatile uint64_t value = context->mutationScratch ^ instruction->immediate;
+    (void)finished;
+    return value ? VM_ERR_OPCODE_UNSUPPORTED : VM_ERR_HANDLER_BUG;
+}
+
+static VM_NOINLINE uint32_t junk_handler_1(
+    VM_EXECUTION_CONTEXT* context, const VM_BYTECODE_INSTRUCTION* instruction, int* finished)
+{
+    volatile uint64_t value = context->metadata->layoutSeed + instruction->aux;
+    (void)finished;
+    return value ? VM_ERR_SCHEMA_MISMATCH : VM_ERR_HANDLER_BUG;
+}
+
+static VM_NOINLINE uint32_t junk_handler_2(
+    VM_EXECUTION_CONTEXT* context, const VM_BYTECODE_INSTRUCTION* instruction, int* finished)
+{
+    volatile uintptr_t value = context->imageBase ^ (uintptr_t)instruction;
+    (void)finished;
+    return value ? VM_ERR_BYTECODE_RANGE : VM_ERR_HANDLER_BUG;
+}
+
+static VM_NOINLINE uint32_t junk_handler_3(
+    VM_EXECUTION_CONTEXT* context, const VM_BYTECODE_INSTRUCTION* instruction, int* finished)
+{
+    volatile uint64_t value = context->flags + instruction->branchTargetOffset;
+    (void)finished;
+    return value ? VM_ERR_HANDLER_BUG : VM_ERR_OPCODE_UNSUPPORTED;
+}
+
+static const VM_HANDLER_ENTRY vm_handler_variants[VM_HANDLER_VARIANT_COUNT] = {
+    execute_handler_variant_0,
+    execute_handler_variant_1,
+    execute_handler_variant_2,
+    execute_handler_variant_3
+};
+
+static const VM_HANDLER_ENTRY vm_junk_handler_variants[VM_HANDLER_VARIANT_COUNT] = {
+    junk_handler_0,
+    junk_handler_1,
+    junk_handler_2,
+    junk_handler_3
+};
+
 VM_NOINLINE uint32_t vm_runtime_interpret(
     void* nativeFrame,
     uint32_t functionRva,
@@ -1582,6 +1761,20 @@ VM_NOINLINE uint32_t vm_runtime_interpret(
     error = validate_record(&context, masterKey);
     for (i = 0; i < sizeof(masterKey); ++i) masterKey[i] = 0;
     if (error) return error;
+    if (metadata->flags & VM_METADATA_FLAG_JUNK_HANDLERS) {
+        volatile uintptr_t catalogFingerprint = 0;
+        uint32_t observedJunk = 0;
+        for (i = 0; i < VM_HANDLER_TABLE_SIZE; ++i) {
+            if (context.handlerSlotToSemantic[i] != VM_HANDLER_JUNK) continue;
+            if (context.handlerVariants[i] >= VM_HANDLER_VARIANT_COUNT)
+                return VM_ERR_HANDLER_BUG;
+            catalogFingerprint |=
+                (uintptr_t)vm_junk_handler_variants[context.handlerVariants[i]];
+            ++observedJunk;
+        }
+        if (observedJunk != metadata->junkHandlerCount || catalogFingerprint == 0)
+            return VM_ERR_HANDLER_BUG;
+    }
     error = initialize_registers(&context, nativeFrame);
     if (error) return error;
     if (context.originalStackPointer < context.record->guestStackSize) {
@@ -1592,7 +1785,10 @@ VM_NOINLINE uint32_t vm_runtime_interpret(
     while (!finished) {
         error = decode_instruction(&context, &instruction);
         if (error) return error;
-        error = execute_instruction(&context, &instruction, &finished);
+        if (context.currentHandlerVariant >= VM_HANDLER_VARIANT_COUNT)
+            return VM_ERR_HANDLER_BUG;
+        error = vm_handler_variants[context.currentHandlerVariant](
+            &context, &instruction, &finished);
         if (error) return error;
         if (context.regs[context.registerMap[4]] < context.guestStackLow) {
             return VM_ERR_STACK_ALIGNMENT;

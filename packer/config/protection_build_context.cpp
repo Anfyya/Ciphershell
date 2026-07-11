@@ -1,11 +1,14 @@
 #include "protection_build_context.h"
 
 #include "../../runtime/common/vm_crypto.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
-#include <cstring>
-
 #pragma comment(lib, "bcrypt.lib")
+#else
+#include <random>
+#endif
+#include <cstring>
 
 namespace CipherShell {
 
@@ -49,8 +52,18 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     ctx.quickLevel = config.global.protectionLevel > 0 ? config.global.protectionLevel : cliLevel;
     ctx.debugNames = verbose;
     ctx.randomizeSectionNames = config.global.randomizeSections;
+#ifdef _WIN32
     ctx.entropyReady = BCryptGenRandom(nullptr, ctx.isaSeed.data(),
         static_cast<ULONG>(ctx.isaSeed.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+    try {
+        std::random_device source;
+        for (auto& byte : ctx.isaSeed) byte = static_cast<uint8_t>(source());
+        ctx.entropyReady = true;
+    } catch (...) {
+        ctx.entropyReady = false;
+    }
+#endif
 
     ctx.sectionEncryption = PresetFeature(ctx.quickLevel >= 1, 50 + ctx.quickLevel * 8, "startup");
     ctx.stringEncryption = PresetFeature(ctx.quickLevel >= 2 && config.global.stringEncryption, 60, "startup");

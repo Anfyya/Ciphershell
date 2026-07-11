@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell 涓荤▼搴忓叆鍙?
  * 鍛戒护琛岀晫闈?
  */
@@ -492,12 +492,87 @@ static bool ValidateVMStaticLink(
     std::string emittedVerificationError;
     if (!CipherShell::VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
             image, emitResult.metadataRVA, records, bytecode,
-            emitResult.runtimeKeyShare, emittedVerificationError)) {
+            emitResult.runtimeKeyShare,
+            emitResult.handlerSemanticToSlot,
+            emitResult.handlerSlotToSemantic,
+            emitResult.handlerVariants,
+            emitResult.junkHandlerCount,
+            emitResult.handlerMutationEnabled,
+            emitResult.junkHandlersEnabled,
+            emittedVerificationError)) {
         reason = "emitted_metadata_or_bytecode_verification_failed: " + emittedVerificationError;
         return false;
     }
     return true;
 }
+
+static bool ValidateLoaderStaticLink(
+    const CipherShell::CS_PE_IMAGE* image,
+    const CipherShell::StubEmbedResult& loader,
+    uint32_t originalEntryPoint,
+    std::string& reason)
+{
+    if (!image || !image->isValid || !loader.success || !loader.wxVerified ||
+        loader.stubRVA == 0 || loader.stubSize == 0 ||
+        loader.virtualProtectIatRVA == 0 || loader.flushInstructionCacheIatRVA == 0) {
+        reason = "loader_result_incomplete";
+        return false;
+    }
+    bool foundVirtualProtect = false;
+    bool foundFlushInstructionCache = false;
+    for (const auto& dll : image->imports.dlls) {
+        for (const auto& function : dll.functions) {
+            if (function.thunkRVA == loader.virtualProtectIatRVA &&
+                function.name == "VirtualProtect") foundVirtualProtect = true;
+            if (function.thunkRVA == loader.flushInstructionCacheIatRVA &&
+                function.name == "FlushInstructionCache") foundFlushInstructionCache = true;
+        }
+    }
+    if (!foundVirtualProtect || !foundFlushInstructionCache) {
+        reason = "loader_runtime_imports_missing";
+        return false;
+    }
+    bool stubInRxSection = false;
+    for (uint32_t i = 0; i < image->numSections; ++i) {
+        const auto& section = image->sections[i];
+        const uint32_t span = (std::max)(section.Misc.VirtualSize,
+            static_cast<DWORD>(section.SizeOfRawData));
+        const bool execute = (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        const bool write = (section.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        if (execute && write) {
+            reason = "writable_executable_section_present index=" + std::to_string(i);
+            return false;
+        }
+        if (span != 0 && loader.stubRVA >= section.VirtualAddress &&
+            loader.stubRVA - section.VirtualAddress < span) {
+            stubInRxSection = execute && !write &&
+                (section.Characteristics & IMAGE_SCN_MEM_READ) != 0;
+        }
+    }
+    if (!stubInRxSection) {
+        reason = "loader_stub_not_in_rx_section";
+        return false;
+    }
+    const uint32_t entryPoint = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.AddressOfEntryPoint
+        : image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
+    if (loader.installedAsTlsCallback) {
+        const uint64_t imageBase = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.ImageBase
+            : image->ntHeaders32->OptionalHeader.ImageBase;
+        if (!image->tls.valid || image->tls.callbackAddresses.empty() ||
+            image->tls.callbackAddresses.front() != imageBase + loader.stubRVA ||
+            entryPoint != originalEntryPoint) {
+            reason = "tls_loader_order_not_preserved";
+            return false;
+        }
+    } else if (entryPoint != loader.stubRVA) {
+        reason = "entrypoint_loader_not_linked";
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     // 璁剧疆鎺у埗鍙颁负 UTF-8 缂栫爜
     SetConsoleOutputCP(65001);
@@ -728,6 +803,17 @@ int main(int argc, char* argv[]) {
                 region.originalRVA = s.rva;
                 region.originalSize = s.length;
                 region.encryptedSize = s.length;
+                region.originalCharacteristics = IMAGE_SCN_MEM_READ;
+                for (uint32_t sectionIndex = 0; sectionIndex < image->numSections; ++sectionIndex) {
+                    const auto& section = image->sections[sectionIndex];
+                    const uint32_t span = (std::max)(section.Misc.VirtualSize,
+                        static_cast<DWORD>(section.SizeOfRawData));
+                    if (span != 0 && s.rva >= section.VirtualAddress &&
+                        s.rva - section.VirtualAddress < span) {
+                        region.originalCharacteristics = section.Characteristics;
+                        break;
+                    }
+                }
                 memcpy(region.sectionKey.key, s.key, 32);
                 memcpy(region.sectionKey.nonce, s.nonce, 12);
                 region.sectionKey.counter = 0;
@@ -927,15 +1013,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        if (config.vm.handlerMutation || config.vm.embedJunkHandlers) {
-            std::cerr << "VM_INIT_FAIL module=CapabilityChecker"
-                      << " reason=runtime_handler_mutation_not_linked"
-                      << " handler_mutation=" << (config.vm.handlerMutation ? "true" : "false")
-                      << " embed_junk_handlers=" << (config.vm.embedJunkHandlers ? "true" : "false")
-                      << std::endl;
-            PrintFeatureStatus("vm", "failed", "runtime_handler_mutation_not_linked");
-            return 1;
-        }
         if (config.vm.stackSize < 0x4000 || config.vm.stackSize > 0x70000 ||
             (config.vm.stackSize & 0x0FFF) != 0) {
             std::cerr << "VM_INIT_FAIL module=CapabilityChecker"
@@ -951,6 +1028,12 @@ int main(int argc, char* argv[]) {
         mutConfig.randomizeRegisterMap = true;
         mutConfig.registerCount = static_cast<uint32_t>(config.vm.registerCount);
         mutConfig.seed = buildCtx.isaSeed;
+        mutConfig.mutateHandlers = config.vm.handlerMutation;
+        mutConfig.embedJunkHandlers = config.vm.embedJunkHandlers;
+        mutConfig.requestedJunkHandlerCount = config.vm.embedJunkHandlers ? 16u : 0u;
+        for (const auto& descriptor : CipherShell::VMSchema::Opcodes()) {
+            mutConfig.validOpcodes.push_back(descriptor.opcode);
+        }
         if (!mutEngine.Initialize(mutConfig)) {
             std::cerr << "VM_INIT_FAIL module=MutationEngine reason=register_count_must_be_16_to_32" << std::endl;
             PrintFeatureStatus("vm", "failed", "invalid_register_count");
@@ -968,6 +1051,10 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "    ISA seed fingerprint: 0x" << std::hex
                   << mutEngine.GetSeedFingerprint() << std::dec << std::endl;
+        std::cout << "VM_HANDLER_LAYOUT mutated="
+                  << (mutatedISA.handlerMutationEnabled ? "true" : "false")
+                  << " junk_handlers=" << mutatedISA.junkHandlerCount
+                  << " variant_count=" << VM_HANDLER_VARIANT_COUNT << std::endl;
 
         CipherShell::Translator translator;
         CipherShell::TranslationConfig transConfig;
@@ -998,7 +1085,8 @@ int main(int argc, char* argv[]) {
         std::vector<CipherShell::TranslationResult> pendingTranslations;
 
         CipherShell::FunctionDiscovery functionDiscovery;
-        auto discoveryResult = functionDiscovery.Discover(image.get(), disasm);
+        auto discoveryResult = functionDiscovery.Discover(
+            image.get(), disasm, buildCtx.vm.targetRVAs);
         if (!discoveryResult.success) {
             std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
                       << discoveryResult.error << std::endl;
@@ -1008,6 +1096,15 @@ int main(int argc, char* argv[]) {
         for (const auto& issue : discoveryResult.issues) {
             std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x" << std::hex
                       << issue.rva << std::dec << " reason=" << issue.reason << std::endl;
+        }
+        if (verbose) {
+            for (const auto& function : discoveryResult.functions) {
+                std::cout << "VM_FUNCTION_DISCOVERY rva=0x" << std::hex
+                          << function.entryAddress << " size=0x" << function.size << std::dec
+                          << " source=" << (function.discoverySource.empty() ? "unknown" : function.discoverySource)
+                          << " boundary_trusted=" << (function.boundaryTrusted ? "true" : "false")
+                          << std::endl;
+            }
         }
 
         for (const auto& pattern : buildCtx.vm.targetFunctions) {
@@ -1049,7 +1146,7 @@ int main(int argc, char* argv[]) {
                               << " reason=function_too_small" << std::endl;
                     continue;
                 }
-                if (func.entryAddress > 0xFFFFFFFFULL || func.size > 0xFFFFFFFFULL) {
+                if (func.entryAddress > 0xFFFFFFFFULL) {
                     std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
                               << std::dec << " reason=function_range_too_large" << std::endl;
                     rejectedCount++;
@@ -1135,7 +1232,7 @@ int main(int argc, char* argv[]) {
                 record.functionSize = protectedFunctions[i].size;
                 record.bytecodeOffset = static_cast<uint32_t>(vmBytecodeBlob.size());
                 record.bytecodeSize = static_cast<uint32_t>(vmBytecode.size());
-                record.flags = is64 ? VM_RECORD_FLAG_X64 : 0u;
+                record.flags = is64 ? static_cast<uint32_t>(VM_RECORD_FLAG_X64) : 0u;
                 if (pendingTranslations[i].usesSimd) record.flags |= VM_RECORD_FLAG_USES_SIMD;
                 if (pendingTranslations[i].usesAvx) record.flags |= VM_RECORD_FLAG_USES_AVX;
                 if (pendingTranslations[i].usesX87) record.flags |= VM_RECORD_FLAG_USES_X87;
@@ -1150,7 +1247,11 @@ int main(int argc, char* argv[]) {
         if (!vmRecords.empty()) {
             CipherShell::VMSectionEmitter vmEmitter;
             emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
-                buildCtx.opcodeMap, buildCtx.registerMap, 0, buildCtx.vmSectionName);
+                buildCtx.opcodeMap, buildCtx.registerMap,
+                mutatedISA.handlerSemanticToSlot, mutatedISA.handlerSlotToSemantic,
+                mutatedISA.handlerVariants, mutatedISA.junkHandlerCount,
+                mutatedISA.handlerMutationEnabled, mutatedISA.junkHandlersEnabled,
+                0, buildCtx.vmSectionName);
             if (!emitResult.success) {
                 std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
                                 PrintFeatureStatus("vm", "failed", emitResult.error);
@@ -1172,9 +1273,10 @@ int main(int argc, char* argv[]) {
 
             std::string patchError;
             const uint32_t runtimeVerifiedFlags = runtimeResult.unwindVerified
-                ? VM_METADATA_FLAG_UNWIND_VERIFIED : 0u;
+                ? static_cast<uint32_t>(VM_METADATA_FLAG_UNWIND_VERIFIED) : 0u;
             const uint32_t linkageVerifiedFlags = runtimeVerifiedFlags |
-                (runtimeResult.cfgVerified ? VM_METADATA_FLAG_CFG_VERIFIED : 0u);
+                (runtimeResult.cfgVerified
+                    ? static_cast<uint32_t>(VM_METADATA_FLAG_CFG_VERIFIED) : 0u);
             if (!vmEmitter.PatchLinkage(image.get(), emitResult.metadataRVA,
                     runtimeResult.sectionRVA, runtimeResult.runtimeEntryRVA,
                     runtimeResult.runtimeImageSize,
@@ -1282,6 +1384,8 @@ int main(int argc, char* argv[]) {
     }
     // Phase F: Section 鍔犲瘑锛圠1+锛屾渶鍚庢墽琛屸€斺€斿姞瀵嗘墍鏈夊彉鎹㈠悗鐨勪唬鐮侊級
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedSections;
+    CipherShell::StubEmbedResult loaderResult{};
+    bool loaderApplied = false;
     if (buildCtx.sectionEncryption.enabled) {
         std::cout << "  搴旂敤 Section 鍔犲瘑..." << std::endl;
 
@@ -1348,11 +1452,23 @@ int main(int argc, char* argv[]) {
 
     if (!encryptedSections.empty()) {
         CipherShell::StubBuilder stubBuilder;
-        if (!stubBuilder.EmbedStub(
-                image.get(), encryptedSections, originalOEP, buildCtx.vm.enabled)) {
-            std::cerr << "  閿欒: Stub 宓屽叆澶辫触" << std::endl;
+        loaderResult = stubBuilder.EmbedStub(
+            image.get(), encryptedSections, originalOEP, buildCtx.vm.enabled);
+        if (!loaderResult.success) {
+            std::cerr << "LOADER_BUILD_FAIL module=StubBuilder reason="
+                      << loaderResult.error << std::endl;
             return 1;
         }
+        std::cout << "LOADER_WX_PASS stub_rva=0x" << std::hex << loaderResult.stubRVA
+                  << " stub_size=0x" << loaderResult.stubSize
+                  << " virtual_protect_iat=0x" << loaderResult.virtualProtectIatRVA
+                  << " flush_icache_iat=0x" << loaderResult.flushInstructionCacheIatRVA
+                  << " tls_callback_array=0x" << loaderResult.tlsCallbackArrayRVA
+                  << std::dec << " mode="
+                  << (loaderResult.installedAsTlsCallback ? "tls_first" : "entrypoint")
+                  << " wx_verified=" << (loaderResult.wxVerified ? "true" : "false")
+                  << std::endl;
+        loaderApplied = true;
     } else {
         std::cout << "  跳过（没有需要解密的 section）" << std::endl;
     }
@@ -1404,6 +1520,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    if (loaderApplied) {
+        std::string loaderReason;
+        if (!ValidateLoaderStaticLink(rebuiltImage, loaderResult, originalOEP, loaderReason)) {
+            parser.FreeImage(rebuiltImage);
+            std::cerr << "LOADER_FINAL_STATIC_CHECK_FAIL module=LoaderVerifier reason="
+                      << loaderReason << std::endl;
+            return 1;
+        }
+        std::cout << "LOADER_FINAL_STATIC_CHECK_PASS module=LoaderVerifier" << std::endl;
+    }
     parser.FreeImage(rebuiltImage);
     std::cout << "PE_STATIC_CHECK_PASS module=PEVerifier" << std::endl;
 
@@ -1452,6 +1578,16 @@ int main(int argc, char* argv[]) {
             std::remove(outputFile.c_str());
             std::cerr << "VM_WRITE_VERIFY_FAIL module=VMStaticLinkChecker reason="
                       << writtenVMReason << std::endl;
+            return 1;
+        }
+    }
+    if (loaderApplied) {
+        std::string loaderReason;
+        if (!ValidateLoaderStaticLink(verifyImage, loaderResult, originalOEP, loaderReason)) {
+            parser.FreeImage(verifyImage);
+            std::remove(outputFile.c_str());
+            std::cerr << "LOADER_WRITE_VERIFY_FAIL module=LoaderVerifier reason="
+                      << loaderReason << std::endl;
             return 1;
         }
     }

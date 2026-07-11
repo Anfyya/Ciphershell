@@ -99,21 +99,6 @@ void Translator::SetOpcodeMap(const std::unordered_map<uint8_t, uint8_t>& map) {
 void Translator::SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& map) { m_registerMap = map; }
 const std::vector<TranslationFailure>& Translator::GetLastFailures() const { return m_lastFailures; }
 
-std::unordered_map<uint8_t, uint8_t> Translator::GenerateOpcodeMap() {
-    std::unordered_map<uint8_t, uint8_t> result;
-    std::array<uint8_t, 256> values{};
-    for (uint32_t i = 0; i < values.size(); ++i) values[i] = static_cast<uint8_t>(i);
-    uint32_t state = 0xC51F4E31u ^ m_config.virtualRegisterCount;
-    for (size_t i = values.size() - 1; i > 0; --i) {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        std::swap(values[i], values[state % (i + 1)]);
-    }
-    for (uint32_t i = 0; i < values.size(); ++i) result[static_cast<uint8_t>(i)] = values[i];
-    return result;
-}
-
 std::vector<const OperandIR*> Translator::SemanticOperands(const InstructionIR& instruction) const {
     std::vector<const OperandIR*> result;
     for (const auto& operand : instruction.operands) {
@@ -579,7 +564,7 @@ bool Translator::TranslateBranch(const InstructionIR& instruction, BytecodeInstr
     }
     if (!instruction.hasBranchTarget) return FailInstruction(instruction, "branch has no absolute target RVA");
     output.opcode = instruction.branchKind == BranchKind::Unconditional
-        ? VM_JMP : OpcodeForCondition(instruction.branchKind);
+        ? static_cast<uint8_t>(VM_JMP) : OpcodeForCondition(instruction.branchKind);
     if (output.opcode == 0) return FailInstruction(instruction, "branch condition has no VM mapping");
     output.condition = static_cast<uint8_t>(MapCondition(instruction.branchKind));
     output.branchTargetOffset = instruction.branchTargetRVA;
@@ -595,7 +580,8 @@ bool Translator::TranslateCall(const InstructionIR& instruction, BytecodeInstr& 
         return FailInstruction(instruction, "native CALL stack arguments exceed bridge capacity");
     }
     const uint32_t abi = instruction.machineMode == MachineMode::X64
-        ? VM_ABI_WIN64 : static_cast<uint32_t>(m_config.x86CallAbi);
+        ? static_cast<uint32_t>(VM_ABI_WIN64)
+        : static_cast<uint32_t>(m_config.x86CallAbi);
     output.aux = VM_CALL_AUX_ENCODE(abi, nativeStackBytes);
     if (instruction.isIndirectBranch) {
         if (operands.size() != 1) return FailInstruction(instruction, "indirect CALL requires one target operand");
@@ -915,7 +901,7 @@ bool Translator::TranslateExtendedBridge(
     }
     if (hasRipRelativeMemory &&
         (instruction.displacementSize != 4 || instruction.displacementOffset > instruction.length ||
-         4u > instruction.length - instruction.displacementOffset)) {
+         static_cast<uint32_t>(instruction.length - instruction.displacementOffset) < 4u)) {
         return FailInstruction(instruction, "RIP-relative bridge instruction has no relocatable disp32 field");
     }
 

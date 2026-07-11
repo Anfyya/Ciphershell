@@ -74,7 +74,6 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
         DWORD pos = 0;
         while (pos < sectionSize) {
             // 检查是否可能是字符串
-            bool isWide = false;
             DWORD strLen = 0;
 
             // 检查 ANSI 字符串

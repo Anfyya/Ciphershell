@@ -8,14 +8,19 @@
 extern "C" {
 #endif
 
-#define VM_METADATA_VERSION 0x00030001u
-#define VM_RUNTIME_VERSION  0x00030003u
+#define VM_METADATA_VERSION 0x00030002u
+#define VM_RUNTIME_VERSION  0x00030004u
 #define VM_KEY_ENCODING_VERSION 0x00010000u
 #define VM_RUNTIME_KEY_SHARE_SIZE 32u
 #define VM_ARCH_X86 0x00000086u
 #define VM_ARCH_X64 0x00008664u
 #define VM_OPCODE_MAP_SIZE 256u
 #define VM_REGISTER_MAP_SIZE 32u
+#define VM_HANDLER_TABLE_SIZE 256u
+#define VM_HANDLER_USABLE_SLOT_COUNT (VM_HANDLER_TABLE_SIZE - 1u)
+#define VM_HANDLER_VARIANT_COUNT 4u
+#define VM_HANDLER_INVALID 0xFFu
+#define VM_HANDLER_JUNK 0xFEu
 
 enum {
     VM_METADATA_FLAG_AUTHENTICATED = 0x00000001u,
@@ -23,7 +28,9 @@ enum {
     VM_METADATA_FLAG_NATIVE_BODY_DESTROYED = 0x00000004u,
     VM_METADATA_FLAG_CFG_VERIFIED = 0x00000008u,
     VM_METADATA_FLAG_UNWIND_VERIFIED = 0x00000010u,
-    VM_METADATA_FLAG_CFG_ENABLED = 0x00000020u
+    VM_METADATA_FLAG_CFG_ENABLED = 0x00000020u,
+    VM_METADATA_FLAG_HANDLER_MUTATED = 0x00000040u,
+    VM_METADATA_FLAG_JUNK_HANDLERS = 0x00000080u
 };
 
 enum {
@@ -63,6 +70,12 @@ typedef struct VM_METADATA_HEADER {
     uint32_t keyEncodingVersion;
     uint32_t opcodeMapSize;
     uint32_t registerMapSize;
+    uint32_t handlerSemanticMapOffset;
+    uint32_t handlerDescriptorOffset;
+    uint32_t handlerVariantOffset;
+    uint32_t handlerTableSize;
+    uint32_t handlerVariantCount;
+    uint32_t junkHandlerCount;
     uint8_t buildId[16];
     uint8_t encodedMasterKey[32];
     uint64_t metadataTag;
@@ -99,7 +112,7 @@ typedef struct VM_TRACE_STATE {
 
 #ifdef __cplusplus
 }
-static_assert(sizeof(VM_METADATA_HEADER) == 160, "VM metadata header size mismatch");
+static_assert(sizeof(VM_METADATA_HEADER) == 184, "VM metadata header size mismatch");
 static_assert(sizeof(VM_FUNCTION_RECORD) == 64, "VM function record size mismatch");
 static_assert(sizeof(VM_TRACE_STATE) == 32, "VM trace state size mismatch");
 #endif

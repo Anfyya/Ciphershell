@@ -4,14 +4,20 @@
 #include "../vm/vm_schema.h"
 #include "../../runtime/common/vm_crypto.h"
 #include <algorithm>
+#ifdef _WIN32
 #include <bcrypt.h>
+#else
+#include <random>
+#endif
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef _WIN32
 #pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace CipherShell {
 namespace {
@@ -21,7 +27,9 @@ constexpr uint32_t kKnownHeaderFlags = VM_METADATA_FLAG_AUTHENTICATED |
     VM_METADATA_FLAG_NATIVE_BODY_DESTROYED |
     VM_METADATA_FLAG_CFG_VERIFIED |
     VM_METADATA_FLAG_UNWIND_VERIFIED |
-    VM_METADATA_FLAG_CFG_ENABLED;
+    VM_METADATA_FLAG_CFG_ENABLED |
+    VM_METADATA_FLAG_HANDLER_MUTATED |
+    VM_METADATA_FLAG_JUNK_HANDLERS;
 constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
     VM_RECORD_FLAG_UNWIND_VERIFIED |
@@ -31,9 +39,17 @@ constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_USES_X87;
 
 bool SecureRandom(void* destination, size_t size) {
-    if (!destination || size == 0 || size > std::numeric_limits<ULONG>::max()) return false;
+    if (!destination || size == 0) return false;
+#ifdef _WIN32
+    if (size > std::numeric_limits<ULONG>::max()) return false;
     return BCryptGenRandom(nullptr, static_cast<PUCHAR>(destination), static_cast<ULONG>(size),
         BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+    std::random_device source;
+    auto* output = static_cast<uint8_t*>(destination);
+    for (size_t i = 0; i < size; ++i) output[i] = static_cast<uint8_t>(source());
+    return true;
+#endif
 }
 
 void EncodeMasterKey(
@@ -130,6 +146,72 @@ bool BuildRegisterMap(
     return true;
 }
 
+bool ValidateHandlerLayout(
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& semanticToSlot,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& slotToSemantic,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& variants,
+    uint32_t expectedJunkCount,
+    std::string& error)
+{
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> usedSlots{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> validSemantics{};
+    uint32_t junkCount = 0;
+    for (const auto& descriptor : VMSchema::Opcodes()) {
+        if (descriptor.opcode == VM_HANDLER_INVALID || descriptor.opcode == VM_HANDLER_JUNK) {
+            error = "VM_EMIT: production opcode collides with a handler sentinel";
+            return false;
+        }
+        validSemantics[descriptor.opcode] = 1;
+        const uint8_t slot = semanticToSlot[descriptor.opcode];
+        if (slot == VM_HANDLER_INVALID || slot >= VM_HANDLER_USABLE_SLOT_COUNT ||
+            usedSlots[slot] || slotToSemantic[slot] != descriptor.opcode) {
+            error = "VM_EMIT: handler map is missing, duplicated, reserved, or not reversible";
+            return false;
+        }
+        usedSlots[slot] = 1;
+    }
+    for (uint32_t semantic = 0; semantic < VM_HANDLER_TABLE_SIZE; ++semantic) {
+        if (!validSemantics[semantic] && semanticToSlot[semantic] != VM_HANDLER_INVALID) {
+            error = "VM_EMIT: unsupported semantic opcode owns a handler slot";
+            return false;
+        }
+    }
+    for (uint32_t slot = 0; slot < VM_HANDLER_TABLE_SIZE; ++slot) {
+        if (variants[slot] >= VM_HANDLER_VARIANT_COUNT) {
+            error = "VM_EMIT: handler variant is out of range";
+            return false;
+        }
+        const uint8_t semantic = slotToSemantic[slot];
+        if (slot >= VM_HANDLER_USABLE_SLOT_COUNT) {
+            if (semantic != VM_HANDLER_INVALID || variants[slot] != 0) {
+                error = "VM_EMIT: reserved handler slot 0xFF is not empty";
+                return false;
+            }
+            continue;
+        }
+        if (semantic == VM_HANDLER_JUNK) {
+            if (usedSlots[slot]) {
+                error = "VM_EMIT: junk handler overlaps a real handler slot";
+                return false;
+            }
+            ++junkCount;
+            continue;
+        }
+        if (semantic == VM_HANDLER_INVALID) continue;
+        if (!validSemantics[semantic] || semanticToSlot[semantic] != slot) {
+            error = "VM_EMIT: handler slot descriptor is unsupported or not reversible";
+            return false;
+        }
+    }
+    if (junkCount != expectedJunkCount ||
+        junkCount > VM_HANDLER_USABLE_SLOT_COUNT - VMSchema::Opcodes().size()) {
+        error = "VM_EMIT: junk handler count does not match the usable handler table";
+        return false;
+    }
+    return true;
+}
+
+
 } // namespace
 
 uint32_t VMSectionEmitter::AlignUp(uint32_t value, uint32_t alignment) {
@@ -143,6 +225,12 @@ VMEmitResult VMSectionEmitter::Emit(
     const std::vector<VMFunctionRecord>& inputRecords,
     const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     const std::unordered_map<uint8_t, uint8_t>& registerMap,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerSemanticToSlot,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerSlotToSemantic,
+    const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& handlerVariants,
+    uint32_t junkHandlerCount,
+    bool handlerMutationEnabled,
+    bool junkHandlersEnabled,
     uint32_t runtimeEntryRVA,
     const char sectionName[8])
 {
@@ -160,7 +248,9 @@ VMEmitResult VMSectionEmitter::Emit(
     uint8_t reverseOpcode[VM_OPCODE_MAP_SIZE]{};
     uint8_t encodedRegisterMap[VM_REGISTER_MAP_SIZE]{};
     if (!BuildReverseOpcodeMap(opcodeMap, reverseOpcode, result.error) ||
-        !BuildRegisterMap(registerMap, encodedRegisterMap, result.error)) return result;
+        !BuildRegisterMap(registerMap, encodedRegisterMap, result.error) ||
+        !ValidateHandlerLayout(handlerSemanticToSlot, handlerSlotToSemantic,
+            handlerVariants, junkHandlerCount, result.error)) return result;
 
     VM_METADATA_HEADER header{};
     uint8_t masterKey[32]{};
@@ -183,10 +273,15 @@ VMEmitResult VMSectionEmitter::Emit(
     header.architecture = image->is64Bit ? VM_ARCH_X64 : VM_ARCH_X86;
     header.flags = VM_METADATA_FLAG_AUTHENTICATED | VM_METADATA_FLAG_BYTECODE_CHACHA20;
     if (image->loadConfig.hasCFG) header.flags |= VM_METADATA_FLAG_CFG_ENABLED;
+    if (handlerMutationEnabled) header.flags |= VM_METADATA_FLAG_HANDLER_MUTATED;
+    if (junkHandlersEnabled) header.flags |= VM_METADATA_FLAG_JUNK_HANDLERS;
     header.recordCount = static_cast<uint32_t>(inputRecords.size());
     header.recordSize = sizeof(VM_FUNCTION_RECORD);
     header.opcodeMapSize = VM_OPCODE_MAP_SIZE;
     header.registerMapSize = VM_REGISTER_MAP_SIZE;
+    header.handlerTableSize = VM_HANDLER_TABLE_SIZE;
+    header.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+    header.junkHandlerCount = junkHandlerCount;
     header.imageSize = image->is64Bit
         ? image->ntHeaders64->OptionalHeader.SizeOfImage
         : image->ntHeaders32->OptionalHeader.SizeOfImage;
@@ -235,8 +330,32 @@ VMEmitResult VMSectionEmitter::Emit(
         return result;
     }
     header.registerMapOffset = AlignUp(static_cast<uint32_t>(registerOffset), 16);
-    const uint64_t bytecodeOffset = static_cast<uint64_t>(header.registerMapOffset) +
+    const uint64_t semanticMapOffset = static_cast<uint64_t>(header.registerMapOffset) +
         VM_REGISTER_MAP_SIZE + NextLayoutPadding(layoutState, 16, 127);
+    if (semanticMapOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: handler semantic map offset exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.handlerSemanticMapOffset = AlignUp(static_cast<uint32_t>(semanticMapOffset), 16);
+    const uint64_t descriptorOffset = static_cast<uint64_t>(header.handlerSemanticMapOffset) +
+        VM_HANDLER_TABLE_SIZE + NextLayoutPadding(layoutState, 16, 127);
+    if (descriptorOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: handler descriptor offset exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.handlerDescriptorOffset = AlignUp(static_cast<uint32_t>(descriptorOffset), 16);
+    const uint64_t variantOffset = static_cast<uint64_t>(header.handlerDescriptorOffset) +
+        VM_HANDLER_TABLE_SIZE + NextLayoutPadding(layoutState, 16, 127);
+    if (variantOffset > std::numeric_limits<uint32_t>::max()) {
+        result.error = "VM_EMIT: handler variant offset exceeds uint32 metadata range";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.handlerVariantOffset = AlignUp(static_cast<uint32_t>(variantOffset), 16);
+    const uint64_t bytecodeOffset = static_cast<uint64_t>(header.handlerVariantOffset) +
+        VM_HANDLER_TABLE_SIZE + NextLayoutPadding(layoutState, 16, 127);
     if (bytecodeOffset > std::numeric_limits<uint32_t>::max()) {
         result.error = "VM_EMIT: randomized metadata layout exceeds uint32 RVA range";
         std::memset(masterKey, 0, sizeof(masterKey));
@@ -307,6 +426,12 @@ VMEmitResult VMSectionEmitter::Emit(
         result.records.size() * sizeof(VM_FUNCTION_RECORD));
     std::memcpy(section.data() + header.reverseOpcodeMapOffset, reverseOpcode, sizeof(reverseOpcode));
     std::memcpy(section.data() + header.registerMapOffset, encodedRegisterMap, sizeof(encodedRegisterMap));
+    std::memcpy(section.data() + header.handlerSemanticMapOffset,
+        handlerSemanticToSlot.data(), handlerSemanticToSlot.size());
+    std::memcpy(section.data() + header.handlerDescriptorOffset,
+        handlerSlotToSemantic.data(), handlerSlotToSemantic.size());
+    std::memcpy(section.data() + header.handlerVariantOffset,
+        handlerVariants.data(), handlerVariants.size());
     std::memcpy(section.data() + header.bytecodeOffset, encryptedBytecode.data(), encryptedBytecode.size());
 
     header.metadataTag = ComputeMetadataTag(section.data(), header.totalSize, masterKey);
@@ -335,6 +460,12 @@ VMEmitResult VMSectionEmitter::Emit(
     result.schemaVersion = header.schemaVersion;
     std::copy(std::begin(header.buildId), std::end(header.buildId), result.buildId.begin());
     result.runtimeKeyShare = runtimeKeyShare;
+    result.handlerSemanticToSlot = handlerSemanticToSlot;
+    result.handlerSlotToSemantic = handlerSlotToSemantic;
+    result.handlerVariants = handlerVariants;
+    result.junkHandlerCount = junkHandlerCount;
+    result.handlerMutationEnabled = handlerMutationEnabled;
+    result.junkHandlersEnabled = junkHandlersEnabled;
     return result;
 }
 
@@ -359,7 +490,9 @@ bool VMSectionEmitter::VerifyMetadata(
         (header.architecture != VM_ARCH_X86 && header.architecture != VM_ARCH_X64) ||
         (header.flags & ~kKnownHeaderFlags) != 0 ||
         header.opcodeMapSize != VM_OPCODE_MAP_SIZE ||
-        header.registerMapSize != VM_REGISTER_MAP_SIZE) {
+        header.registerMapSize != VM_REGISTER_MAP_SIZE ||
+        header.handlerTableSize != VM_HANDLER_TABLE_SIZE ||
+        header.handlerVariantCount != VM_HANDLER_VARIANT_COUNT) {
         error = "metadata version or fixed structure size mismatch";
         return false;
     }
@@ -372,8 +505,15 @@ bool VMSectionEmitter::VerifyMetadata(
         header.recordCount > (header.reverseOpcodeMapOffset - header.recordOffset) / header.recordSize ||
         header.reverseOpcodeMapOffset > header.registerMapOffset ||
         VM_OPCODE_MAP_SIZE > header.registerMapOffset - header.reverseOpcodeMapOffset ||
-        header.registerMapOffset > header.bytecodeOffset ||
-        VM_REGISTER_MAP_SIZE > header.bytecodeOffset - header.registerMapOffset ||
+        header.registerMapOffset > header.handlerSemanticMapOffset ||
+        VM_REGISTER_MAP_SIZE > header.handlerSemanticMapOffset - header.registerMapOffset ||
+        header.handlerSemanticMapOffset > header.handlerDescriptorOffset ||
+        VM_HANDLER_TABLE_SIZE > header.handlerDescriptorOffset - header.handlerSemanticMapOffset ||
+        header.handlerDescriptorOffset > header.handlerVariantOffset ||
+        VM_HANDLER_TABLE_SIZE > header.handlerVariantOffset - header.handlerDescriptorOffset ||
+        header.handlerVariantOffset > header.bytecodeOffset ||
+        VM_HANDLER_TABLE_SIZE > header.bytecodeOffset - header.handlerVariantOffset ||
+        header.junkHandlerCount > VM_HANDLER_USABLE_SLOT_COUNT ||
         header.layoutSeed == 0 || header.imageSize == 0 ||
         ((header.runtimeBaseRVA == 0 || header.runtimeEntryRVA == 0 || header.runtimeSize == 0) &&
             (header.runtimeBaseRVA != 0 || header.runtimeEntryRVA != 0 || header.runtimeSize != 0)) ||
@@ -452,6 +592,29 @@ bool VMSectionEmitter::VerifyMetadata(
             return false;
         }
         registerSeen[registers[i]] = 1;
+    }
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> semanticToSlot{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> slotToSemantic{};
+    std::array<uint8_t, VM_HANDLER_TABLE_SIZE> variants{};
+    std::memcpy(semanticToSlot.data(), metadata + header.handlerSemanticMapOffset,
+        semanticToSlot.size());
+    std::memcpy(slotToSemantic.data(), metadata + header.handlerDescriptorOffset,
+        slotToSemantic.size());
+    std::memcpy(variants.data(), metadata + header.handlerVariantOffset, variants.size());
+    if (!ValidateHandlerLayout(semanticToSlot, slotToSemantic, variants,
+            header.junkHandlerCount, error)) return false;
+    if (((header.flags & VM_METADATA_FLAG_HANDLER_MUTATED) != 0) ==
+            std::all_of(VMSchema::Opcodes().begin(), VMSchema::Opcodes().end(),
+                [&](const VMOpcodeDescriptor& descriptor) {
+                    return semanticToSlot[descriptor.opcode] == descriptor.opcode;
+                })) {
+        error = "handler mutation flag does not match the emitted handler entry layout";
+        return false;
+    }
+    if (((header.flags & VM_METADATA_FLAG_JUNK_HANDLERS) != 0) !=
+            (header.junkHandlerCount != 0)) {
+        error = "junk handler flag does not match the emitted handler table";
+        return false;
     }
     return true;
 }

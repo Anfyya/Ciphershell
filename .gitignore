@@ -5,6 +5,7 @@
 # 编译输出 / CMake 生成
 build/
 build_linux/
+build*/
 out/
 obj/
 *.dir/
@@ -53,3 +54,6 @@ tests/samples/output.txt
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Generated assembler/object artifacts
+stub/build/

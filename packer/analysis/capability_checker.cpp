@@ -1,4 +1,4 @@
-﻿#include "capability_checker.h"
+#include "capability_checker.h"
 #include "../pe_parser/pe_utils.h"
 #include <algorithm>
 
@@ -24,11 +24,6 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
     }
 
     if (ctx.vm.enabled) {
-        if (ctx.sectionEncryption.enabled) {
-            AddIssue(report, "SectionEncryption", 0,
-                "VM and startup section encryption cannot be combined until the loader restores W^X and preserves TLS initialization order",
-                true);
-        }
         const WORD dllCharacteristics = image->is64Bit
             ? image->ntHeaders64->OptionalHeader.DllCharacteristics
             : image->ntHeaders32->OptionalHeader.DllCharacteristics;
@@ -55,6 +50,18 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
             if (guardTargetMissing) {
                 AddIssue(report, "LoadConfig", 0,
                     "CFG image has no architecture-specific Guard check/dispatch pointer", true);
+            }
+        }
+    }
+
+    if (ctx.sectionEncryption.enabled) {
+        for (uint32_t i = 0; i < image->numSections; ++i) {
+            const uint32_t characteristics = image->sections[i].Characteristics;
+            if ((characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
+                (characteristics & IMAGE_SCN_MEM_WRITE) != 0) {
+                AddIssue(report, "SectionEncryption", image->sections[i].VirtualAddress,
+                    "input contains a writable-executable section; final W^X restoration is ambiguous",
+                    true);
             }
         }
     }

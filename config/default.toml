@@ -15,11 +15,11 @@ target_rvas = []
 register_count = 24
 stack_size = 0x20000
 opcode_randomization = true
-handler_mutation = false
+handler_mutation = true
 bytecode_encryption = true
 native_body_policy = "destroy"
 x86_call_abi = "auto"
-embed_junk_handlers = false
+embed_junk_handlers = true
 simd_bridge = true
 x87_bridge = true
 

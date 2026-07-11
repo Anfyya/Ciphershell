@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <unordered_set>
 
 namespace CipherShell {
 
@@ -52,6 +53,10 @@ MutatedISA MutationEngine::GenerateMutatedISA() {
         }
     }
 
+    if (!BuildHandlerLayout(isa)) {
+        isa.opcodeMap.clear();
+        isa.registerMap.clear();
+    }
     return isa;
 }
 
@@ -92,6 +97,88 @@ std::unordered_map<uint8_t, uint8_t> MutationEngine::RandomizeRegisterMap() {
         map[i] = available[i];
     }
     return map;
+}
+
+bool MutationEngine::BuildHandlerLayout(MutatedISA& isa) {
+    isa.handlerSemanticToSlot.fill(VM_HANDLER_INVALID);
+    isa.handlerSlotToSemantic.fill(VM_HANDLER_INVALID);
+    isa.handlerVariants.fill(0);
+
+    std::vector<uint8_t> valid;
+    std::unordered_set<uint8_t> seen;
+    for (uint8_t opcode : m_config.validOpcodes) {
+        if (opcode == VM_HANDLER_INVALID || opcode == VM_HANDLER_JUNK ||
+            !seen.insert(opcode).second) continue;
+        valid.push_back(opcode);
+    }
+    if (valid.empty() || valid.size() > VM_HANDLER_USABLE_SLOT_COUNT) return false;
+
+    // 0xFF is the invalid sentinel stored in semanticToSlot, so slot 255 is
+    // intentionally reserved and can never be assigned to a real or junk handler.
+    std::vector<uint8_t> slots(VM_HANDLER_USABLE_SLOT_COUNT);
+    for (uint32_t i = 0; i < slots.size(); ++i) slots[i] = static_cast<uint8_t>(i);
+    if (m_config.mutateHandlers) {
+        for (uint32_t i = static_cast<uint32_t>(slots.size() - 1); i > 0; --i) {
+            const uint32_t j = RandomBelow(i + 1u);
+            std::swap(slots[i], slots[j]);
+        }
+    }
+
+    size_t cursor = 0;
+    for (uint8_t opcode : valid) {
+        uint8_t slot;
+        if (!m_config.mutateHandlers && isa.handlerSlotToSemantic[opcode] == VM_HANDLER_INVALID) {
+            slot = opcode;
+        } else {
+            while (cursor < slots.size() &&
+                   isa.handlerSlotToSemantic[slots[cursor]] != VM_HANDLER_INVALID) ++cursor;
+            if (cursor >= slots.size()) return false;
+            slot = slots[cursor++];
+        }
+        isa.handlerSemanticToSlot[opcode] = slot;
+        isa.handlerSlotToSemantic[slot] = opcode;
+        isa.handlerVariants[slot] = m_config.mutateHandlers
+            ? static_cast<uint8_t>(RandomBelow(VM_HANDLER_VARIANT_COUNT))
+            : 0;
+    }
+
+    if (m_config.mutateHandlers) {
+        bool anyMoved = false;
+        for (uint8_t opcode : valid) {
+            if (isa.handlerSemanticToSlot[opcode] != opcode) {
+                anyMoved = true;
+                break;
+            }
+        }
+        if (!anyMoved && valid.size() >= 2) {
+            const uint8_t first = valid[0];
+            const uint8_t second = valid[1];
+            const uint8_t firstSlot = isa.handlerSemanticToSlot[first];
+            const uint8_t secondSlot = isa.handlerSemanticToSlot[second];
+            isa.handlerSemanticToSlot[first] = secondSlot;
+            isa.handlerSemanticToSlot[second] = firstSlot;
+            isa.handlerSlotToSemantic[firstSlot] = second;
+            isa.handlerSlotToSemantic[secondSlot] = first;
+            std::swap(isa.handlerVariants[firstSlot], isa.handlerVariants[secondSlot]);
+        }
+    }
+
+    if (m_config.embedJunkHandlers) {
+        const uint32_t available = static_cast<uint32_t>(VM_HANDLER_USABLE_SLOT_COUNT - valid.size());
+        const uint32_t requested = (std::min)(m_config.requestedJunkHandlerCount, available);
+        for (uint32_t i = 0; i < requested; ++i) {
+            while (cursor < slots.size() &&
+                   isa.handlerSlotToSemantic[slots[cursor]] != VM_HANDLER_INVALID) ++cursor;
+            if (cursor >= slots.size()) break;
+            const uint8_t slot = slots[cursor++];
+            isa.handlerSlotToSemantic[slot] = VM_HANDLER_JUNK;
+            isa.handlerVariants[slot] = static_cast<uint8_t>(RandomBelow(VM_HANDLER_VARIANT_COUNT));
+            ++isa.junkHandlerCount;
+        }
+    }
+    isa.handlerMutationEnabled = m_config.mutateHandlers;
+    isa.junkHandlersEnabled = isa.junkHandlerCount != 0;
+    return true;
 }
 
 uint32_t MutationEngine::NextRandom() {

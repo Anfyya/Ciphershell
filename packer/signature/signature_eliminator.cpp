@@ -168,19 +168,6 @@ bool SignatureEliminator::CheckUPXSignature(CS_PE_IMAGE* image, std::vector<Sign
         }
     }
 
-    // 检查 UPX 特征字节
-    if (image->rawSize > 0x100) {
-        // UPX 通常在入口点附近有特定模式
-        DWORD entryOffset = 0;
-        if (image->is64Bit) {
-            entryOffset = image->ntHeaders64->OptionalHeader.AddressOfEntryPoint;
-        } else {
-            entryOffset = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
-        }
-
-        // 简化检查
-    }
-
     return false;
 }
 

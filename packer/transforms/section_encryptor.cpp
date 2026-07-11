@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CipherShell Section 鍔犲瘑鍣?- 瀹炵幇
  */
 
@@ -75,13 +75,15 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
             sectionKey = masterKey;
         }
 
+        const DWORD originalCharacteristics = section->Characteristics;
         // 鍔犲瘑 section
         if (EncryptSection(image, i, sectionKey)) {
-            CS_ENCRYPTED_SECTION encSection;
+            CS_ENCRYPTED_SECTION encSection{};
             encSection.sectionIndex = i;
             encSection.originalRVA = section->VirtualAddress;
             encSection.originalSize = section->Misc.VirtualSize;
             encSection.encryptedSize = section->SizeOfRawData;
+            encSection.originalCharacteristics = originalCharacteristics;
             memcpy(&encSection.sectionKey, &sectionKey, sizeof(CS_ENCRYPTION_KEY));
 
             result.push_back(encSection);
@@ -167,7 +169,7 @@ BYTE* SectionEncryptor::SerializeKeys(
 
     // 璁＄畻杈撳嚭澶у皬
     // 鏍煎紡锛歔section_count:4][section_info:N*56]
-    DWORD totalSize = 4 + (DWORD)encryptedSections.size() * (4 + 4 + 4 + 32 + 12 + 4);
+    DWORD totalSize = 4 + (DWORD)encryptedSections.size() * (4 + 4 + 4 + 4 + 32 + 12 + 4);
 
     BYTE* output = new(std::nothrow) BYTE[totalSize];
     if (!output) {
@@ -188,6 +190,9 @@ BYTE* SectionEncryptor::SerializeKeys(
         offset += 4;
 
         *(DWORD*)(output + offset) = encSection.originalSize;
+        offset += 4;
+
+        *(DWORD*)(output + offset) = encSection.originalCharacteristics;
         offset += 4;
 
         memcpy(output + offset, encSection.sectionKey.key, 32);
@@ -236,8 +241,11 @@ bool SectionEncryptor::EncryptSection(
         RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
     }
 
+    // Encrypted code is mapped writable and non-executable.  The loader
+    // temporarily grants RW while decrypting and restores the original RX/R
+    // protection with VirtualProtect before any original code is entered.
     section->Characteristics |= IMAGE_SCN_MEM_WRITE;
-    // section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
+    section->Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
 
     return true;
 }

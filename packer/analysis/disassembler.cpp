@@ -786,6 +786,13 @@ bool Disassembler::AnalyzeFunctionRange(
                 }
                 if (!instruction.hasBranchTarget || instruction.branchTargetRVA < functionRVA ||
                     instruction.branchTargetRVA >= functionRVA + rangeSize) {
+                    if (trustedSize == 0 && !instruction.IsConditionalBranch() &&
+                        instruction.hasBranchTarget) {
+                        // An unbounded recursive-descent candidate may end in a
+                        // direct tail jump to another known/adjacent function.
+                        hasTerminal = true;
+                        break;
+                    }
                     SetError(instruction.address, "direct branch exits the trusted function range");
                     return false;
                 }
