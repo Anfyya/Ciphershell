@@ -46,7 +46,7 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
         return result;
     }
 
-    // 閬嶅巻鎵€鏈?sections
+    // 遍历所有 sections
     for (WORD i = 0; i < image->numSections; i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
@@ -150,7 +150,7 @@ CS_ENCRYPTION_KEY SectionEncryptor::DeriveSectionKey(
     salt[3] = (uint8_t)(sectionRVA >> 8);
     salt[4] = (uint8_t)(sectionRVA >> 16);
     salt[5] = (uint8_t)(sectionRVA >> 24);
-    salt[6] = 0xC5;  // CipherShell 鏍囪
+    salt[6] = 0xC5;  // CipherShell 标记
     salt[7] = 0x5E;
 
     CS_ENCRYPTION_KEY derivedKey;
@@ -278,7 +278,7 @@ bool SectionEncryptor::DecryptSection(
         RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
     }
 
-    // 鎭㈠鎵ц鏉冮檺
+    // 恢复执行权限
     section->Characteristics |= IMAGE_SCN_MEM_EXECUTE;
 
     return true;

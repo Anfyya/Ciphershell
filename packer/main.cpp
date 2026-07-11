@@ -685,7 +685,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "  PE 解析成功" << std::endl;
     std::cout << "  架构: " << (image->is64Bit ? "x64" : "x86") << std::endl;
-    std::cout << "  鍏ュ彛鐐? 0x" << std::hex;
+    std::cout << "  入口点: 0x" << std::hex;
     if (image->is64Bit) {
         std::cout << image->ntHeaders64->OptionalHeader.AddressOfEntryPoint;
     } else {
@@ -748,7 +748,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     // ============================================================================
-    // Step 1.5: 淇濆瓨鍘熷鍏ュ彛鐐?
+    // Step 1.5: 保存原始入口点
     // ============================================================================
 
     DWORD originalOEP = 0;
@@ -758,7 +758,7 @@ int main(int argc, char* argv[]) {
         originalOEP = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
     }
     const WORD originalSectionCount = image->numSections;
-    std::cout << "  鍘熷鍏ュ彛鐐?(OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
+    std::cout << "  原始入口点 (OEP): 0x" << std::hex << originalOEP << std::dec << std::endl;
 
     // ============================================================================
     // Step 2: 应用保护变换
@@ -1474,7 +1474,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
-    // Step 5: 閲嶅缓 PE
+    // Step 5: 重建 PE
     // ============================================================================
 
     std::cout << "\n[5/6] 写入输出文件..." << std::endl;

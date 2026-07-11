@@ -64,7 +64,7 @@ DLLPackResult DLLPacker::PackDLL(CS_PE_IMAGE* image, const DLLPackConfig& config
         }
     }
 
-    // 4. 淇濈暀 TLS
+    // 4. 保留 TLS
     if (config.preserveTLS) {
         PreserveTLSCallbacks(image);
     }
@@ -96,7 +96,7 @@ BYTE* DLLPacker::GenerateExportTrampolines(
     BYTE* code = new(std::nothrow) BYTE[totalSize];
     if (!code) return nullptr;
 
-    memset(code, 0x90, totalSize);  // NOP 濉厖
+    memset(code, 0x90, totalSize);  // NOP 填充
 
     DWORD offset = 0;
 
@@ -155,10 +155,10 @@ BYTE* DLLPacker::GenerateDllMainStub(
             0xEB, 0x18,                         // jmp .done
 
             // .attach: 初始化 VM，解密代码
-            0xE8, 0x00, 0x00, 0x00, 0x00,       // call vm_init (鐩稿鍋忕Щ)
+            0xE8, 0x00, 0x00, 0x00, 0x00,       // call vm_init (相对偏移)
             0xEB, 0x10,                         // jmp .done
 
-            // .detach: 娓呯悊
+            // .detach: 清理
             0xE8, 0x00, 0x00, 0x00, 0x00,       // call vm_cleanup
             0xEB, 0x08,                         // jmp .done
 
@@ -166,7 +166,7 @@ BYTE* DLLPacker::GenerateDllMainStub(
             0x90,                               // nop
             0xEB, 0x04,                         // jmp .done
 
-            // .done: 璋冪敤鍘熷 DllMain
+            // .done: 调用原始 DllMain
             0xE8, 0x00, 0x00, 0x00, 0x00,       // call original_DllMain
             0xC3                                // ret
         };

@@ -313,7 +313,8 @@ bool PEParser::ParseImportTable(CS_PE_IMAGE* image) {
                         // 按序号导入
                         func.ordinal = IMAGE_ORDINAL64(ilt->u1.Ordinal);
                     } else {
-                        // 鎸夊悕绉板鍏?                        func.isOrdinal = false;
+                        // 按名称导入
+                        func.isOrdinal = false;
                         DWORD hintNameOffset = RVAToOffset(image, (DWORD)ilt->u1.AddressOfData);
                         if (hintNameOffset != 0) {
                             PIMAGE_IMPORT_BY_NAME importByName =

@@ -41,7 +41,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
     // 复制原始数据
     memcpy(output, image->rawData, image->rawSize);
 
-    // 鑾峰彇 NT Headers
+    // 获取 NT Headers
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
     if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) >= image->rawSize) {
         *outputSize = image->rawSize;
@@ -54,7 +54,7 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         ntHeaders->FileHeader.TimeDateStamp = 0;
     }
 
-    // 娓呴櫎璋冭瘯淇℃伅
+    // 清除调试信息
     if (!config.preserveDebugInfo) {
         if (ntHeaders->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) {
             PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)ntHeaders;
@@ -191,7 +191,7 @@ bool PERebuilder::RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBU
 }
 
 bool PERebuilder::RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config) {
-    // 鑾峰彇 NT Headers 淇℃伅
+    // 获取 NT Headers 信息
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)output;
     if (dosHeader->e_lfanew <= 0 || static_cast<DWORD>(dosHeader->e_lfanew) > 0x1000) return false;
     
