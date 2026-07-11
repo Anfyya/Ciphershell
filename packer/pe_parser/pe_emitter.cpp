@@ -215,6 +215,24 @@ PEAppendSectionResult PEEmitter::AppendSection(
     }
     SetSizeOfImage(virtualAddress + virtualSize);
 
+    // Fix Security Directory (Authenticode) — it uses file offsets, not RVAs.
+    // If an overlay was shifted, the certificate table offset must be updated.
+    if (overlaySize > 0) {
+        IMAGE_DATA_DIRECTORY& secDir = m_image->is64Bit
+            ? m_image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY]
+            : m_image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+        if (secDir.VirtualAddress >= lastFileEnd && secDir.Size != 0) {
+            secDir.VirtualAddress = secDir.VirtualAddress + (rawOffset + rawSize - lastFileEnd);
+        }
+
+        // Fix debug directory PointerToRawData entries in the overlay
+        for (auto& entry : m_image->debugDir.entries) {
+            if (entry.pointerToRawData >= lastFileEnd && entry.pointerToRawData != 0) {
+                entry.pointerToRawData += (rawOffset + rawSize - lastFileEnd);
+            }
+        }
+    }
+
     result.success = true;
     result.rva = virtualAddress;
     result.rawOffset = rawOffset;

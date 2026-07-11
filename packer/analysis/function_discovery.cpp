@@ -355,6 +355,58 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
         return result;
     }
     if (!ValidateFunctionOwnership(result)) return result;
+
+    // x86 SEH detection: mark functions that use frame-based SEH
+    // (push fs:[0] / mov fs:[0], esp pattern or SafeSEH table match)
+    if (!image->is64Bit) {
+        std::unordered_set<uint32_t> safeSehHandlers;
+        if (image->loadConfig.valid) {
+            // SEHandlerTable is stored in Load Config for x86 SafeSEH
+            // guardCFFunctionTable doubles as SEH handler table when CFG is absent
+            // Parse from Load Config SEHandlerTable field if available
+            const DWORD loadConfigOffset = PEUtils::RvaToOffset(image, image->loadConfig.directoryRVA);
+            if (loadConfigOffset != 0 && loadConfigOffset + 72 <= image->rawSize) {
+                uint32_t sehTableVA = 0, sehCount = 0;
+                std::memcpy(&sehTableVA, image->rawData + loadConfigOffset + 64, 4);
+                std::memcpy(&sehCount, image->rawData + loadConfigOffset + 68, 4);
+                const uint32_t lcImageBase = static_cast<uint32_t>(
+                    image->ntHeaders32->OptionalHeader.ImageBase);
+                if (sehTableVA >= lcImageBase && sehCount > 0 && sehCount < 0x10000) {
+                    uint32_t sehTableRVA = sehTableVA - lcImageBase;
+                    DWORD sehOffset = PEUtils::RvaToOffset(image, sehTableRVA);
+                    if (sehOffset != 0 && sehOffset + sehCount * 4 <= image->rawSize) {
+                        for (uint32_t i = 0; i < sehCount; i++) {
+                            uint32_t handlerRVA = 0;
+                            std::memcpy(&handlerRVA, image->rawData + sehOffset + i * 4, 4);
+                            safeSehHandlers.insert(handlerRVA);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (auto& function : result.functions) {
+            if (safeSehHandlers.count(static_cast<uint32_t>(function.entryAddress))) {
+                function.usesSEH = true;
+                continue;
+            }
+            // Detect frame-based SEH: look for fs:[0] segment access
+            for (const auto& block : function.blocks) {
+                for (const auto& instr : block.instructions) {
+                    for (const auto& operand : instr.operands) {
+                        if (operand.type == OperandType::Memory &&
+                            operand.memory.segment == RegisterId::FS) {
+                            function.usesSEH = true;
+                            break;
+                        }
+                    }
+                    if (function.usesSEH) break;
+                }
+                if (function.usesSEH) break;
+            }
+        }
+    }
+
     AssignFunctionNames(image, result.functions);
     std::sort(result.functions.begin(), result.functions.end(), [](const auto& left, const auto& right) {
         return left.entryAddress < right.entryAddress;

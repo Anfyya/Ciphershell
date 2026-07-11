@@ -341,23 +341,40 @@ std::vector<uint8_t> BuildX86Stub(
     c.Raw({0xFF,0x14,0x13,0x85,0xC0});
     c.Jz(fail);
 
-    // Legacy XOR stream used by the x86 encryptor.
-    c.Raw({0x8B,0x7C,0x24,0x04});
-    c.Raw({0x8B,0x4C,0x24,0x08});
-    c.Raw({0x8D,0x6E,0x0C});
-    c.Raw({0x31,0xD2});
+    // Rolling stream cipher (matches RuntimeStreamCipher::ApplyRolling decrypt).
+    // Regs: EAX=state, EBX=mask/temp, ECX=count, EDX=key_index,
+    //        EDI=data ptr, EBP=key ptr, ESI=ciphertext feedback.
+    c.Raw({0x8B,0x7C,0x24,0x04});          // mov edi, [esp+4]  ; target
+    c.Raw({0x8B,0x4C,0x24,0x08});          // mov ecx, [esp+8]  ; size
+    c.Raw({0x8D,0x6E,0x0C});              // lea ebp, [esi+0xC]; key ptr
+    c.U8(0x53);                            // push ebx           ; save image base
+    c.U8(0x56);                            // push esi           ; save task ptr
+    c.Raw({0x8B,0x45,0x00});              // mov eax, [ebp]    ; state = *(uint32*)key
+    c.Raw({0x85,0xC0});                    // test eax, eax
+    c.Jnz(decryptLoop);
+    c.U8(0xB8); c.U32(0x0C5C5E11u);      // mov eax, 0x0C5C5E11 (fallback)
     c.Bind(decryptLoop);
-    c.Raw({0x85,0xC9});
-    c.Jz(decrypted);
-    c.Raw({0x8A,0x44,0x15,0x00});
-    c.Raw({0x30,0x07,0x47,0x42,0x83,0xFA,0x20});
-    c.Jb8(keyNoWrap);
-    c.Raw({0x31,0xD2});
+    c.Raw({0x31,0xD2});                    // xor edx, edx      ; key index = 0
     c.Bind(keyNoWrap);
-    c.Raw({0x49});
-    c.Jmp(decryptLoop);
+    c.Raw({0x85,0xC9});                    // test ecx, ecx
+    c.Jz(decrypted);
+    c.Raw({0x0F,0xB6,0x37});              // movzx esi, byte [edi] ; esi = ciphertext (feedback)
+    c.Raw({0x8A,0x5C,0x15,0x00});         // mov bl, [ebp+edx] ; bl = key[index]
+    c.Raw({0x30,0xC3});                    // xor bl, al        ; bl = mask (key[idx]^(u8)state)
+    c.Raw({0x30,0x1F});                    // xor [edi], bl     ; decrypt byte
+    c.Raw({0xC1,0xC8,0x08});              // ror eax, 8        ; state = ror(state, 8)
+    c.Raw({0x31,0xF0});                    // xor eax, esi      ; state ^= (u32)ciphertext
+    c.U8(0x47);                            // inc edi
+    c.U8(0x49);                            // dec ecx
+    c.U8(0x42);                            // inc edx
+    c.Raw({0x83,0xFA,0x20});              // cmp edx, 32
+    c.Jb8(keyNoWrap);
+    c.Raw({0x31,0xD2});                    // xor edx, edx
+    c.Jmp(keyNoWrap);
 
     c.Bind(decrypted);
+    c.U8(0x5E);                            // pop esi            ; restore task ptr
+    c.U8(0x5B);                            // pop ebx            ; restore image base
     // Restore original protection.
     c.Raw({0x8D,0x04,0x24,0x50});
     c.Raw({0xFF,0x76,0x08});

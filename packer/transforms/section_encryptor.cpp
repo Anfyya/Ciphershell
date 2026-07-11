@@ -234,12 +234,7 @@ bool SectionEncryptor::EncryptSection(
 
     BYTE* sectionData = image->rawData + section->PointerToRawData;
 
-    // x64 stub 使用同一套滚动流解密；x86 仍保留旧格式以避免破坏现有 32 位启动 stub。
-    if (image->is64Bit) {
-        RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, true);
-    } else {
-        RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
-    }
+    RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, true);
 
     // Encrypted code is mapped writable and non-executable.  The loader
     // temporarily grants RW while decrypting and restores the original RX/R
@@ -271,12 +266,7 @@ bool SectionEncryptor::DecryptSection(
 
     BYTE* sectionData = image->rawData + section->PointerToRawData;
 
-    // 与 EncryptSection 和启动 stub 保持一致。
-    if (image->is64Bit) {
-        RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, false);
-    } else {
-        RuntimeStreamCipher::ApplyLegacyXor(sectionData, section->SizeOfRawData, key.key);
-    }
+    RuntimeStreamCipher::ApplyRolling(sectionData, section->SizeOfRawData, key.key, false);
 
     // 恢复执行权限
     section->Characteristics |= IMAGE_SCN_MEM_EXECUTE;

@@ -107,7 +107,16 @@ FlatteningResult CFGFlattener::Flatten(const ControlFlowGraph& cfg, const Flatte
 }
 
 FlatteningResult CFGFlattener::FlattenFunction(const Function& func, const FlatteningConfig& config) {
-    // 从函数构建临时 CFG
+    for (const auto& block : func.blocks) {
+        for (const auto& instr : block.instructions) {
+            for (const auto& operand : instr.operands) {
+                if (operand.type == OperandType::Memory && operand.memory.isRipRelative) {
+                    return {};
+                }
+            }
+        }
+    }
+
     CFGBuilder builder;
     ControlFlowGraph cfg = builder.Build(func.blocks);
 
@@ -163,10 +172,10 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
             origBytesTotal += instr.length;
         }
     }
-    DWORD estimatedSize = 10                              // 入口
-                        + (DWORD)(blockCount * 12 + 1)   // dispatcher
+    DWORD estimatedSize = 12                              // 入口 (push eax + mov + jmp)
+                        + (DWORD)(blockCount * 12 + 4)   // dispatcher (pushf + cmp/je + popf+pop+ret)
                         + origBytesTotal
-                        + (DWORD)(blockCount * 30)        // 每块尾部
+                        + (DWORD)(blockCount * 36)        // 每块尾部 (popf+pop + push+pushf + transitions)
                         + 64;                             // 裕量
 
     BYTE* code = new(std::nothrow) BYTE[estimatedSize];
@@ -201,6 +210,8 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
     // ==================================================================
     // 1. 入口段
     // ==================================================================
+    // push eax (save original EAX — dispatcher uses it as state var)
+    code[off++] = 0x50;
     // mov eax, entryStateId
     code[off++] = 0xB8;
     write32(result.entryStateId);
@@ -215,6 +226,9 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
     // ==================================================================
     labelOffsets[LABEL_DISPATCHER] = off;
 
+    // pushf (save flags before comparison)
+    code[off++] = 0x9C;
+
     for (size_t i = 0; i < blockCount; i++) {
         // cmp eax, stateId   (81 F8 imm32)
         code[off++] = 0x81;
@@ -228,7 +242,9 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
         write32(0);
     }
 
-    // dispatcher 尾部：stateId==0 表示退出
+    // popf + pop eax (restore before return — exit path)
+    code[off++] = 0x9D;  // popf
+    code[off++] = 0x58;  // pop eax
     code[off++] = 0xC3;  // ret
 
     // ==================================================================
@@ -238,19 +254,25 @@ BYTE* CFGFlattener::GenerateFlattenedCode(const FlatteningResult& result, bool i
         labelOffsets[LABEL_BLOCK_BASE + (int)i] = off;
         const auto& blk = result.blocks[i];
 
-        // BUG 8 修复：写入原始指令字节时，剔除末尾的跳转指令
-        // 因为平坦化后原始跳转目标地址已失效，由 dispatcher 跳转替代
+        // Restore flags and EAX before executing original instructions
+        code[off++] = 0x9D;  // popf
+        code[off++] = 0x58;  // pop eax
+
         size_t instrCount = blk.originalBlock.instructions.size();
         for (size_t j = 0; j < instrCount; j++) {
             const auto& instr = blk.originalBlock.instructions[j];
-            // 跳过末尾的分支指令（条件跳转、无条件跳转），保留 call 和 ret
             if (j == instrCount - 1 && instr.IsBranch()) {
-                continue;  // 剔除原始跳转，由下方 dispatcher 跳转替代
+                continue;
             }
             for (size_t b = 0; b < instr.length; b++) {
                 code[off++] = instr.rawBytes[b];
             }
         }
+
+        // Save EAX and flags again before transitioning back to dispatcher
+        // push eax; pushf
+        code[off++] = 0x50;  // push eax
+        code[off++] = 0x9C;  // pushf (saved below dispatcher's popf)
 
         // 尾部跳转
         if (blk.isConditional) {

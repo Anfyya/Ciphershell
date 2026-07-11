@@ -990,6 +990,9 @@ void Translator::AnalyzeNativeCallStackArguments(const Function& function) {
                 uint32_t bytes = instruction.machineMode == MachineMode::X64
                     ? AlignUpValue(writtenArgumentBytes, 8)
                     : AlignUpValue((std::max)(pushedBytes, writtenArgumentBytes), 2);
+                if (bytes > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES) {
+                    bytes = VM_NATIVE_MAX_STACK_ARGUMENT_BYTES;
+                }
                 m_nativeCallStackBytes[instruction.address] = bytes;
                 pushedBytes = 0;
                 writtenArgumentBytes = 0;

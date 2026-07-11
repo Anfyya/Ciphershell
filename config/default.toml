@@ -51,7 +51,7 @@ strength = 55
 target_functions = []
 
 [control_flow.bogus]
-enabled = true
+enabled = false
 strength = 50
 
 [anti_debug]

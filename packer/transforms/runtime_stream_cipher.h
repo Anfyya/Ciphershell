@@ -18,6 +18,8 @@ inline uint32_t RotateRight32(uint32_t value, uint32_t bits) {
     return (value >> bits) | (value << ((32u - bits) & 31u));
 }
 
+// DEPRECATED: Simple repeating XOR with no feedback. Trivially broken by
+// known-plaintext attacks.  All callers migrated to ApplyRolling.
 inline void ApplyLegacyXor(
     uint8_t* data,
     uint32_t size,

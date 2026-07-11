@@ -99,22 +99,26 @@ BogusFlowResult BogusFlowInjector::InjectIntoFunction(const Function& func, cons
 BYTE* BogusFlowInjector::GenerateBogusCode(const BogusFlowResult& result, bool is64Bit, DWORD* codeSize) {
     if (!codeSize) return nullptr;
 
-    // 估算代码大小
-    DWORD estimatedSize = result.totalBlocks * 100;
+    DWORD estimatedSize = 0;
+    for (const auto& bogusBlock : result.allBlocks) {
+        estimatedSize += 64;
+        for (const auto& instr : bogusBlock.block.instructions) {
+            estimatedSize += instr.length;
+        }
+    }
+    estimatedSize += 64;
 
     BYTE* code = new(std::nothrow) BYTE[estimatedSize];
     if (!code) return nullptr;
 
     DWORD offset = 0;
 
-    // 生成每个块的代码
     for (const auto& bogusBlock : result.allBlocks) {
-        // 为假块生成不透明谓词检查
         if (bogusBlock.isBogus) {
             DWORD predSize = 0;
             BYTE* predCode = m_predicateGen.GenerateConditionalJump(
                 bogusBlock.guardPredicate,
-                0,  // 目标地址稍后填充
+                0,
                 is64Bit,
                 &predSize
             );
@@ -126,8 +130,11 @@ BYTE* BogusFlowInjector::GenerateBogusCode(const BogusFlowResult& result, bool i
             }
         }
 
-        // 生成块代码（简化）
-        // 实际实现需要复制原始块的指令
+        for (const auto& instr : bogusBlock.block.instructions) {
+            if (offset + instr.length > estimatedSize) break;
+            memcpy(code + offset, instr.rawBytes.data(), instr.length);
+            offset += instr.length;
+        }
     }
 
     *codeSize = offset;

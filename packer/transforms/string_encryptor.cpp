@@ -276,11 +276,7 @@ bool StringEncryptor::EncryptStrings(
         // 获取字符串数据
         BYTE* data = image->rawData + entry.offset;
 
-        if (image->is64Bit) {
-            RuntimeStreamCipher::ApplyRolling(data, entry.length, entry.key, true);
-        } else {
-            RuntimeStreamCipher::ApplyLegacyXor(data, entry.length, entry.key);
-        }
+        RuntimeStreamCipher::ApplyRolling(data, entry.length, entry.key, true);
 
         // 更新加密后大小
         entry.encryptedSize = entry.length;
@@ -292,29 +288,43 @@ bool StringEncryptor::EncryptStrings(
 BYTE* StringEncryptor::GenerateDecryptFunction(bool is64Bit, DWORD* funcSize) {
     if (!funcSize) return nullptr;
 
-    // x86 解密函数 shellcode
-    // void* decrypt_string(const void* encrypted, DWORD length, const BYTE* key, const BYTE* nonce)
+    // x86 rolling stream cipher decrypt (matches RuntimeStreamCipher::ApplyRolling).
+    // cdecl: decrypt_string(void* data, DWORD length, const BYTE key[32])
+    // Regs: ESI=data, ECX=count, EDI=key, EAX=state, EBX=key_index, EDX=scratch
     static const BYTE x86_decrypt[] = {
         0x55,                               // push ebp
         0x89, 0xE5,                         // mov ebp, esp
         0x53,                               // push ebx
         0x56,                               // push esi
         0x57,                               // push edi
-        0x8B, 0x75, 0x08,                   // mov esi, [ebp+8]  ; encrypted data
+        0x8B, 0x75, 0x08,                   // mov esi, [ebp+8]  ; data
         0x8B, 0x4D, 0x0C,                   // mov ecx, [ebp+12] ; length
         0x8B, 0x7D, 0x10,                   // mov edi, [ebp+16] ; key
-        // 简单 XOR 解密（实际应使用 ChaCha20）
-        0x31, 0xDB,                         // xor ebx, ebx
+        0x8B, 0x07,                         // mov eax, [edi]    ; state = *(u32*)key
+        0x85, 0xC0,                         // test eax, eax
+        0x75, 0x05,                         // jnz .stateOk
+        0xB8, 0x11, 0x5E, 0xC5, 0x0C,      // mov eax, 0x0C5C5E11
+        // .stateOk:
+        0x31, 0xDB,                         // xor ebx, ebx      ; key index = 0
         // .loop:
         0x85, 0xC9,                         // test ecx, ecx
-        0x74, 0x0A,                         // jz .done
-        0x8A, 0x04, 0x1F,                   // mov al, [edi+ebx]
-        0x30, 0x06,                         // xor [esi], al
+        0x74, 0x1D,                         // jz .done (skip 29 bytes)
+        0x0F, 0xB6, 0x16,                   // movzx edx, byte [esi] ; ciphertext
+        0x52,                               // push edx           ; save feedback
+        0x8A, 0x14, 0x1F,                   // mov dl, [edi+ebx]  ; key[index]
+        0x30, 0xC2,                         // xor dl, al         ; mask
+        0x30, 0x16,                         // xor [esi], dl      ; decrypt
+        0x5A,                               // pop edx            ; feedback
+        0xC1, 0xC8, 0x08,                   // ror eax, 8
+        0x31, 0xD0,                         // xor eax, edx       ; state ^= feedback
         0x46,                               // inc esi
         0x43,                               // inc ebx
-        0x83, 0xE3, 0x1F,                   // and ebx, 31
+        0x83, 0xFB, 0x20,                   // cmp ebx, 32
+        0x72, 0x02,                         // jb .noWrap
+        0x31, 0xDB,                         // xor ebx, ebx
+        // .noWrap:
         0x49,                               // dec ecx
-        0xEB, 0xEF,                         // jmp .loop
+        0xEB, 0xDF,                         // jmp .loop
         // .done:
         0x5F,                               // pop edi
         0x5E,                               // pop esi
@@ -323,25 +333,39 @@ BYTE* StringEncryptor::GenerateDecryptFunction(bool is64Bit, DWORD* funcSize) {
         0xC3                                // ret
     };
 
-    // x64 解密函数 shellcode
+    // x64 rolling stream cipher decrypt (matches RuntimeStreamCipher::ApplyRolling).
+    // Win64: RCX=data, RDX=length, R8=key
+    // Regs: RSI=data, RCX=count, RDI=key, EAX=state, EBX=feedback, EDX=key_index
     static const BYTE x64_decrypt[] = {
         0x48, 0x89, 0x5C, 0x24, 0x08,       // mov [rsp+8], rbx
         0x48, 0x89, 0x74, 0x24, 0x10,       // mov [rsp+16], rsi
         0x48, 0x89, 0x7C, 0x24, 0x18,       // mov [rsp+24], rdi
-        0x48, 0x89, 0xCE,                   // mov rsi, rcx      ; encrypted data
+        0x48, 0x89, 0xCE,                   // mov rsi, rcx      ; data
         0x48, 0x89, 0xD1,                   // mov rcx, rdx      ; length
-        0x49, 0x89, 0xC7,                   // mov r15, r8       ; key
-        0x48, 0x31, 0xDB,                   // xor rbx, rbx
+        0x4C, 0x89, 0xC7,                   // mov rdi, r8       ; key
+        0x8B, 0x07,                         // mov eax, [rdi]    ; state
+        0x85, 0xC0,                         // test eax, eax
+        0x75, 0x05,                         // jnz .stateOk
+        0xB8, 0x11, 0x5E, 0xC5, 0x0C,      // mov eax, 0x0C5C5E11
+        // .stateOk:
+        0x31, 0xD2,                         // xor edx, edx      ; key index
         // .loop:
         0x48, 0x85, 0xC9,                   // test rcx, rcx
-        0x74, 0x0D,                         // jz .done
-        0x41, 0x8A, 0x04, 0x1F,             // mov al, [r15+rbx]
-        0x30, 0x06,                         // xor [rsi], al
+        0x74, 0x23,                         // jz .done (skip 35 bytes)
+        0x0F, 0xB6, 0x1E,                   // movzx ebx, byte [rsi] ; ciphertext
+        0x44, 0x8A, 0x04, 0x17,             // mov r8b, [rdi+rdx]; key[index]
+        0x41, 0x30, 0xC0,                   // xor r8b, al       ; mask
+        0x44, 0x30, 0x06,                   // xor [rsi], r8b    ; decrypt
+        0xC1, 0xC8, 0x08,                   // ror eax, 8
+        0x31, 0xD8,                         // xor eax, ebx      ; state ^= feedback
         0x48, 0xFF, 0xC6,                   // inc rsi
-        0x48, 0xFF, 0xC3,                   // inc rbx
-        0x48, 0x83, 0xE3, 0x1F,             // and rbx, 31
+        0xFF, 0xC2,                         // inc edx
+        0x83, 0xFA, 0x20,                   // cmp edx, 32
+        0x72, 0x02,                         // jb .noWrap
+        0x31, 0xD2,                         // xor edx, edx
+        // .noWrap:
         0x48, 0xFF, 0xC9,                   // dec rcx
-        0xEB, 0xEB,                         // jmp .loop
+        0xEB, 0xD8,                         // jmp .loop
         // .done:
         0x48, 0x8B, 0x5C, 0x24, 0x08,       // mov rbx, [rsp+8]
         0x48, 0x8B, 0x74, 0x24, 0x10,       // mov rsi, [rsp+16]

@@ -817,9 +817,10 @@ int main(int argc, char* argv[]) {
         std::cout << "    已处理 " << obfImports.size() << " 个导入函数" << std::endl;
         PrintFeatureStatus(
             "import_protection",
-            "applied",
-            "mode=rebuilt_import_directory real_iat=preserved fake_imports=" +
-                std::to_string(obfuscator.GetWrittenFakeImportCount()));
+            "partial",
+            "mode=fake_imports_only real_iat=unprotected fake_imports=" +
+                std::to_string(obfuscator.GetWrittenFakeImportCount()) +
+                " note=runtime_resolver_callsite_rewrite_not_implemented");
     } else {
         PrintFeatureStatus("import_protection", "skipped", "disabled");
     }

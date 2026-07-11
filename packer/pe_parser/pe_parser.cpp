@@ -828,6 +828,12 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
     PIMAGE_DEBUG_DIRECTORY debugEntries = (PIMAGE_DEBUG_DIRECTORY)(image->rawData + debugOffset);
 
     for (DWORD i = 0; i < entryCount; i++) {
+        if (debugEntries[i].PointerToRawData != 0 && debugEntries[i].SizeOfData != 0) {
+            if (debugEntries[i].PointerToRawData > image->rawSize ||
+                debugEntries[i].SizeOfData > image->rawSize - debugEntries[i].PointerToRawData) {
+                return false;
+            }
+        }
         CS_DEBUG_ENTRY entry;
         entry.type = debugEntries[i].Type;
         entry.sizeOfData = debugEntries[i].SizeOfData;
@@ -858,7 +864,45 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
     DWORD delayOffset = RVAToOffset(image, delayImportDir.VirtualAddress);
     if (delayOffset == 0 || !CheckBounds(image, delayOffset, delayImportDir.Size)) return false;
 
-    // 延迟导入使用 IMAGE_DELAYLOAD_DESCRIPTOR 结构
+    const DWORD descriptorSize = 32;
+    const DWORD maxDescriptors = delayImportDir.Size / descriptorSize;
+    if (maxDescriptors == 0) return false;
+
+    for (DWORD i = 0; i < maxDescriptors; i++) {
+        DWORD descOffset = delayOffset + i * descriptorSize;
+        if (!CheckBounds(image, descOffset, descriptorSize)) break;
+
+        uint32_t attributes = 0, dllNameRva = 0, moduleHandleRva = 0;
+        uint32_t iatRva = 0, intRva = 0;
+        std::memcpy(&attributes, image->rawData + descOffset, 4);
+        std::memcpy(&dllNameRva, image->rawData + descOffset + 4, 4);
+        std::memcpy(&moduleHandleRva, image->rawData + descOffset + 8, 4);
+        std::memcpy(&iatRva, image->rawData + descOffset + 12, 4);
+        std::memcpy(&intRva, image->rawData + descOffset + 16, 4);
+
+        if (dllNameRva == 0 && iatRva == 0 && intRva == 0) break;
+
+        if (dllNameRva == 0 || iatRva == 0) return false;
+
+        DWORD nameOffset = RVAToOffset(image, dllNameRva);
+        if (nameOffset == 0 || nameOffset >= image->rawSize) return false;
+
+        DWORD maxNameLen = image->rawSize - nameOffset;
+        const char* dllName = (const char*)(image->rawData + nameOffset);
+        bool terminated = false;
+        for (DWORD n = 0; n < maxNameLen && n < 256; n++) {
+            if (dllName[n] == '\0') { terminated = true; break; }
+        }
+        if (!terminated) return false;
+
+        CS_DELAY_IMPORT_DLL dll;
+        dll.dllName = dllName;
+        dll.moduleHandleRVA = moduleHandleRva;
+        dll.iatRVA = iatRva;
+        dll.intRVA = intRva;
+        image->delayImports.dlls.push_back(dll);
+    }
+
     return true;
 }
 
