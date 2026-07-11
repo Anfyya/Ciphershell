@@ -1,142 +1,80 @@
 /**
- * CipherShell 解密工具
- * 手动解密已加壳的 PE 文件
+ * CipherShell legacy decryptor diagnostic.
+ *
+ * The production format uses authenticated, per-function/per-section keys and
+ * does not currently expose an offline recovery-key contract. This tool must
+ * therefore fail closed instead of copying an encrypted file and claiming it
+ * was decrypted.
  */
 
-#include <iostream>
-#include <fstream>
-#include <vector>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <vector>
 
-// ============================================================================
-// ChaCha20 简化实现
-// ============================================================================
+namespace {
 
-static uint32_t rotl32(uint32_t x, int n) {
-    return (x << n) | (x >> (32 - n));
+template <typename T>
+bool ReadValue(const std::vector<std::uint8_t>& data, std::size_t offset, T& value) {
+    if (offset > data.size() || data.size() - offset < sizeof(T)) return false;
+    std::memcpy(&value, data.data() + offset, sizeof(T));
+    return true;
 }
 
-static void quarterround(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
-    a += b; d ^= a; d = rotl32(d, 16);
-    c += d; b ^= c; b = rotl32(b, 12);
-    a += b; d ^= a; d = rotl32(d, 8);
-    c += d; b ^= c; b = rotl32(b, 7);
-}
+bool IsStructurallyValidPE(const std::vector<std::uint8_t>& data) {
+    if (data.size() < 0x40 || data[0] != 'M' || data[1] != 'Z') return false;
 
-// ============================================================================
-// 滚动密钥解密
-// ============================================================================
+    std::uint32_t peOffset = 0;
+    if (!ReadValue(data, 0x3c, peOffset)) return false;
+    std::uint32_t signature = 0;
+    if (!ReadValue(data, peOffset, signature) || signature != 0x00004550u) return false;
 
-void DecryptWithRollingKey(uint8_t* data, size_t size, const uint8_t* key) {
-    uint32_t rollingKey = 0;
-    for (int i = 0; i < 4; i++) {
-        rollingKey |= ((uint32_t)key[i]) << (i * 8);
+    std::uint16_t sectionCount = 0;
+    std::uint16_t optionalHeaderSize = 0;
+    if (!ReadValue(data, static_cast<std::size_t>(peOffset) + 6, sectionCount) ||
+        !ReadValue(data, static_cast<std::size_t>(peOffset) + 20, optionalHeaderSize)) {
+        return false;
     }
+    if (sectionCount == 0 || sectionCount > 96) return false;
 
-    for (size_t i = 0; i < size; i++) {
-        uint8_t keyByte = (uint8_t)(rollingKey & 0xFF);
-        data[i] ^= keyByte;
-        rollingKey = (rollingKey >> 8) | (rollingKey << 24);
-        rollingKey ^= (uint32_t)data[i];
-    }
+    const std::size_t sectionTable = static_cast<std::size_t>(peOffset) + 24 + optionalHeaderSize;
+    return sectionTable <= data.size() &&
+        static_cast<std::size_t>(sectionCount) <= (data.size() - sectionTable) / 40;
 }
 
-// ============================================================================
-// PE 结构
-// ============================================================================
-
-#pragma pack(push, 1)
-struct PEHeader {
-    uint32_t signature;
-    uint16_t machine;
-    uint16_t numSections;
-    uint32_t timestamp;
-    uint32_t symbolTable;
-    uint32_t numSymbols;
-    uint16_t optionalHeaderSize;
-    uint16_t characteristics;
-};
-#pragma pack(pop)
-
-// ============================================================================
-// 主函数
-// ============================================================================
+} // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cout << "CipherShell Decryptor v0.1" << std::endl;
-        std::cout << "用法: decryptor <输入文件> <输出文件>" << std::endl;
+    if (argc != 2) {
+        std::cerr << "用法: decryptor <输入文件>\n";
         return 1;
     }
 
-    std::string inputFile = argv[1];
-    std::string outputFile = argv[2];
-
-    // 读取输入文件
-    std::ifstream inFile(inputFile, std::ios::binary | std::ios::ate);
-    if (!inFile) {
-        std::cerr << "错误: 无法打开输入文件" << std::endl;
+    std::ifstream input(argv[1], std::ios::binary | std::ios::ate);
+    if (!input) {
+        std::cerr << "错误: 无法打开输入文件\n";
+        return 1;
+    }
+    const std::streamoff length = input.tellg();
+    if (length <= 0 || static_cast<std::uintmax_t>(length) >
+            (std::numeric_limits<std::size_t>::max)()) {
+        std::cerr << "错误: 输入文件大小无效\n";
+        return 1;
+    }
+    input.seekg(0);
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(length));
+    if (!input.read(reinterpret_cast<char*>(data.data()), length)) {
+        std::cerr << "错误: 无法完整读取输入文件\n";
+        return 1;
+    }
+    if (!IsStructurallyValidPE(data)) {
+        std::cerr << "错误: 输入不是结构完整的 PE 文件\n";
         return 1;
     }
 
-    size_t fileSize = inFile.tellg();
-    inFile.seekg(0);
-
-    std::vector<uint8_t> data(fileSize);
-    inFile.read(reinterpret_cast<char*>(data.data()), fileSize);
-    inFile.close();
-
-    // 验证 PE 签名
-    if (data[0] != 'M' || data[1] != 'Z') {
-        std::cerr << "错误: 不是有效的 PE 文件" << std::endl;
-        return 1;
-    }
-
-    // 获取 PE 头偏移
-    uint32_t peOffset = *reinterpret_cast<uint32_t*>(&data[0x3C]);
-    if (peOffset + sizeof(PEHeader) > fileSize) {
-        std::cerr << "错误: PE 头偏移无效" << std::endl;
-        return 1;
-    }
-
-    PEHeader* pe = reinterpret_cast<PEHeader*>(&data[peOffset]);
-    if (pe->signature != 0x00004550) {  // "PE\0\0"
-        std::cerr << "错误: PE 签名无效" << std::endl;
-        return 1;
-    }
-
-    std::cout << "PE 文件信息:" << std::endl;
-    std::cout << "  机器类型: 0x" << std::hex << pe->machine << std::dec << std::endl;
-    std::cout << "  Section 数量: " << pe->numSections << std::endl;
-
-    // 注意：这里只是演示解密流程
-    // 实际的 CipherShell 加壳会在特定位置存储加密密钥
-    // 这里我们使用默认密钥进行测试
-
-    uint8_t defaultKey[32] = {
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-        0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20
-    };
-
-    // 解密 section 数据
-    // 注意：这里只是演示，实际需要从 PE 中读取加密信息
-    std::cout << "  解密完成（演示模式）" << std::endl;
-
-    // 写入输出文件
-    std::ofstream outFile(outputFile, std::ios::binary);
-    if (!outFile) {
-        std::cerr << "错误: 无法创建输出文件" << std::endl;
-        return 1;
-    }
-
-    outFile.write(reinterpret_cast<char*>(data.data()), fileSize);
-    outFile.close();
-
-    std::cout << "输出文件: " << outputFile << std::endl;
-    std::cout << "注意: 这是演示版本，实际解密需要完整的 stub 支持" << std::endl;
-
-    return 0;
+    std::cerr
+        << "UNSUPPORTED: 当前生产格式没有离线恢复密钥契约；未创建任何输出文件。\n";
+    return 2;
 }

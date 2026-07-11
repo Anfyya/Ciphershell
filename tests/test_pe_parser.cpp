@@ -1,138 +1,118 @@
-/**
- * CipherShell PE Parser 测试
- */
+#include "packer/pe_parser/pe_parser.h"
 
+#include <cstring>
 #include <iostream>
-#include <string>
-#include <cassert>
+#include <memory>
 
-#include "../packer/pe_parser/pe_parser.h"
+namespace {
 
-// ============================================================================
-// 测试辅助函数
-// ============================================================================
+constexpr DWORD kFileSize = 0x400;
+constexpr DWORD kNtOffset = 0x80;
+constexpr DWORD kSectionRva = 0x1000;
+constexpr DWORD kSectionOffset = 0x200;
 
-void PrintTestResult(const std::string& testName, bool passed) {
-    std::cout << "[" << (passed ? "PASS" : "FAIL") << "] " << testName << std::endl;
+BYTE* MakeMinimalPE() {
+    auto data = std::make_unique<BYTE[]>(kFileSize);
+    std::memset(data.get(), 0, kFileSize);
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(data.get());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = kNtOffset;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data.get() + kNtOffset);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.ImageBase = 0x140000000ull;
+    nt->OptionalHeader.FileAlignment = 0x200;
+    nt->OptionalHeader.SectionAlignment = 0x1000;
+    nt->OptionalHeader.SizeOfHeaders = kSectionOffset;
+    nt->OptionalHeader.SizeOfImage = 0x2000;
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(section->Name, ".test", 5);
+    section->Misc.VirtualSize = 0x200;
+    section->VirtualAddress = kSectionRva;
+    section->SizeOfRawData = 0x200;
+    section->PointerToRawData = kSectionOffset;
+    section->Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+    return data.release();
 }
 
-// ============================================================================
-// 测试用例
-// ============================================================================
+bool Expect(bool condition, const char* name) {
+    std::cout << '[' << (condition ? "PASS" : "FAIL") << "] " << name << '\n';
+    return condition;
+}
 
-bool TestPEParser_BasicParsing() {
-    // 测试基本的 PE 解析功能
+bool TestMinimalImage() {
     CipherShell::PEParser parser;
-
-    // 注意：这里需要一个实际的 PE 文件进行测试
-    // 在实际测试中，应该使用测试样本
-
-    std::cout << "  基本解析测试需要实际的 PE 文件" << std::endl;
-    return true;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(MakeMinimalPE(), kFileSize);
+    const bool valid = image && image->isValid && image->is64Bit && image->numSections == 1;
+    parser.FreeImage(image);
+    return valid;
 }
 
-bool TestPEParser_InvalidFile() {
+bool TestTruncatedImportDirectory() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {kSectionRva, 8};
+
     CipherShell::PEParser parser;
-
-    // 测试无效文件
-    CipherShell::CS_PE_IMAGE* image = parser.LoadFromFile("nonexistent.exe");
-    bool passed = (image == nullptr);
-
-    if (image) {
-        parser.FreeImage(image);
-    }
-
-    return passed;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid &&
+        image->errorMessage.find("import") != std::string::npos;
+    parser.FreeImage(image);
+    return rejected;
 }
 
-bool TestPEParser_InvalidPE() {
+bool TestUnterminatedImportDirectory() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {
+        kSectionRva, sizeof(IMAGE_IMPORT_DESCRIPTOR)};
+    auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(data + kSectionOffset);
+    descriptor->Name = kSectionRva + sizeof(IMAGE_IMPORT_DESCRIPTOR);
+
     CipherShell::PEParser parser;
-
-    // 创建一个无效的 PE 文件（不是 PE 格式）
-    FILE* f = fopen("invalid.pe", "wb");
-    if (f) {
-        char data[] = "This is not a PE file";
-        fwrite(data, 1, sizeof(data), f);
-        fclose(f);
-
-        CipherShell::CS_PE_IMAGE* image = parser.LoadFromFile("invalid.pe");
-        bool passed = (image == nullptr || !image->isValid);
-
-        if (image) {
-            parser.FreeImage(image);
-        }
-
-        // 清理测试文件
-        remove("invalid.pe");
-
-        return passed;
-    }
-
-    return false;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid;
+    parser.FreeImage(image);
+    return rejected;
 }
 
-bool TestPEParser_DataStructures() {
-    // 测试数据结构的正确性
-    bool passed = true;
+bool TestOversizedExportTable() {
+    BYTE* data = MakeMinimalPE();
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(data + kNtOffset);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {
+        kSectionRva, sizeof(IMAGE_EXPORT_DIRECTORY)};
+    auto* exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(data + kSectionOffset);
+    exports->Name = kSectionRva + sizeof(IMAGE_EXPORT_DIRECTORY);
+    exports->NumberOfFunctions = 0xFFFFFFFFu;
 
-    // 检查结构体大小
-    if (sizeof(CipherShell::CS_PE_IMAGE) == 0) {
-        passed = false;
-    }
-
-    // 检查导入表结构
-    CipherShell::CS_IMPORT_TABLE importTable;
-    if (importTable.dlls.capacity() == 0) {
-        // 这是正常的，vector 初始为空
-    }
-
-    return passed;
+    CipherShell::PEParser parser;
+    CipherShell::CS_PE_IMAGE* image = parser.LoadFromBuffer(data, kFileSize);
+    const bool rejected = image && !image->isValid &&
+        image->errorMessage.find("export") != std::string::npos;
+    parser.FreeImage(image);
+    return rejected;
 }
 
-bool TestPEParser_HashFunctions() {
-    // 测试哈希函数的一致性（简化版本，不依赖 APIResolver）
-    // 使用简单的哈希测试
-    uint32_t hash1 = 0x12345678;
-    uint32_t hash2 = 0x12345678;
-    uint32_t hash3 = 0x87654321;
-
-    bool passed = (hash1 == hash2) && (hash1 != hash3);
-
-    return passed;
+bool TestNonexistentFile() {
+    CipherShell::PEParser parser;
+    return parser.LoadFromFile("this-file-must-not-exist.exe") == nullptr;
 }
 
-// ============================================================================
-// 主测试函数
-// ============================================================================
+} // namespace
 
 int main() {
-    std::cout << "CipherShell PE Parser 测试" << std::endl;
-    std::cout << "==========================" << std::endl;
-
-    int passed = 0;
-    int failed = 0;
-
-    // 运行测试
-    auto RunTest = [&](const std::string& name, bool (*testFunc)()) {
-        try {
-            bool result = testFunc();
-            PrintTestResult(name, result);
-            if (result) passed++; else failed++;
-        } catch (const std::exception& e) {
-            std::cout << "[FAIL] " << name << " - 异常: " << e.what() << std::endl;
-            failed++;
-        }
-    };
-
-    RunTest("PE Parser - 基本解析", TestPEParser_BasicParsing);
-    RunTest("PE Parser - 无效文件", TestPEParser_InvalidFile);
-    RunTest("PE Parser - 无效 PE", TestPEParser_InvalidPE);
-    RunTest("PE Parser - 数据结构", TestPEParser_DataStructures);
-    RunTest("PE Parser - 哈希函数", TestPEParser_HashFunctions);
-
-    // 输出结果
-    std::cout << "\n==========================" << std::endl;
-    std::cout << "测试结果: " << passed << " 通过, " << failed << " 失败" << std::endl;
-
-    return (failed > 0) ? 1 : 0;
+    int failures = 0;
+    failures += !Expect(TestMinimalImage(), "minimal PE32+ image");
+    failures += !Expect(TestTruncatedImportDirectory(), "truncated import directory rejected");
+    failures += !Expect(TestUnterminatedImportDirectory(), "unterminated import directory rejected");
+    failures += !Expect(TestOversizedExportTable(), "oversized export table rejected");
+    failures += !Expect(TestNonexistentFile(), "nonexistent file rejected");
+    return failures == 0 ? 0 : 1;
 }

@@ -13,6 +13,8 @@ target_link_libraries(test_pe_parser PRIVATE
     ciphershell_packer
 )
 
+target_include_directories(test_pe_parser PRIVATE ${CMAKE_SOURCE_DIR})
+
 # VM 正确性测试
 add_executable(test_vm_correctness
     test_vm_correctness.cpp
@@ -53,3 +55,13 @@ add_executable(test_e2e_packaging
 target_link_libraries(test_e2e_packaging PRIVATE
     ciphershell_packer
 )
+
+add_executable(test_cli_options
+    test_cli_options.cpp
+    ../packer/cli_options.cpp
+)
+
+target_include_directories(test_cli_options PRIVATE ${CMAKE_SOURCE_DIR})
+
+add_test(NAME cli_options COMMAND test_cli_options)
+add_test(NAME pe_parser_bounds COMMAND test_pe_parser)

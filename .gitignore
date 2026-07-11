@@ -22,6 +22,7 @@ obj/
 # IDE / 编辑器
 .vs/
 .vscode/
+.codegraph/
 *.user
 *.suo
 *.sln
