@@ -25,7 +25,7 @@ simd_bridge = true
 x87_bridge = true
 
 [string_encryption]
-enabled = true
+enabled = false
 strength = 80
 mode = "startup"
 ascii = true
@@ -34,7 +34,7 @@ resources = false
 clear_after_use = false
 
 [import_protection]
-enabled = true
+enabled = false
 strength = 60
 
 [section_encryption]

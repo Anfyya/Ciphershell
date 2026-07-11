@@ -65,12 +65,15 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     }
 #endif
 
-    ctx.sectionEncryption = PresetFeature(ctx.quickLevel >= 1, 50 + ctx.quickLevel * 8, "startup");
-    ctx.stringEncryption = PresetFeature(ctx.quickLevel >= 2 && config.global.stringEncryption, 60, "startup");
-    ctx.importProtection = PresetFeature(ctx.quickLevel >= 2 && config.global.importObfuscation, 50, "metadata");
-    ctx.controlFlow = PresetFeature(ctx.quickLevel >= 3, 55, "mixed");
-    ctx.flattening = PresetFeature(ctx.quickLevel >= 3, 55, "basic");
-    ctx.bogusFlow = PresetFeature(ctx.quickLevel >= 3, 50, "safe_nop_only");
+    // These legacy transforms do not yet have a complete semantic/runtime proof.
+    // Presets must never enable them implicitly; explicit requests are rejected by
+    // CapabilityChecker until their production contracts are implemented.
+    ctx.sectionEncryption = PresetFeature(false, 50 + ctx.quickLevel * 8, "unsupported");
+    ctx.stringEncryption = PresetFeature(false, 60, "unsupported");
+    ctx.importProtection = PresetFeature(false, 50, "unsupported");
+    ctx.controlFlow = PresetFeature(false, 55, "unsupported");
+    ctx.flattening = PresetFeature(false, 55, "unsupported");
+    ctx.bogusFlow = PresetFeature(false, 50, "unsupported");
     ctx.vm = PresetFeature(ctx.quickLevel >= 4, 80 + (ctx.quickLevel >= 5 ? 10 : 0), "function_vm");
 
     if (config.vm.enabledSet) ctx.vm.enabled = config.vm.enabled;

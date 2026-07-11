@@ -356,6 +356,15 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
     }
     if (!ValidateFunctionOwnership(result)) return result;
     AssignFunctionNames(image, result.functions);
+    if (!image->is64Bit && image->loadConfig.hasSafeSEH) {
+        const std::unordered_set<uint32_t> safeHandlers(
+            image->loadConfig.safeSEHHandlerRVAs.begin(),
+            image->loadConfig.safeSEHHandlerRVAs.end());
+        for (auto& function : result.functions) {
+            function.usesSEH = safeHandlers.count(
+                static_cast<uint32_t>(function.entryAddress)) != 0;
+        }
+    }
     std::sort(result.functions.begin(), result.functions.end(), [](const auto& left, const auto& right) {
         return left.entryAddress < right.entryAddress;
     });
