@@ -549,6 +549,77 @@ std::vector<uint8_t> BuildUnwindInfoValid() {
     return {0x01, 0x00, 0x00, 0x00};
 }
 
+CipherShell::CS_PE_IMAGE* ParseSingleExceptionWithUnwind(const std::vector<uint8_t>& unwind) {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    return Parse(lay);
+}
+
+void TestExceptionPushMachFrameCodeOffsetZeroAccepted() {
+    // PUSH_MACHFRAME 是唯一允许 CodeOffset=0 的普通 UWOP；OpInfo=1 表示带 error code。
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x00, 0x01, 0x00,
+        0x00, static_cast<uint8_t>(0x10 | CipherShell::PEUtils::kUwopPushMachFrame),
+        0x00, 0x00  // CountOfCodes 为奇数时的 DWORD padding
+    });
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionPushMachFrameNonzeroOffsetRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x01, 0x01, 0x00,
+        0x01, CipherShell::PEUtils::kUwopPushMachFrame,
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionPushMachFrameBadOpInfoRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x00, 0x01, 0x00,
+        0x00, static_cast<uint8_t>(0x20 | CipherShell::PEUtils::kUwopPushMachFrame),
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionPushMachFrameMustBeLogicalLast() {
+    // 即使后续 operation 自身编码有效，MACHFRAME 后仍不得再有正常 prolog operation。
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x01, 0x02, 0x00,
+        0x00, CipherShell::PEUtils::kUwopPushMachFrame,
+        0x01, static_cast<uint8_t>(0x30 | CipherShell::PEUtils::kUwopPushNonvol)
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionOtherUwopCodeOffsetZeroRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x00, 0x01, 0x00,
+        0x00, CipherShell::PEUtils::kUwopAllocSmall,
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
 void TestExceptionValid() {
     Writer rd;
     const size_t entryRel = rd.mark();
@@ -1724,6 +1795,11 @@ int main() {
     TestTlsCallbackNotTerminated();
     TestTlsCallbackScanConfinedToOwnSection();
     TestExceptionValid();
+    TestExceptionPushMachFrameCodeOffsetZeroAccepted();
+    TestExceptionPushMachFrameNonzeroOffsetRejected();
+    TestExceptionPushMachFrameBadOpInfoRejected();
+    TestExceptionPushMachFrameMustBeLogicalLast();
+    TestExceptionOtherUwopCodeOffsetZeroRejected();
     TestExceptionBeginNotLessThanEnd();
     TestExceptionRangeNotExecutable();
     TestExceptionRangeNotFileBacked();

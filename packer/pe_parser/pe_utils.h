@@ -313,7 +313,17 @@ inline bool ValidateUnwindCodes(
 
         sawNormalCode = true;
         if (sawFirstEpilog && (epilogSlotCount & 1u) != 0) return false;
-        if (codeOffset == 0 || codeOffset > header.sizeOfProlog || codeOffset > previousCodeOffset) {
+
+        // PUSH_MACHFRAME 是唯一合法使用 CodeOffset==0 的普通 unwind operation，且必须
+        // 位于逻辑代码数组末尾。它仍参与降序状态更新；其他 UWOP 继续要求非零 offset。
+        const bool isPushMachFrame = op == kUwopPushMachFrame;
+        if (isPushMachFrame) {
+            if (codeOffset != 0 || opInfo > 1 || index + 1u != count ||
+                codeOffset > previousCodeOffset) {
+                return false;
+            }
+        } else if (codeOffset == 0 || codeOffset > header.sizeOfProlog ||
+                   codeOffset > previousCodeOffset) {
             return false;
         }
         previousCodeOffset = codeOffset;
@@ -353,7 +363,7 @@ inline bool ValidateUnwindCodes(
             consumed = 3;
             break;
         case kUwopPushMachFrame:
-            if (opInfo > 1) return false;
+            // CodeOffset、OpInfo 与逻辑末尾约束已在通用降序检查前单独验证。
             break;
         default:
             return false;

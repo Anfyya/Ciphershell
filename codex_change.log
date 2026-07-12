@@ -67,3 +67,9 @@
 原因：原实现把 Parser 的 V2 接受范围直接当成 VM 能力范围，只按 CountOfCodes 总长度检查 unwind 数组，未验证 UWOP 槽位语义、保留/冲突 Flags、同 section 完整范围，也未递归校验 chained UnwindData，可能使畸形元数据或 VM 尚不支持的 V2 epilog 语义通过安全门。
 验证：已在 D:\vscode\CipherShell\build 执行 cmake --build . --config Release --target test_pe_hardening -- /m，ciphershell_packer 与 test_pe_hardening 编译通过；已执行 git diff --check，格式检查通过；按要求未运行 test_pe_hardening.exe 或任何其他编译产物，未安装或下载依赖。
 如何部署更改：无需新增依赖；在 D:\vscode\CipherShell\build 执行 cmake --build . --config Release --target test_pe_hardening -- /m 可重新编译相关目标。测试程序需由用户自行决定是否运行。
+[2026-07-13 01:57] v2.4
+变更摘要：修正 x64 UWOP_PUSH_MACHFRAME 的 CodeOffset 规则：允许且强制 CodeOffset=0，OpInfo 仅允许 0/1，并要求该 operation 位于 unwind code 逻辑末尾；MACHFRAME 仍参与降序状态更新，其他 UWOP 继续拒绝 CodeOffset=0。新增合法 MACHFRAME、非零 offset、非法 OpInfo、后续 operation 和其他 UWOP 零 offset 回归测试。
+涉及文件：packer/pe_parser/pe_utils.h；tests/test_pe_hardening.cpp；codex_change.log。
+原因：原 ValidateUnwindCodes 在进入 UWOP 专用分支前统一拒绝 CodeOffset=0，导致合法 UWOP_PUSH_MACHFRAME 元数据被误判为畸形。
+验证：已在 D:\vscode\CipherShell\build 执行 cmake --build . --config Release --target test_pe_hardening -- /m，ciphershell_packer 与 test_pe_hardening 编译通过；已执行 git diff --check，格式检查通过；按要求未运行 test_pe_hardening.exe 或其他编译产物。
+如何部署更改：无需新增依赖；在 D:\vscode\CipherShell\build 重新构建 test_pe_hardening 目标即可。
