@@ -289,7 +289,14 @@ bool ReadSimpleUnwind(
     const uint8_t flags = versionAndFlags >> 3u;
     const uint8_t prologSize = image->rawData[offset + 1u];
     const uint8_t codeCount = image->rawData[offset + 2u];
-    if ((version != 1u && version != 2u) || flags != 0u) {
+    // CapabilityChecker 已在函数级拒绝 V2；桥接重建器仍保留同样的本地防线，避免未来
+    // 调用路径绕过 CapabilityChecker 后把 V2 epilog 元数据按 V1 原样复制。
+    if (version < PEUtils::kParserUnwindInfoMinVersion ||
+        version > PEUtils::kVmUnwindInfoMaxVersion || flags != 0u) {
+        if (version == 2u) {
+            error = "bridge source uses unsupported x64 unwind version 2 epilog semantics";
+            return false;
+        }
         error = "bridge source unwind uses handlers or chained metadata";
         return false;
     }

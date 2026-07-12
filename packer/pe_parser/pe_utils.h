@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace CipherShell {
 namespace PEUtils {
@@ -184,66 +185,255 @@ struct CS_UNWIND_INFO_HEADER {
 #pragma pack(pop)
 static_assert(sizeof(CS_UNWIND_INFO_HEADER) == 4, "UNWIND_INFO header must be 4 bytes");
 
-// x64 UNWIND_INFO 支持的 Version 范围（低 3 位字段）。标准 x64 ABI 只定义 Version 1；
-// 本项目的 CapabilityChecker::IsFunctionVmSafe 额外接受 Version 2，因此这里作为唯一的
-// 权威定义，解析器与 CapabilityChecker 都必须引用这两个常量，不得各自硬编码不同范围。
-constexpr uint8_t kUnwindInfoMinVersion = 1;
-constexpr uint8_t kUnwindInfoMaxVersion = 2;
+// Parser 能完整识别的 UNWIND_INFO 版本。VM 的能力范围不得复用这个上限：Parser 接受
+// 只表示输入格式合法，不代表 VM runtime/重建器已经能保持该版本的运行时语义。
+constexpr uint8_t kParserUnwindInfoMinVersion = 1;
+constexpr uint8_t kParserUnwindInfoMaxVersion = 2;
+constexpr uint8_t kVmUnwindInfoMaxVersion = 1;
 
-inline bool IsSupportedUnwindVersion(uint8_t version) {
-    return version >= kUnwindInfoMinVersion && version <= kUnwindInfoMaxVersion;
+inline bool IsParserSupportedUnwindVersion(uint8_t version) {
+    return version >= kParserUnwindInfoMinVersion && version <= kParserUnwindInfoMaxVersion;
 }
 
 // UNWIND_INFO.Flags 位定义（Flags 字段的低 3 位为已定义标志，高 2 位保留）。
 constexpr uint8_t kUnwindFlagEHandler = 0x1;   // 有语言相关异常处理函数
 constexpr uint8_t kUnwindFlagUHandler = 0x2;   // 有终止处理函数
 constexpr uint8_t kUnwindFlagChainInfo = 0x4;  // 本记录是链式 UNWIND_INFO 的延续
+constexpr uint8_t kUnwindKnownFlags =
+    kUnwindFlagEHandler | kUnwindFlagUHandler | kUnwindFlagChainInfo;
 
-// x64 UNWIND_INFO 完整结构校验：
-//   1. 4 字节固定头部可读，Version 落在 [kUnwindInfoMinVersion, kUnwindInfoMaxVersion]。
-//   2. CountOfCodes 个 UNWIND_CODE（每个 2 字节）数组完整落在文件范围内；规范要求
-//      奇数个时补齐 1 个 slot 到偶数以保持后续数据 DWORD 对齐，这里同样按偶数计入。
-//   3. 按 Flags 校验紧随其后的尾部结构（互斥）：
-//        - UNW_FLAG_CHAININFO：尾部是一个链接的 IMAGE_RUNTIME_FUNCTION_ENTRY（12 字节），
-//          要求完整可读且 BeginAddress < EndAddress；不递归校验其自身 UnwindData，
-//          避免恶意构造的链条造成无界递归。
-//        - UNW_FLAG_EHANDLER / UNW_FLAG_UHANDLER：尾部是 4 字节异常处理函数 RVA，
-//          要求可读且落在可执行且 file-backed 的 section 内。
-//        - 均未设置：无需尾部结构。
-//   全部范围计算使用 64 位中间值，避免 32 位加法回绕。
-inline bool IsValidUnwindInfo(const CS_PE_IMAGE* image, uint32_t unwindRVA) {
+// AMD64 V1/V2 UNWIND_CODE 操作码。
+constexpr uint8_t kUwopPushNonvol = 0;
+constexpr uint8_t kUwopAllocLarge = 1;
+constexpr uint8_t kUwopAllocSmall = 2;
+constexpr uint8_t kUwopSetFpReg = 3;
+constexpr uint8_t kUwopSaveNonvol = 4;
+constexpr uint8_t kUwopSaveNonvolFar = 5;
+constexpr uint8_t kUwopEpilog = 6;       // 仅 V2
+constexpr uint8_t kUwopSpareCode = 7;    // 保留，必须拒绝
+constexpr uint8_t kUwopSaveXmm128 = 8;
+constexpr uint8_t kUwopSaveXmm128Far = 9;
+constexpr uint8_t kUwopPushMachFrame = 10;
+constexpr uint32_t kMaxUnwindChainDepth = 32;
+
+inline bool IsNonvolatileGpr(uint8_t reg) {
+    return reg == 3 || reg == 5 || reg == 6 || reg == 7 || reg >= 12;
+}
+
+inline bool IsNonvolatileXmm(uint8_t reg) {
+    return reg >= 6 && reg <= 15;
+}
+
+inline bool ReadUnwindInfoVersion(
+    const CS_PE_IMAGE* image, uint32_t unwindRVA, uint8_t& version, uint8_t& flags) {
     const uint32_t offset = RvaToOffset(image, unwindRVA);
     if (offset == 0 || !CheckRawBounds(image, offset, sizeof(CS_UNWIND_INFO_HEADER))) return false;
+    version = image->rawData[offset] & 0x07u;
+    flags = static_cast<uint8_t>(image->rawData[offset] >> 3);
+    return true;
+}
 
-    CS_UNWIND_INFO_HEADER header;
+namespace detail {
+
+inline bool ValidateRuntimeFunctionInternal(
+    const CS_PE_IMAGE* image,
+    const CS_RUNTIME_FUNCTION& runtimeFunction,
+    std::vector<uint32_t>& visited,
+    uint32_t depth);
+
+inline bool ValidateUnwindCodes(
+    const CS_PE_IMAGE* image,
+    const CS_RUNTIME_FUNCTION& runtimeFunction,
+    uint32_t unwindOffset,
+    const CS_UNWIND_INFO_HEADER& header,
+    uint8_t version) {
+    const uint32_t count = header.countOfCodes;
+    const uint8_t frameRegister = header.frameRegisterAndOffset & 0x0Fu;
+    const uint8_t frameOffset = header.frameRegisterAndOffset >> 4;
+    if ((frameRegister == 0 && frameOffset != 0) ||
+        (frameRegister != 0 && !IsNonvolatileGpr(frameRegister))) {
+        return false;
+    }
+    if (header.sizeOfProlog > runtimeFunction.endAddress - runtimeFunction.beginAddress) return false;
+
+    uint32_t index = 0;
+    bool sawNormalCode = false;
+    bool sawFirstEpilog = false;
+    bool sawExplicitEpilog = false;
+    bool sawEpilogPadding = false;
+    bool epilogAtEnd = false;
+    uint32_t epilogSlotCount = 0;
+    uint32_t epilogSize = 0;
+    uint32_t previousEpilogOffset = 0;
+    uint8_t previousCodeOffset = 0xFF;
+    bool sawSetFpReg = false;
+
+    while (index < count) {
+        const uint32_t slotOffset = unwindOffset + sizeof(CS_UNWIND_INFO_HEADER) + index * 2u;
+        const uint8_t codeOffset = image->rawData[slotOffset];
+        const uint8_t opAndInfo = image->rawData[slotOffset + 1u];
+        const uint8_t op = opAndInfo & 0x0Fu;
+        const uint8_t opInfo = opAndInfo >> 4;
+
+        if (op == kUwopEpilog) {
+            if (version != 2 || sawNormalCode) return false;
+            ++epilogSlotCount;
+            if (!sawFirstEpilog) {
+                // 第一条 EPILOG 槽存放统一 epilog 长度；OpInfo 仅 bit0 表示函数尾部
+                // 存在隐式 epilog，其余位保留。
+                if (codeOffset == 0 || (opInfo & ~0x01u) != 0) return false;
+                sawFirstEpilog = true;
+                epilogAtEnd = (opInfo & 0x01u) != 0;
+                epilogSize = codeOffset;
+                if (epilogSize > runtimeFunction.endAddress - runtimeFunction.beginAddress) return false;
+            } else {
+                const uint32_t epilogOffset =
+                    static_cast<uint32_t>(codeOffset) | (static_cast<uint32_t>(opInfo) << 8);
+                if (epilogOffset == 0) {
+                    // V2 用全零 EPILOG 槽把 epilog 描述符数量补成偶数。它必须是
+                    // epilog 前缀的最后一槽；其后仍可跟普通 prolog unwind codes。
+                    if (sawEpilogPadding) return false;
+                    sawEpilogPadding = true;
+                } else {
+                    if (sawEpilogPadding) return false;
+                    const uint32_t functionSize =
+                        runtimeFunction.endAddress - runtimeFunction.beginAddress;
+                    if ((sawExplicitEpilog && epilogOffset <= previousEpilogOffset) ||
+                        epilogOffset >= functionSize || epilogSize > functionSize - epilogOffset) {
+                        return false;
+                    }
+                    if (epilogAtEnd && epilogOffset >= functionSize - epilogSize) return false;
+                    previousEpilogOffset = epilogOffset;
+                    sawExplicitEpilog = true;
+                }
+            }
+            ++index;
+            continue;
+        }
+
+        sawNormalCode = true;
+        if (sawFirstEpilog && (epilogSlotCount & 1u) != 0) return false;
+        if (codeOffset == 0 || codeOffset > header.sizeOfProlog || codeOffset > previousCodeOffset) {
+            return false;
+        }
+        previousCodeOffset = codeOffset;
+
+        uint32_t consumed = 1;
+        switch (op) {
+        case kUwopPushNonvol:
+            if (!IsNonvolatileGpr(opInfo)) return false;
+            break;
+        case kUwopAllocLarge:
+            if (opInfo == 0) consumed = 2;
+            else if (opInfo == 1) consumed = 3;
+            else return false;
+            break;
+        case kUwopAllocSmall:
+            break;
+        case kUwopSetFpReg:
+            if (opInfo != 0 || frameRegister == 0 || sawSetFpReg) return false;
+            sawSetFpReg = true;
+            break;
+        case kUwopSaveNonvol:
+            if (!IsNonvolatileGpr(opInfo)) return false;
+            consumed = 2;
+            break;
+        case kUwopSaveNonvolFar:
+            if (!IsNonvolatileGpr(opInfo)) return false;
+            consumed = 3;
+            break;
+        case kUwopSpareCode:
+            return false;
+        case kUwopSaveXmm128:
+            if (!IsNonvolatileXmm(opInfo)) return false;
+            consumed = 2;
+            break;
+        case kUwopSaveXmm128Far:
+            if (!IsNonvolatileXmm(opInfo)) return false;
+            consumed = 3;
+            break;
+        case kUwopPushMachFrame:
+            if (opInfo > 1) return false;
+            break;
+        default:
+            return false;
+        }
+        if (consumed > count - index) return false;
+        index += consumed;
+    }
+
+    if (sawFirstEpilog && ((epilogSlotCount & 1u) != 0 ||
+        (!epilogAtEnd && !sawExplicitEpilog))) return false;
+    return frameRegister == 0 || sawSetFpReg;
+}
+
+inline bool ValidateRuntimeFunctionInternal(
+    const CS_PE_IMAGE* image,
+    const CS_RUNTIME_FUNCTION& runtimeFunction,
+    std::vector<uint32_t>& visited,
+    uint32_t depth) {
+    if (!image || runtimeFunction.beginAddress >= runtimeFunction.endAddress ||
+        runtimeFunction.unwindData == 0 || depth >= kMaxUnwindChainDepth ||
+        !IsExecutableFileBackedRange(image, runtimeFunction.beginAddress, runtimeFunction.endAddress) ||
+        std::find(visited.begin(), visited.end(), runtimeFunction.unwindData) != visited.end()) {
+        return false;
+    }
+    visited.push_back(runtimeFunction.unwindData);
+
+    const uint32_t offset = RvaToOffset(image, runtimeFunction.unwindData);
+    if (offset == 0 || !CheckRawBounds(image, offset, sizeof(CS_UNWIND_INFO_HEADER))) return false;
+
+    CS_UNWIND_INFO_HEADER header{};
     std::memcpy(&header, image->rawData + offset, sizeof(header));
     const uint8_t version = header.versionAndFlags & 0x07u;
     const uint8_t flags = static_cast<uint8_t>(header.versionAndFlags >> 3);
-    if (!IsSupportedUnwindVersion(version)) return false;
-
-    // UnwindCode 数组：CountOfCodes 个 2 字节 slot，奇数时向上补齐到偶数。
-    const uint32_t codeSlots = (static_cast<uint32_t>(header.countOfCodes) + 1u) & ~1u;
-    const uint64_t codesBytes64 = static_cast<uint64_t>(codeSlots) * 2u;
-    const uint64_t afterCodesOffset64 =
-        static_cast<uint64_t>(offset) + sizeof(CS_UNWIND_INFO_HEADER) + codesBytes64;
-    if (afterCodesOffset64 > image->rawSize) return false;
-    const uint32_t afterCodesOffset = static_cast<uint32_t>(afterCodesOffset64);
-
-    if (flags & kUnwindFlagChainInfo) {
-        constexpr uint32_t kChainedEntrySize = 12;  // BeginAddress+EndAddress+UnwindData
-        if (!CheckRawBounds(image, afterCodesOffset, kChainedEntrySize)) return false;
-        DWORD chainedBegin = 0, chainedEnd = 0;
-        std::memcpy(&chainedBegin, image->rawData + afterCodesOffset, sizeof(DWORD));
-        std::memcpy(&chainedEnd, image->rawData + afterCodesOffset + sizeof(DWORD), sizeof(DWORD));
-        if (chainedBegin >= chainedEnd) return false;
-    } else if (flags & (kUnwindFlagEHandler | kUnwindFlagUHandler)) {
-        if (!CheckRawBounds(image, afterCodesOffset, sizeof(DWORD))) return false;
-        DWORD handlerRVA = 0;
-        std::memcpy(&handlerRVA, image->rawData + afterCodesOffset, sizeof(DWORD));
-        if (handlerRVA == 0 || !IsExecutableFileBackedAddress(image, handlerRVA)) return false;
+    if (!IsParserSupportedUnwindVersion(version) || (flags & ~kUnwindKnownFlags) != 0 ||
+        ((flags & kUnwindFlagChainInfo) != 0 &&
+         (flags & (kUnwindFlagEHandler | kUnwindFlagUHandler)) != 0)) {
+        return false;
     }
 
+    const uint32_t paddedCodeSlots = (static_cast<uint32_t>(header.countOfCodes) + 1u) & ~1u;
+    const uint64_t baseSize64 = sizeof(CS_UNWIND_INFO_HEADER) +
+        static_cast<uint64_t>(paddedCodeSlots) * 2u;
+    const uint32_t tailSize = (flags & kUnwindFlagChainInfo) != 0
+        ? static_cast<uint32_t>(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY))
+        : ((flags & (kUnwindFlagEHandler | kUnwindFlagUHandler)) != 0
+            ? static_cast<uint32_t>(sizeof(DWORD)) : 0u);
+    const uint64_t totalSize64 = baseSize64 + tailSize;
+    if (totalSize64 > std::numeric_limits<uint32_t>::max() ||
+        !IsFileBackedSpan(image, runtimeFunction.unwindData, static_cast<uint32_t>(totalSize64))) {
+        return false;
+    }
+    if (!ValidateUnwindCodes(image, runtimeFunction, offset, header, version)) return false;
+
+    const uint32_t tailOffset = offset + static_cast<uint32_t>(baseSize64);
+    if ((flags & kUnwindFlagChainInfo) != 0) {
+        IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
+        std::memcpy(&chained, image->rawData + tailOffset, sizeof(chained));
+        CS_RUNTIME_FUNCTION chainedEntry{};
+        chainedEntry.beginAddress = chained.BeginAddress;
+        chainedEntry.endAddress = chained.EndAddress;
+        chainedEntry.unwindData = chained.UnwindData;
+        return ValidateRuntimeFunctionInternal(image, chainedEntry, visited, depth + 1u);
+    }
+    if ((flags & (kUnwindFlagEHandler | kUnwindFlagUHandler)) != 0) {
+        DWORD handlerRVA = 0;
+        std::memcpy(&handlerRVA, image->rawData + tailOffset, sizeof(handlerRVA));
+        if (handlerRVA == 0 || !IsExecutableFileBackedAddress(image, handlerRVA)) return false;
+    }
     return true;
+}
+
+} // namespace detail
+
+// 从根 RUNTIME_FUNCTION 开始完整验证 UNWIND_INFO。链式记录递归验证其代码范围、
+// UnwindData 和下一层元数据；visited 拒绝循环，固定深度上限拒绝恶意超长链。
+inline bool IsValidRuntimeFunction(
+    const CS_PE_IMAGE* image, const CS_RUNTIME_FUNCTION& runtimeFunction) {
+    std::vector<uint32_t> visited;
+    visited.reserve(kMaxUnwindChainDepth);
+    return detail::ValidateRuntimeFunctionInternal(image, runtimeFunction, visited, 0);
 }
 
 // 失败（结果无法用 uint32_t 表示）时返回 0，与本文件其余函数“0 表示无效”的约定一致。

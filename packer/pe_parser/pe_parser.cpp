@@ -901,12 +901,7 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
 
         // BeginAddress < EndAddress；UnwindData 非零，且必须是一个完整合法的 UNWIND_INFO
         // （版本受支持、UnwindCode 数组落在文件范围内、按 Flags 校验 handler/链式尾部）。
-        if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            !PEUtils::IsValidUnwindInfo(image, entry.unwindData)) {
-            return false;
-        }
-        // 代码范围必须位于可执行且 file-backed section。
-        if (!PEUtils::IsExecutableFileBackedRange(image, entry.beginAddress, entry.endAddress)) {
+        if (!PEUtils::IsValidRuntimeFunction(image, entry)) {
             return false;
         }
         // 表必须按 BeginAddress 有序且不重叠（允许相邻 entry 的 end == 下一个 begin）。

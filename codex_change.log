@@ -61,3 +61,9 @@
 原因：handler 映射使用 0xFF 作为无效值时不能同时允许真实 handler 占用 slot 255，否则该 handler 会被误判为无效；非 .pdata 函数在 CFG 范围内存在未解码间隙时不能安全覆盖原 native body；乱码会降低诊断与维护可靠性；迁移 workflow 不属于正式产品源码。
 验证：在全新 build_final_verify2 目录完成 CMake 配置与全量 Release 编译，Zydis、Zycore、ciphershell_packer 与 ciphershell 均构建通过；vm_runtime_core.c 与 vm_crypto.c 使用 -Wall -Wextra -Werror 独立语法检查通过；git diff --check 通过；生产 VM 路径精确搜索未发现 rand/srand/mt19937/xorshift、runtime_handler_mutation_not_linked、GenerateOpcodeMap、DecodeModRMInstr 或 DecodedModRM；源代码 PUA/替换字符扫描为 0。未运行 ciphershell、runtime blob、样本、加壳产物或任何测试 EXE。Linux 环境未安装 NASM，因此汇编 runtime 仍需用户在 VS2022/NASM 环境执行最终平台编译确认。
 如何部署更改：git clone --recursive 后使用 CMake VS2022 generator 配置并构建；Zydis 由 third_party/zydis 固定 submodule 提供。
+[2026-07-13 01:03] v2.3
+变更摘要：分离 x64 UNWIND_INFO 的 Parser 能力与 VM 安全能力：Parser 完整校验并接受 V1/V2，CapabilityChecker 对 V2 函数级 fail-closed，VM bridge 同步保留本地 V2 拒绝防线；完整拒绝保留 Flags 及 CHAININFO 与 EHANDLER/UHANDLER 冲突；逐项验证 V1/V2 UWOP、额外槽位、V2 EPILOG 长度/offset/padding；要求 UNWIND_INFO 头、代码数组和固定尾部整体位于同一 file-backed section；链式 RUNTIME_FUNCTION 递归验证代码范围与 UnwindData，使用 visited 和 32 层上限拒绝循环/超长链；同步补充相关回归测试并删除 chained UnwindData=0 合法假设。
+涉及文件：packer/analysis/capability_checker.cpp；packer/pe_parser/pe_utils.h；packer/pe_parser/pe_parser.cpp；packer/pe_parser/pe_emitter.cpp；packer/transforms/vm_instruction_bridge_builder.cpp；tests/test_pe_hardening.cpp；codex_change.log。
+原因：原实现把 Parser 的 V2 接受范围直接当成 VM 能力范围，只按 CountOfCodes 总长度检查 unwind 数组，未验证 UWOP 槽位语义、保留/冲突 Flags、同 section 完整范围，也未递归校验 chained UnwindData，可能使畸形元数据或 VM 尚不支持的 V2 epilog 语义通过安全门。
+验证：已在 D:\vscode\CipherShell\build 执行 cmake --build . --config Release --target test_pe_hardening -- /m，ciphershell_packer 与 test_pe_hardening 编译通过；已执行 git diff --check，格式检查通过；按要求未运行 test_pe_hardening.exe 或任何其他编译产物，未安装或下载依赖。
+如何部署更改：无需新增依赖；在 D:\vscode\CipherShell\build 执行 cmake --build . --config Release --target test_pe_hardening -- /m 可重新编译相关目标。测试程序需由用户自行决定是否运行。

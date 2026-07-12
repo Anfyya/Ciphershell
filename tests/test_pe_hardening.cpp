@@ -11,9 +11,9 @@
 //     读到下一个 section 或 overlay）
 //   - x64 Exception Directory：Begin<End、代码区间必须整体可执行且 file-backed
 //     （含仅虚存尾部拒绝）、条目不重叠；UnwindData 必须是完整合法的 UNWIND_INFO——
-//     Version 与 CapabilityChecker 共用同一份受支持范围 [1,2]、CountOfCodes 对应的
-//     UnwindCode 数组必须落在文件范围内、按 Flags 校验 handler RVA 或链式
-//     RUNTIME_FUNCTION 尾部结构
+//     Parser 完整接受 V1/V2、CapabilityChecker 对 V2 函数级 fail-closed；逐项校验
+//     UWOP 与额外槽位、保留/冲突 Flags、V2 EPILOG 描述符；头/代码/尾部必须整体
+//     位于同一 file-backed section；链式 RUNTIME_FUNCTION 递归校验并拒绝循环
 //   - Delay Import：INT / IAT / ModuleHandle / Bound / Unload 表分别独立测试合法与
 //     非法两种情形，及无终止项 / Size 非 32 倍数 / VA-based 负面场景
 //   - Resource（循环 / 名称截断 / data 越界）
@@ -32,6 +32,7 @@
 #include "../packer/pe_parser/pe_parser.h"
 #include "../packer/pe_parser/pe_emitter.h"
 #include "../packer/pe_parser/pe_utils.h"
+#include "../packer/analysis/capability_checker.h"
 
 #include <cstring>
 #include <cstdint>
@@ -727,7 +728,7 @@ void TestExceptionUnwindBadVersion() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(0x03);  // Version=3：超出解析器与 CapabilityChecker 共同支持的 [1,2]
+    rd.buf.push_back(0x03);  // Version=3：超出 Parser 支持的 [1,2]
     rd.buf.push_back(0x00);
     rd.buf.push_back(0x00);
     rd.buf.push_back(0x00);
@@ -750,17 +751,21 @@ void TestExceptionUnwindBadVersion() {
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
-void TestExceptionUnwindVersion2Accepted() {
-    // Version=2 是解析器与 CapabilityChecker::IsFunctionVmSafe 共同支持的版本
-    // （PEUtils::kUnwindInfoMaxVersion），必须被接受而不是拒绝。
+void TestExceptionUnwindVersion2ParsedButVmRejected() {
+    // Parser 能完整解析合法 V2；VM runtime/重建器尚未证明 V2 epilog unwind 语义，
+    // CapabilityChecker 必须在函数级 fail-closed。
     Writer rd;
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
     rd.buf.push_back(0x02);  // Version=2, Flags=0
     rd.buf.push_back(0x00);
+    rd.buf.push_back(0x02);  // 长度槽 + V2 要求的偶数 epilog padding 槽
     rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);
+    rd.buf.push_back(0x02);  // epilog 长度=2
+    rd.buf.push_back(static_cast<uint8_t>(0x10 | CipherShell::PEUtils::kUwopEpilog));
+    rd.buf.push_back(0x00);  // padding EPILOG offset=0
+    rd.buf.push_back(CipherShell::PEUtils::kUwopEpilog);
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
     entry.BeginAddress = kExcTextVA;
@@ -776,6 +781,125 @@ void TestExceptionUnwindVersion2Accepted() {
     auto* img = Parse(lay);
     CS_TEST_CHECK(img && img->isValid);
     CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+
+    CipherShell::Function function{};
+    function.entryAddress = kExcTextVA;
+    function.size = 8;
+    function.boundaryTrusted = true;
+    function.decodedBytes = 8;
+    function.blocks.emplace_back();
+    std::string reason;
+    CipherShell::CapabilityChecker checker;
+    CS_TEST_CHECK(!checker.IsFunctionVmSafe(img, function, reason));
+    CS_TEST_CHECK(reason.find("version 2") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindReservedFlagsRejected() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x08 << 3)));  // Flags bit3 保留
+    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindConflictingFlagsRejected() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x05 << 3)));  // CHAININFO|EHANDLER
+    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindVersion2MalformedEpilogRejected() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.buf.push_back(0x02);  // Version=2, Flags=0
+    rd.buf.push_back(0x00);
+    rd.buf.push_back(0x01);  // 只有第一条 EPILOG 长度槽
+    rd.buf.push_back(0x00);
+    rd.buf.push_back(0x04);  // epilog 长度
+    rd.buf.push_back(CipherShell::PEUtils::kUwopEpilog);  // atEnd=0，却没有显式 epilog offset
+    rd.u16(0);  // DWORD 对齐 padding，不属于 CountOfCodes
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindCrossSectionRejected() {
+    // UNWIND_INFO 头位于 .text 最后 4 字节，EHANDLER 尾部物理上紧邻在 .rdata，且
+    // handler 值本可指向合法 .text；整体跨 section，必须在读取尾部语义前拒绝。
+    std::vector<uint8_t> text(kFileAlign, 0xCC);
+    text[kFileAlign - 4] = static_cast<uint8_t>(0x01 | (0x01 << 3));
+    text[kFileAlign - 3] = 0;
+    text[kFileAlign - 2] = 0;
+    text[kFileAlign - 1] = 0;
+
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcTextVA + kFileAlign - 4;
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    auto lay = BuildPe(true, text, rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(lay.bytes.data() + sizeof(IMAGE_DOS_HEADER));
+    auto* sections = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        lay.bytes.data() + sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64));
+    nt->OptionalHeader.SectionAlignment = kFileAlign;
+    nt->OptionalHeader.SizeOfImage = kExcTextVA + 2 * kFileAlign;
+    sections[1].VirtualAddress = kExcTextVA + kFileAlign;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress =
+        sections[1].VirtualAddress + static_cast<uint32_t>(entryRel);
+
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -882,11 +1006,17 @@ void TestExceptionUnwindChainedValid() {
     rd.buf.push_back(0x00);
     rd.buf.push_back(0x00);  // CountOfCodes=0
     rd.buf.push_back(0x00);
+    const size_t chainedRel = rd.mark();
     IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
     chained.BeginAddress = kExcTextVA;
     chained.EndAddress = kExcTextVA + 4;
-    chained.UnwindData = 0;  // 不递归校验，值本身无所谓
+    chained.UnwindData = 0;  // inner unwind 写入后回填
     rd.put(&chained, sizeof(chained));
+    const size_t innerUnwindRel = rd.mark();
+    auto innerUnwind = BuildUnwindInfoValid();
+    rd.put(innerUnwind.data(), innerUnwind.size());
+    chained.UnwindData = kExcRdataVA + static_cast<uint32_t>(innerUnwindRel);
+    std::memcpy(rd.buf.data() + chainedRel, &chained, sizeof(chained));
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
     entry.BeginAddress = kExcTextVA;
@@ -905,8 +1035,8 @@ void TestExceptionUnwindChainedValid() {
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
-void TestExceptionUnwindChainedInvalid() {
-    // Flags=UNW_FLAG_CHAININFO，链式 entry 的 BeginAddress >= EndAddress（畸形）→ 拒绝。
+void TestExceptionUnwindChainedZeroUnwindRejected() {
+    // chained UnwindData=0 不再视为合法：即使 Begin<End，也必须 fail-closed。
     Writer rd;
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
@@ -916,8 +1046,8 @@ void TestExceptionUnwindChainedInvalid() {
     rd.buf.push_back(0x00);  // CountOfCodes=0
     rd.buf.push_back(0x00);
     IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
-    chained.BeginAddress = kExcTextVA + 8;
-    chained.EndAddress = kExcTextVA;  // Begin >= End：畸形链式尾部
+    chained.BeginAddress = kExcTextVA;
+    chained.EndAddress = kExcTextVA + 4;
     chained.UnwindData = 0;
     rd.put(&chained, sizeof(chained));
 
@@ -936,6 +1066,33 @@ void TestExceptionUnwindChainedInvalid() {
     CS_TEST_CHECK(!img->isValid);
     CS_TEST_CHECK(img->exceptions.entries.empty());
     CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindChainedCycleRejected() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x4 << 3)));
+    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+    IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
+    chained.BeginAddress = kExcTextVA;
+    chained.EndAddress = kExcTextVA + 4;
+    chained.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);  // 自环
+    rd.put(&chained, sizeof(chained));
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -1573,12 +1730,17 @@ int main() {
     TestExceptionOverlappingRanges();
     TestExceptionUnwindHeaderTooShort();
     TestExceptionUnwindBadVersion();
-    TestExceptionUnwindVersion2Accepted();
+    TestExceptionUnwindVersion2ParsedButVmRejected();
+    TestExceptionUnwindReservedFlagsRejected();
+    TestExceptionUnwindConflictingFlagsRejected();
+    TestExceptionUnwindVersion2MalformedEpilogRejected();
+    TestExceptionUnwindCrossSectionRejected();
     TestExceptionUnwindCodeArrayTruncated();
     TestExceptionUnwindHandlerValid();
     TestExceptionUnwindHandlerInvalid();
     TestExceptionUnwindChainedValid();
-    TestExceptionUnwindChainedInvalid();
+    TestExceptionUnwindChainedZeroUnwindRejected();
+    TestExceptionUnwindChainedCycleRejected();
     TestDelayImportValid();
     TestDelayImportNoTerminator();
     TestDelayImportSizeNotMultiple();

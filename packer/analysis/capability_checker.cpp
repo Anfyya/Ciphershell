@@ -139,17 +139,23 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
                 reason = "function boundary does not match its x64 runtime-function entry";
                 return false;
             }
-            const uint32_t unwindOffset = PEUtils::RvaToOffset(image, entry.unwindData);
-            if (unwindOffset == 0 || unwindOffset >= image->rawSize) {
-                reason = "x64 unwind info is outside the PE image";
+            if (!PEUtils::IsValidRuntimeFunction(image, entry)) {
+                reason = "x64 runtime-function or unwind metadata is malformed";
                 return false;
             }
-            const uint8_t versionAndFlags = image->rawData[unwindOffset];
-            const uint8_t version = versionAndFlags & 0x07u;
-            const uint8_t flags = versionAndFlags >> 3;
-            // Version 范围与解析器共用同一份定义（PEUtils::kUnwindInfoMinVersion/MaxVersion），
-            // 不在此处另行硬编码，避免两处判定范围出现分歧。
-            if (!PEUtils::IsSupportedUnwindVersion(version) || (flags & 0x07u) != 0) {
+            uint8_t version = 0;
+            uint8_t flags = 0;
+            if (!PEUtils::ReadUnwindInfoVersion(image, entry.unwindData, version, flags)) {
+                reason = "x64 unwind header is outside the PE image";
+                return false;
+            }
+            // Parser 可完整解析 V1/V2；VM runtime 与重建器当前仅证明了 V1 语义。
+            // 因而 V2 必须在函数级 fail-closed，不能把“可解析”误当成“可 VM 化”。
+            if (version > PEUtils::kVmUnwindInfoMaxVersion) {
+                reason = "x64 unwind version 2 epilog semantics are not supported by the VM runtime";
+                return false;
+            }
+            if (flags != 0) {
                 reason = "x64 function uses exception handlers or chained unwind metadata";
                 return false;
             }
