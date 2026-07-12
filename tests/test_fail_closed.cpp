@@ -1,6 +1,6 @@
 // CipherShell fail-closed 基线测试
 //
-// 这些测试只要求编译通过；运行由使用者在隔离环境中完成。
+// 本文件通过 ctest 实际运行（见 tests/CMakeLists.txt 的 fail_closed_baseline）。
 // 覆盖：
 //   A. 默认配置不启用危险模块；显式开启 flattening/bogus/import/section/string 被
 //      CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；controlFlow 主/子开关一致性。

@@ -99,6 +99,37 @@ inline uint32_t RvaToOffset(const CS_PE_IMAGE* image, uint32_t rva) {
     return 0;
 }
 
+// 单点校验：rva 必须落在某个可执行且 file-backed 的 section 内（能映射到文件字节）。
+// 供 SafeSEH handler、TLS callback 等“单地址”场景复用。
+inline bool IsExecutableFileBackedAddress(const CS_PE_IMAGE* image, uint32_t rva) {
+    if (!image || !image->sections) return false;
+    for (WORD i = 0; i < image->numSections; ++i) {
+        const IMAGE_SECTION_HEADER& s = image->sections[i];
+        const uint32_t span = SectionMappedSpan(s);
+        if (span == 0 || rva < s.VirtualAddress || rva - s.VirtualAddress >= span) continue;
+        if ((s.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) return false;
+        return RvaToOffset(image, rva) != 0;
+    }
+    return false;
+}
+
+// 范围校验：[begin, end) 必须整体落在某个可执行且 file-backed 的 section 内，
+// 供异常表 BeginAddress/EndAddress 等“地址区间”场景复用。
+inline bool IsExecutableFileBackedRange(const CS_PE_IMAGE* image, uint32_t begin, uint32_t end) {
+    if (!image || !image->sections || begin >= end) return false;
+    for (WORD i = 0; i < image->numSections; ++i) {
+        const IMAGE_SECTION_HEADER& s = image->sections[i];
+        const uint32_t span = SectionMappedSpan(s);
+        if (span == 0) continue;
+        if (begin < s.VirtualAddress || end > s.VirtualAddress + span) continue;
+        const uint32_t endDelta = end - s.VirtualAddress;
+        if (endDelta > s.SizeOfRawData) return false;  // 越过 raw 边界 → 仅虚存，不可执行验证
+        if ((s.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) return false;
+        return RvaToOffset(image, begin) != 0 && RvaToOffset(image, end - 1) != 0;
+    }
+    return false;
+}
+
 inline uint32_t RecomputeSizeOfImage(const CS_PE_IMAGE* image) {
     if (!image || !image->sections) return 0;
     const uint32_t align = SectionAlignment(image);

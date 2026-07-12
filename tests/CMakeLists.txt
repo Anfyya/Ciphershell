@@ -87,3 +87,5 @@ target_include_directories(test_pe_hardening PRIVATE ${CMAKE_SOURCE_DIR})
 
 add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
+add_test(NAME fail_closed_baseline COMMAND test_fail_closed)
+add_test(NAME pe_hardening_regression COMMAND test_pe_hardening)

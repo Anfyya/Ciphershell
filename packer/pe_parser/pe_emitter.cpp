@@ -203,6 +203,14 @@ PEAppendSectionResult PEEmitter::AppendSection(
         return result;
     }
 
+    // 统一偏移映射必须先在旧 buffer 状态下验证成功，任何一项映射溢出都必须在
+    // 分配/提交新 buffer 之前中止，否则会在提交后才发现失败,留下半成品 image。
+    RemapPlan remapPlan;
+    if (!BuildRemapPlan(firstRaw, lastFileEnd, headerDelta, overlayDestBase, remapPlan)) {
+        result.error = "file offset remap would overflow";
+        return result;
+    }
+
     // 至此所有计算与验证完成。分配唯一的新 buffer；失败时 image 完全不变。
     BYTE* newData = new(std::nothrow) BYTE[newRawSize];
     if (!newData) {
@@ -231,10 +239,10 @@ PEAppendSectionResult PEEmitter::AppendSection(
     m_image->rawSize = newRawSize;
     RefreshPointers(ntOffset);
 
-    // 用统一偏移映射重写所有文件偏移型引用（section/overlay/security/debug）。
+    // 用预先算好且已验证成功的映射写入所有文件偏移型引用（section/overlay/security/debug）。
     // 必须在写入新 section header 之前调用：此时 numSections 仍是旧值，
     // 新槽尚未写入，不会被映射误伤。
-    RemapFileOffsetReferences(firstRaw, lastFileEnd, headerDelta, overlayDestBase);
+    ApplyRemapPlan(remapPlan);
 
     // 写入新 section header。
     PIMAGE_SECTION_HEADER newSection = &m_image->sections[m_image->numSections];
@@ -264,13 +272,13 @@ PEAppendSectionResult PEEmitter::AppendSection(
     return result;
 }
 
-void PEEmitter::RemapFileOffsetReferences(uint32_t firstRaw, uint32_t lastFileEnd,
-                                          uint32_t headerDelta, uint32_t overlayDestBase) {
+bool PEEmitter::BuildRemapPlan(uint32_t firstRaw, uint32_t lastFileEnd, uint32_t headerDelta,
+                               uint32_t overlayDestBase, RemapPlan& plan) const {
     // 统一偏移映射（两种区域不同 delta）：
     //   off < firstRaw            → off
     //   firstRaw <= off < lastFileEnd → off + headerDelta
     //   off >= lastFileEnd        → overlayDestBase + (off - lastFileEnd)
-    // 返回 false 表示映射后越界（畸形输入），调用方已保证不会进入。
+    // 任何一项映射加法溢出都视为整体失败，调用方必须在提交新 buffer 之前中止。
     auto mapOffset = [&](uint32_t off, uint32_t& mapped) -> bool {
         if (off == 0) { mapped = 0; return true; }
         if (off < firstRaw) { mapped = off; return true; }
@@ -282,58 +290,72 @@ void PEEmitter::RemapFileOffsetReferences(uint32_t firstRaw, uint32_t lastFileEn
         return CheckedAdd(overlayDestBase, tail, mapped);
     };
 
-    // 1. section.PointerToRawData（BSS 的 0 保持 0）。
+    // 1. section.PointerToRawData（BSS 的 0 保持 0）。此时仍是旧 buffer/旧 sections。
+    plan.sectionRaw.resize(m_image->numSections);
     for (WORD i = 0; i < m_image->numSections; i++) {
-        uint32_t mapped = 0;
-        if (mapOffset(m_image->sections[i].PointerToRawData, mapped)) {
-            m_image->sections[i].PointerToRawData = mapped;
-        }
+        if (!mapOffset(m_image->sections[i].PointerToRawData, plan.sectionRaw[i])) return false;
     }
 
     // 2. overlayOffset。
     if (m_image->hasOverlay) {
-        uint32_t mapped = 0;
-        if (mapOffset(m_image->overlayOffset, mapped)) {
-            m_image->overlayOffset = mapped;
-        }
+        plan.hasOverlay = true;
+        if (!mapOffset(m_image->overlayOffset, plan.overlayOffset)) return false;
     }
 
     // 3. Security Directory.VirtualAddress 是文件偏移（绝不做 RVA 转换）。
-    if (m_image->is64Bit) {
-        IMAGE_DATA_DIRECTORY& secDir =
-            m_image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-        uint32_t mapped = 0;
-        if (secDir.VirtualAddress != 0 && mapOffset(secDir.VirtualAddress, mapped)) {
-            secDir.VirtualAddress = mapped;
-        }
-    } else {
-        IMAGE_DATA_DIRECTORY& secDir =
-            m_image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-        uint32_t mapped = 0;
-        if (secDir.VirtualAddress != 0 && mapOffset(secDir.VirtualAddress, mapped)) {
-            secDir.VirtualAddress = mapped;
-        }
+    const IMAGE_DATA_DIRECTORY secDir = PEUtils::GetDataDirectory(m_image, IMAGE_DIRECTORY_ENTRY_SECURITY);
+    if (secDir.VirtualAddress != 0) {
+        plan.hasSecurity = true;
+        if (!mapOffset(secDir.VirtualAddress, plan.securityOffset)) return false;
     }
 
     // 4. Debug Directory 每个 IMAGE_DEBUG_DIRECTORY.PointerToRawData（含同步副本）。
-    //    必须在 section PointerToRawData 重映射之后计算 debug 目录文件偏移，
-    //    使 RvaToOffset 指向新位置。
+    //    目录自身的位置也要重映射，才能在新 buffer 中定位到同一批结构体。
     const IMAGE_DATA_DIRECTORY dbgDir = PEUtils::GetDataDirectory(m_image, IMAGE_DIRECTORY_ENTRY_DEBUG);
-    if (dbgDir.VirtualAddress == 0 || dbgDir.Size == 0) return;
-    if (dbgDir.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0) return;
-    const DWORD dbgOff = PEUtils::RvaToOffset(m_image, dbgDir.VirtualAddress);
-    if (dbgOff == 0 || !PEUtils::CheckRawBounds(m_image, dbgOff, dbgDir.Size)) return;
-    PIMAGE_DEBUG_DIRECTORY dbgEntries = reinterpret_cast<PIMAGE_DEBUG_DIRECTORY>(
-        m_image->rawData + dbgOff);
-    const DWORD count = dbgDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
-    for (DWORD i = 0; i < count; ++i) {
-        uint32_t mapped = 0;
-        if (mapOffset(dbgEntries[i].PointerToRawData, mapped)) {
-            dbgEntries[i].PointerToRawData = mapped;
+    if (dbgDir.VirtualAddress != 0 && dbgDir.Size != 0) {
+        if (dbgDir.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0) return false;
+        const DWORD dbgOff = PEUtils::RvaToOffset(m_image, dbgDir.VirtualAddress);
+        if (dbgOff == 0 || !PEUtils::CheckRawBounds(m_image, dbgOff, dbgDir.Size)) return false;
+        if (!mapOffset(dbgOff, plan.debugDirNewOffset)) return false;
+        const PIMAGE_DEBUG_DIRECTORY dbgEntries = reinterpret_cast<PIMAGE_DEBUG_DIRECTORY>(
+            m_image->rawData + dbgOff);
+        const DWORD count = dbgDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+        plan.hasDebug = true;
+        plan.debugPointers.resize(count);
+        for (DWORD i = 0; i < count; ++i) {
+            if (!mapOffset(dbgEntries[i].PointerToRawData, plan.debugPointers[i])) return false;
         }
-        if (i < m_image->debugDir.entries.size() &&
-            mapOffset(m_image->debugDir.entries[i].pointerToRawData, mapped)) {
-            m_image->debugDir.entries[i].pointerToRawData = mapped;
+    }
+
+    return true;
+}
+
+void PEEmitter::ApplyRemapPlan(const RemapPlan& plan) {
+    // 纯写入：全部目标值已由 BuildRemapPlan 验证成功，这里不会失败。
+    for (WORD i = 0; i < m_image->numSections && i < plan.sectionRaw.size(); i++) {
+        m_image->sections[i].PointerToRawData = plan.sectionRaw[i];
+    }
+
+    if (plan.hasOverlay) {
+        m_image->overlayOffset = plan.overlayOffset;
+    }
+
+    if (plan.hasSecurity) {
+        if (m_image->is64Bit) {
+            m_image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = plan.securityOffset;
+        } else {
+            m_image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = plan.securityOffset;
+        }
+    }
+
+    if (plan.hasDebug) {
+        PIMAGE_DEBUG_DIRECTORY dbgEntries = reinterpret_cast<PIMAGE_DEBUG_DIRECTORY>(
+            m_image->rawData + plan.debugDirNewOffset);
+        for (size_t i = 0; i < plan.debugPointers.size(); ++i) {
+            dbgEntries[i].PointerToRawData = plan.debugPointers[i];
+            if (i < m_image->debugDir.entries.size()) {
+                m_image->debugDir.entries[i].pointerToRawData = plan.debugPointers[i];
+            }
         }
     }
 }
@@ -343,8 +365,14 @@ bool PEEmitter::PatchBytes(uint32_t rva, const std::vector<uint8_t>& bytes, std:
         if (error) *error = "invalid PE image or empty patch";
         return false;
     }
+    if (bytes.size() > std::numeric_limits<uint32_t>::max()) {
+        if (error) *error = "patch size exceeds PE limits";
+        return false;
+    }
     uint32_t offset = RvaToOffset(rva);
-    if (offset == 0 || offset + bytes.size() > m_image->rawSize) {
+    uint32_t patchEnd = 0;
+    if (offset == 0 || !CheckedAdd(offset, static_cast<uint32_t>(bytes.size()), patchEnd) ||
+        patchEnd > m_image->rawSize) {
         if (error) *error = "patch RVA is outside file data";
         return false;
     }
@@ -358,7 +386,8 @@ bool PEEmitter::FillBytes(uint32_t rva, uint32_t size, uint8_t value, std::strin
         return false;
     }
     uint32_t offset = RvaToOffset(rva);
-    if (offset == 0 || offset + size > m_image->rawSize) {
+    uint32_t fillEnd = 0;
+    if (offset == 0 || !CheckedAdd(offset, size, fillEnd) || fillEnd > m_image->rawSize) {
         if (error) *error = "fill RVA is outside file data";
         return false;
     }
@@ -401,10 +430,13 @@ bool PEEmitter::RebuildExceptionDirectory(
     uint32_t previousEnd = 0;
     for (const auto& entry : entries) {
         if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            RvaToOffset(entry.beginAddress) == 0 ||
-            RvaToOffset(entry.endAddress - 1) == 0 ||
             RvaToOffset(entry.unwindData) == 0) {
             if (error) *error = "exception directory contains an invalid runtime-function range";
+            return false;
+        }
+        // 代码范围必须整体位于可执行且 file-backed section。
+        if (!PEUtils::IsExecutableFileBackedRange(m_image, entry.beginAddress, entry.endAddress)) {
+            if (error) *error = "exception directory range is not executable/file-backed";
             return false;
         }
         if (previousEnd != 0 && entry.beginAddress < previousEnd) {
@@ -512,6 +544,26 @@ bool PEEmitter::RebuildGuardCFFunctionTable(
     for (const auto& entry : entries) table.insert(
         table.end(), entry.second.begin(), entry.second.end());
 
+    // Load Config 里 GuardCFFunctionTable/GuardCFFunctionCount 两个字段的位置在
+    // AppendSection 之前就已确定；必须先确认它们可写（RvaToOffset 成功且在文件范围内），
+    // 否则一旦 AppendSection 提交新 section 之后再发现不可写，就会留下半成品 image。
+    const uint32_t fieldWidth = m_image->is64Bit ? 8u : 4u;
+    const uint32_t tableFieldRVA = m_image->loadConfig.directoryRVA + static_cast<uint32_t>(
+        m_image->is64Bit ? offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionTable)
+                         : offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionTable));
+    const uint32_t countFieldRVA = m_image->loadConfig.directoryRVA + static_cast<uint32_t>(
+        m_image->is64Bit ? offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount)
+                         : offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount));
+    auto rvaIsPatchable = [&](uint32_t rva) -> bool {
+        const uint32_t off = RvaToOffset(rva);
+        uint32_t end = 0;
+        return off != 0 && CheckedAdd(off, fieldWidth, end) && end <= m_image->rawSize;
+    };
+    if (!rvaIsPatchable(tableFieldRVA) || !rvaIsPatchable(countFieldRVA)) {
+        if (error) *error = "Guard CF directory fields are not patchable";
+        return false;
+    }
+
     PEAppendSectionResult appended = AppendSection(sectionName, table,
         IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
     if (!appended.success) {
@@ -520,14 +572,8 @@ bool PEEmitter::RebuildGuardCFFunctionTable(
     }
     const uint64_t tableVA = imageBase + appended.rva;
     const uint64_t count = entries.size();
-    const uint32_t tableFieldRVA = m_image->loadConfig.directoryRVA + static_cast<uint32_t>(
-        m_image->is64Bit ? offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionTable)
-                         : offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionTable));
-    const uint32_t countFieldRVA = m_image->loadConfig.directoryRVA + static_cast<uint32_t>(
-        m_image->is64Bit ? offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount)
-                         : offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount));
-    std::vector<uint8_t> tableField(m_image->is64Bit ? 8u : 4u, 0);
-    std::vector<uint8_t> countField(m_image->is64Bit ? 8u : 4u, 0);
+    std::vector<uint8_t> tableField(fieldWidth, 0);
+    std::vector<uint8_t> countField(fieldWidth, 0);
     std::memcpy(tableField.data(), &tableVA, tableField.size());
     std::memcpy(countField.data(), &count, countField.size());
     if (!PatchBytes(tableFieldRVA, tableField, error) ||

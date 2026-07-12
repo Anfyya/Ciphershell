@@ -747,39 +747,64 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
         return false;
     }
 
-    image->tls.directoryRVA = tlsDir.VirtualAddress;
-    image->tls.callbackAddresses.clear();
+    // 先解析到局部结构，全部验证通过后才一次性提交，失败不得留下部分状态。
+    CS_TLS_INFO local{};
+    local.directoryRVA = tlsDir.VirtualAddress;
+
     if (image->is64Bit) {
         PIMAGE_TLS_DIRECTORY64 tlsDir64 = (PIMAGE_TLS_DIRECTORY64)(image->rawData + tlsOffset);
-        image->tls.startAddress = tlsDir64->StartAddressOfRawData;
-        image->tls.endAddress = tlsDir64->EndAddressOfRawData;
-        image->tls.indexAddress = tlsDir64->AddressOfIndex;
-        image->tls.callbacksAddress = tlsDir64->AddressOfCallBacks;
+        local.startAddress = tlsDir64->StartAddressOfRawData;
+        local.endAddress = tlsDir64->EndAddressOfRawData;
+        local.indexAddress = tlsDir64->AddressOfIndex;
+        local.callbacksAddress = tlsDir64->AddressOfCallBacks;
     } else {
         PIMAGE_TLS_DIRECTORY32 tlsDir32 = (PIMAGE_TLS_DIRECTORY32)(image->rawData + tlsOffset);
-        image->tls.startAddress = tlsDir32->StartAddressOfRawData;
-        image->tls.endAddress = tlsDir32->EndAddressOfRawData;
-        image->tls.indexAddress = tlsDir32->AddressOfIndex;
-        image->tls.callbacksAddress = tlsDir32->AddressOfCallBacks;
+        local.startAddress = tlsDir32->StartAddressOfRawData;
+        local.endAddress = tlsDir32->EndAddressOfRawData;
+        local.indexAddress = tlsDir32->AddressOfIndex;
+        local.callbacksAddress = tlsDir32->AddressOfCallBacks;
     }
 
-    image->tls.valid = TRUE;
+    const uint64_t imageBase = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.ImageBase
+        : image->ntHeaders32->OptionalHeader.ImageBase;
 
-    // 计算回调数量
-    if (image->tls.callbacksAddress != 0) {
-        const uint64_t imageBase = image->is64Bit
-            ? image->ntHeaders64->OptionalHeader.ImageBase
-            : image->ntHeaders32->OptionalHeader.ImageBase;
-        if (image->tls.callbacksAddress < imageBase ||
-            image->tls.callbacksAddress - imageBase > 0xFFFFFFFFull) {
-            image->tls.valid = FALSE;
+    // VA → RVA：VA 必须不小于 ImageBase，且差值落在 32 位 RVA 空间内。
+    auto vaToRva = [&](DWORD64 va, DWORD& rvaOut) -> bool {
+        if (va < imageBase || va - imageBase > 0xFFFFFFFFull) return false;
+        rvaOut = static_cast<DWORD>(va - imageBase);
+        return true;
+    };
+
+    // 1. Start/End：TLS 模板数据范围，Start <= End；非空范围必须整体可映射到文件。
+    if (local.startAddress != 0 || local.endAddress != 0) {
+        DWORD startRVA = 0, endRVA = 0;
+        if (!vaToRva(local.startAddress, startRVA) || !vaToRva(local.endAddress, endRVA) ||
+            startRVA > endRVA) {
             return false;
         }
-        DWORD callbackOffset = RVAToOffset(
-            image, static_cast<DWORD>(image->tls.callbacksAddress - imageBase));
+        if (startRVA != endRVA &&
+            (RVAToOffset(image, startRVA) == 0 || RVAToOffset(image, endRVA - 1) == 0)) {
+            return false;
+        }
+    }
 
+    // 2. AddressOfIndex：TLS 索引变量地址，必须非零、VA→RVA 合法且可映射到文件。
+    DWORD indexRVA = 0;
+    if (local.indexAddress == 0 || !vaToRva(local.indexAddress, indexRVA) ||
+        RVAToOffset(image, indexRVA) == 0) {
+        return false;
+    }
+
+    // 3. 回调数组：VA→RVA、逐项读取直到 NULL 终止符，且每个回调必须位于可执行 file-backed section。
+    std::vector<DWORD64> callbacks;
+    if (local.callbacksAddress != 0) {
+        DWORD callbacksRVA = 0;
+        if (!vaToRva(local.callbacksAddress, callbacksRVA)) {
+            return false;
+        }
+        DWORD callbackOffset = RVAToOffset(image, callbacksRVA);
         if (callbackOffset == 0 || callbackOffset >= image->rawSize) {
-            image->tls.valid = FALSE;
             return false;
         }
         const DWORD pointerSize = image->is64Bit ? 8u : 4u;
@@ -793,16 +818,23 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
                 terminated = true;
                 break;
             }
-            image->tls.callbackAddresses.push_back(callback);
+            DWORD callbackRVA = 0;
+            if (!vaToRva(callback, callbackRVA) ||
+                !PEUtils::IsExecutableFileBackedAddress(image, callbackRVA)) {
+                return false;
+            }
+            callbacks.push_back(callback);
         }
         if (!terminated) {
-            image->tls.callbackAddresses.clear();
-            image->tls.valid = FALSE;
             return false;
         }
-        image->tls.callbackCount = static_cast<DWORD>(image->tls.callbackAddresses.size());
     }
 
+    // 全部验证通过后一次性提交。
+    local.callbackAddresses = std::move(callbacks);
+    local.callbackCount = static_cast<DWORD>(local.callbackAddresses.size());
+    local.valid = TRUE;
+    image->tls = std::move(local);
     return true;
 }
 
@@ -827,18 +859,42 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
         exceptionDir.Size % sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) != 0 ||
         !CheckBounds(image, exceptionOffset, exceptionDir.Size)) return false;
 
-    DWORD entryCount = exceptionDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
-    PIMAGE_RUNTIME_FUNCTION_ENTRY runtimeFuncs =
+    const DWORD entryCount = exceptionDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+    const PIMAGE_RUNTIME_FUNCTION_ENTRY runtimeFuncs =
         (PIMAGE_RUNTIME_FUNCTION_ENTRY)(image->rawData + exceptionOffset);
 
+    // 先解析到局部容器，全部通过验证后才提交，失败不得留下部分 entries。
+    std::vector<CS_RUNTIME_FUNCTION> local;
+    local.reserve(entryCount);
+
+    DWORD previousEnd = 0;
+    bool firstEntry = true;
     for (DWORD i = 0; i < entryCount; i++) {
         CS_RUNTIME_FUNCTION entry;
         entry.beginAddress = runtimeFuncs[i].BeginAddress;
         entry.endAddress = runtimeFuncs[i].EndAddress;
         entry.unwindData = runtimeFuncs[i].UnwindData;
-        image->exceptions.entries.push_back(entry);
+
+        // BeginAddress < EndAddress；UnwindData 非零且可映射到文件。
+        if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
+            RVAToOffset(image, entry.unwindData) == 0) {
+            return false;
+        }
+        // 代码范围必须位于可执行且 file-backed section。
+        if (!PEUtils::IsExecutableFileBackedRange(image, entry.beginAddress, entry.endAddress)) {
+            return false;
+        }
+        // 表必须按 BeginAddress 有序且不重叠（允许相邻 entry 的 end == 下一个 begin）。
+        if (!firstEntry && entry.beginAddress < previousEnd) {
+            return false;
+        }
+        previousEnd = entry.endAddress;
+        firstEntry = false;
+
+        local.push_back(entry);
     }
 
+    image->exceptions.entries = std::move(local);
     return true;
 }
 
@@ -999,15 +1055,7 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         }
         // 每个 handler RVA 必须位于映像范围、能映射到文件数据、且位于可执行 section。
         auto handlerRvaIsValid = [&](DWORD rva) -> bool {
-            if (rva == 0) return false;
-            for (WORD i = 0; i < image->numSections; ++i) {
-                const IMAGE_SECTION_HEADER& s = image->sections[i];
-                const uint32_t span = PEUtils::SectionMappedSpan(s);
-                if (span == 0 || rva < s.VirtualAddress || rva - s.VirtualAddress >= span) continue;
-                if ((s.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) return false;
-                return RVAToOffset(image, rva) != 0;
-            }
-            return false;
+            return rva != 0 && PEUtils::IsExecutableFileBackedAddress(image, rva);
         };
         std::vector<DWORD> sehRVAs;
         sehRVAs.reserve(static_cast<size_t>(local.seHandlerCount));

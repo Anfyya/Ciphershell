@@ -1,16 +1,21 @@
 // CipherShell PE 解析/发射加固回归测试
 //
 // 覆盖本次主要改动：
-//   - Load Config 短结构（GuardFlags 缺失仍合法）/ declared Size 越界拒绝
-//   - SafeSEH handler 完整验证（合法 / handler 落在非可执行段拒绝）
-//   - Delay Import（合法 / 无终止项 / Size 非 32 倍数 / VA-based / INT 未终止）
+//   - Load Config 短结构（GuardFlags 缺失仍合法）/ declared Size 越界拒绝，目录 RVA
+//     指向真实 .rdata（而非退化成 0）
+//   - SafeSEH handler 完整验证（合法 / handler 落在非可执行段拒绝），PE32 字段按
+//     真实 32 位宽度写入
+//   - Delay Import：INT / IAT / ModuleHandle / Bound / Unload 表分别独立测试合法与
+//     非法两种情形，及无终止项 / Size 非 32 倍数 / VA-based 负面场景
 //   - Resource（循环 / 名称截断 / data 越界）
 //   - Security / WIN_CERTIFICATE（合法链 / dwLength 越界 / 对齐错误）
-//   - Debug payload 越界拒绝
+//   - Debug payload 越界拒绝；PEEmitter 追加 section 场景下真实回填并同步
+//     PointerToRawData/AddressOfRawData
 //   - PEEmitter：追加 section 后 Security/Debug/overlay 偏移同步、连续追加无重复偏移、
 //     失败回滚（image 不变）、header relocation 后 section 偏移同步
 //
-// 约束：本测试仅要求编译通过；运行由使用者在隔离环境中完成。
+// 本文件通过 ctest 实际运行（见 tests/CMakeLists.txt 的 pe_hardening_regression），
+// 全部断言要求真实通过，而不仅是编译通过。
 // 受 /W4 /WX 约束，使用始终求值的检查宏（Release 下 assert 会被编译为空）。
 
 #include "../packer/pe_parser/pe_parser.h"
@@ -186,7 +191,7 @@ void TestLoadConfigShortNoGuardFlags() {
     // 不写 GuardFlags。
 
     std::vector<DirEntry> dirs = {
-        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0 + lcOff), declaredSize}
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff), declaredSize}
     };
     auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
     auto* img = Parse(lay);
@@ -205,7 +210,7 @@ void TestLoadConfigDeclaredSizeExceedsAvailable() {
     rd.u32(0x10000);  // 声称 64KB，但 rdata 只有几十字节
     rd.pad(32);
     std::vector<DirEntry> dirs = {
-        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0 + lcOff), 0x10000}
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff), 0x10000}
     };
     auto lay = BuildPe(true, {0xCC}, rd.buf, dirs, {});
     auto* img = Parse(lay);
@@ -221,7 +226,7 @@ void TestLoadConfigShortNoSEHandler() {
     const uint32_t declaredSize = sizeof(DWORD);  // 只有 Size 字段
     rd.u32(declaredSize);
     std::vector<DirEntry> dirs = {
-        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0 + lcOff), declaredSize}
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff), declaredSize}
     };
     auto lay = BuildPe(false, {0xCC, 0xCC}, rd.buf, dirs, {});
     auto* img = Parse(lay);
@@ -242,9 +247,10 @@ void TestSafeSEHValid() {
     const size_t lcOff = rd.mark();
     rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32));  // Size
     rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable) - sizeof(DWORD));
-    // 先占位 SEHandlerTable(VA)/Count，表数据紧跟。
+    // 先占位 SEHandlerTable/Count，表数据紧跟。PE32 的 SEHandlerTable 是 32 位 VA
+    // （DWORD 字段），必须按 32 位写入，否则会错位覆盖紧随其后的 SEHandlerCount。
     const size_t sehTableRel = rd.mark();
-    rd.u64(0);  // SEHandlerTable (VA) 占位
+    rd.u32(0);  // SEHandlerTable (32 位 VA) 占位
     rd.u32(2);  // SEHandlerCount
     // handler 表：2 个 DWORD，指向 .text 内 RVA。
     const size_t tableDataOff = rd.mark();
@@ -255,12 +261,12 @@ void TestSafeSEHValid() {
 
     const uint32_t imageBase = 0x10000000;
     const uint32_t tableRVA = /*rdataVA*/ 0x2000 + static_cast<uint32_t>(tableDataOff);
-    const uint64_t tableVA = imageBase + tableRVA;
-    // 回填 SEHandlerTable VA。
-    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint64_t));
+    const uint32_t tableVA = imageBase + tableRVA;
+    // 回填 SEHandlerTable VA（32 位）。
+    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint32_t));
 
     std::vector<DirEntry> dirs = {
-        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0 + lcOff),
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
          sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32)}
     };
     auto lay = BuildPe(false, {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
@@ -279,19 +285,20 @@ void TestSafeSEHHandlerNotExecutable() {
     const size_t lcOff = rd.mark();
     rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32));
     rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable) - sizeof(DWORD));
+    // SEHandlerTable 是 PE32 的 32 位 VA 字段，必须按 32 位写入。
     const size_t sehTableRel = rd.mark();
-    rd.u64(0);
+    rd.u32(0);
     rd.u32(1);
     const size_t tableDataOff = rd.mark();
     const uint32_t imageBase = 0x10000000;
     uint32_t badHandler = 0x2000;  // .rdata，不可执行
     rd.u32(badHandler);
     const uint32_t tableRVA = 0x2000 + static_cast<uint32_t>(tableDataOff);
-    const uint64_t tableVA = imageBase + tableRVA;
-    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint64_t));
+    const uint32_t tableVA = imageBase + tableRVA;
+    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint32_t));
 
     std::vector<DirEntry> dirs = {
-        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0 + lcOff),
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
          sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32)}
     };
     auto lay = BuildPe(false, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
@@ -310,13 +317,28 @@ struct DelayLayout {
     size_t descRel = 0;
 };
 
-// 构造一个合法 RVA-based delay import descriptor（x64，2 个按名称导入 + 终止符）。
-DelayLayout BuildValidDelay() {
+// ModuleHandle/Bound/Unload 均为可选表：withXxx 控制是否携带该表，
+// xxxBad 控制该表是否被故意构造为非法（用于对应的负面测试）。
+struct DelayOptions {
+    bool withModuleHandle = false;
+    bool moduleHandleBad = false;  // ModuleHandleRVA 指向文件之外，无法映射
+    bool withBoundTable = false;
+    bool boundTableBad = false;    // Bound 表终止槽非零
+    bool withUnloadTable = false;
+    bool unloadTableBad = false;   // Unload 表终止槽非零
+};
+
+// 构造一个合法 RVA-based delay import descriptor（x64，2 个按名称导入 + 终止符），
+// 按需附加 ModuleHandle/Bound/Unload 表。
+DelayLayout BuildDelay(const DelayOptions& opt = {}) {
     Writer rd;
     const size_t descRel = rd.mark();
     // 占位 descriptor（32 字节）。
     rd.pad(sizeof(IMAGE_DELAYLOAD_DESCRIPTOR));
-    IMAGE_DELAYLOAD_DESCRIPTOR zero{};
+    // 全零终止符 descriptor（32 字节），紧跟在真实 descriptor 之后。
+    // 必须真实存在且全零：目录 Size 覆盖 2 个 descriptor 槽位时，解析器会依次扫描，
+    // 若第二槽不是全零就会被当成另一个（非法的）descriptor 而拒绝整个目录。
+    rd.pad(sizeof(IMAGE_DELAYLOAD_DESCRIPTOR));
     // DLL 名称。
     const size_t nameRel = rd.mark();
     const char* dll = "test.dll";
@@ -342,14 +364,42 @@ DelayLayout BuildValidDelay() {
     const uint32_t rdataVA = 0x2000;
     auto rva = [&](size_t rel) { return rdataVA + static_cast<uint32_t>(rel); };
 
+    // ModuleHandleRVA：合法时指向一个指针宽度的占位句柄槽；非法时指向文件之外的 RVA。
+    uint32_t moduleHandleRVA = 0;
+    if (opt.withModuleHandle) {
+        if (opt.moduleHandleBad) {
+            moduleHandleRVA = 0x7FFFFFFF;  // 远超文件范围，无法映射
+        } else {
+            const size_t moduleHandleRel = rd.mark();
+            rd.u64(0);
+            moduleHandleRVA = rva(moduleHandleRel);
+        }
+    }
+
+    // Bound/Unload 表：2 项占位 + 终止槽；xxxBad 时终止槽写非零值。
+    uint32_t boundRVA = 0;
+    if (opt.withBoundTable) {
+        const size_t boundRel = rd.mark();
+        rd.u64(0); rd.u64(0);
+        rd.u64(opt.boundTableBad ? 0x1234ULL : 0ULL);
+        boundRVA = rva(boundRel);
+    }
+    uint32_t unloadRVA = 0;
+    if (opt.withUnloadTable) {
+        const size_t unloadRel = rd.mark();
+        rd.u64(0); rd.u64(0);
+        rd.u64(opt.unloadTableBad ? 0x5678ULL : 0ULL);
+        unloadRVA = rva(unloadRel);
+    }
+
     IMAGE_DELAYLOAD_DESCRIPTOR desc{};
     desc.Attributes.AllAttributes = 0x1;  // RVA-based
     desc.DllNameRVA = rva(nameRel);
-    desc.ModuleHandleRVA = 0;
+    desc.ModuleHandleRVA = moduleHandleRVA;
     desc.ImportAddressTableRVA = rva(iatRel);
     desc.ImportNameTableRVA = rva(intRel);
-    desc.BoundImportAddressTableRVA = 0;
-    desc.UnloadInformationTableRVA = 0;
+    desc.BoundImportAddressTableRVA = boundRVA;
+    desc.UnloadInformationTableRVA = unloadRVA;
     desc.TimeDateStamp = 0;
     std::memcpy(rd.buf.data() + descRel, &desc, sizeof(desc));
 
@@ -365,6 +415,9 @@ DelayLayout BuildValidDelay() {
 
     return {std::move(rd.buf), descRel};
 }
+
+// 兼容旧调用点：不带任何可选表的最简合法 descriptor。
+DelayLayout BuildValidDelay() { return BuildDelay({}); }
 
 void TestDelayImportValid() {
     auto dl = BuildValidDelay();
@@ -424,17 +477,33 @@ void TestDelayImportVaBased() {
 
 void TestDelayImportIntNotTerminated() {
     auto dl = BuildValidDelay();
-    // 把 INT 终止槽改成非零。
-    // INT 起始后的第 3 个 8 字节槽（终止符）写非零值。
-    size_t intRel = 0;  // 由 BuildValidDelay 内部决定，这里通过扫描定位终止槽较繁琐；
-    // 简化：直接把 IAT 终止槽写非零（IAT 终止槽也必须为 0）。
-    // 定位 IAT：descriptor 中 ImportAddressTableRVA。
+    // 把 INT 终止槽改成非零：定位 INT（descriptor 中 ImportNameTableRVA），
+    // 2 个非终止项后是终止槽。
+    IMAGE_DELAYLOAD_DESCRIPTOR desc{};
+    std::memcpy(&desc, dl.rdata.data() + dl.descRel, sizeof(desc));
+    uint32_t intRVA = desc.ImportNameTableRVA;
+    size_t intRel = intRVA - 0x2000;
+    uint64_t bad = 0x1234;
+    std::memcpy(dl.rdata.data() + intRel + 16, &bad, 8);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportIatNotTerminated() {
+    auto dl = BuildValidDelay();
+    // 把 IAT 终止槽改成非零：定位 IAT（descriptor 中 ImportAddressTableRVA），
+    // 2 个非终止项后是终止槽。INT 本身保持合法且已终止，隔离出 IAT 这一项校验。
     IMAGE_DELAYLOAD_DESCRIPTOR desc{};
     std::memcpy(&desc, dl.rdata.data() + dl.descRel, sizeof(desc));
     uint32_t iatRVA = desc.ImportAddressTableRVA;
     size_t iatRel = iatRVA - 0x2000;
     uint64_t bad = 0x1234;
-    // 2 个非终止项后是终止槽。
     std::memcpy(dl.rdata.data() + iatRel + 16, &bad, 8);
     std::vector<DirEntry> dirs = {
         {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
@@ -443,7 +512,94 @@ void TestDelayImportIntNotTerminated() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
-    (void)intRel;
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportModuleHandleValid() {
+    // ModuleHandleRVA 指向文件内一个合法的指针宽度槽 → 正常解析。
+    DelayOptions opt; opt.withModuleHandle = true; opt.moduleHandleBad = false;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->delayImports.dlls.size() == 1);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportModuleHandleInvalid() {
+    // ModuleHandleRVA 指向文件之外 → 拒绝。其余字段与合法用例完全相同，
+    // 隔离出 ModuleHandleRVA 这一项校验。
+    DelayOptions opt; opt.withModuleHandle = true; opt.moduleHandleBad = true;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportBoundTableValid() {
+    // BoundImportAddressTableRVA 存在且终止槽为零 → 正常解析。
+    DelayOptions opt; opt.withBoundTable = true; opt.boundTableBad = false;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->delayImports.dlls.size() == 1);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportBoundTableInvalid() {
+    // Bound 表终止槽非零 → 拒绝。其余字段与合法用例完全相同，隔离出 Bound 表校验。
+    DelayOptions opt; opt.withBoundTable = true; opt.boundTableBad = true;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportUnloadTableValid() {
+    // UnloadInformationTableRVA 存在且终止槽为零 → 正常解析。
+    DelayOptions opt; opt.withUnloadTable = true; opt.unloadTableBad = false;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->delayImports.dlls.size() == 1);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestDelayImportUnloadTableInvalid() {
+    // Unload 表终止槽非零 → 拒绝。其余字段与合法用例完全相同，隔离出 Unload 表校验。
+    DelayOptions opt; opt.withUnloadTable = true; opt.unloadTableBad = true;
+    auto dl = BuildDelay(opt);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x2000 + static_cast<uint32_t>(dl.descRel),
+         sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) * 2}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img->delayImports.dlls.empty());
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -635,17 +791,26 @@ void TestEmitterAppendSyncsOffsets() {
     rd.put(&de, sizeof(de));
     const size_t payloadOff = rd.mark();
     rd.u32(0xCAFEBABE);
-    // 回填 debug payload 文件偏移。
+    // Security 目录需要指向一条合法的 WIN_CERTIFICATE 记录，否则整个 PE 解析会因
+    // Security 目录畸形而失败。
+    auto cert = BuildCertChainValid();
     auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf,
                        {{IMAGE_DIRECTORY_ENTRY_DEBUG, 0x2000 + static_cast<uint32_t>(dbgDirOff),
-                         sizeof(IMAGE_DEBUG_DIRECTORY)}}, {0xAA, 0xBB});
-    // 设置 Security 目录指向 overlay（文件偏移）。
+                         sizeof(IMAGE_DEBUG_DIRECTORY)}}, cert);
+
+    // 回填 debug 目录项的 PointerToRawData/AddressOfRawData，指向 .rdata 内的实际 payload
+    // （BuildPe 构造时 de 尚未知道自己在整个文件中的真实位置，这里在布局确定后回填）。
+    const uint32_t dbgPayloadFile = lay.rdataFileOff + static_cast<uint32_t>(payloadOff);
+    const uint32_t dbgPayloadRVA = lay.rdataVA + static_cast<uint32_t>(payloadOff);
+    auto* dbgEntry = reinterpret_cast<IMAGE_DEBUG_DIRECTORY*>(
+        lay.bytes.data() + lay.rdataFileOff + dbgDirOff);
+    dbgEntry->PointerToRawData = dbgPayloadFile;
+    dbgEntry->AddressOfRawData = dbgPayloadRVA;
+
+    // 设置 Security 目录指向 overlay（文件偏移）中的合法证书记录。
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(lay.bytes.data() + sizeof(IMAGE_DOS_HEADER));
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = lay.overlayFileOff;
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 2;
-
-    // 记录 debug payload 文件偏移（在 .rdata 内）。
-    const uint32_t dbgPayloadFile = lay.rdataFileOff + static_cast<uint32_t>(payloadOff);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = static_cast<DWORD>(cert.size());
 
     auto* img = Parse(lay);
     CS_TEST_CHECK(img && img->isValid);
@@ -737,6 +902,13 @@ int main() {
     TestDelayImportSizeNotMultiple();
     TestDelayImportVaBased();
     TestDelayImportIntNotTerminated();
+    TestDelayImportIatNotTerminated();
+    TestDelayImportModuleHandleValid();
+    TestDelayImportModuleHandleInvalid();
+    TestDelayImportBoundTableValid();
+    TestDelayImportBoundTableInvalid();
+    TestDelayImportUnloadTableValid();
+    TestDelayImportUnloadTableInvalid();
     TestResourceCycle();
     TestResourceTruncatedName();
     TestResourceDataOob();
