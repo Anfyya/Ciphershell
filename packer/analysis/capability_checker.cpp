@@ -23,6 +23,58 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
         return report;
     }
 
+    // ========================================================================
+    // Fail-closed 关卡：以下模块当前不具备完整生产语义闭环。
+    // 任何显式开启都在此处（任何 PE 内容、section、header、入口点、导入表或
+    // 文件偏移被修改之前）以 fatal issue 拒绝。绝不进入 partial / native fallback /
+    // 静默跳过 / 产物后提示 unsupported 等路径。
+    // ========================================================================
+    if (ctx.sectionEncryption.enabled) {
+        AddIssue(report, "SectionEncryption", 0,
+            "section encryption uses an unauthenticated cipher with a recoverable key; "
+            "no production closure exists (reject before any PE modification)",
+            true);
+    }
+    if (ctx.stringEncryption.enabled) {
+        AddIssue(report, "StringEncryption", 0,
+            "startup string encryption uses an unauthenticated cipher with a recoverable key; "
+            "no production closure exists (reject before any PE modification)",
+            true);
+    }
+    if (ctx.importProtection.enabled) {
+        AddIssue(report, "ImportProtection", 0,
+            "import protection does not rewrite the real IAT callsite; "
+            "the original IAT is preserved and only fake imports are appended (reject before any PE modification)",
+            true);
+    }
+    if (ctx.flattening.enabled) {
+        AddIssue(report, "ControlFlow", 0,
+            "CFG flattening lacks RIP-relative/CALL relocation, ABI, unwind and CFG repair; "
+            "it cannot preserve original function semantics (reject before any PE modification)",
+            true);
+    }
+    if (ctx.bogusFlow.enabled) {
+        AddIssue(report, "ControlFlow", 0,
+            "bogus flow cannot prove original function semantics are preserved; "
+            "no production closure exists (reject before any PE modification)",
+            true);
+    }
+
+    // controlFlow 总开关与 flattening/bogus 子开关的一致性。
+    // 不得出现：总开关开启但实际什么都不做；子功能开启却绕过 CapabilityChecker；
+    // 配置与执行状态互相矛盾。
+    const bool anyControlFlowSub = ctx.flattening.enabled || ctx.bogusFlow.enabled;
+    if (ctx.controlFlow.enabled && !anyControlFlowSub) {
+        AddIssue(report, "ControlFlow", 0,
+            "control_flow master switch is enabled but no sub-feature is active (no-op configuration)",
+            true);
+    }
+    if (!ctx.controlFlow.enabled && anyControlFlowSub) {
+        AddIssue(report, "ControlFlow", 0,
+            "a control_flow sub-feature is enabled while the master switch is off (configuration contradiction)",
+            true);
+    }
+
     if (ctx.vm.enabled) {
         const WORD dllCharacteristics = image->is64Bit
             ? image->ntHeaders64->OptionalHeader.DllCharacteristics
@@ -52,26 +104,6 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
                     "CFG image has no architecture-specific Guard check/dispatch pointer", true);
             }
         }
-    }
-
-    if (ctx.sectionEncryption.enabled) {
-        for (uint32_t i = 0; i < image->numSections; ++i) {
-            const uint32_t characteristics = image->sections[i].Characteristics;
-            if ((characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
-                (characteristics & IMAGE_SCN_MEM_WRITE) != 0) {
-                AddIssue(report, "SectionEncryption", image->sections[i].VirtualAddress,
-                    "input contains a writable-executable section; final W^X restoration is ambiguous",
-                    true);
-            }
-        }
-    }
-
-    if (ctx.importProtection.enabled && ctx.importProtection.strength >= 70) {
-        AddIssue(report, "ImportProtection", 0, "runtime resolver callsite rewrite is required for high strength import protection", true);
-    }
-
-    if (ctx.stringEncryption.enabled && ctx.stringEncryption.mode == "on_demand") {
-        AddIssue(report, "StringEncryption", 0, "on-demand decrypt thunks are not yet available; use startup mode for this build", true);
     }
 
     return report;
@@ -107,15 +139,23 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
                 reason = "function boundary does not match its x64 runtime-function entry";
                 return false;
             }
-            const uint32_t unwindOffset = PEUtils::RvaToOffset(image, entry.unwindData);
-            if (unwindOffset == 0 || unwindOffset >= image->rawSize) {
-                reason = "x64 unwind info is outside the PE image";
+            if (!PEUtils::IsValidRuntimeFunction(image, entry)) {
+                reason = "x64 runtime-function or unwind metadata is malformed";
                 return false;
             }
-            const uint8_t versionAndFlags = image->rawData[unwindOffset];
-            const uint8_t version = versionAndFlags & 0x07u;
-            const uint8_t flags = versionAndFlags >> 3;
-            if ((version != 1 && version != 2) || (flags & 0x07u) != 0) {
+            uint8_t version = 0;
+            uint8_t flags = 0;
+            if (!PEUtils::ReadUnwindInfoVersion(image, entry.unwindData, version, flags)) {
+                reason = "x64 unwind header is outside the PE image";
+                return false;
+            }
+            // Parser 可完整解析 V1/V2；VM runtime 与重建器当前仅证明了 V1 语义。
+            // 因而 V2 必须在函数级 fail-closed，不能把“可解析”误当成“可 VM 化”。
+            if (version > PEUtils::kVmUnwindInfoMaxVersion) {
+                reason = "x64 unwind version 2 epilog semantics are not supported by the VM runtime";
+                return false;
+            }
+            if (flags != 0) {
                 reason = "x64 function uses exception handlers or chained unwind metadata";
                 return false;
             }

@@ -141,6 +141,9 @@ struct CS_LOAD_CONFIG {
     DWORD       guardFlags;
     DWORD       guardTableEntrySize;
     std::vector<DWORD> guardFunctionRVAs;
+    DWORD64     seHandlerTable;         // x86 SafeSEH handler table (VA)
+    DWORD64     seHandlerCount;
+    std::vector<DWORD> safeSEHHandlerRVAs;  // 解析后的 handler RVA 列表
     bool        hasCFG;             // Control Flow Guard
     bool        hasRFGuard;         // Return Flow Guard
     bool        valid;
@@ -261,6 +264,7 @@ private:
     bool ParseLoadConfig(CS_PE_IMAGE* image);
     bool ParseDebugDirectory(CS_PE_IMAGE* image);
     bool ParseDelayImports(CS_PE_IMAGE* image);
+    bool ParseSecurity(CS_PE_IMAGE* image);
     bool ParseRichHeader(CS_PE_IMAGE* image);
     bool DetectOverlay(CS_PE_IMAGE* image);
     bool DetectDotNet(CS_PE_IMAGE* image);

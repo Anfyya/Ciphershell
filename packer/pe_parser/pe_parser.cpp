@@ -281,7 +281,8 @@ bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
             &PEParser::ParseExceptionTable, "exception")) &&
         parseIfPresent(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &PEParser::ParseLoadConfig, "load config") &&
         parseIfPresent(IMAGE_DIRECTORY_ENTRY_DEBUG, &PEParser::ParseDebugDirectory, "debug") &&
-        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &PEParser::ParseDelayImports, "delay import");
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &PEParser::ParseDelayImports, "delay import") &&
+        parseIfPresent(IMAGE_DIRECTORY_ENTRY_SECURITY, &PEParser::ParseSecurity, "security");
 }
 
 // ============================================================================
@@ -559,6 +560,137 @@ bool PEParser::ParseRelocationTable(CS_PE_IMAGE* image) {
 // ============================================================================
 // 资源表解析
 
+namespace {
+constexpr uint32_t kResourceDepthLimit = 32;
+constexpr uint32_t kResourceNodeLimit = 1000000;
+
+struct ResourceParseState {
+    const CS_PE_IMAGE* image;
+    DWORD base;     // resource directory 起始文件偏移
+    DWORD span;     // DataDirectory.Size，树内偏移相对 base
+    uint32_t nodesVisited = 0;
+    std::vector<uint32_t> path;  // 当前递归路径上的子目录相对偏移，用于环检测
+    std::vector<CS_RESOURCE_ENTRY> entries;
+    bool failed = false;
+    std::string error;
+
+    bool InRange(uint32_t rel, uint32_t size) const {
+        return rel <= span && size <= span - rel;
+    }
+};
+
+// RAII 守卫：确保递归路径在任何退出路径（含提前 return / 异常）下都正确恢复，
+// 不留下错误的递归状态用于后续环检测。
+struct ResourcePathGuard {
+    std::vector<uint32_t>& path;
+    ResourcePathGuard(std::vector<uint32_t>& p, uint32_t v) : path(p) { path.push_back(v); }
+    ~ResourcePathGuard() { if (!path.empty()) path.pop_back(); }
+};
+
+bool ParseResourceSubdir(ResourceParseState& s, uint32_t relOffset, uint32_t depth,
+                         CS_RESOURCE_ENTRY cur) {
+    if (s.failed) return false;
+    if (depth > kResourceDepthLimit) {
+        s.failed = true; s.error = "resource tree depth limit exceeded"; return false;
+    }
+    if (s.nodesVisited++ > kResourceNodeLimit) {
+        s.failed = true; s.error = "resource node count limit exceeded"; return false;
+    }
+    // 用当前递归路径集合检测环，不使用全局 visited，避免误杀合法共享节点。
+    for (uint32_t p : s.path) {
+        if (p == relOffset) {
+            s.failed = true; s.error = "resource tree contains a cycle"; return false;
+        }
+    }
+    // push 后由 guard 在所有退出路径统一 pop，提前 return 也不会留下残余状态。
+    ResourcePathGuard guard(s.path, relOffset);
+
+    if (!s.InRange(relOffset, sizeof(IMAGE_RESOURCE_DIRECTORY))) {
+        s.failed = true; s.error = "resource directory header out of range"; return false;
+    }
+    IMAGE_RESOURCE_DIRECTORY dir{};
+    std::memcpy(&dir, s.image->rawData + s.base + relOffset, sizeof(dir));
+
+    // NumberOfNamedEntries + NumberOfIdEntries 加法与乘法不溢出。
+    const uint64_t namedCount = dir.NumberOfNamedEntries;
+    const uint64_t idCount = dir.NumberOfIdEntries;
+    const uint64_t total64 = namedCount + idCount;
+    const uint64_t entryBytes = total64 * static_cast<uint64_t>(sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY));
+    if (total64 > 0xFFFF || entryBytes > 0xFFFFFFFFull ||
+        !s.InRange(static_cast<uint32_t>(relOffset + sizeof(IMAGE_RESOURCE_DIRECTORY)),
+                   static_cast<uint32_t>(entryBytes))) {
+        s.failed = true; s.error = "resource directory entry array out of range"; return false;
+    }
+    const uint32_t total = static_cast<uint32_t>(total64);
+    const IMAGE_RESOURCE_DIRECTORY_ENTRY* entries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(
+        s.image->rawData + s.base + relOffset + sizeof(IMAGE_RESOURCE_DIRECTORY));
+
+    for (uint32_t i = 0; i < total; ++i) {
+        CS_RESOURCE_ENTRY child = cur;
+        const IMAGE_RESOURCE_DIRECTORY_ENTRY& e = entries[i];
+
+        if (e.Name & 0x80000000u) {
+            // 名称字符串（相对 base 的偏移）。
+            const uint32_t nameRel = e.Name & 0x7FFFFFFFu;
+            if (!s.InRange(nameRel, sizeof(WORD))) {
+                s.failed = true; s.error = "resource name length field out of range"; return false;
+            }
+            WORD strLen = 0;
+            std::memcpy(&strLen, s.image->rawData + s.base + nameRel, sizeof(WORD));
+            const uint64_t strBytes = sizeof(WORD) + static_cast<uint64_t>(strLen) * 2ull;
+            if (strBytes > 0xFFFFFFFFull || !s.InRange(nameRel, static_cast<uint32_t>(strBytes))) {
+                s.failed = true; s.error = "resource name UTF-16 data truncated/out of range"; return false;
+            }
+            const WCHAR* wstr = reinterpret_cast<const WCHAR*>(
+                s.image->rawData + s.base + nameRel + sizeof(WORD));
+            std::string name8;
+            name8.reserve(strLen);
+            for (WORD c = 0; c < strLen; ++c) {
+                const WCHAR ch = wstr[c];
+                name8.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
+            }
+            child.isNamed = true;
+            child.name = std::move(name8);
+            if (depth == 1) child.id = 0;
+            else if (depth >= 2) child.languageId = 0;
+        } else {
+            // ID。
+            child.isNamed = false;
+            const uint32_t idVal = e.Name;
+            if (depth == 0) child.type = idVal;
+            else if (depth == 1) child.id = idVal;
+            else child.languageId = static_cast<WORD>(idVal);
+        }
+
+        if (e.OffsetToData & 0x80000000u) {
+            // 子目录（相对 base）。
+            const uint32_t subRel = e.OffsetToData & 0x7FFFFFFFu;
+            if (!ParseResourceSubdir(s, subRel, depth + 1, child)) {
+                return false;
+            }
+        } else {
+            // IMAGE_RESOURCE_DATA_ENTRY（相对 base）。
+            const uint32_t dataRel = e.OffsetToData;
+            if (!s.InRange(dataRel, sizeof(IMAGE_RESOURCE_DATA_ENTRY))) {
+                s.failed = true; s.error = "resource data entry out of range"; return false;
+            }
+            IMAGE_RESOURCE_DATA_ENTRY de{};
+            std::memcpy(&de, s.image->rawData + s.base + dataRel, sizeof(de));
+            // de.OffsetToData 是 RVA，映射到文件范围。
+            const DWORD dataFileOff = PEUtils::RvaToOffset(s.image, de.OffsetToData);
+            if (dataFileOff == 0 || de.Size > s.image->rawSize - dataFileOff) {
+                s.failed = true; s.error = "resource data RVA+size does not map into the file"; return false;
+            }
+            child.dataRVA = de.OffsetToData;
+            child.dataSize = de.Size;
+            s.entries.push_back(child);
+        }
+    }
+
+    return true;
+}
+} // namespace
+
 bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
     IMAGE_DATA_DIRECTORY resourceDir;
     if (image->is64Bit) {
@@ -571,8 +703,24 @@ bool PEParser::ParseResourceTable(CS_PE_IMAGE* image) {
         return false;
     }
 
-    DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
-    return resourceOffset != 0 && CheckBounds(image, resourceOffset, resourceDir.Size);
+    const DWORD resourceOffset = RVAToOffset(image, resourceDir.VirtualAddress);
+    if (resourceOffset == 0 || !CheckBounds(image, resourceOffset, resourceDir.Size)) {
+        return false;
+    }
+
+    // 先解析到局部容器，全部成功后一次性提交，避免留下半解析数据。
+    ResourceParseState state;
+    state.image = image;
+    state.base = resourceOffset;
+    state.span = resourceDir.Size;
+
+    CS_RESOURCE_ENTRY root{};
+    if (!ParseResourceSubdir(state, 0, 0, root) || state.failed) {
+        return false;
+    }
+
+    image->resources.entries = std::move(state.entries);
+    return true;
 }
 
 // ============================================================================
@@ -599,43 +747,92 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
         return false;
     }
 
-    image->tls.directoryRVA = tlsDir.VirtualAddress;
-    image->tls.callbackAddresses.clear();
+    // 先解析到局部结构，全部验证通过后才一次性提交，失败不得留下部分状态。
+    CS_TLS_INFO local{};
+    local.directoryRVA = tlsDir.VirtualAddress;
+
     if (image->is64Bit) {
         PIMAGE_TLS_DIRECTORY64 tlsDir64 = (PIMAGE_TLS_DIRECTORY64)(image->rawData + tlsOffset);
-        image->tls.startAddress = tlsDir64->StartAddressOfRawData;
-        image->tls.endAddress = tlsDir64->EndAddressOfRawData;
-        image->tls.indexAddress = tlsDir64->AddressOfIndex;
-        image->tls.callbacksAddress = tlsDir64->AddressOfCallBacks;
+        local.startAddress = tlsDir64->StartAddressOfRawData;
+        local.endAddress = tlsDir64->EndAddressOfRawData;
+        local.indexAddress = tlsDir64->AddressOfIndex;
+        local.callbacksAddress = tlsDir64->AddressOfCallBacks;
     } else {
         PIMAGE_TLS_DIRECTORY32 tlsDir32 = (PIMAGE_TLS_DIRECTORY32)(image->rawData + tlsOffset);
-        image->tls.startAddress = tlsDir32->StartAddressOfRawData;
-        image->tls.endAddress = tlsDir32->EndAddressOfRawData;
-        image->tls.indexAddress = tlsDir32->AddressOfIndex;
-        image->tls.callbacksAddress = tlsDir32->AddressOfCallBacks;
+        local.startAddress = tlsDir32->StartAddressOfRawData;
+        local.endAddress = tlsDir32->EndAddressOfRawData;
+        local.indexAddress = tlsDir32->AddressOfIndex;
+        local.callbacksAddress = tlsDir32->AddressOfCallBacks;
     }
 
-    image->tls.valid = TRUE;
+    const uint64_t imageBase = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.ImageBase
+        : image->ntHeaders32->OptionalHeader.ImageBase;
 
-    // 计算回调数量
-    if (image->tls.callbacksAddress != 0) {
-        const uint64_t imageBase = image->is64Bit
-            ? image->ntHeaders64->OptionalHeader.ImageBase
-            : image->ntHeaders32->OptionalHeader.ImageBase;
-        if (image->tls.callbacksAddress < imageBase ||
-            image->tls.callbacksAddress - imageBase > 0xFFFFFFFFull) {
-            image->tls.valid = FALSE;
+    // VA → RVA：VA 必须不小于 ImageBase，且差值落在 32 位 RVA 空间内。
+    auto vaToRva = [&](DWORD64 va, DWORD& rvaOut) -> bool {
+        if (va < imageBase || va - imageBase > 0xFFFFFFFFull) return false;
+        rvaOut = static_cast<DWORD>(va - imageBase);
+        return true;
+    };
+
+    // 1. Start/End：TLS 模板数据范围，Start <= End；非空范围必须整体落在同一个
+    //    file-backed section 内——分别校验两个端点不够，因为它们可能落在不同 section，
+    //    中间跨越空洞或另一段数据，因此用区间校验整体确认。
+    if (local.startAddress != 0 || local.endAddress != 0) {
+        DWORD startRVA = 0, endRVA = 0;
+        if (!vaToRva(local.startAddress, startRVA) || !vaToRva(local.endAddress, endRVA) ||
+            startRVA > endRVA) {
             return false;
         }
-        DWORD callbackOffset = RVAToOffset(
-            image, static_cast<DWORD>(image->tls.callbacksAddress - imageBase));
+        if (startRVA != endRVA && !PEUtils::IsFileBackedRange(image, startRVA, endRVA)) {
+            return false;
+        }
+    }
 
+    // 2. AddressOfIndex：TLS 索引变量地址，必须非零、VA→RVA 合法，且至少能容纳一个
+    //    完整 DWORD（4 字节）落在同一个 file-backed section 内，而非仅首字节可映射。
+    DWORD indexRVA = 0;
+    if (local.indexAddress == 0 || !vaToRva(local.indexAddress, indexRVA) ||
+        !PEUtils::IsFileBackedSpan(image, indexRVA, sizeof(DWORD))) {
+        return false;
+    }
+
+    // 3. 回调数组：VA→RVA、逐项读取直到 NULL 终止符，且每个回调必须位于可执行 file-backed section。
+    std::vector<DWORD64> callbacks;
+    if (local.callbacksAddress != 0) {
+        DWORD callbacksRVA = 0;
+        if (!vaToRva(local.callbacksAddress, callbacksRVA)) {
+            return false;
+        }
+        DWORD callbackOffset = RVAToOffset(image, callbacksRVA);
         if (callbackOffset == 0 || callbackOffset >= image->rawSize) {
-            image->tls.valid = FALSE;
+            return false;
+        }
+        // 扫描范围必须限制在 callbacksRVA 所在 section 自身的 file-backed 区域内，
+        // 不能越界读到下一个 section 或 overlay 的数据（那会把不相关的字节误判为
+        // 回调 VA 或意外的 0 终止符）。PointerToRawData+SizeOfRawData 已在 ParseHeaders
+        // 阶段对每个 section 校验过不越界，此处直接使用是安全的。
+        uint32_t sectionRawEnd = 0;
+        bool foundSection = false;
+        for (WORD i = 0; i < image->numSections; ++i) {
+            const IMAGE_SECTION_HEADER& s = image->sections[i];
+            if (callbackOffset >= s.PointerToRawData &&
+                callbackOffset < s.PointerToRawData + s.SizeOfRawData) {
+                sectionRawEnd = s.PointerToRawData + s.SizeOfRawData;
+                foundSection = true;
+                break;
+            }
+        }
+        if (!foundSection) {
             return false;
         }
         const DWORD pointerSize = image->is64Bit ? 8u : 4u;
-        const DWORD maxCallbacks = (image->rawSize - callbackOffset) / pointerSize;
+        const DWORD scanLimit = (std::min)(static_cast<uint32_t>(image->rawSize), sectionRawEnd);
+        if (callbackOffset >= scanLimit) {
+            return false;
+        }
+        const DWORD maxCallbacks = (scanLimit - callbackOffset) / pointerSize;
         bool terminated = false;
         for (DWORD count = 0; count < maxCallbacks; ++count) {
             DWORD64 callback = 0;
@@ -645,16 +842,23 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
                 terminated = true;
                 break;
             }
-            image->tls.callbackAddresses.push_back(callback);
+            DWORD callbackRVA = 0;
+            if (!vaToRva(callback, callbackRVA) ||
+                !PEUtils::IsExecutableFileBackedAddress(image, callbackRVA)) {
+                return false;
+            }
+            callbacks.push_back(callback);
         }
         if (!terminated) {
-            image->tls.callbackAddresses.clear();
-            image->tls.valid = FALSE;
             return false;
         }
-        image->tls.callbackCount = static_cast<DWORD>(image->tls.callbackAddresses.size());
     }
 
+    // 全部验证通过后一次性提交。
+    local.callbackAddresses = std::move(callbacks);
+    local.callbackCount = static_cast<DWORD>(local.callbackAddresses.size());
+    local.valid = TRUE;
+    image->tls = std::move(local);
     return true;
 }
 
@@ -679,18 +883,38 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
         exceptionDir.Size % sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) != 0 ||
         !CheckBounds(image, exceptionOffset, exceptionDir.Size)) return false;
 
-    DWORD entryCount = exceptionDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
-    PIMAGE_RUNTIME_FUNCTION_ENTRY runtimeFuncs =
+    const DWORD entryCount = exceptionDir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+    const PIMAGE_RUNTIME_FUNCTION_ENTRY runtimeFuncs =
         (PIMAGE_RUNTIME_FUNCTION_ENTRY)(image->rawData + exceptionOffset);
 
+    // 先解析到局部容器，全部通过验证后才提交，失败不得留下部分 entries。
+    std::vector<CS_RUNTIME_FUNCTION> local;
+    local.reserve(entryCount);
+
+    DWORD previousEnd = 0;
+    bool firstEntry = true;
     for (DWORD i = 0; i < entryCount; i++) {
         CS_RUNTIME_FUNCTION entry;
         entry.beginAddress = runtimeFuncs[i].BeginAddress;
         entry.endAddress = runtimeFuncs[i].EndAddress;
         entry.unwindData = runtimeFuncs[i].UnwindData;
-        image->exceptions.entries.push_back(entry);
+
+        // BeginAddress < EndAddress；UnwindData 非零，且必须是一个完整合法的 UNWIND_INFO
+        // （版本受支持、UnwindCode 数组落在文件范围内、按 Flags 校验 handler/链式尾部）。
+        if (!PEUtils::IsValidRuntimeFunction(image, entry)) {
+            return false;
+        }
+        // 表必须按 BeginAddress 有序且不重叠（允许相邻 entry 的 end == 下一个 begin）。
+        if (!firstEntry && entry.beginAddress < previousEnd) {
+            return false;
+        }
+        previousEnd = entry.endAddress;
+        firstEntry = false;
+
+        local.push_back(entry);
     }
 
+    image->exceptions.entries = std::move(local);
     return true;
 }
 
@@ -710,97 +934,166 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         return false;
     }
 
-    DWORD loadConfigOffset = RVAToOffset(image, loadConfigDir.VirtualAddress);
+    // 1. 先验证目录 RVA 与原始文件范围。
+    const DWORD loadConfigOffset = RVAToOffset(image, loadConfigDir.VirtualAddress);
     if (loadConfigOffset == 0 || loadConfigOffset >= image->rawSize) {
         return false;
     }
 
-    image->loadConfig.directoryRVA = loadConfigDir.VirtualAddress;
-    image->loadConfig.directorySize = loadConfigDir.Size;
-    const size_t available = (std::min)(
-        static_cast<size_t>(loadConfigDir.Size),
-        static_cast<size_t>(image->rawSize - loadConfigOffset));
-    auto hasField = [available](size_t offset, size_t size) {
-        return offset <= available && size <= available - offset;
+    // rawAvailable = min(directory.Size, rawSize - directoryOffset)
+    const uint64_t rawAvailable64 = (std::min)(
+        static_cast<uint64_t>(loadConfigDir.Size),
+        static_cast<uint64_t>(image->rawSize) - loadConfigOffset);
+    if (rawAvailable64 > 0xFFFFFFFFull) return false;
+    const DWORD rawAvailable = static_cast<DWORD>(rawAvailable64);
+
+    // 2. 至少有 sizeof(DWORD) 后，读取 Load Config 开头的 Size 字段。
+    if (rawAvailable < sizeof(DWORD)) return false;
+
+    DWORD declaredSize = 0;
+    std::memcpy(&declaredSize, image->rawData + loadConfigOffset, sizeof(DWORD));
+    // 4. declaredSize 自身不合法或超过文件可用范围时解析失败。
+    if (declaredSize < sizeof(DWORD)) return false;
+    if (declaredSize > rawAvailable) return false;
+
+    // 5. effectiveSize 必须使用 declaredSize，而非整个目录大小。
+    const DWORD effectiveSize = declaredSize;
+    auto hasField = [effectiveSize](size_t offset, size_t size) {
+        return offset <= effectiveSize && size <= effectiveSize - offset;
     };
 
+    // 全部在 local 上构建，成功后才一次性提交，避免半解析状态。
+    // 旧版较短的结构合法：只要 declaredSize 自身合法且在文件范围内即允许解析，
+    // 只解析该版本实际存在的字段；后期新增字段（含 GuardFlags）缺失时按零处理，
+    // 不因缺少后期字段而拒绝整个 PE。
+    CS_LOAD_CONFIG local{};
+
     if (image->is64Bit) {
+        PIMAGE_LOAD_CONFIG_DIRECTORY64 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY64)(image->rawData + loadConfigOffset);
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(lc->SecurityCookie)))
+            local.securityCookie = lc->SecurityCookie;
+        // x64 不使用 SafeSEH（使用 .pdata 异常表），不解析 SEHandlerTable/Count。
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
+            local.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
+            local.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
+            local.guardCFFunctionTable = lc->GuardCFFunctionTable;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
+            local.guardCFFunctionCount = lc->GuardCFFunctionCount;
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags), sizeof(DWORD))) {
-            PIMAGE_LOAD_CONFIG_DIRECTORY64 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY64)(image->rawData + loadConfigOffset);
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(lc->SecurityCookie)))
-                image->loadConfig.securityCookie = lc->SecurityCookie;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
-                image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
-                image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
-                image->loadConfig.guardCFFunctionTable = lc->GuardCFFunctionTable;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
-                image->loadConfig.guardCFFunctionCount = lc->GuardCFFunctionCount;
-            image->loadConfig.guardFlags = lc->GuardFlags;
-            image->loadConfig.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
-            image->loadConfig.hasRFGuard = (lc->GuardFlags &
+            local.guardFlags = lc->GuardFlags;
+            local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            local.hasRFGuard = (lc->GuardFlags &
                 (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
                  IMAGE_GUARD_RF_STRICT)) != 0;
-            image->loadConfig.valid = TRUE;
         }
     } else {
+        PIMAGE_LOAD_CONFIG_DIRECTORY32 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY32)(image->rawData + loadConfigOffset);
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SecurityCookie), sizeof(lc->SecurityCookie)))
+            local.securityCookie = lc->SecurityCookie;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable), sizeof(lc->SEHandlerTable)))
+            local.seHandlerTable = lc->SEHandlerTable;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerCount), sizeof(lc->SEHandlerCount)))
+            local.seHandlerCount = lc->SEHandlerCount;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
+            local.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
+            local.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
+            local.guardCFFunctionTable = lc->GuardCFFunctionTable;
+        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
+            local.guardCFFunctionCount = lc->GuardCFFunctionCount;
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardFlags), sizeof(DWORD))) {
-            PIMAGE_LOAD_CONFIG_DIRECTORY32 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY32)(image->rawData + loadConfigOffset);
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SecurityCookie), sizeof(lc->SecurityCookie)))
-                image->loadConfig.securityCookie = lc->SecurityCookie;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
-                image->loadConfig.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
-                image->loadConfig.guardCFDispatchFunctionPointer = lc->GuardCFDispatchFunctionPointer;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionTable), sizeof(lc->GuardCFFunctionTable)))
-                image->loadConfig.guardCFFunctionTable = lc->GuardCFFunctionTable;
-            if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, GuardCFFunctionCount), sizeof(lc->GuardCFFunctionCount)))
-                image->loadConfig.guardCFFunctionCount = lc->GuardCFFunctionCount;
-            image->loadConfig.guardFlags = lc->GuardFlags;
-            image->loadConfig.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
-            image->loadConfig.hasRFGuard = (lc->GuardFlags &
+            local.guardFlags = lc->GuardFlags;
+            local.hasCFG = (lc->GuardFlags & IMAGE_GUARD_CF_INSTRUMENTED) != 0;
+            local.hasRFGuard = (lc->GuardFlags &
                 (IMAGE_GUARD_RF_INSTRUMENTED | IMAGE_GUARD_RF_ENABLE |
                  IMAGE_GUARD_RF_STRICT)) != 0;
-            image->loadConfig.valid = TRUE;
         }
     }
 
-    if (image->loadConfig.valid && image->loadConfig.guardCFFunctionTable != 0 &&
-        image->loadConfig.guardCFFunctionCount != 0) {
+    // 只有所有已声明字段都通过验证后才能设置 valid = true。
+    local.directoryRVA = loadConfigDir.VirtualAddress;
+    local.directorySize = loadConfigDir.Size;
+    local.valid = TRUE;
+
+    const uint64_t imageBase = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.ImageBase
+        : image->ntHeaders32->OptionalHeader.ImageBase;
+
+    // 解析 Guard CF function table（带 64 位溢出检查）。
+    if (local.guardCFFunctionTable != 0 && local.guardCFFunctionCount != 0) {
         constexpr DWORD kGuardTableSizeMask = 0xF0000000u;
         constexpr DWORD kGuardTableSizeShift = 28u;
-        const DWORD extraBytes = (image->loadConfig.guardFlags & kGuardTableSizeMask) >>
+        const DWORD extraBytes = (local.guardFlags & kGuardTableSizeMask) >>
             kGuardTableSizeShift;
         const DWORD entrySize = sizeof(DWORD) + extraBytes;
-        image->loadConfig.guardTableEntrySize = entrySize;
-        const uint64_t imageBase = image->is64Bit
-            ? image->ntHeaders64->OptionalHeader.ImageBase
-            : image->ntHeaders32->OptionalHeader.ImageBase;
-        if (image->loadConfig.guardCFFunctionTable < imageBase ||
-            image->loadConfig.guardCFFunctionTable - imageBase > 0xFFFFFFFFULL ||
-            image->loadConfig.guardCFFunctionCount > 0x1000000ULL) {
-            image->loadConfig.valid = FALSE;
+        local.guardTableEntrySize = entrySize;
+        if (local.guardCFFunctionTable < imageBase ||
+            local.guardCFFunctionTable - imageBase > 0xFFFFFFFFULL ||
+            local.guardCFFunctionCount > 0x1000000ULL) {
             return false;
         }
         const DWORD tableRVA = static_cast<DWORD>(
-            image->loadConfig.guardCFFunctionTable - imageBase);
+            local.guardCFFunctionTable - imageBase);
         const DWORD tableOffset = RVAToOffset(image, tableRVA);
-        const uint64_t tableBytes = image->loadConfig.guardCFFunctionCount * entrySize;
-        if (tableOffset == 0 || tableBytes > image->rawSize - tableOffset) {
-            image->loadConfig.valid = FALSE;
+        const uint64_t tableBytes = local.guardCFFunctionCount *
+            static_cast<uint64_t>(entrySize);  // 64 位乘法，无溢出截断
+        if (tableOffset == 0 ||
+            tableBytes > static_cast<uint64_t>(image->rawSize) - tableOffset) {
             return false;
         }
-        image->loadConfig.guardFunctionRVAs.reserve(
-            static_cast<size_t>(image->loadConfig.guardCFFunctionCount));
-        for (uint64_t i = 0; i < image->loadConfig.guardCFFunctionCount; ++i) {
+        std::vector<DWORD> guardRVAs;
+        guardRVAs.reserve(static_cast<size_t>(local.guardCFFunctionCount));
+        for (uint64_t i = 0; i < local.guardCFFunctionCount; ++i) {
             DWORD functionRVA = 0;
             std::memcpy(&functionRVA,
-                image->rawData + tableOffset + static_cast<size_t>(i * entrySize), sizeof(functionRVA));
-            image->loadConfig.guardFunctionRVAs.push_back(functionRVA);
+                image->rawData + tableOffset + static_cast<size_t>(i * entrySize),
+                sizeof(functionRVA));
+            guardRVAs.push_back(functionRVA);
         }
+        local.guardFunctionRVAs = std::move(guardRVAs);
     }
 
+    // 解析 x86 SafeSEH handler 表（SEHandlerTable/Count）。
+    // 只对 PE32 解析；x64 使用 .pdata 异常表，不解析 SafeSEH。
+    // SEHandlerTable 是 VA：不小于 ImageBase，差值不超过 32 位，count×sizeof(DWORD) 不溢出。
+    if (!image->is64Bit && local.seHandlerTable != 0 && local.seHandlerCount != 0) {
+        if (local.seHandlerTable < imageBase ||
+            local.seHandlerTable - imageBase > 0xFFFFFFFFULL ||
+            local.seHandlerCount > 0x1000000ULL) {
+            return false;
+        }
+        const DWORD sehRVA = static_cast<DWORD>(local.seHandlerTable - imageBase);
+        const uint64_t tableBytes = local.seHandlerCount *
+            static_cast<uint64_t>(sizeof(DWORD));  // 64 位乘法
+        const DWORD tableOffset = RVAToOffset(image, sehRVA);
+        if (tableOffset == 0 ||
+            tableBytes > static_cast<uint64_t>(image->rawSize) - tableOffset) {
+            return false;
+        }
+        // 每个 handler RVA 必须位于映像范围、能映射到文件数据、且位于可执行 section。
+        auto handlerRvaIsValid = [&](DWORD rva) -> bool {
+            return rva != 0 && PEUtils::IsExecutableFileBackedAddress(image, rva);
+        };
+        std::vector<DWORD> sehRVAs;
+        sehRVAs.reserve(static_cast<size_t>(local.seHandlerCount));
+        for (uint64_t i = 0; i < local.seHandlerCount; ++i) {
+            DWORD handlerRVA = 0;
+            std::memcpy(&handlerRVA,
+                image->rawData + tableOffset + static_cast<size_t>(i * sizeof(DWORD)),
+                sizeof(handlerRVA));
+            if (!handlerRvaIsValid(handlerRVA)) {
+                return false;
+            }
+            sehRVAs.push_back(handlerRVA);
+        }
+        local.safeSEHHandlerRVAs = std::move(sehRVAs);
+    }
+
+    // 全部成功后一次性提交。
+    image->loadConfig = std::move(local);
     return image->loadConfig.valid;
 }
 
@@ -820,22 +1113,58 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
         return false;
     }
 
-    DWORD debugOffset = RVAToOffset(image, debugDir.VirtualAddress);
+    // 1. Size 必须是 IMAGE_DEBUG_DIRECTORY 大小的整数倍。
+    // 2. 目录数组整体在文件范围内。
+    const DWORD debugOffset = RVAToOffset(image, debugDir.VirtualAddress);
     if (debugOffset == 0 || debugDir.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0 ||
-        !CheckBounds(image, debugOffset, debugDir.Size)) return false;
-
-    DWORD entryCount = debugDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
-    PIMAGE_DEBUG_DIRECTORY debugEntries = (PIMAGE_DEBUG_DIRECTORY)(image->rawData + debugOffset);
-
-    for (DWORD i = 0; i < entryCount; i++) {
-        CS_DEBUG_ENTRY entry;
-        entry.type = debugEntries[i].Type;
-        entry.sizeOfData = debugEntries[i].SizeOfData;
-        entry.addressOfRawData = debugEntries[i].AddressOfRawData;
-        entry.pointerToRawData = debugEntries[i].PointerToRawData;
-        image->debugDir.entries.push_back(entry);
+        !CheckBounds(image, debugOffset, debugDir.Size)) {
+        return false;
     }
 
+    const DWORD entryCount = debugDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+    const PIMAGE_DEBUG_DIRECTORY debugEntries = (PIMAGE_DEBUG_DIRECTORY)(image->rawData + debugOffset);
+
+    // 5. 先解析到局部 vector，全部成功后再写入。
+    std::vector<CS_DEBUG_ENTRY> local;
+    local.reserve(entryCount);
+
+    for (DWORD i = 0; i < entryCount; i++) {
+        const IMAGE_DEBUG_DIRECTORY& src = debugEntries[i];
+        CS_DEBUG_ENTRY entry;
+        entry.type = src.Type;
+        entry.sizeOfData = src.SizeOfData;
+        entry.addressOfRawData = src.AddressOfRawData;
+        entry.pointerToRawData = src.PointerToRawData;
+
+        // 3. SizeOfData > 0 时，PointerToRawData 必须存在并完整位于文件范围（溢出安全）。
+        if (entry.sizeOfData > 0) {
+            const uint64_t payloadEnd = static_cast<uint64_t>(entry.pointerToRawData) +
+                entry.sizeOfData;
+            if (entry.pointerToRawData == 0 ||
+                payloadEnd > static_cast<uint64_t>(image->rawSize)) {
+                return false;
+            }
+        }
+
+        // 4. AddressOfRawData 非零时，必须能从 RVA 映射到文件，且映射范围覆盖 SizeOfData。
+        if (entry.addressOfRawData != 0) {
+            const DWORD addrOff = RVAToOffset(image, entry.addressOfRawData);
+            if (addrOff == 0) {
+                return false;
+            }
+            if (entry.sizeOfData > 0) {
+                const uint64_t coverEnd = static_cast<uint64_t>(addrOff) + entry.sizeOfData;
+                if (coverEnd > static_cast<uint64_t>(image->rawSize)) {
+                    return false;
+                }
+            }
+        }
+
+        local.push_back(entry);
+    }
+
+    // 6. 任一条目失败，整个目录解析失败（已在循环中 return false）。
+    image->debugDir.entries = std::move(local);
     return true;
 }
 
@@ -855,10 +1184,220 @@ bool PEParser::ParseDelayImports(CS_PE_IMAGE* image) {
         return false;
     }
 
-    DWORD delayOffset = RVAToOffset(image, delayImportDir.VirtualAddress);
-    if (delayOffset == 0 || !CheckBounds(image, delayOffset, delayImportDir.Size)) return false;
+    // 1/2. 描述符固定 32 字节；DataDirectory.Size 必须是其整数倍。
+    if (delayImportDir.Size % sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) != 0) {
+        return false;
+    }
+    const DWORD delayOffset = RVAToOffset(image, delayImportDir.VirtualAddress);
+    if (delayOffset == 0 || !CheckBounds(image, delayOffset, delayImportDir.Size)) {
+        return false;
+    }
+    const DWORD descriptorCount = delayImportDir.Size / sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+    const DWORD thunkSize = image->is64Bit ? 8u : 4u;
 
-    // 延迟导入使用 IMAGE_DELAYLOAD_DESCRIPTOR 结构
+    // 全部解析到局部容器，成功并发现终止项后一次性提交。
+    std::vector<CS_DELAY_IMPORT_DLL> local;
+    bool terminated = false;
+
+    for (DWORD di = 0; di < descriptorCount; ++di) {
+        IMAGE_DELAYLOAD_DESCRIPTOR desc{};
+        std::memcpy(&desc,
+            image->rawData + delayOffset + di * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR),
+            sizeof(desc));
+
+        // 3. 必须在目录范围内遇到全零终止描述符。
+        if (desc.Attributes.AllAttributes == 0 && desc.DllNameRVA == 0 &&
+            desc.ModuleHandleRVA == 0 && desc.ImportAddressTableRVA == 0 &&
+            desc.ImportNameTableRVA == 0 && desc.BoundImportAddressTableRVA == 0 &&
+            desc.UnloadInformationTableRVA == 0 && desc.TimeDateStamp == 0) {
+            terminated = true;
+            break;
+        }
+
+        // 4. 当前只支持 RVA-based descriptor；attributes bit 0 未设置时明确拒绝。
+        if ((desc.Attributes.AllAttributes & 0x1u) == 0) {
+            return false;
+        }
+
+        CS_DELAY_IMPORT_DLL dll{};
+        dll.moduleHandleRVA = desc.ModuleHandleRVA;
+        dll.iatRVA = desc.ImportAddressTableRVA;
+        dll.intRVA = desc.ImportNameTableRVA;
+
+        // 5. 验证 DLL 名称 RVA 和 NUL 终止字符串。
+        const DWORD dllNameOff = RVAToOffset(image, desc.DllNameRVA);
+        if (desc.DllNameRVA == 0 || dllNameOff == 0 ||
+            !ReadCString(image, dllNameOff, dll.dllName)) {
+            return false;
+        }
+
+        // 6. INT 与 IAT：起始 RVA 可映射，每次读取前检查完整 thunk 宽度。
+        if (desc.ImportNameTableRVA == 0 || desc.ImportAddressTableRVA == 0) {
+            return false;
+        }
+        const DWORD intOff = RVAToOffset(image, desc.ImportNameTableRVA);
+        const DWORD iatOff = RVAToOffset(image, desc.ImportAddressTableRVA);
+        if (intOff == 0 || iatOff == 0) {
+            return false;
+        }
+
+        // 解析 INT 直到零终止项。func.thunkRVA = IAT 槽 RVA，用 64 位累加并校验回绕。
+        std::vector<CS_IMPORT_FUNCTION> funcs;
+        bool intTerminated = false;
+        for (DWORD idx = 0; ; ++idx) {
+            if (idx > 0x1000000) return false;  // 防恶意
+            const uint64_t pos = static_cast<uint64_t>(intOff) +
+                static_cast<uint64_t>(idx) * thunkSize;
+            if (pos + thunkSize > static_cast<uint64_t>(image->rawSize)) {
+                return false;  // INT 未在文件范围内终止
+            }
+            uint64_t thunkVal = 0;
+            std::memcpy(&thunkVal, image->rawData + pos, thunkSize);
+            if (thunkVal == 0) {
+                intTerminated = true;
+                break;
+            }
+            CS_IMPORT_FUNCTION func;
+            // ImportAddressTableRVA + idx * thunkSize，显式防止 32 位回绕。
+            const uint64_t slotRVA = static_cast<uint64_t>(desc.ImportAddressTableRVA) +
+                static_cast<uint64_t>(idx) * thunkSize;
+            if (slotRVA > 0xFFFFFFFFull) return false;
+            func.thunkRVA = static_cast<DWORD>(slotRVA);
+            const bool isOrdinal = image->is64Bit
+                ? IMAGE_SNAP_BY_ORDINAL64(thunkVal)
+                : IMAGE_SNAP_BY_ORDINAL32(static_cast<DWORD>(thunkVal));
+            if (isOrdinal) {
+                func.isOrdinal = true;
+                func.ordinal = image->is64Bit
+                    ? IMAGE_ORDINAL64(thunkVal)
+                    : IMAGE_ORDINAL32(static_cast<DWORD>(thunkVal));
+            } else {
+                // 7. 非 ordinal：验证 Hint 字段与名称字符串。
+                func.isOrdinal = false;
+                if (thunkVal > 0xFFFFFFFFull) return false;
+                const DWORD hintNameRVA = static_cast<DWORD>(thunkVal);
+                const DWORD hintNameOff = RVAToOffset(image, hintNameRVA);
+                if (hintNameOff == 0 ||
+                    !CheckBounds(image, hintNameOff, sizeof(WORD)) ||
+                    !ReadCString(image, hintNameOff + sizeof(WORD), func.name)) {
+                    return false;
+                }
+                std::memcpy(&func.ordinal, image->rawData + hintNameOff, sizeof(WORD));
+            }
+            funcs.push_back(func);
+        }
+        if (!intTerminated) return false;
+
+        // IAT 必须至少覆盖与 INT 相同数量的项及终止槽，并读取确认最后的终止槽为零。
+        const size_t thunkCount = funcs.size();
+        const uint64_t iatNeed = static_cast<uint64_t>(iatOff) +
+            (static_cast<uint64_t>(thunkCount) + 1ull) * thunkSize;
+        if (iatNeed > static_cast<uint64_t>(image->rawSize)) {
+            return false;
+        }
+        uint64_t iatTerm = 0;
+        std::memcpy(&iatTerm, image->rawData + iatOff + thunkCount * thunkSize, thunkSize);
+        if (iatTerm != 0) return false;  // IAT 末尾终止槽非零
+
+        // 8. moduleHandleRVA 非零时，至少容纳一个指针宽度。
+        if (desc.ModuleHandleRVA != 0) {
+            const DWORD mhOff = RVAToOffset(image, desc.ModuleHandleRVA);
+            if (mhOff == 0 ||
+                static_cast<uint64_t>(mhOff) + thunkSize > static_cast<uint64_t>(image->rawSize)) {
+                return false;
+            }
+        }
+        // 9/10. boundIatRVA / unloadIatRVA 非零时，不仅覆盖容量，还要读取并确认
+        // 末尾终止槽为零（验证表结构而非仅容量）。
+        auto tableTerminatorIsZero = [&](DWORD rva) -> bool {
+            const DWORD off = RVAToOffset(image, rva);
+            if (off == 0) return false;
+            const uint64_t need = static_cast<uint64_t>(off) +
+                (static_cast<uint64_t>(thunkCount) + 1ull) * thunkSize;
+            if (need > static_cast<uint64_t>(image->rawSize)) return false;
+            uint64_t term = 0;
+            std::memcpy(&term, image->rawData + off + thunkCount * thunkSize, thunkSize);
+            return term == 0;
+        };
+        if (desc.BoundImportAddressTableRVA != 0 &&
+            !tableTerminatorIsZero(desc.BoundImportAddressTableRVA)) {
+            return false;
+        }
+        if (desc.UnloadInformationTableRVA != 0 &&
+            !tableTerminatorIsZero(desc.UnloadInformationTableRVA)) {
+            return false;
+        }
+
+        // 12. 单个 descriptor 全部验证成功后才加入局部结果。
+        dll.functions = std::move(funcs);
+        local.push_back(std::move(dll));
+    }
+
+    // 13. 所有 descriptors 成功并发现终止项后才提交；否则失败。
+    if (!terminated) return false;
+
+    image->delayImports.dlls = std::move(local);
+    return true;
+}
+
+// ============================================================================
+// Security Directory / WIN_CERTIFICATE 解析
+// ============================================================================
+
+bool PEParser::ParseSecurity(CS_PE_IMAGE* image) {
+    IMAGE_DATA_DIRECTORY secDir;
+    if (image->is64Bit) {
+        secDir = image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    } else {
+        secDir = image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
+    }
+    if (secDir.VirtualAddress == 0 || secDir.Size == 0) {
+        return false;  // 由 parseIfPresent 保证仅在两者均非零时进入
+    }
+
+    // 1. VirtualAddress 是文件偏移，绝不做 RVA 转换。
+    const DWORD dirOffset = secDir.VirtualAddress;
+    // 2. 验证目录整体文件范围（加法溢出安全）。
+    const uint64_t dirEnd = static_cast<uint64_t>(dirOffset) + secDir.Size;
+    if (dirOffset == 0 || dirOffset >= image->rawSize ||
+        dirEnd > static_cast<uint64_t>(image->rawSize)) {
+        return false;
+    }
+
+    // 3. 遍历 WIN_CERTIFICATE 记录链。
+    DWORD cursor = dirOffset;
+    const DWORD end = static_cast<DWORD>(dirEnd);
+    bool sawAny = false;
+    while (cursor < end) {
+        // 最小长度至少 8 字节。
+        if (static_cast<uint64_t>(cursor) + 8ull > static_cast<uint64_t>(image->rawSize)) {
+            return false;
+        }
+        DWORD dwLength = 0;
+        std::memcpy(&dwLength, image->rawData + cursor, sizeof(dwLength));
+        if (dwLength < 8) {
+            return false;  // dwLength 小于 WIN_CERTIFICATE 头
+        }
+        const uint64_t recEnd = static_cast<uint64_t>(cursor) + dwLength;
+        if (recEnd > static_cast<uint64_t>(end)) {
+            return false;  // dwLength 越界
+        }
+        sawAny = true;
+        // 每条记录按 8 字节对齐前进，对齐计算不得溢出。
+        const uint64_t aligned = (recEnd + 7ull) & ~7ull;
+        if (aligned > static_cast<uint64_t>(end)) {
+            return false;  // 对齐后越过目录末尾
+        }
+        cursor = static_cast<DWORD>(aligned);
+    }
+
+    // 最终 cursor 必须精确到达目录末尾。
+    if (cursor != end || !sawAny) {
+        return false;
+    }
+
+    // 4. 只在整条证书链有效时设置 hasSignature。
+    image->hasSignature = TRUE;
     return true;
 }
 

@@ -96,7 +96,6 @@ private:
     bool ClearDebugDirectory(CS_PE_IMAGE* image);
     bool ClearTimestamps(CS_PE_IMAGE* image);
     bool ClearChecksum(CS_PE_IMAGE* image);
-    bool NormalizePermissions(CS_PE_IMAGE* image);
 
     // 辅助函数
     bool PatternMatch(const BYTE* data, DWORD size, const BYTE* pattern, DWORD patternSize);
