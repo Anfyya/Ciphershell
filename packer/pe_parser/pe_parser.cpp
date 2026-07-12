@@ -809,8 +809,30 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
         if (callbackOffset == 0 || callbackOffset >= image->rawSize) {
             return false;
         }
+        // 扫描范围必须限制在 callbacksRVA 所在 section 自身的 file-backed 区域内，
+        // 不能越界读到下一个 section 或 overlay 的数据（那会把不相关的字节误判为
+        // 回调 VA 或意外的 0 终止符）。PointerToRawData+SizeOfRawData 已在 ParseHeaders
+        // 阶段对每个 section 校验过不越界，此处直接使用是安全的。
+        uint32_t sectionRawEnd = 0;
+        bool foundSection = false;
+        for (WORD i = 0; i < image->numSections; ++i) {
+            const IMAGE_SECTION_HEADER& s = image->sections[i];
+            if (callbackOffset >= s.PointerToRawData &&
+                callbackOffset < s.PointerToRawData + s.SizeOfRawData) {
+                sectionRawEnd = s.PointerToRawData + s.SizeOfRawData;
+                foundSection = true;
+                break;
+            }
+        }
+        if (!foundSection) {
+            return false;
+        }
         const DWORD pointerSize = image->is64Bit ? 8u : 4u;
-        const DWORD maxCallbacks = (image->rawSize - callbackOffset) / pointerSize;
+        const DWORD scanLimit = (std::min)(static_cast<uint32_t>(image->rawSize), sectionRawEnd);
+        if (callbackOffset >= scanLimit) {
+            return false;
+        }
+        const DWORD maxCallbacks = (scanLimit - callbackOffset) / pointerSize;
         bool terminated = false;
         for (DWORD count = 0; count < maxCallbacks; ++count) {
             DWORD64 callback = 0;
@@ -877,10 +899,10 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
         entry.endAddress = runtimeFuncs[i].EndAddress;
         entry.unwindData = runtimeFuncs[i].UnwindData;
 
-        // BeginAddress < EndAddress；UnwindData 非零，且至少能读取合法的 UNWIND_INFO
-        // 最小固定头部（4 字节、Version==1），而非仅首字节可映射。
+        // BeginAddress < EndAddress；UnwindData 非零，且必须是一个完整合法的 UNWIND_INFO
+        // （版本受支持、UnwindCode 数组落在文件范围内、按 Flags 校验 handler/链式尾部）。
         if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            !PEUtils::IsValidUnwindInfoHeader(image, entry.unwindData)) {
+            !PEUtils::IsValidUnwindInfo(image, entry.unwindData)) {
             return false;
         }
         // 代码范围必须位于可执行且 file-backed section。

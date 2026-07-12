@@ -441,10 +441,10 @@ bool PEEmitter::RebuildExceptionDirectory(
 
     uint32_t previousEnd = 0;
     for (const auto& entry : entries) {
-        // UnwindData 必须至少能读取合法的 UNWIND_INFO 最小固定头部（4 字节、Version==1），
-        // 而不是仅首字节可映射。
+        // UnwindData 必须是一个完整合法的 UNWIND_INFO（版本受支持、UnwindCode 数组落在
+        // 文件范围内、按 Flags 校验 handler/链式尾部），而不是仅头部可读。
         if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            !PEUtils::IsValidUnwindInfoHeader(m_image, entry.unwindData)) {
+            !PEUtils::IsValidUnwindInfo(m_image, entry.unwindData)) {
             if (error) *error = "exception directory contains an invalid runtime-function range";
             return false;
         }

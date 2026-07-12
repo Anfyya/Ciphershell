@@ -15,6 +15,13 @@ inline uint32_t AlignUp(uint32_t value, uint32_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+// 64 位对齐：调用方在自己的 64 位计算中使用，随后自行与 UINT32_MAX 比较判定是否
+// 能安全转回 uint32_t。避免像 AlignUp 那样在 32 位域内相加可能静默回绕。
+inline uint64_t AlignUp64(uint64_t value, uint32_t alignment) {
+    if (alignment == 0) return value;
+    return (value + alignment - 1) & ~static_cast<uint64_t>(alignment - 1);
+}
+
 inline bool CheckRawBounds(const CS_PE_IMAGE* image, uint32_t offset, uint32_t size) {
     return image && image->rawData && offset <= image->rawSize && size <= image->rawSize - offset;
 }
@@ -91,7 +98,12 @@ inline uint32_t RvaToOffset(const CS_PE_IMAGE* image, uint32_t rva) {
             return 0;
         }
 
-        const uint32_t offset = sec.PointerToRawData + delta;
+        // 64 位预计算，避免 PointerToRawData+delta 在 32 位域内回绕后意外落入合法范围。
+        const uint64_t offset64 = static_cast<uint64_t>(sec.PointerToRawData) + delta;
+        if (offset64 > std::numeric_limits<uint32_t>::max()) {
+            return 0;
+        }
+        const uint32_t offset = static_cast<uint32_t>(offset64);
         if (CheckRawBounds(image, offset, 1)) {
             return offset;
         }
@@ -127,7 +139,10 @@ inline const IMAGE_SECTION_HEADER* FindContainingFileBackedSection(
         const IMAGE_SECTION_HEADER& s = image->sections[i];
         const uint32_t span = SectionMappedSpan(s);
         if (span == 0) continue;
-        if (begin < s.VirtualAddress || end > s.VirtualAddress + span) continue;
+        // 64 位预计算 section 的虚拟结束地址，避免 VirtualAddress+span 在 32 位域内回绕
+        // 后让本不该匹配的 [begin,end) 意外通过范围检查。
+        const uint64_t sectionVirtualEnd64 = static_cast<uint64_t>(s.VirtualAddress) + span;
+        if (begin < s.VirtualAddress || end > sectionVirtualEnd64) continue;
         const uint32_t endDelta = end - s.VirtualAddress;
         if (endDelta > s.SizeOfRawData) return nullptr;  // 越过 raw 边界 → 仅虚存
         if (RvaToOffset(image, begin) == 0 || RvaToOffset(image, end - 1) == 0) return nullptr;
@@ -169,30 +184,84 @@ struct CS_UNWIND_INFO_HEADER {
 #pragma pack(pop)
 static_assert(sizeof(CS_UNWIND_INFO_HEADER) == 4, "UNWIND_INFO header must be 4 bytes");
 
-// x64 UNWIND_INFO 最小校验：unwindRVA 必须可映射，且至少能完整读取 4 字节固定头部
-// （不校验变长 UnwindCode 数组），并且 Version 字段（低 3 位）必须等于当前唯一定义的
-// 版本号 1，否则视为不是一个合法的 UNWIND_INFO。
-inline bool IsValidUnwindInfoHeader(const CS_PE_IMAGE* image, uint32_t unwindRVA) {
-    const uint32_t offset = RvaToOffset(image, unwindRVA);
-    if (offset == 0 || !CheckRawBounds(image, offset, sizeof(CS_UNWIND_INFO_HEADER))) return false;
-    CS_UNWIND_INFO_HEADER header;
-    std::memcpy(&header, image->rawData + offset, sizeof(header));
-    constexpr uint8_t kUnwindInfoVersion = 1;
-    return (header.versionAndFlags & 0x07u) == kUnwindInfoVersion;
+// x64 UNWIND_INFO 支持的 Version 范围（低 3 位字段）。标准 x64 ABI 只定义 Version 1；
+// 本项目的 CapabilityChecker::IsFunctionVmSafe 额外接受 Version 2，因此这里作为唯一的
+// 权威定义，解析器与 CapabilityChecker 都必须引用这两个常量，不得各自硬编码不同范围。
+constexpr uint8_t kUnwindInfoMinVersion = 1;
+constexpr uint8_t kUnwindInfoMaxVersion = 2;
+
+inline bool IsSupportedUnwindVersion(uint8_t version) {
+    return version >= kUnwindInfoMinVersion && version <= kUnwindInfoMaxVersion;
 }
 
+// UNWIND_INFO.Flags 位定义（Flags 字段的低 3 位为已定义标志，高 2 位保留）。
+constexpr uint8_t kUnwindFlagEHandler = 0x1;   // 有语言相关异常处理函数
+constexpr uint8_t kUnwindFlagUHandler = 0x2;   // 有终止处理函数
+constexpr uint8_t kUnwindFlagChainInfo = 0x4;  // 本记录是链式 UNWIND_INFO 的延续
+
+// x64 UNWIND_INFO 完整结构校验：
+//   1. 4 字节固定头部可读，Version 落在 [kUnwindInfoMinVersion, kUnwindInfoMaxVersion]。
+//   2. CountOfCodes 个 UNWIND_CODE（每个 2 字节）数组完整落在文件范围内；规范要求
+//      奇数个时补齐 1 个 slot 到偶数以保持后续数据 DWORD 对齐，这里同样按偶数计入。
+//   3. 按 Flags 校验紧随其后的尾部结构（互斥）：
+//        - UNW_FLAG_CHAININFO：尾部是一个链接的 IMAGE_RUNTIME_FUNCTION_ENTRY（12 字节），
+//          要求完整可读且 BeginAddress < EndAddress；不递归校验其自身 UnwindData，
+//          避免恶意构造的链条造成无界递归。
+//        - UNW_FLAG_EHANDLER / UNW_FLAG_UHANDLER：尾部是 4 字节异常处理函数 RVA，
+//          要求可读且落在可执行且 file-backed 的 section 内。
+//        - 均未设置：无需尾部结构。
+//   全部范围计算使用 64 位中间值，避免 32 位加法回绕。
+inline bool IsValidUnwindInfo(const CS_PE_IMAGE* image, uint32_t unwindRVA) {
+    const uint32_t offset = RvaToOffset(image, unwindRVA);
+    if (offset == 0 || !CheckRawBounds(image, offset, sizeof(CS_UNWIND_INFO_HEADER))) return false;
+
+    CS_UNWIND_INFO_HEADER header;
+    std::memcpy(&header, image->rawData + offset, sizeof(header));
+    const uint8_t version = header.versionAndFlags & 0x07u;
+    const uint8_t flags = static_cast<uint8_t>(header.versionAndFlags >> 3);
+    if (!IsSupportedUnwindVersion(version)) return false;
+
+    // UnwindCode 数组：CountOfCodes 个 2 字节 slot，奇数时向上补齐到偶数。
+    const uint32_t codeSlots = (static_cast<uint32_t>(header.countOfCodes) + 1u) & ~1u;
+    const uint64_t codesBytes64 = static_cast<uint64_t>(codeSlots) * 2u;
+    const uint64_t afterCodesOffset64 =
+        static_cast<uint64_t>(offset) + sizeof(CS_UNWIND_INFO_HEADER) + codesBytes64;
+    if (afterCodesOffset64 > image->rawSize) return false;
+    const uint32_t afterCodesOffset = static_cast<uint32_t>(afterCodesOffset64);
+
+    if (flags & kUnwindFlagChainInfo) {
+        constexpr uint32_t kChainedEntrySize = 12;  // BeginAddress+EndAddress+UnwindData
+        if (!CheckRawBounds(image, afterCodesOffset, kChainedEntrySize)) return false;
+        DWORD chainedBegin = 0, chainedEnd = 0;
+        std::memcpy(&chainedBegin, image->rawData + afterCodesOffset, sizeof(DWORD));
+        std::memcpy(&chainedEnd, image->rawData + afterCodesOffset + sizeof(DWORD), sizeof(DWORD));
+        if (chainedBegin >= chainedEnd) return false;
+    } else if (flags & (kUnwindFlagEHandler | kUnwindFlagUHandler)) {
+        if (!CheckRawBounds(image, afterCodesOffset, sizeof(DWORD))) return false;
+        DWORD handlerRVA = 0;
+        std::memcpy(&handlerRVA, image->rawData + afterCodesOffset, sizeof(DWORD));
+        if (handlerRVA == 0 || !IsExecutableFileBackedAddress(image, handlerRVA)) return false;
+    }
+
+    return true;
+}
+
+// 失败（结果无法用 uint32_t 表示）时返回 0，与本文件其余函数“0 表示无效”的约定一致。
 inline uint32_t RecomputeSizeOfImage(const CS_PE_IMAGE* image) {
     if (!image || !image->sections) return 0;
     const uint32_t align = SectionAlignment(image);
-    uint32_t size = AlignUp(SizeOfHeaders(image), align);
+    // 全程用 64 位累加，最后统一与 UINT32_MAX 比较后再转回 uint32_t，避免
+    // VirtualAddress+AlignUp(span,align) 在 32 位域内回绕成一个偏小的错误结果。
+    uint64_t size64 = AlignUp64(SizeOfHeaders(image), align);
     for (WORD i = 0; i < image->numSections; i++) {
         const IMAGE_SECTION_HEADER& sec = image->sections[i];
         const uint32_t span = SectionMappedSpan(sec);
         if (span == 0) continue;
-        const uint32_t sectionEnd = static_cast<uint32_t>(sec.VirtualAddress) + AlignUp(span, align);
-        size = (std::max)(size, sectionEnd);
+        const uint64_t sectionEnd64 = static_cast<uint64_t>(sec.VirtualAddress) + AlignUp64(span, align);
+        size64 = (std::max)(size64, sectionEnd64);
     }
-    return size;
+    if (size64 > std::numeric_limits<uint32_t>::max()) return 0;
+    return static_cast<uint32_t>(size64);
 }
 
 } // namespace PEUtils

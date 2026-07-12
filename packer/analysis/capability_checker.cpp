@@ -147,7 +147,9 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
             const uint8_t versionAndFlags = image->rawData[unwindOffset];
             const uint8_t version = versionAndFlags & 0x07u;
             const uint8_t flags = versionAndFlags >> 3;
-            if ((version != 1 && version != 2) || (flags & 0x07u) != 0) {
+            // Version 范围与解析器共用同一份定义（PEUtils::kUnwindInfoMinVersion/MaxVersion），
+            // 不在此处另行硬编码，避免两处判定范围出现分歧。
+            if (!PEUtils::IsSupportedUnwindVersion(version) || (flags & 0x07u) != 0) {
                 reason = "x64 function uses exception handlers or chained unwind metadata";
                 return false;
             }
