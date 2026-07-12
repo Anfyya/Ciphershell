@@ -4,6 +4,8 @@
 #include "pe_parser.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 namespace CipherShell {
 namespace PEUtils {
@@ -113,21 +115,70 @@ inline bool IsExecutableFileBackedAddress(const CS_PE_IMAGE* image, uint32_t rva
     return false;
 }
 
-// 范围校验：[begin, end) 必须整体落在某个可执行且 file-backed 的 section 内，
-// 供异常表 BeginAddress/EndAddress 等“地址区间”场景复用。
-inline bool IsExecutableFileBackedRange(const CS_PE_IMAGE* image, uint32_t begin, uint32_t end) {
-    if (!image || !image->sections || begin >= end) return false;
+namespace detail {
+// 定位 [begin, end) 整体落入的唯一 section：要求二者都在同一个 section 的映射范围内、
+// 该 section 是 file-backed（越过 SizeOfRawData 视为仅虚存，拒绝），且首尾字节都能
+// 映射到文件数据。只检查两个端点分别可映射是不够的——不同端点可能落在不同 section，
+// 中间跨越空洞或另一段数据，因此必须先确认整个区间都属于同一个 section。
+inline const IMAGE_SECTION_HEADER* FindContainingFileBackedSection(
+    const CS_PE_IMAGE* image, uint32_t begin, uint32_t end) {
+    if (!image || !image->sections || begin >= end) return nullptr;
     for (WORD i = 0; i < image->numSections; ++i) {
         const IMAGE_SECTION_HEADER& s = image->sections[i];
         const uint32_t span = SectionMappedSpan(s);
         if (span == 0) continue;
         if (begin < s.VirtualAddress || end > s.VirtualAddress + span) continue;
         const uint32_t endDelta = end - s.VirtualAddress;
-        if (endDelta > s.SizeOfRawData) return false;  // 越过 raw 边界 → 仅虚存，不可执行验证
-        if ((s.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) return false;
-        return RvaToOffset(image, begin) != 0 && RvaToOffset(image, end - 1) != 0;
+        if (endDelta > s.SizeOfRawData) return nullptr;  // 越过 raw 边界 → 仅虚存
+        if (RvaToOffset(image, begin) == 0 || RvaToOffset(image, end - 1) == 0) return nullptr;
+        return &s;
     }
-    return false;
+    return nullptr;
+}
+} // namespace detail
+
+// 范围校验（不要求可执行）：[begin, end) 必须整体落在同一个 file-backed 的 section 内。
+// 供 TLS Start/End 模板数据范围等“地址区间但无需可执行”场景复用。
+inline bool IsFileBackedRange(const CS_PE_IMAGE* image, uint32_t begin, uint32_t end) {
+    return detail::FindContainingFileBackedSection(image, begin, end) != nullptr;
+}
+
+// 大小校验（不要求可执行）：[rva, rva+size) 必须整体落在同一个 file-backed 的 section 内；
+// 内部处理 rva+size 的 32 位加法溢出。供 AddressOfIndex 等“地址 + 固定宽度字段”场景复用。
+inline bool IsFileBackedSpan(const CS_PE_IMAGE* image, uint32_t rva, uint32_t size) {
+    if (size == 0 || rva > std::numeric_limits<uint32_t>::max() - size) return false;
+    return IsFileBackedRange(image, rva, rva + size);
+}
+
+// 范围校验：[begin, end) 必须整体落在同一个可执行且 file-backed 的 section 内，
+// 供异常表 BeginAddress/EndAddress 等“地址区间”场景复用。
+inline bool IsExecutableFileBackedRange(const CS_PE_IMAGE* image, uint32_t begin, uint32_t end) {
+    const IMAGE_SECTION_HEADER* s = detail::FindContainingFileBackedSection(image, begin, end);
+    return s != nullptr && (s->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+}
+
+#pragma pack(push, 1)
+// x64 UNWIND_INFO 固定头部（不含变长 UnwindCode 数组）。自行定义而非依赖 SDK 头文件，
+// 避免不同编译环境下该结构是否公开暴露的差异。
+struct CS_UNWIND_INFO_HEADER {
+    uint8_t versionAndFlags;         // bits 0-2: Version, bits 3-7: Flags
+    uint8_t sizeOfProlog;
+    uint8_t countOfCodes;
+    uint8_t frameRegisterAndOffset;  // bits 0-3: FrameRegister, bits 4-7: FrameOffset
+};
+#pragma pack(pop)
+static_assert(sizeof(CS_UNWIND_INFO_HEADER) == 4, "UNWIND_INFO header must be 4 bytes");
+
+// x64 UNWIND_INFO 最小校验：unwindRVA 必须可映射，且至少能完整读取 4 字节固定头部
+// （不校验变长 UnwindCode 数组），并且 Version 字段（低 3 位）必须等于当前唯一定义的
+// 版本号 1，否则视为不是一个合法的 UNWIND_INFO。
+inline bool IsValidUnwindInfoHeader(const CS_PE_IMAGE* image, uint32_t unwindRVA) {
+    const uint32_t offset = RvaToOffset(image, unwindRVA);
+    if (offset == 0 || !CheckRawBounds(image, offset, sizeof(CS_UNWIND_INFO_HEADER))) return false;
+    CS_UNWIND_INFO_HEADER header;
+    std::memcpy(&header, image->rawData + offset, sizeof(header));
+    constexpr uint8_t kUnwindInfoVersion = 1;
+    return (header.versionAndFlags & 0x07u) == kUnwindInfoVersion;
 }
 
 inline uint32_t RecomputeSizeOfImage(const CS_PE_IMAGE* image) {

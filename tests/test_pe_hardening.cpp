@@ -5,6 +5,12 @@
 //     指向真实 .rdata（而非退化成 0）
 //   - SafeSEH handler 完整验证（合法 / handler 落在非可执行段拒绝），PE32 字段按
 //     真实 32 位宽度写入
+//   - TLS：Start/End 区间必须落在同一个 file-backed section（拒绝跨 section 的
+//     端点各自合法但整体不合法）、AddressOfIndex 必须容纳完整 DWORD、回调数组
+//     终止符与逐项可执行性校验
+//   - x64 Exception Directory：Begin<End、代码区间必须整体可执行且 file-backed
+//     （含仅虚存尾部拒绝）、条目不重叠、UnwindData 必须能读取合法 UNWIND_INFO
+//     最小头部（4 字节 + Version==1）
 //   - Delay Import：INT / IAT / ModuleHandle / Bound / Unload 表分别独立测试合法与
 //     非法两种情形，及无终止项 / Size 非 32 倍数 / VA-based 负面场景
 //   - Resource（循环 / 名称截断 / data 越界）
@@ -13,6 +19,8 @@
 //     PointerToRawData/AddressOfRawData
 //   - PEEmitter：追加 section 后 Security/Debug/overlay 偏移同步、连续追加无重复偏移、
 //     失败回滚（image 不变）、header relocation 后 section 偏移同步
+//   - 负面测试普遍核对 img->isValid 与 errorMessage 中的目录关键字，确认解析确实
+//     因目标目录本身畸形而失败，而非巧合地留空容器
 //
 // 本文件通过 ctest 实际运行（见 tests/CMakeLists.txt 的 pe_hardening_regression），
 // 全部断言要求真实通过，而不仅是编译通过。
@@ -309,6 +317,396 @@ void TestSafeSEHHandlerNotExecutable() {
 }
 
 // ============================================================================
+// TLS
+// ============================================================================
+
+constexpr uint64_t kTlsImageBase = 0x140000000ULL;
+constexpr uint32_t kTlsRdataVA = 0x2000;
+
+struct TlsLayout {
+    std::vector<uint8_t> rdata;
+    size_t dirRel = 0;
+};
+
+// 构造一个合法的 x64 TLS 目录：模板数据 [Start,End) 落在 .rdata 内，AddressOfIndex
+// 指向 .rdata 内一个 4 字节槽，AddressOfCallBacks 指向一个以 0 结尾的回调 VA 数组
+// （默认 1 个回调，指向 .text 入口）。返回 rdata 缓冲区与 TLS 目录结构体的相对偏移，
+// 调用方可据此直接改写缓冲区构造负面场景。
+TlsLayout BuildTlsValid() {
+    Writer rd;
+    const size_t dirRel = rd.mark();
+    rd.pad(sizeof(IMAGE_TLS_DIRECTORY64));
+    const size_t templateRel = rd.mark();
+    rd.u32(0xAAAAAAAA);  // 4 字节模板数据
+    const size_t indexRel = rd.mark();
+    rd.u32(0);           // AddressOfIndex 槽
+    const size_t callbacksRel = rd.mark();
+    rd.u64(kTlsImageBase + 0x1000);  // 1 个回调，指向 .text 入口（可执行）
+    rd.u64(0);                       // 终止符
+
+    auto va = [&](size_t rel) { return kTlsImageBase + kTlsRdataVA + static_cast<uint64_t>(rel); };
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    tlsDir.StartAddressOfRawData = va(templateRel);
+    tlsDir.EndAddressOfRawData = va(templateRel) + 4;
+    tlsDir.AddressOfIndex = va(indexRel);
+    tlsDir.AddressOfCallBacks = va(callbacksRel);
+    std::memcpy(rd.buf.data() + dirRel, &tlsDir, sizeof(tlsDir));
+
+    return {std::move(rd.buf), dirRel};
+}
+
+void TestTlsValid() {
+    auto tls = BuildTlsValid();
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(tls.dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, tls.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->tls.valid);
+    CS_TEST_CHECK(img->tls.callbackAddresses.size() == 1);
+    CS_TEST_CHECK(img->tls.callbackAddresses[0] == kTlsImageBase + 0x1000);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestTlsStartAfterEnd() {
+    auto tls = BuildTlsValid();
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    std::memcpy(&tlsDir, tls.rdata.data() + tls.dirRel, sizeof(tlsDir));
+    std::swap(tlsDir.StartAddressOfRawData, tlsDir.EndAddressOfRawData);  // Start > End
+    std::memcpy(tls.rdata.data() + tls.dirRel, &tlsDir, sizeof(tlsDir));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(tls.dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, tls.rdata, dirs, {});
+    auto* img = Parse(lay);
+    // 目标错误：Start > End，必须因 TLS 目录本身畸形而拒绝整个 PE（而不是巧合失败）。
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(!img->tls.valid);
+    CS_TEST_CHECK(img->errorMessage.find("TLS") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestTlsCrossSectionRange() {
+    // Start 落在 .text，End 落在 .rdata：两个端点各自都能映射，但整个区间并不落在
+    // 同一个 file-backed section 内——必须整体拒绝，而不能仅靠校验两个端点判断合法。
+    auto tls = BuildTlsValid();
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    std::memcpy(&tlsDir, tls.rdata.data() + tls.dirRel, sizeof(tlsDir));
+    tlsDir.StartAddressOfRawData = kTlsImageBase + 0x1000;         // .text 入口
+    tlsDir.EndAddressOfRawData = kTlsImageBase + kTlsRdataVA + 4;  // .rdata 内
+    std::memcpy(tls.rdata.data() + tls.dirRel, &tlsDir, sizeof(tlsDir));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(tls.dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, tls.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(!img->tls.valid);
+    CS_TEST_CHECK(img->errorMessage.find("TLS") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestTlsIndexTooSmall() {
+    // AddressOfIndex 指向 .rdata 对齐区的最后 1 字节：首字节可映射，但容不下完整的
+    // 4 字节 DWORD，必须拒绝。
+    auto tls = BuildTlsValid();
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    std::memcpy(&tlsDir, tls.rdata.data() + tls.dirRel, sizeof(tlsDir));
+    tlsDir.AddressOfIndex = kTlsImageBase + kTlsRdataVA + kFileAlign - 1;  // 对齐区最后 1 字节
+    std::memcpy(tls.rdata.data() + tls.dirRel, &tlsDir, sizeof(tlsDir));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(tls.dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, tls.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(!img->tls.valid);
+    CS_TEST_CHECK(img->errorMessage.find("TLS") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestTlsCallbackNotExecutable() {
+    // 回调 VA 指向 .rdata（非可执行）→ 拒绝。
+    auto tls = BuildTlsValid();
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    std::memcpy(&tlsDir, tls.rdata.data() + tls.dirRel, sizeof(tlsDir));
+    const uint64_t callbacksVA = tlsDir.AddressOfCallBacks;
+    const size_t callbacksRel = static_cast<size_t>(callbacksVA - kTlsImageBase - kTlsRdataVA);
+    const uint64_t badCallback = kTlsImageBase + kTlsRdataVA;  // .rdata 自身，不可执行
+    std::memcpy(tls.rdata.data() + callbacksRel, &badCallback, sizeof(badCallback));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(tls.dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, tls.rdata, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(!img->tls.valid);
+    CS_TEST_CHECK(img->errorMessage.find("TLS") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestTlsCallbackNotTerminated() {
+    // 回调数组一直填到文件对齐边界为止，全部是合法且可执行的重复 VA，故意不留终止符：
+    // 必须因为“扫描耗尽文件范围仍未找到 NULL 终止符”而拒绝——不能被对齐 padding 的
+    // 零字节意外“救回”，也不能因为目标非法而提前失败于无关原因。
+    Writer rd;
+    const size_t dirRel = rd.mark();
+    rd.pad(sizeof(IMAGE_TLS_DIRECTORY64));
+    const size_t templateRel = rd.mark();
+    rd.u32(0xAAAAAAAA);
+    const size_t indexRel = rd.mark();
+    rd.u32(0);
+    const size_t callbacksRel = rd.mark();
+    const uint64_t validCallback = kTlsImageBase + 0x1000;  // .text 入口，合法且可执行
+    while (rd.buf.size() % kFileAlign != 0) {
+        rd.u64(validCallback);
+    }
+
+    auto va = [&](size_t rel) { return kTlsImageBase + kTlsRdataVA + static_cast<uint64_t>(rel); };
+    IMAGE_TLS_DIRECTORY64 tlsDir{};
+    tlsDir.StartAddressOfRawData = va(templateRel);
+    tlsDir.EndAddressOfRawData = va(templateRel) + 4;
+    tlsDir.AddressOfIndex = va(indexRel);
+    tlsDir.AddressOfCallBacks = va(callbacksRel);
+    std::memcpy(rd.buf.data() + dirRel, &tlsDir, sizeof(tlsDir));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_TLS, kTlsRdataVA + static_cast<uint32_t>(dirRel),
+         sizeof(IMAGE_TLS_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(!img->tls.valid);
+    CS_TEST_CHECK(img->errorMessage.find("TLS") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+// ============================================================================
+// x64 Exception Directory
+// ============================================================================
+
+constexpr uint32_t kExcTextVA = 0x1000;
+constexpr uint32_t kExcRdataVA = 0x2000;
+
+// 合法的 UNWIND_INFO 最小固定头部：Version=1, Flags=0, 无 prolog/UnwindCode。
+std::vector<uint8_t> BuildUnwindInfoValid() {
+    return {0x01, 0x00, 0x00, 0x00};
+}
+
+void TestExceptionValid() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+    CS_TEST_CHECK(img->exceptions.entries[0].beginAddress == kExcTextVA);
+    CS_TEST_CHECK(img->exceptions.entries[0].endAddress == kExcTextVA + 8);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionBeginNotLessThanEnd() {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA + 8;
+    entry.EndAddress = kExcTextVA;  // Begin >= End
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionRangeNotExecutable() {
+    // BeginAddress/EndAddress 落在 .rdata（可读但不可执行）→ 拒绝。
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcRdataVA;
+    entry.EndAddress = kExcRdataVA + 4;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionRangeNotFileBacked() {
+    // 人为把 .text 的 VirtualSize 撑大到 SizeOfRawData 之外（模拟仅虚存、无文件支持
+    // 的尾部区域，且刻意不越界到 .rdata），异常表条目落在该尾部必须被拒绝。
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA + kFileAlign;  // .text raw 边界（0x200）之外
+    entry.EndAddress = entry.BeginAddress + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    // 撑大 .text 的 VirtualSize 到 0x1000（仍严格小于 .rdata 的 VA 0x2000，不产生重叠），
+    // 使 [kFileAlign, kFileAlign+8) 落在“仅虚存”的尾部而非 .rdata。
+    auto* secs = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        lay.bytes.data() + sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64));
+    secs[0].Misc.VirtualSize = 0x1000;
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionOverlappingRanges() {
+    // 两个条目按 BeginAddress 排列后仍互相重叠（第二个的 Begin < 第一个的 End）→ 拒绝。
+    Writer rd;
+    const size_t entriesRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) * 2);
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entries[2]{};
+    entries[0].BeginAddress = kExcTextVA;
+    entries[0].EndAddress = kExcTextVA + 0x10;
+    entries[0].UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    entries[1].BeginAddress = kExcTextVA + 0x08;  // 落在 entries[0] 范围内 → 重叠
+    entries[1].EndAddress = kExcTextVA + 0x18;
+    entries[1].UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entriesRel, entries, sizeof(entries));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entriesRel),
+         sizeof(entries)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(0x18, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindHeaderTooShort() {
+    // UnwindData 指向文件末尾前仅剩 2 字节的位置：首字节可映射，但容不下完整的
+    // 4 字节 UNWIND_INFO 固定头部，必须拒绝。
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    // 用合法字节填满到对齐边界前 2 字节处，让 UnwindData 指向的位置只剩 2 字节可读。
+    while (rd.buf.size() % kFileAlign != kFileAlign - 2) {
+        rd.buf.push_back(0);
+    }
+    const size_t unwindRel = rd.mark();
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionUnwindBadVersion() {
+    // UnwindData 完整可读 4 字节，但 Version 字段不是 1 → 拒绝。
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    rd.buf.push_back(0x02);  // Version=2（非法：唯一定义的版本是 1）
+    rd.buf.push_back(0x00);
+    rd.buf.push_back(0x00);
+    rd.buf.push_back(0x00);
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.empty());
+    CS_TEST_CHECK(img->errorMessage.find("exception") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+// ============================================================================
 // Delay Import
 // ============================================================================
 
@@ -443,6 +841,8 @@ void TestDelayImportNoTerminator() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -455,6 +855,8 @@ void TestDelayImportSizeNotMultiple() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -472,6 +874,8 @@ void TestDelayImportVaBased() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -492,6 +896,8 @@ void TestDelayImportIntNotTerminated() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -512,6 +918,8 @@ void TestDelayImportIatNotTerminated() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -542,6 +950,8 @@ void TestDelayImportModuleHandleInvalid() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -571,6 +981,8 @@ void TestDelayImportBoundTableInvalid() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -600,6 +1012,8 @@ void TestDelayImportUnloadTableInvalid() {
     auto lay = BuildPe(true, {0xCC, 0xCC}, dl.rdata, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->delayImports.dlls.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("delay import") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -671,7 +1085,10 @@ void TestResourceCycle() {
     std::vector<DirEntry> dirs = {{IMAGE_DIRECTORY_ENTRY_RESOURCE, 0x2000, static_cast<uint32_t>(rd.size())}};
     auto lay = BuildPe(true, {0xCC}, rd, dirs, {});
     auto* img = Parse(lay);
+    // 目标错误：确认整个 PE 因 resource 目录本身畸形而拒绝，而不是巧合地留空容器。
     CS_TEST_CHECK(img->resources.entries.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("resource") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -681,6 +1098,8 @@ void TestResourceTruncatedName() {
     auto lay = BuildPe(true, {0xCC}, rd, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->resources.entries.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("resource") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -690,6 +1109,8 @@ void TestResourceDataOob() {
     auto lay = BuildPe(true, {0xCC}, rd, dirs, {});
     auto* img = Parse(lay);
     CS_TEST_CHECK(img->resources.entries.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("resource") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -732,7 +1153,10 @@ void TestSecurityLengthOob() {
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress = lay.overlayFileOff;
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = static_cast<DWORD>(cert.size());
     auto* img = Parse(lay);
+    // 目标错误：确认整个 PE 因 security 目录本身畸形而拒绝，而不是巧合地留空标志位。
     CS_TEST_CHECK(!img->hasSignature);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("security") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -749,6 +1173,8 @@ void TestSecurityAlignmentError() {
     nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size = 12;  // 12 != 对齐后 16
     auto* img = Parse(lay);
     CS_TEST_CHECK(!img->hasSignature);
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("security") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -769,7 +1195,10 @@ void TestDebugPayloadOob() {
                                    sizeof(IMAGE_DEBUG_DIRECTORY)}};
     auto lay = BuildPe(true, {0xCC}, rd.buf, dirs, {});
     auto* img = Parse(lay);
+    // 目标错误：确认整个 PE 因 debug 目录本身畸形而拒绝，而不是巧合地留空容器。
     CS_TEST_CHECK(img->debugDir.entries.empty());
+    CS_TEST_CHECK(!img->isValid);
+    CS_TEST_CHECK(img->errorMessage.find("debug") != std::string::npos);
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -897,6 +1326,19 @@ int main() {
     TestLoadConfigShortNoSEHandler();
     TestSafeSEHValid();
     TestSafeSEHHandlerNotExecutable();
+    TestTlsValid();
+    TestTlsStartAfterEnd();
+    TestTlsCrossSectionRange();
+    TestTlsIndexTooSmall();
+    TestTlsCallbackNotExecutable();
+    TestTlsCallbackNotTerminated();
+    TestExceptionValid();
+    TestExceptionBeginNotLessThanEnd();
+    TestExceptionRangeNotExecutable();
+    TestExceptionRangeNotFileBacked();
+    TestExceptionOverlappingRanges();
+    TestExceptionUnwindHeaderTooShort();
+    TestExceptionUnwindBadVersion();
     TestDelayImportValid();
     TestDelayImportNoTerminator();
     TestDelayImportSizeNotMultiple();

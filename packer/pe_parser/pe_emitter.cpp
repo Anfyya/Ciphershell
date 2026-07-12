@@ -96,6 +96,10 @@ PEAppendSectionResult PEEmitter::AppendSection(
         result.error = "empty section name or data";
         return result;
     }
+    if (data.size() > std::numeric_limits<uint32_t>::max()) {
+        result.error = "section data exceeds PE size limits";
+        return result;
+    }
 
     const uint32_t fileAlign = GetFileAlignment();
     const uint32_t sectionAlign = GetSectionAlignment();
@@ -134,8 +138,16 @@ PEAppendSectionResult PEEmitter::AppendSection(
     if (firstRaw == 0xFFFFFFFFu) firstRaw = GetSizeOfHeaders();
 
     // requiredHeaderEnd = 增加 1 条 section header 后的 section table 末尾。
-    const uint32_t requiredHeaderEnd = static_cast<uint32_t>(
-        reinterpret_cast<BYTE*>(&m_image->sections[m_image->numSections + 1]) - m_image->rawData);
+    // 用整数偏移 + 64 位乘加计算，避免指针运算结果直接截断到 32 位可能吞掉的溢出。
+    const uint64_t sectionTableOffset = static_cast<uint64_t>(
+        reinterpret_cast<BYTE*>(m_image->sections) - m_image->rawData);
+    const uint64_t requiredHeaderEnd64 = sectionTableOffset +
+        (static_cast<uint64_t>(m_image->numSections) + 1ull) * sizeof(IMAGE_SECTION_HEADER);
+    if (requiredHeaderEnd64 > std::numeric_limits<uint32_t>::max()) {
+        result.error = "section table would exceed PE header limits";
+        return result;
+    }
+    const uint32_t requiredHeaderEnd = static_cast<uint32_t>(requiredHeaderEnd64);
 
     // headerDelta：仅当现有头部放不下 +1 条 section header 时才需要扩容。
     // 此处只计算 delta，不提交。
@@ -429,8 +441,10 @@ bool PEEmitter::RebuildExceptionDirectory(
 
     uint32_t previousEnd = 0;
     for (const auto& entry : entries) {
+        // UnwindData 必须至少能读取合法的 UNWIND_INFO 最小固定头部（4 字节、Version==1），
+        // 而不是仅首字节可映射。
         if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            RvaToOffset(entry.unwindData) == 0) {
+            !PEUtils::IsValidUnwindInfoHeader(m_image, entry.unwindData)) {
             if (error) *error = "exception directory contains an invalid runtime-function range";
             return false;
         }

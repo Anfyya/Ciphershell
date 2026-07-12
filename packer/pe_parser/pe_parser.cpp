@@ -776,23 +776,25 @@ bool PEParser::ParseTLS(CS_PE_IMAGE* image) {
         return true;
     };
 
-    // 1. Start/End：TLS 模板数据范围，Start <= End；非空范围必须整体可映射到文件。
+    // 1. Start/End：TLS 模板数据范围，Start <= End；非空范围必须整体落在同一个
+    //    file-backed section 内——分别校验两个端点不够，因为它们可能落在不同 section，
+    //    中间跨越空洞或另一段数据，因此用区间校验整体确认。
     if (local.startAddress != 0 || local.endAddress != 0) {
         DWORD startRVA = 0, endRVA = 0;
         if (!vaToRva(local.startAddress, startRVA) || !vaToRva(local.endAddress, endRVA) ||
             startRVA > endRVA) {
             return false;
         }
-        if (startRVA != endRVA &&
-            (RVAToOffset(image, startRVA) == 0 || RVAToOffset(image, endRVA - 1) == 0)) {
+        if (startRVA != endRVA && !PEUtils::IsFileBackedRange(image, startRVA, endRVA)) {
             return false;
         }
     }
 
-    // 2. AddressOfIndex：TLS 索引变量地址，必须非零、VA→RVA 合法且可映射到文件。
+    // 2. AddressOfIndex：TLS 索引变量地址，必须非零、VA→RVA 合法，且至少能容纳一个
+    //    完整 DWORD（4 字节）落在同一个 file-backed section 内，而非仅首字节可映射。
     DWORD indexRVA = 0;
     if (local.indexAddress == 0 || !vaToRva(local.indexAddress, indexRVA) ||
-        RVAToOffset(image, indexRVA) == 0) {
+        !PEUtils::IsFileBackedSpan(image, indexRVA, sizeof(DWORD))) {
         return false;
     }
 
@@ -875,9 +877,10 @@ bool PEParser::ParseExceptionTable(CS_PE_IMAGE* image) {
         entry.endAddress = runtimeFuncs[i].EndAddress;
         entry.unwindData = runtimeFuncs[i].UnwindData;
 
-        // BeginAddress < EndAddress；UnwindData 非零且可映射到文件。
+        // BeginAddress < EndAddress；UnwindData 非零，且至少能读取合法的 UNWIND_INFO
+        // 最小固定头部（4 字节、Version==1），而非仅首字节可映射。
         if (entry.beginAddress >= entry.endAddress || entry.unwindData == 0 ||
-            RVAToOffset(image, entry.unwindData) == 0) {
+            !PEUtils::IsValidUnwindInfoHeader(image, entry.unwindData)) {
             return false;
         }
         // 代码范围必须位于可执行且 file-backed section。
