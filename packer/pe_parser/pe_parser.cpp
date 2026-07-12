@@ -579,6 +579,14 @@ struct ResourceParseState {
     }
 };
 
+// RAII 守卫：确保递归路径在任何退出路径（含提前 return / 异常）下都正确恢复，
+// 不留下错误的递归状态用于后续环检测。
+struct ResourcePathGuard {
+    std::vector<uint32_t>& path;
+    ResourcePathGuard(std::vector<uint32_t>& p, uint32_t v) : path(p) { path.push_back(v); }
+    ~ResourcePathGuard() { if (!path.empty()) path.pop_back(); }
+};
+
 bool ParseResourceSubdir(ResourceParseState& s, uint32_t relOffset, uint32_t depth,
                          CS_RESOURCE_ENTRY cur) {
     if (s.failed) return false;
@@ -594,7 +602,8 @@ bool ParseResourceSubdir(ResourceParseState& s, uint32_t relOffset, uint32_t dep
             s.failed = true; s.error = "resource tree contains a cycle"; return false;
         }
     }
-    s.path.push_back(relOffset);
+    // push 后由 guard 在所有退出路径统一 pop，提前 return 也不会留下残余状态。
+    ResourcePathGuard guard(s.path, relOffset);
 
     if (!s.InRange(relOffset, sizeof(IMAGE_RESOURCE_DIRECTORY))) {
         s.failed = true; s.error = "resource directory header out of range"; return false;
@@ -678,7 +687,6 @@ bool ParseResourceSubdir(ResourceParseState& s, uint32_t relOffset, uint32_t dep
         }
     }
 
-    s.path.pop_back();
     return true;
 }
 } // namespace
@@ -888,10 +896,7 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         PIMAGE_LOAD_CONFIG_DIRECTORY64 lc = (PIMAGE_LOAD_CONFIG_DIRECTORY64)(image->rawData + loadConfigOffset);
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie), sizeof(lc->SecurityCookie)))
             local.securityCookie = lc->SecurityCookie;
-        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SEHandlerTable), sizeof(lc->SEHandlerTable)))
-            local.seHandlerTable = lc->SEHandlerTable;
-        if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SEHandlerCount), sizeof(lc->SEHandlerCount)))
-            local.seHandlerCount = lc->SEHandlerCount;
+        // x64 不使用 SafeSEH（使用 .pdata 异常表），不解析 SEHandlerTable/Count。
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer), sizeof(lc->GuardCFCheckFunctionPointer)))
             local.guardCFCheckFunctionPointer = lc->GuardCFCheckFunctionPointer;
         if (hasField(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFDispatchFunctionPointer), sizeof(lc->GuardCFDispatchFunctionPointer)))
@@ -976,8 +981,9 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     }
 
     // 解析 x86 SafeSEH handler 表（SEHandlerTable/Count）。
+    // 只对 PE32 解析；x64 使用 .pdata 异常表，不解析 SafeSEH。
     // SEHandlerTable 是 VA：不小于 ImageBase，差值不超过 32 位，count×sizeof(DWORD) 不溢出。
-    if (local.seHandlerTable != 0 && local.seHandlerCount != 0) {
+    if (!image->is64Bit && local.seHandlerTable != 0 && local.seHandlerCount != 0) {
         if (local.seHandlerTable < imageBase ||
             local.seHandlerTable - imageBase > 0xFFFFFFFFULL ||
             local.seHandlerCount > 0x1000000ULL) {

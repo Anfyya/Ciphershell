@@ -139,14 +139,22 @@ PEAppendSectionResult PEEmitter::AppendSection(
 
     // headerDelta：仅当现有头部放不下 +1 条 section header 时才需要扩容。
     // 此处只计算 delta，不提交。
+    // 关键：新 SizeOfHeaders 必须 fileAlign 对齐，且 firstRaw + headerDelta 必须严格
+    // 等于新 SizeOfHeaders（section data 紧跟对齐后的头部），否则布局不一致。
     uint32_t headerDelta = 0;
+    uint32_t newSizeOfHeaders = GetSizeOfHeaders();
     if (requiredHeaderEnd > firstRaw) {
-        const uint32_t gap = requiredHeaderEnd - firstRaw;
-        headerDelta = AlignUp(gap, fileAlign);
-        if (headerDelta < gap) {  // AlignUp 回绕
-            result.error = "header relocation alignment overflow";
+        newSizeOfHeaders = AlignUp(requiredHeaderEnd, fileAlign);
+        if (newSizeOfHeaders < requiredHeaderEnd) {  // AlignUp 回绕
+            result.error = "new SizeOfHeaders alignment overflow";
             return result;
         }
+        // firstRaw + headerDelta == newSizeOfHeaders（严格）。
+        if (newSizeOfHeaders < firstRaw) {
+            result.error = "header relocation would shrink first raw offset";
+            return result;
+        }
+        headerDelta = newSizeOfHeaders - firstRaw;
     }
 
     // 平移后的 section 数据末尾 = lastFileEnd + headerDelta。
@@ -186,8 +194,6 @@ PEAppendSectionResult PEEmitter::AppendSection(
         result.error = "SizeOfImage overflows";
         return result;
     }
-    const uint32_t newSizeOfHeaders = (headerDelta != 0)
-        ? AlignUp(requiredHeaderEnd, fileAlign) : GetSizeOfHeaders();
 
     // 拷贝区域合法性（防止越界读源 buffer）。
     //   头部 [0, firstRaw)；section 数据 [firstRaw, lastFileEnd)；
