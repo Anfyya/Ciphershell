@@ -398,6 +398,9 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
         case VM_UOP_NOT:
         case VM_UOP_NEG:
         case VM_UOP_MUL:
+        case VM_UOP_BIT_TEST:
+        case VM_UOP_BIT_SET:
+        case VM_UOP_BIT_RESET:
             return true;
         default:
             return false;
@@ -794,6 +797,66 @@ bool EmitBusinessCoreVariant(
                 if (strategy == 0u) c.Raw({0x48,0x0F,0xAF,0xC2});
                 else c.Raw({0x48,0xF7,0xE2});
                 return true;
+            case VM_UOP_BIT_TEST:
+                // Common to both strategies: reduce the raw bit-index operand
+                // (rdx) modulo the operand width in bits.
+                X64LoadByte(c, 1, CtxDecodedOperands);
+                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
+                X64BinaryRegister(c, 0x21, 2, 1);
+                if (strategy == 0u) {
+                    // strategy 0: manual shift-and-mask against the saved
+                    // pre-core copy of a (r8).
+                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
+                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
+                    c.Raw({0x49,0x83,0xE2,0x01});
+                    X64MovRegister(c, 0, 8);
+                } else {
+                    // strategy 1: native BT — CF *is* the tested bit by
+                    // hardware definition; BT never modifies its r/m operand.
+                    X64MovRegister(c, 0, 8);
+                    c.Raw({0x48,0x0F,0xA3,0xD0});
+                    c.Raw({0x41,0x0F,0x92,0xC2});
+                }
+                return true;
+            case VM_UOP_BIT_SET:
+                X64LoadByte(c, 1, CtxDecodedOperands);
+                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
+                X64BinaryRegister(c, 0x21, 2, 1);
+                if (strategy == 0u) {
+                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
+                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
+                    c.Raw({0x49,0x83,0xE2,0x01});
+                    c.Raw({0xB8,0x01,0x00,0x00,0x00}); // mov eax,1
+                    c.Raw({0x48,0xD3,0xE0});           // shl rax,cl
+                    X64BinaryRegister(c, 0x09, 0, 8);
+                } else {
+                    // strategy 1: native BTS sets the bit and reports the old
+                    // value in CF in the same instruction.
+                    X64MovRegister(c, 0, 8);
+                    c.Raw({0x48,0x0F,0xAB,0xD0});
+                    c.Raw({0x41,0x0F,0x92,0xC2});
+                }
+                return true;
+            case VM_UOP_BIT_RESET:
+                X64LoadByte(c, 1, CtxDecodedOperands);
+                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
+                X64BinaryRegister(c, 0x21, 2, 1);
+                if (strategy == 0u) {
+                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
+                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
+                    c.Raw({0x49,0x83,0xE2,0x01});
+                    c.Raw({0xB8,0x01,0x00,0x00,0x00}); // mov eax,1
+                    c.Raw({0x48,0xD3,0xE0});           // shl rax,cl
+                    c.Raw({0x48,0xF7,0xD0});           // not rax
+                    X64BinaryRegister(c, 0x21, 0, 8);
+                } else {
+                    // strategy 1: native BTR resets the bit and reports the
+                    // old value in CF in the same instruction.
+                    X64MovRegister(c, 0, 8);
+                    c.Raw({0x48,0x0F,0xB3,0xD0});
+                    c.Raw({0x41,0x0F,0x92,0xC2});
+                }
+                return true;
             default:
                 return false;
         }
@@ -834,6 +897,58 @@ bool EmitBusinessCoreVariant(
             // is safe for the same reason (a/b already latched earlier).
             if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
             else c.Raw({0xF7,0xE2});
+            return true;
+        case VM_UOP_BIT_TEST:
+            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
+            X86LoadByte(c, 2, CtxDecodedOperands);
+            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
+            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
+            if (strategy == 0u) {
+                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
+            } else {
+                // strategy 1: native BT — CF is the tested bit; the r/m
+                // operand (eax) is left unmodified by BT.
+                c.Raw({0x31,0xD2});
+                c.Raw({0x0F,0xA3,0xC8});
+                c.Raw({0x0F,0x92,0xC2});
+            }
+            X86StoreD(c, CtxMutationScratch + 4u, 2);
+            return true;
+        case VM_UOP_BIT_SET:
+            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
+            X86LoadByte(c, 2, CtxDecodedOperands);
+            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
+            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
+            if (strategy == 0u) {
+                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
+                c.Raw({0xBE,0x01,0x00,0x00,0x00,0xD3,0xE6});
+                c.Raw({0x09,0xF0});
+            } else {
+                // strategy 1: native BTS sets the bit and reports the old
+                // value in CF in the same instruction.
+                c.Raw({0x31,0xD2});
+                c.Raw({0x0F,0xAB,0xC8});
+                c.Raw({0x0F,0x92,0xC2});
+            }
+            X86StoreD(c, CtxMutationScratch + 4u, 2);
+            return true;
+        case VM_UOP_BIT_RESET:
+            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
+            X86LoadByte(c, 2, CtxDecodedOperands);
+            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
+            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
+            if (strategy == 0u) {
+                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
+                c.Raw({0xBE,0x01,0x00,0x00,0x00,0xD3,0xE6});
+                c.Raw({0xF7,0xD6,0x21,0xF0});
+            } else {
+                // strategy 1: native BTR resets the bit and reports the old
+                // value in CF in the same instruction.
+                c.Raw({0x31,0xD2});
+                c.Raw({0x0F,0xB3,0xC8});
+                c.Raw({0x0F,0x92,0xC2});
+            }
+            X86StoreD(c, CtxMutationScratch + 4u, 2);
             return true;
         default:
             return false;
@@ -1906,21 +2021,6 @@ void EmitX64BinaryAlu(
             case VM_UOP_ROR:
                 EmitX64SizedShiftOrRotate(c, semantic, widthFailure);
                 break;
-            case VM_UOP_BIT_TEST:
-            case VM_UOP_BIT_SET:
-            case VM_UOP_BIT_RESET: {
-                X64LoadByte(c, 1, CtxDecodedOperands);
-                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
-                X64Binary(c, 0x21, 2, 1);      // bit index modulo width
-                X64Move(c, 10, 8); X64Move(c, 1, 2); X64ShiftCl(c, 5, 10);
-                c.Raw({0x49,0x83,0xE2,0x01});
-                if (semantic != VM_UOP_BIT_TEST) {
-                    c.Raw({0xB8,0x01,0x00,0x00,0x00}); X64ShiftCl(c, 4, 0);
-                    if (semantic == VM_UOP_BIT_SET) X64Binary(c, 0x09, 0, 8);
-                    else { X64Not(c, 0); X64Binary(c, 0x21, 0, 8); }
-                } else X64Move(c, 0, 8);
-                break;
-            }
             default: break;
         }
     }
@@ -2155,19 +2255,6 @@ void EmitX86BinaryAlu(
             case VM_UOP_ROL:
             case VM_UOP_ROR:
                 EmitX86SizedShiftOrRotate(c, semantic, widthFailure);
-                break;
-            case VM_UOP_BIT_TEST:
-            case VM_UOP_BIT_SET:
-            case VM_UOP_BIT_RESET:
-                X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
-                X86LoadByte(c, 2, CtxDecodedOperands); c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
-                X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a)); c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
-                if (semantic != VM_UOP_BIT_TEST) {
-                    c.Raw({0xBE,0x01,0x00,0x00,0x00,0xD3,0xE6});
-                    if (semantic == VM_UOP_BIT_SET) c.Raw({0x09,0xF0});
-                    else c.Raw({0xF7,0xD6,0x21,0xF0});
-                }
-                X86StoreD(c, CtxMutationScratch + 4u, 2);
                 break;
             default: break;
         }

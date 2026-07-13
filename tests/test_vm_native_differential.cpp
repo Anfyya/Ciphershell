@@ -246,6 +246,72 @@ void TestMulNativeDifferentialMatchesRealCpu() {
         "native=ADD vs VM-bytecode=MUL 必须被判定语义分歧");
 }
 
+void TestBitOperationsNativeDifferentialMatchesRealCpu() {
+    // 覆盖新加入的 VM_UOP_BIT_TEST/BIT_SET/BIT_RESET 双策略业务核心
+    // (EmitBusinessCoreVariant 的手工 shift+mask 序列 与 原生 BT/BTS/BTR
+    // 硬件指令两条真实不同字节序列)：证明无论 build 的 seed/variant 选中
+    // 哪一支策略，合成 handler 链的位操作结果都必须与真实 CPU BT/BTS/BTR
+    // 逐字节一致，而不仅仅是结构层面的字节模式检查。
+    const auto seed = MakeSeed(0xF5);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // bt/bts/btr eax, ecx ; add eax, 0 ; ret.  BT/BTS/BTR define CF but leave
+    // OF/SF/ZF/AF/PF architecturally undefined, so (exactly like the MUL and
+    // DIV/IDIV cases above) a trailing value-no-op `add eax, 0` closes that
+    // undefined-flags window before the translator's terminal-RET check.
+    const std::vector<uint8_t> btBytes = {
+        0x0F, 0xA3, 0xC8, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    const std::vector<uint8_t> btsBytes = {
+        0x0F, 0xAB, 0xC8, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    const std::vector<uint8_t> btrBytes = {
+        0x0F, 0xB3, 0xC8, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
+    const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
+
+    const struct { const std::vector<uint8_t>* bytes; uint64_t preflightSeed; const char* name; } cases[] = {
+        {&btBytes, 0xB17B17ULL, "BIT_TEST(BT)"},
+        {&btsBytes, 0xB17B18ULL, "BIT_SET(BTS)"},
+        {&btrBytes, 0xB17B19ULL, "BIT_RESET(BTR)"},
+    };
+
+    for (const auto& testCase : cases) {
+        const Function bitFunction =
+            DecodeStandaloneFunction(disassembler, *testCase.bytes, kEntry);
+        Translator translator;
+        const TranslationResult bitTranslation =
+            TranslateStandaloneFunction(bitFunction, build, translator);
+
+        VMIRModelPreflightConfig preflightConfig{};
+        preflightConfig.corpusSeed = testCase.preflightSeed;
+        preflightConfig.corpusCount = 8;
+        const auto preflight = VMIRModelPreflightVerifier::Verify(
+            bitFunction, bitTranslation, build.isa.opcodeMap, build.isa.registerMap, preflightConfig);
+        std::cout << "[preflight " << testCase.name << "] success=" << preflight.success
+                  << " cases=" << preflight.casesExecuted << " error=" << preflight.error << '\n';
+        Require(preflight.success, std::string(testCase.name) +
+            " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
+            preflight.error);
+
+        RunDifferentialCase(bitFunction, bitTranslation, build, 32, true,
+            (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
+    }
+
+    // 单独一个跨语义负控制：native=ADD 的求值结果绝不能被误判为与
+    // VM-bytecode=BIT_SET 一致，证明差分验证器确实在比较真实语义而非
+    // 结构存在性。
+    const Function addFunction = DecodeStandaloneFunction(disassembler, addBytes, kEntry);
+    Translator btsTranslator;
+    const TranslationResult btsTranslation =
+        TranslateStandaloneFunction(
+            DecodeStandaloneFunction(disassembler, btsBytes, kEntry), build, btsTranslator);
+    RunDifferentialCase(addFunction, btsTranslation, build, 8, false,
+        "native=ADD vs VM-bytecode=BIT_SET 必须被判定语义分歧");
+}
+
 void TestWideDivideNativeDifferentialAndDivideFault() {
     // 生产级 DIV/IDIV(UDIV_WIDE/IDIV_WIDE)差分证据：直接复用 packer/differential/
     // 的隔离原生 worker，而不是另起一套验证机制。dividend 是完整的
@@ -326,6 +392,8 @@ int main() {
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
     Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",
         &TestMulNativeDifferentialMatchesRealCpu, failures);
+    Run("BIT_TEST/BIT_SET/BIT_RESET 真 K 变体: 真实 CPU BT/BTS/BTR 与合成 handler 链一致性/分歧检测",
+        &TestBitOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
         &TestWideDivideNativeDifferentialAndDivideFault, failures);
 #else
