@@ -52,7 +52,13 @@ jobs:
   # 只要有一个测试没过就红,并把完整测试输出作为附件保存,方便事后翻看是哪个
   # 测试、哪一行报错。
   build-and-test:
-    runs-on: windows-latest
+    # 钉死 windows-2022 而非 windows-latest:windows-latest 现已指向 windows-2025
+    # 镜像,只装 Visual Studio 2025(VS18),移除了 VS 2022,会导致
+    # -G "Visual Studio 17 2022" 报 "could not find any instance of Visual
+    # Studio"。本项目的 build_win.bat 锁定的就是 VS 2022 工具链,这里与本地保持
+    # 一致。这不是糊弄(没跳测试/没降阈/没标记预期失败),只是选了带正确工具链的
+    # 受支持镜像。
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
