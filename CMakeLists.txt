@@ -33,8 +33,15 @@ add_subdirectory(third_party/zydis EXCLUDE_FROM_ALL)
 # 链接或嵌入任何参考解释器 PE，避免产物共享逐字节相同的 runtime blob。
 
 # MSVC 特定选项
+# 用 COMPILE_LANGUAGE 生成器表达式限定在 C/C++ 上：这些选项都是 MSVC cl.exe
+# 的参数，一旦某个目标同时含有 ASM_NASM 源文件，不加限定会把它们原样传给
+# nasm.exe 导致断言失败退出。
 if(MSVC)
-    add_compile_options(/W4 /WX /utf-8 /w14244 /wd4100)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/WX>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/w14244>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/wd4100>)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_definitions(WIN32_LEAN_AND_MEAN)
     add_compile_definitions(NOMINMAX)

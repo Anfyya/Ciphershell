@@ -62,6 +62,23 @@ target_link_libraries(test_vm_runtime_integrity PRIVATE
 
 target_include_directories(test_vm_runtime_integrity PRIVATE ${CMAKE_SOURCE_DIR})
 
+# 隔离原生差分证据源：真实 CPU 执行一小段原生字节，与本次 build 合成的
+# handler 链在隔离 worker 进程里逐位比较，并验证蓄意语义分歧真的会被拒绝。
+# 依赖 vm_native_differential_worker 与本可执行文件同目录。
+add_executable(test_vm_native_differential
+    test_vm_native_differential.cpp
+)
+
+target_link_libraries(test_vm_native_differential PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_vm_native_differential PRIVATE ${CMAKE_SOURCE_DIR})
+
+if(WIN32 AND HAVE_NASM)
+    add_dependencies(test_vm_native_differential vm_native_differential_worker)
+endif()
+
 # 性能基准测试
 add_executable(benchmark
     benchmark.cpp
@@ -138,6 +155,11 @@ add_test(NAME vm_micro_core COMMAND test_vm_micro_core)
 set_tests_properties(vm_micro_core PROPERTIES LABELS "vm;hard-gate")
 add_test(NAME vm_runtime_integrity COMMAND test_vm_runtime_integrity)
 set_tests_properties(vm_runtime_integrity PROPERTIES LABELS "vm;hard-gate")
+add_test(NAME vm_native_differential COMMAND test_vm_native_differential)
+set_tests_properties(vm_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
 
 # 微操作内核源码硬门禁：只读源码，不运行原始/加壳/样例 PE。
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

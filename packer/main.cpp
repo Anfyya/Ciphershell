@@ -48,6 +48,7 @@
 #include "transforms/vm_runtime_builder.h"
 #include "transforms/vm_instruction_bridge_builder.h"
 #include "transforms/loader_import_builder.h"
+#include "differential/vm_native_differential_provider.h"
 #include "analysis/capability_checker.h"
 #include "analysis/hotspot_analyzer.h"
 #include "config/protection_build_context.h"
@@ -873,6 +874,39 @@ int main(int argc, char* argv[]) {
                   << " junk_handlers=" << mutatedISA.junkHandlerCount
                   << " variant_count=" << VM_HANDLER_VARIANT_COUNT << std::endl;
 
+        // 隔离原生差分证据源：本次 build 只合成一次 handler 镜像（与最终
+        // PE 里写入的 handler 语义等价，只是 decryptor IAT 槽位不同——那两个
+        // 槽位只影响 W^X 解密流程，不影响任何一条微语义的计算结果），后续
+        // 每个候选函数的每个 corpus case 都复用它，在隔离 worker 里对逐位
+        // 比较原生 CPU 执行与该镜像的执行结果。worker 缺失、初始化失败或
+        // 架构不匹配都必须让下面每个函数的 native differential 检查 fail-
+        // closed，不能有静默降级路径。
+        CipherShell::VMWindowsNativeDifferentialEvidenceProvider nativeDifferentialProvider;
+        CipherShell::VMHandlerOperandCodecConfig nativeDifferentialOperandCodec{};
+        nativeDifferentialOperandCodec.opcodeXor = static_cast<uint8_t>(buildCtx.isaSeed[3] | 1u);
+        nativeDifferentialOperandCodec.opcodeAdd = static_cast<uint8_t>(buildCtx.isaSeed[7] | 1u);
+        nativeDifferentialOperandCodec.opcodeRotate =
+            static_cast<uint8_t>((buildCtx.isaSeed[11] % 7u) + 1u);
+        constexpr uint32_t kVmNativeDifferentialMemorySize = 0x10000u;
+        std::string nativeDifferentialInitError;
+        const bool nativeDifferentialProviderReady = nativeDifferentialProvider.Initialize(
+            image->is64Bit
+                ? CipherShell::VMHandlerArchitecture::X64
+                : CipherShell::VMHandlerArchitecture::X86,
+            buildCtx.isaSeed,
+            mutatedISA.handlerSemanticToSlot,
+            mutatedISA.handlerSlotToSemantic,
+            mutatedISA.handlerVariants,
+            nativeDifferentialOperandCodec,
+            kVmNativeDifferentialMemorySize,
+            nativeDifferentialInitError);
+        if (!nativeDifferentialProviderReady) {
+            std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL reason="
+                      << nativeDifferentialInitError << std::endl;
+            std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL every candidate function "
+                         "will fail closed at the native differential gate below" << std::endl;
+        }
+
         CipherShell::Translator translator;
         CipherShell::TranslationConfig transConfig;
         transConfig.virtualRegisterCount = mutConfig.registerCount;
@@ -1059,6 +1093,9 @@ int main(int argc, char* argv[]) {
                 modelConfig.corpusSeed =
                     vmOperandCodecSeed ^ func.entryAddress;
                 modelConfig.corpusCount = 256;
+                // Must match kVmNativeDifferentialMemorySize: the native
+                // differential gate below reuses this corpus's memory size.
+                modelConfig.memorySize = kVmNativeDifferentialMemorySize;
                 const auto modelPreflight =
                     CipherShell::VMIRModelPreflightVerifier::Verify(
                     func, transResult, buildCtx.opcodeMap,
@@ -1077,16 +1114,35 @@ int main(int argc, char* argv[]) {
                           << " cases=" << modelPreflight.casesExecuted
                           << " evidence=software_model_only" << std::endl;
 
+                // The synthesized handler's operand decode-plan table is keyed by
+                // function RVA (matching how VMRuntimeBuilder builds the real
+                // shipped table later), so it must be (re)prepared per function
+                // before any of that function's corpus cases run.
+                bool nativeDifferentialFunctionReady = false;
+                if (nativeDifferentialProviderReady) {
+                    std::string prepareError;
+                    nativeDifferentialFunctionReady = nativeDifferentialProvider.PrepareForFunction(
+                        static_cast<uint32_t>(func.entryAddress), transResult.operandCodec,
+                        prepareError);
+                    if (!nativeDifferentialFunctionReady) {
+                        std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_PREPARE_FAIL function_rva=0x"
+                                  << std::hex << func.entryAddress << std::dec
+                                  << " reason=" << prepareError << std::endl;
+                    }
+                }
+
                 CipherShell::VMNativeDifferentialConfig nativeConfig{};
                 nativeConfig.corpusSeed = modelConfig.corpusSeed;
                 nativeConfig.corpusCount = modelConfig.corpusCount;
                 nativeConfig.memorySize = modelConfig.memorySize;
                 nativeConfig.timeoutMilliseconds = 1000;
-                // 当前生产链没有隔离的同架构 native/handler worker，也尚未绑定
-                // 本次 handler image。这里必须显式缺席并 fail-closed；软件 IR
-                // 预检绝不能代替真实 CPU 与合成 handler 的逐例证据。
-                nativeConfig.expectedHandlerImageDigest = 0;
-                nativeConfig.evidenceProvider = nullptr;
+                // A missing/failed-to-initialize provider (worker binary absent,
+                // wrong architecture, synthesis failure) must fail closed here,
+                // never fall back to the software IR preflight as evidence.
+                nativeConfig.expectedHandlerImageDigest = nativeDifferentialFunctionReady
+                    ? nativeDifferentialProvider.SemanticIdentityDigest() : 0;
+                nativeConfig.evidenceProvider = nativeDifferentialFunctionReady
+                    ? &nativeDifferentialProvider : nullptr;
                 const auto nativeDifferential =
                     CipherShell::VMNativeDifferentialVerifier::Verify(
                         func, transResult, buildCtx.opcodeMap,
@@ -1541,6 +1597,21 @@ int main(int argc, char* argv[]) {
     std::cout << "  输出文件静态复验成功" << std::endl;
     if (vmApplied) {
         PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
+        // Scope note (do not drop this when editing nearby logging): "applied"
+        // means every emitted function passed real native-CPU-vs-synthesized-
+        // handler differential evidence (VM_NATIVE_DIFFERENTIAL_PASS) for its
+        // corpus -- semantic correctness is verified for those functions.
+        // It does NOT mean VM protection as a whole is production-ready or
+        // hardened against generic unpacking/deobfuscation tooling: K-variant
+        // instruction-sequence diversity beyond ADD/SUB/AND/OR/XOR/NOT/NEG is
+        // still incomplete (see vm_kernel_static_gate's insufficient-real-k-
+        // variant-coverage check), so most emitted micro-op semantics still
+        // share one fixed core instruction sequence across builds/variants.
+        // Never report or log this as "ready to enable in production" until
+        // that gap is closed.
+        std::cout << "VM_PROTECTION_SCOPE_NOTE correctness=verified "
+                     "anti_cracking_hardening=incomplete "
+                     "reason=k_variant_coverage_below_target" << std::endl;
     }
 
     std::cout << "\n======================================" << std::endl;

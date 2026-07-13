@@ -194,6 +194,133 @@ def arithmetic_bridge_hits(path: Path, code: str) -> list[Violation]:
     return hits
 
 
+def extract_function_body(code: str, name: str) -> str | None:
+    """Brace-matched extraction so the coverage check survives reformatting
+    without depending on a single brittle multi-line regex."""
+    match = re.search(re.escape(name) + r"\s*\([^{]*\)\s*\{", code)
+    if not match:
+        return None
+    depth = 1
+    index = match.end()
+    while index < len(code) and depth > 0:
+        if code[index] == "{":
+            depth += 1
+        elif code[index] == "}":
+            depth -= 1
+        index += 1
+    if depth != 0:
+        return None
+    return code[match.end():index - 1]
+
+
+def extract_switch_semantic_blocks(body: str) -> list[str]:
+    blocks: list[str] = []
+    for match in re.finditer(r"switch\s*\(semantic\)\s*\{", body):
+        depth = 1
+        index = match.end()
+        while index < len(body) and depth > 0:
+            if body[index] == "{":
+                depth += 1
+            elif body[index] == "}":
+                depth -= 1
+            index += 1
+        if depth == 0:
+            blocks.append(body[match.end():index - 1])
+    return blocks
+
+
+def case_segments(switch_body: str) -> dict[str, str]:
+    segments: dict[str, str] = {}
+    matches = list(re.finditer(r"case (VM_UOP_[A-Z0-9_]+):", switch_body))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(switch_body)
+        segment = switch_body[match.end():end]
+        segments[match.group(1)] = segments.get(match.group(1), "") + segment
+    return segments
+
+
+def consume_statement(text: str, index: int) -> tuple[str, int]:
+    """Consume one ';'-terminated statement or one brace-delimited block
+    starting at (whitespace-skipped) index.  Returns (text, next_index)."""
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index < len(text) and text[index] == "{":
+        depth = 1
+        start = index
+        index += 1
+        while index < len(text) and depth > 0:
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+            index += 1
+        return text[start:index], index
+    start = index
+    depth = 0
+    while index < len(text):
+        ch = text[index]
+        if ch in "({":
+            depth += 1
+        elif ch in ")}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            index += 1
+            break
+        index += 1
+    return text[start:index], index
+
+
+def has_real_strategy_branch(segment: str) -> bool:
+    """A real K-variant core branches on `strategy` with two arms whose
+    emitted code actually differs; forwarding `strategy` unused, or an
+    if/else pair that emits byte-identical code on both arms, does not
+    count."""
+    for match in re.finditer(r"if\s*\(\s*strategy\s*(?:==|!=)\s*[^)]*\)", segment):
+        then_text, next_index = consume_statement(segment, match.end())
+        rest = segment[next_index:]
+        stripped = rest.lstrip()
+        if not stripped.startswith("else"):
+            continue
+        else_index = next_index + (len(rest) - len(stripped)) + len("else")
+        else_text, _ = consume_statement(segment, else_index)
+        if re.sub(r"\s+", "", then_text) != re.sub(r"\s+", "", else_text):
+            return True
+    return False
+
+
+def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
+    """Semantics where EmitBusinessCoreVariant branches on `strategy` with two
+    genuinely different emitted code arms, in *both* the x64 and x86
+    switches.  A case that only forwards `strategy` without an actual
+    strategy-conditioned branch, or whose branches emit identical code,
+    must not count as a real K-variant core."""
+    body = extract_function_body(semantic_code, "bool EmitBusinessCoreVariant")
+    if body is None:
+        return set()
+    switch_blocks = extract_switch_semantic_blocks(body)
+    if len(switch_blocks) < 2:
+        return set()
+    per_arch_real: list[set[str]] = []
+    for switch_body in switch_blocks:
+        real: set[str] = set()
+        for semantic, segment in case_segments(switch_body).items():
+            if has_real_strategy_branch(segment):
+                real.add(semantic)
+        per_arch_real.append(real)
+    common = per_arch_real[0]
+    for extra in per_arch_real[1:]:
+        common &= extra
+    return common
+
+
+# Coverage floor for genuinely branching (not just name-existence) K variants.
+# ADD/SUB/AND/OR/XOR/NOT/NEG already satisfy this today; the assertion exists
+# so future work on the remaining micro-op semantics is forced through the
+# same structural bar instead of being reported done via a string-presence
+# check alone.
+MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = 8
+
+
 def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]) -> list[Violation]:
     joined = "\n".join(code_by_path[path] for path in files)
     required = {
@@ -241,6 +368,23 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
         violations.append(Violation(
             synth_path, 1, "synth-does-not-verify-k-variant-bytes",
             "ValidateVMHandlerSemanticVariantKernel"))
+
+    # Name-existence above only proves the K-variant machinery exists
+    # somewhere in the file; it says nothing about how many semantics it
+    # actually covers.  Count semantics whose EmitBusinessCoreVariant branch
+    # really differs byte-for-byte per strategy in both architectures, and
+    # fail if that count has not grown past the historical ADD/SUB/AND/OR/
+    # XOR/NOT/NEG baseline of 7.
+    real_variant_semantics = real_strategy_variant_semantics(semantic)
+    if len(real_variant_semantics) < MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS:
+        violations.append(Violation(
+            semantic_path, 1, "insufficient-real-k-variant-coverage",
+            f"only {len(real_variant_semantics)} semantic(s) "
+            f"({', '.join(sorted(real_variant_semantics)) or 'none'}) have a "
+            "strategy-conditioned EmitBusinessCoreVariant branch with two "
+            f"distinct emitted byte sequences in both x64 and x86; need >= "
+            f"{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}, not just the ADD/SUB/"
+            "AND/OR/XOR/NOT/NEG baseline"))
     if "0x48,0x83,0xEC,0x28,0xFF,0xD0" not in synth or \
        "0x48,0x83,0xC4,0x28" not in synth:
         violations.append(Violation(

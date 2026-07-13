@@ -52,6 +52,9 @@ add_library(ciphershell_packer STATIC
     # 变异引擎 — Phase 4
     mutation/mutation_engine.cpp
 
+    # 隔离原生差分证据源（provider 侧；worker 是独立进程见下方）
+    differential/vm_native_differential_provider.cpp
+
     # 配置解析
     config/config_parser.cpp
     config/protection_build_context.cpp
@@ -100,4 +103,35 @@ target_link_libraries(ciphershell PRIVATE
 if(MSVC)
     target_compile_options(ciphershell_packer PRIVATE /sdl)
     target_compile_options(ciphershell PRIVATE /sdl /permissive-)
+endif()
+
+# ============================================================================
+# 隔离原生差分 worker：独立、可丢弃的进程，从不链接 ciphershell_packer。
+# Provider（打包器主进程内）每个 corpus case 都会 spawn 一次，用来在真实
+# CPU 上分别执行目标函数原生字节与本次 build 合成的 handler 链。
+# ============================================================================
+
+if(WIN32 AND HAVE_NASM)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(CS_NATIVE_DIFFERENTIAL_TRAMPOLINE_ASM
+            differential/vm_native_exec_trampoline_x64.asm)
+    else()
+        set(CS_NATIVE_DIFFERENTIAL_TRAMPOLINE_ASM
+            differential/vm_native_exec_trampoline_x86.asm)
+    endif()
+
+    add_executable(vm_native_differential_worker
+        differential/vm_native_differential_worker_main.cpp
+        differential/vm_native_differential_worker_harness.cpp
+        ${CS_NATIVE_DIFFERENTIAL_TRAMPOLINE_ASM}
+    )
+    target_include_directories(vm_native_differential_worker PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+    )
+else()
+    message(WARNING
+        "vm_native_differential_worker not built (requires WIN32 + NASM): "
+        "VM protection's native differential evidence gate will fail closed "
+        "for every function on this configuration.")
 endif()
