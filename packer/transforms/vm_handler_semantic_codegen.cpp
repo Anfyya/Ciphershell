@@ -397,6 +397,7 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
         case VM_UOP_XOR:
         case VM_UOP_NOT:
         case VM_UOP_NEG:
+        case VM_UOP_MUL:
             return true;
         default:
             return false;
@@ -781,6 +782,18 @@ bool EmitBusinessCoreVariant(
                 if (strategy == 0u) c.Raw({0x48,0xF7,0xD8});
                 else c.Raw({0x48,0xF7,0xD0,0x48,0xFF,0xC0});
                 return true;
+            case VM_UOP_MUL:
+                // strategy 0: IMUL rax, rdx (two-operand signed multiply).
+                // strategy 1: MUL rdx (one-operand unsigned multiply into
+                // rdx:rax). Signed and unsigned multiply produce identical
+                // low-order-64-bit results modulo 2^64, so the truncated
+                // product in rax is the same either way; only the high
+                // half (discarded here) and flags differ.  This clobbers
+                // rdx, which is safe because a/b were already latched into
+                // r8/r11 before the core runs.
+                if (strategy == 0u) c.Raw({0x48,0x0F,0xAF,0xC2});
+                else c.Raw({0x48,0xF7,0xE2});
+                return true;
             default:
                 return false;
         }
@@ -814,6 +827,13 @@ bool EmitBusinessCoreVariant(
         case VM_UOP_NEG:
             if (strategy == 0u) c.Raw({0xF7,0xD8});
             else c.Raw({0xF7,0xD0,0x40});
+            return true;
+        case VM_UOP_MUL:
+            // Same identity as the x64 case: IMUL EAX,EDX vs. MUL EDX give
+            // the same truncated 32-bit product in eax; the clobbered edx
+            // is safe for the same reason (a/b already latched earlier).
+            if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
+            else c.Raw({0xF7,0xE2});
             return true;
         default:
             return false;
@@ -1879,7 +1899,6 @@ void EmitX64BinaryAlu(
     } else {
         coreVariantOffset = 0;
         switch (semantic) {
-            case VM_UOP_MUL: c.Raw({0x48,0x0F,0xAF,0xC2}); break;
             case VM_UOP_SHL:
             case VM_UOP_SHR:
             case VM_UOP_SAR:
@@ -2130,7 +2149,6 @@ void EmitX86BinaryAlu(
     } else {
         coreVariantOffset = 0;
         switch (semantic) {
-            case VM_UOP_MUL: c.Raw({0x0F,0xAF,0xC2}); break;
             case VM_UOP_SHL:
             case VM_UOP_SHR:
             case VM_UOP_SAR:

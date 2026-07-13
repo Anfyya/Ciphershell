@@ -85,8 +85,8 @@ Function DecodeStandaloneFunction(
     return function;
 }
 
-TranslationResult TranslateAddFunction(
-    const Function& addFunction,
+TranslationResult TranslateStandaloneFunction(
+    const Function& standaloneFunction,
     const HarnessBuild& build,
     Translator& translator)
 {
@@ -98,9 +98,15 @@ TranslationResult TranslateAddFunction(
     Require(translator.Initialize(transConfig), "Translator 初始化失败");
     translator.SetOpcodeMap(build.isa.opcodeMap);
     translator.SetRegisterMap(build.isa.registerMap);
-    TranslationResult result = translator.TranslateFunction(addFunction);
+    TranslationResult result = translator.TranslateFunction(standaloneFunction);
+    for (const auto& failure : result.failures) {
+        std::cerr << "[translate-fail] addr=" << failure.address
+                  << " mnemonic=" << failure.mnemonic
+                  << " bytes=" << failure.bytes
+                  << " reason=" << failure.reason << '\n';
+    }
     Require(result.success && !result.instructions.empty(),
-        "ADD;RET 测试函数翻译失败");
+        "测试函数翻译失败");
     return result;
 }
 
@@ -110,7 +116,8 @@ void RunDifferentialCase(
     const HarnessBuild& build,
     uint32_t corpusCount,
     bool expectSuccess,
-    const char* label)
+    const char* label,
+    bool expectDivideFault = false)
 {
     VMWindowsNativeDifferentialEvidenceProvider provider;
     const auto providerSeed = MakeSeed(0xC7);
@@ -139,6 +146,7 @@ void RunDifferentialCase(
     config.timeoutMilliseconds = 5000;
     config.expectedHandlerImageDigest = provider.SemanticIdentityDigest();
     config.evidenceProvider = &provider;
+    config.expectDivideFault = expectDivideFault;
 
     const auto result = VMNativeDifferentialVerifier::Verify(
         function, translation, build.isa.opcodeMap, build.isa.registerMap, config);
@@ -172,7 +180,8 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
     const Function subFunction = DecodeStandaloneFunction(disassembler, subBytes, kEntry);
 
     Translator translator;
-    const TranslationResult addTranslation = TranslateAddFunction(addFunction, build, translator);
+    const TranslationResult addTranslation =
+        TranslateStandaloneFunction(addFunction, build, translator);
 
     VMIRModelPreflightConfig preflightConfig{};
     preflightConfig.corpusSeed = 0x1234;
@@ -188,6 +197,110 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
         "native-vs-VM ADD 语义一致");
     RunDifferentialCase(subFunction, addTranslation, build, 8, false,
         "native=SUB vs VM-bytecode=ADD 必须被判定语义分歧");
+}
+
+void TestMulNativeDifferentialMatchesRealCpu() {
+    // 覆盖新加入的 VM_UOP_MUL 双策略业务核心(EmitBusinessCoreVariant 的
+    // IMUL reg,reg 与 MUL reg 两条真实不同字节序列)：证明无论 build 的
+    // seed/variant 选中哪一支策略，合成 handler 链的乘法结果都必须与
+    // 真实 CPU IMUL 逐字节一致，而不仅仅是结构层面的字节模式检查。
+    const auto seed = MakeSeed(0xD3);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+
+    // imul eax, ecx ; add eax, 0 ; ret  (two-operand signed multiply).
+    // IMUL only defines CF/OF and leaves SF/ZF/AF/PF architecturally
+    // undefined, so the translator's flags-flow analysis correctly refuses
+    // to translate a terminal RET immediately after it (it cannot know
+    // what a real CPU would leave in those bits). The trailing `add eax, 0`
+    // is a value no-op that fully redefines all six status flags, closing
+    // that undefined-flags window without touching the product in eax.
+    const std::vector<uint8_t> mulBytes = {
+        0x0F, 0xAF, 0xC1, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
+    // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
+    const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+
+    const Function mulFunction = DecodeStandaloneFunction(disassembler, mulBytes, kEntry);
+    const Function addFunction = DecodeStandaloneFunction(disassembler, addBytes, kEntry);
+
+    Translator translator;
+    const TranslationResult mulTranslation =
+        TranslateStandaloneFunction(mulFunction, build, translator);
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0x5678;
+    preflightConfig.corpusCount = 8;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        mulFunction, mulTranslation, build.isa.opcodeMap, build.isa.registerMap, preflightConfig);
+    std::cout << "[preflight] success=" << preflight.success << " cases=" << preflight.casesExecuted
+              << " error=" << preflight.error << '\n';
+    Require(preflight.success, "software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
+        preflight.error);
+
+    RunDifferentialCase(mulFunction, mulTranslation, build, 8, true,
+        "native-vs-VM MUL(IMUL two-operand) 语义一致");
+    RunDifferentialCase(addFunction, mulTranslation, build, 8, false,
+        "native=ADD vs VM-bytecode=MUL 必须被判定语义分歧");
+}
+
+void TestWideDivideNativeDifferentialAndDivideFault() {
+    // 生产级 DIV/IDIV(UDIV_WIDE/IDIV_WIDE)差分证据：直接复用 packer/differential/
+    // 的隔离原生 worker，而不是另起一套验证机制。dividend 是完整的
+    // 高:低寄存器对(x64 下 RDX:RAX = 128 位被除数，x86 下 EDX:EAX = 64 位)，
+    // 除数取自随机语料，因此语料天然混有"商能装下"(两侧都应成功且逐寄存器
+    // 一致)与"除零/商溢出"(两侧都应触发 #DE)两类样本。VMNativeDifferentialConfig
+    // ::expectDivideFault 让验证器按样本实际结果分别核对，而不是把任何 fault
+    // 都当成硬性失败。
+    const auto seed = MakeSeed(0xE4);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+
+    constexpr uint64_t kEntry = 0x1000;
+    for (const bool signedDivide : {false, true}) {
+        // {REX.W} F7 /6|/7 (DIV|IDIV ecx/rcx) ; {REX.W} ADD eax/rax, 0 ; RET.
+        // DIV/IDIV leaves every status flag architecturally undefined, so the
+        // trailing ADD-immediate-0 (a value no-op) closes that undefined-flags
+        // window for the translator's flow analysis, exactly like the MUL
+        // case above. On a faulting sample the CPU never reaches it: the #DE
+        // fires at the DIV/IDIV itself.
+        std::vector<uint8_t> divideBytes;
+        if (kIs64) divideBytes.push_back(0x48);
+        divideBytes.push_back(0xF7);
+        divideBytes.push_back(signedDivide ? 0xF9 : 0xF1);
+        if (kIs64) divideBytes.push_back(0x48);
+        divideBytes.insert(divideBytes.end(), {0x81, 0xC0, 0x00, 0x00, 0x00, 0x00});
+        divideBytes.push_back(0xC3);
+
+        const Function divideFunction =
+            DecodeStandaloneFunction(disassembler, divideBytes, kEntry);
+        Translator translator;
+        const TranslationResult divideTranslation =
+            TranslateStandaloneFunction(divideFunction, build, translator);
+
+        VMIRModelPreflightConfig preflightConfig{};
+        preflightConfig.corpusSeed = signedDivide ? 0x1D19ULL : 0xD19D19ULL;
+        preflightConfig.corpusCount = 8;
+        const auto preflight = VMIRModelPreflightVerifier::Verify(
+            divideFunction, divideTranslation, build.isa.opcodeMap,
+            build.isa.registerMap, preflightConfig);
+        std::cout << "[preflight " << (signedDivide ? "IDIV" : "DIV") << "] success="
+                  << preflight.success << " cases=" << preflight.casesExecuted
+                  << " error=" << preflight.error << '\n';
+        Require(preflight.success,
+            std::string(signedDivide ? "IDIV" : "DIV") +
+                " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
+                preflight.error);
+
+        RunDifferentialCase(divideFunction, divideTranslation, build, 64, true,
+            signedDivide ? "native-vs-VM IDIV_WIDE(128-bit dividend)/#DE 一致"
+                         : "native-vs-VM UDIV_WIDE(128-bit dividend)/#DE 一致",
+            /*expectDivideFault=*/true);
+    }
 }
 
 #endif // _M_X64 || _M_IX86
@@ -211,6 +324,10 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
+    Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",
+        &TestMulNativeDifferentialMatchesRealCpu, failures);
+    Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
+        &TestWideDivideNativeDifferentialAndDivideFault, failures);
 #else
     std::cout << "[SKIP] non-x86/x64 host: native differential evidence provider is Windows x86/x64 only\n";
 #endif

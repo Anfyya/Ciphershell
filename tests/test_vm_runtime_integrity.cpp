@@ -159,6 +159,12 @@ VMRuntimeBuildResult MakeExpectedRuntime(bool is64Bit) {
     }
 
     const uint32_t pointerSize = is64Bit ? 8u : 4u;
+    // 内容区在上面已经被非零测试花纹填满；x86 指针宽度(4 字节)只占用
+    // kDispatchSize(16 字节) 里的前两槽，若不先清零整张表，剩余槽位会残留
+    // 花纹字节，被当成"非空"派发目标而非合法的未使用槽位。
+    std::fill(expectation.expectedSectionBytes.begin() + kDispatchOffset,
+        expectation.expectedSectionBytes.begin() + kDispatchOffset + kDispatchSize,
+        static_cast<uint8_t>(0));
     const uint64_t imageBase = is64Bit ? kImageBase64 : kImageBase32;
     const uint64_t mappedBase = imageBase + kRuntimeSectionRVA;
     const uint64_t firstTarget = mappedBase + kHandlerOffset;
@@ -184,9 +190,12 @@ void RequireVerified(const TestImage& testImage,
                      const VMRuntimeBuildResult& result,
                      const std::string& context) {
     std::string error;
-    Require(VMRuntimeBuilder::VerifyRuntimeContents(
-            &testImage.image, result, error),
-        context + ": " + error);
+    // 函数实参求值顺序未定义：不能在同一次调用里既求值 VerifyRuntimeContents(...)
+    // 又用它写入的 error 拼接消息，否则消息可能在调用发生前就已求值完毕，
+    // 永远看到空字符串。先落地布尔结果，再拼接消息。
+    const bool verified = VMRuntimeBuilder::VerifyRuntimeContents(
+        &testImage.image, result, error);
+    Require(verified, context + ": " + error);
 }
 
 void RequireRejected(const TestImage& testImage,
@@ -418,9 +427,11 @@ void TestBuilderAndReparseIntegration() {
             result.referenceRuntimeBlobFreeVerified,
         "VMRuntimeBuilder 未通过自身产物完整性门禁: " + result.error);
     std::string error;
-    Require(VMRuntimeBuilder::VerifyRuntimeContents(
-            &owned.image, result, error),
-        "VMRuntimeBuilder 构建后复验失败: " + error);
+    // 见 RequireVerified 注释：先落地布尔结果，避免实参求值顺序把消息拼接在
+    // VerifyRuntimeContents 写入 error 之前完成。
+    bool verified = VMRuntimeBuilder::VerifyRuntimeContents(
+        &owned.image, result, error);
+    Require(verified, "VMRuntimeBuilder 构建后复验失败: " + error);
 
     PEEmitter emitter(&owned.image);
     const char laterSection[8] = {'.','t','l','a','t','e',0,0};
@@ -428,9 +439,9 @@ void TestBuilderAndReparseIntegration() {
         std::vector<uint8_t>(0x30u, 0xA5u),
         IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
     Require(appended.success, "后续 PE section 追加失败: " + appended.error);
-    Require(VMRuntimeBuilder::VerifyRuntimeContents(
-            &owned.image, result, error),
-        "后续 PE section 追加后 runtime 复验失败: " + error);
+    verified = VMRuntimeBuilder::VerifyRuntimeContents(
+        &owned.image, result, error);
+    Require(verified, "后续 PE section 追加后 runtime 复验失败: " + error);
 
     BYTE* reparsedBytes = new BYTE[owned.image.rawSize];
     std::memcpy(reparsedBytes, owned.image.rawData, owned.image.rawSize);
@@ -439,9 +450,9 @@ void TestBuilderAndReparseIntegration() {
         reparsedBytes, owned.image.rawSize);
     Require(reparsed != nullptr && reparsed->isValid,
         "最终 PE 字节无法重新解析");
-    Require(VMRuntimeBuilder::VerifyRuntimeContents(
-            reparsed, result, error),
-        "最终 PE 重解析后的 runtime 复验失败: " + error);
+    verified = VMRuntimeBuilder::VerifyRuntimeContents(
+        reparsed, result, error);
+    Require(verified, "最终 PE 重解析后的 runtime 复验失败: " + error);
     parser.FreeImage(reparsed);
 }
 

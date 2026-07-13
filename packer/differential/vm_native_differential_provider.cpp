@@ -2,6 +2,7 @@
 #include "vm_native_differential_protocol.h"
 
 #include "../vm/vm_schema.h"
+#include "../../runtime/common/vm_micro_runtime_abi.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -563,7 +564,32 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
     evidence.nativeFaulted = response.nativeFaulted != 0;
     evidence.nativeExceptionCode = response.nativeExceptionCode;
     evidence.vmFaulted = response.vmFaulted != 0 || response.vmRuntimeError != 0;
-    evidence.vmFault = evidence.vmFaulted ? VMMicroFault::UnsupportedSemantic : VMMicroFault::None;
+    // Divide faults reach here through two different mechanisms, and both
+    // must map to VMMicroFault::DivideError:
+    //   1. response.vmRuntimeError == VM_MICRO_ERR_DIVIDE: some failure paths
+    //      set this VM_MICRO_ERR_* context code directly.
+    //   2. response.vmExceptionCode is a real STATUS_INTEGER_DIVIDE_BY_ZERO /
+    //      STATUS_INTEGER_OVERFLOW: the handler-tail divideFailure trampoline
+    //      (see EmitX64Failure/EmitX86Failure's rotation in
+    //      vm_handler_semantic_codegen.cpp) deliberately executes a real
+    //      `div`-by-zero instead of writing a soft error code, so a debugger
+    //      attached to the packed binary sees a real #DE rather than a
+    //      distinguishable "VM said no" signal. The worker's SEH wrapper
+    //      catches that as a generic VM_MICRO_ERR_HANDLER_BUG, which would
+    //      otherwise misclassify a correctly-detected divide fault as an
+    //      unrelated crash.  Anything else collapses to the previous generic
+    //      fault bucket rather than silently misreporting a real cause.
+    constexpr uint32_t kDivideByZeroExceptionCode = 0xC0000094u;
+    constexpr uint32_t kIntegerOverflowExceptionCode = 0xC0000095u;
+    if (!evidence.vmFaulted) {
+        evidence.vmFault = VMMicroFault::None;
+    } else if (response.vmRuntimeError == VM_MICRO_ERR_DIVIDE ||
+               response.vmExceptionCode == kDivideByZeroExceptionCode ||
+               response.vmExceptionCode == kIntegerOverflowExceptionCode) {
+        evidence.vmFault = VMMicroFault::DivideError;
+    } else {
+        evidence.vmFault = VMMicroFault::UnsupportedSemantic;
+    }
     evidence.nativeInstructionCount = function.blocks.empty() ? 0 :
         [&function]() {
             uint64_t count = 0;

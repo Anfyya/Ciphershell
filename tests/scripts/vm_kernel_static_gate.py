@@ -314,10 +314,10 @@ def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
 
 
 # Coverage floor for genuinely branching (not just name-existence) K variants.
-# ADD/SUB/AND/OR/XOR/NOT/NEG already satisfy this today; the assertion exists
-# so future work on the remaining micro-op semantics is forced through the
-# same structural bar instead of being reported done via a string-presence
-# check alone.
+# ADD/SUB/AND/OR/XOR/NOT/NEG/MUL already satisfy this today; the assertion
+# exists so future work on the remaining micro-op semantics is forced through
+# the same structural bar instead of being reported done via a
+# string-presence check alone.
 MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = 8
 
 
@@ -374,7 +374,7 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
     # actually covers.  Count semantics whose EmitBusinessCoreVariant branch
     # really differs byte-for-byte per strategy in both architectures, and
     # fail if that count has not grown past the historical ADD/SUB/AND/OR/
-    # XOR/NOT/NEG baseline of 7.
+    # XOR/NOT/NEG/MUL baseline of 8.
     real_variant_semantics = real_strategy_variant_semantics(semantic)
     if len(real_variant_semantics) < MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS:
         violations.append(Violation(
@@ -384,7 +384,7 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
             "strategy-conditioned EmitBusinessCoreVariant branch with two "
             f"distinct emitted byte sequences in both x64 and x86; need >= "
             f"{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}, not just the ADD/SUB/"
-            "AND/OR/XOR/NOT/NEG baseline"))
+            "AND/OR/XOR/NOT/NEG/MUL baseline"))
     if "0x48,0x83,0xEC,0x28,0xFF,0xD0" not in synth or \
        "0x48,0x83,0xC4,0x28" not in synth:
         violations.append(Violation(

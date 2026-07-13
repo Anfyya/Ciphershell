@@ -382,12 +382,12 @@ inline bool ValidateRuntimeFunctionInternal(
     const CS_RUNTIME_FUNCTION& runtimeFunction,
     std::vector<uint32_t>& visited,
     uint32_t depth) {
-    if (!image || runtimeFunction.beginAddress >= runtimeFunction.endAddress ||
-        runtimeFunction.unwindData == 0 || depth >= kMaxUnwindChainDepth ||
-        !IsExecutableFileBackedRange(image, runtimeFunction.beginAddress, runtimeFunction.endAddress) ||
-        std::find(visited.begin(), visited.end(), runtimeFunction.unwindData) != visited.end()) {
-        return false;
-    }
+    if (!image) return false;
+    if (runtimeFunction.beginAddress >= runtimeFunction.endAddress) return false;
+    if (runtimeFunction.unwindData == 0) return false;
+    if (depth >= kMaxUnwindChainDepth) return false;
+    if (!IsExecutableFileBackedRange(image, runtimeFunction.beginAddress, runtimeFunction.endAddress)) return false;
+    if (std::find(visited.begin(), visited.end(), runtimeFunction.unwindData) != visited.end()) return false;
     visited.push_back(runtimeFunction.unwindData);
 
     const uint32_t offset = RvaToOffset(image, runtimeFunction.unwindData);

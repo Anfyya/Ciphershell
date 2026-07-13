@@ -2540,8 +2540,36 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
             result.error = "native differential evidence contains no synthesized handler execution";
             return result;
         }
-        if (evidence.nativeFaulted || evidence.nativeExceptionCode != 0u ||
-            evidence.vmFaulted || evidence.vmFault != VMMicroFault::None) {
+        const bool nativeRaisedFault = evidence.nativeFaulted ||
+            evidence.nativeExceptionCode != 0u;
+        const bool vmRaisedFault = evidence.vmFaulted ||
+            evidence.vmFault != VMMicroFault::None;
+        if (config.expectDivideFault && (nativeRaisedFault || vmRaisedFault)) {
+            // The x86/x64 #DE vector is a single hardware fault for both the
+            // divisor=0 and quotient-overflow sub-cases, but Windows' SEH
+            // translation reports them under two different NTSTATUS codes:
+            // STATUS_INTEGER_DIVIDE_BY_ZERO (0xC0000094) and
+            // STATUS_INTEGER_OVERFLOW (0xC0000095). The synthesized handler's
+            // own divideFailure path does not distinguish the two either (both
+            // set VM_MICRO_ERR_DIVIDE), so either native code is a match.
+            constexpr uint32_t kDivideByZeroExceptionCode = 0xC0000094u;
+            constexpr uint32_t kIntegerOverflowExceptionCode = 0xC0000095u;
+            if (!nativeRaisedFault || !vmRaisedFault ||
+                (evidence.nativeExceptionCode != kDivideByZeroExceptionCode &&
+                 evidence.nativeExceptionCode != kIntegerOverflowExceptionCode) ||
+                evidence.vmFault != VMMicroFault::DivideError) {
+                result.error = "native differential divide-fault evidence does not "
+                    "match on both sides (native=" +
+                    std::to_string(evidence.nativeExceptionCode) + " faulted=" +
+                    std::to_string(nativeRaisedFault) + ", vm fault=" +
+                    std::to_string(static_cast<int>(evidence.vmFault)) + " faulted=" +
+                    std::to_string(vmRaisedFault) + ")";
+                return result;
+            }
+            ++result.casesVerified;
+            continue;
+        }
+        if (nativeRaisedFault || vmRaisedFault) {
             result.error = "native differential corpus raised an exception or VM fault";
             return result;
         }

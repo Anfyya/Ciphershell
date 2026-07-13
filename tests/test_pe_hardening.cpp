@@ -54,6 +54,7 @@ struct Writer {
     size_t pos = 0;
     void ensure(size_t n) { if (buf.size() < pos + n) buf.resize(pos + n, 0); }
     void put(const void* p, size_t n) { ensure(n); std::memcpy(buf.data() + pos, p, n); pos += n; }
+    void u8(uint8_t v) { put(&v, 1); }
     void u32(uint32_t v) { put(&v, 4); }
     void u16(uint16_t v) { put(&v, 2); }
     void u64(uint64_t v) { put(&v, 8); }
@@ -771,7 +772,7 @@ void TestExceptionUnwindHeaderTooShort() {
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     // 用合法字节填满到对齐边界前 2 字节处，让 UnwindData 指向的位置只剩 2 字节可读。
     while (rd.buf.size() % kFileAlign != kFileAlign - 2) {
-        rd.buf.push_back(0);
+        rd.u8(0);
     }
     const size_t unwindRel = rd.mark();
 
@@ -799,10 +800,10 @@ void TestExceptionUnwindBadVersion() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(0x03);  // Version=3：超出 Parser 支持的 [1,2]
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);
+    rd.u8(0x03);  // Version=3：超出 Parser 支持的 [1,2]
+    rd.u8(0x00);
+    rd.u8(0x00);
+    rd.u8(0x00);
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
     entry.BeginAddress = kExcTextVA;
@@ -829,14 +830,14 @@ void TestExceptionUnwindVersion2ParsedButVmRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(0x02);  // Version=2, Flags=0
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x02);  // 长度槽 + V2 要求的偶数 epilog padding 槽
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x02);  // epilog 长度=2
-    rd.buf.push_back(static_cast<uint8_t>(0x10 | CipherShell::PEUtils::kUwopEpilog));
-    rd.buf.push_back(0x00);  // padding EPILOG offset=0
-    rd.buf.push_back(CipherShell::PEUtils::kUwopEpilog);
+    rd.u8(0x02);  // Version=2, Flags=0
+    rd.u8(0x00);
+    rd.u8(0x02);  // 长度槽 + V2 要求的偶数 epilog padding 槽
+    rd.u8(0x00);
+    rd.u8(0x02);  // epilog 长度=2
+    rd.u8(static_cast<uint8_t>(0x10 | CipherShell::PEUtils::kUwopEpilog));
+    rd.u8(0x00);  // padding EPILOG offset=0
+    rd.u8(CipherShell::PEUtils::kUwopEpilog);
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
     entry.BeginAddress = kExcTextVA;
@@ -871,8 +872,8 @@ void TestExceptionUnwindReservedFlagsRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x08 << 3)));  // Flags bit3 保留
-    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x08 << 3)));  // Flags bit3 保留
+    rd.u8(0x00); rd.u8(0x00); rd.u8(0x00);
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
     entry.BeginAddress = kExcTextVA;
@@ -893,8 +894,8 @@ void TestExceptionUnwindConflictingFlagsRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x05 << 3)));  // CHAININFO|EHANDLER
-    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x05 << 3)));  // CHAININFO|EHANDLER
+    rd.u8(0x00); rd.u8(0x00); rd.u8(0x00);
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
@@ -916,12 +917,12 @@ void TestExceptionUnwindVersion2MalformedEpilogRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(0x02);  // Version=2, Flags=0
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x01);  // 只有第一条 EPILOG 长度槽
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x04);  // epilog 长度
-    rd.buf.push_back(CipherShell::PEUtils::kUwopEpilog);  // atEnd=0，却没有显式 epilog offset
+    rd.u8(0x02);  // Version=2, Flags=0
+    rd.u8(0x00);
+    rd.u8(0x01);  // 只有第一条 EPILOG 长度槽
+    rd.u8(0x00);
+    rd.u8(0x04);  // epilog 长度
+    rd.u8(CipherShell::PEUtils::kUwopEpilog);  // atEnd=0，却没有显式 epilog offset
     rd.u16(0);  // DWORD 对齐 padding，不属于 CountOfCodes
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
@@ -981,11 +982,11 @@ void TestExceptionUnwindCodeArrayTruncated() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(0x01);  // Version=1, Flags=0
-    rd.buf.push_back(0x00);  // SizeOfProlog
-    rd.buf.push_back(0xFF);  // CountOfCodes=255：数组需要 255(向上补偶=256)*2=512 字节，
+    rd.u8(0x01);  // Version=1, Flags=0
+    rd.u8(0x00);  // SizeOfProlog
+    rd.u8(0xFF);  // CountOfCodes=255：数组需要 255(向上补偶=256)*2=512 字节，
                               // 远超本测试实际提供的数据。
-    rd.buf.push_back(0x00);  // FrameRegister/FrameOffset
+    rd.u8(0x00);  // FrameRegister/FrameOffset
     // 故意不再写任何 UnwindCode 数据。
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
@@ -1013,10 +1014,10 @@ void TestExceptionUnwindHandlerValid() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x1 << 3)));  // Version=1, Flags=EHANDLER
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);  // CountOfCodes=0
-    rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x1 << 3)));  // Version=1, Flags=EHANDLER
+    rd.u8(0x00);
+    rd.u8(0x00);  // CountOfCodes=0
+    rd.u8(0x00);
     rd.u32(kExcTextVA);  // handler RVA：.text 入口，可执行
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
@@ -1042,10 +1043,10 @@ void TestExceptionUnwindHandlerInvalid() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x1 << 3)));  // Version=1, Flags=EHANDLER
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);  // CountOfCodes=0
-    rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x1 << 3)));  // Version=1, Flags=EHANDLER
+    rd.u8(0x00);
+    rd.u8(0x00);  // CountOfCodes=0
+    rd.u8(0x00);
     rd.u32(kExcRdataVA);  // handler RVA：.rdata 自身，不可执行
 
     IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
@@ -1073,10 +1074,10 @@ void TestExceptionUnwindChainedValid() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x4 << 3)));  // Version=1, Flags=CHAININFO
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);  // CountOfCodes=0
-    rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x4 << 3)));  // Version=1, Flags=CHAININFO
+    rd.u8(0x00);
+    rd.u8(0x00);  // CountOfCodes=0
+    rd.u8(0x00);
     const size_t chainedRel = rd.mark();
     IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
     chained.BeginAddress = kExcTextVA;
@@ -1112,10 +1113,10 @@ void TestExceptionUnwindChainedZeroUnwindRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x4 << 3)));  // Version=1, Flags=CHAININFO
-    rd.buf.push_back(0x00);
-    rd.buf.push_back(0x00);  // CountOfCodes=0
-    rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x4 << 3)));  // Version=1, Flags=CHAININFO
+    rd.u8(0x00);
+    rd.u8(0x00);  // CountOfCodes=0
+    rd.u8(0x00);
     IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
     chained.BeginAddress = kExcTextVA;
     chained.EndAddress = kExcTextVA + 4;
@@ -1145,8 +1146,8 @@ void TestExceptionUnwindChainedCycleRejected() {
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
     const size_t unwindRel = rd.mark();
-    rd.buf.push_back(static_cast<uint8_t>(0x01 | (0x4 << 3)));
-    rd.buf.push_back(0x00); rd.buf.push_back(0x00); rd.buf.push_back(0x00);
+    rd.u8(static_cast<uint8_t>(0x01 | (0x4 << 3)));
+    rd.u8(0x00); rd.u8(0x00); rd.u8(0x00);
     IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
     chained.BeginAddress = kExcTextVA;
     chained.EndAddress = kExcTextVA + 4;
@@ -1202,7 +1203,7 @@ DelayLayout BuildDelay(const DelayOptions& opt = {}) {
     const size_t nameRel = rd.mark();
     const char* dll = "test.dll";
     rd.put(dll, 8);
-    rd.buf.push_back(0);
+    rd.u8(0);
     // INT：2 个 hint/name 指针 + 终止符（8 字节）。
     const size_t intRel = rd.mark();
     rd.u64(0); rd.u64(0); rd.u64(0);  // 占位
@@ -1213,12 +1214,12 @@ DelayLayout BuildDelay(const DelayOptions& opt = {}) {
     const size_t hn1Rel = rd.mark();
     rd.u16(0);  // hint
     const char* f1 = "FuncA";
-    rd.put(f1, 5); rd.buf.push_back(0);
+    rd.put(f1, 5); rd.u8(0);
     // hint/name 条目 2。
     const size_t hn2Rel = rd.mark();
     rd.u16(0);
     const char* f2 = "FuncB";
-    rd.put(f2, 5); rd.buf.push_back(0);
+    rd.put(f2, 5); rd.u8(0);
 
     const uint32_t rdataVA = 0x2000;
     auto rva = [&](size_t rel) { return rdataVA + static_cast<uint32_t>(rel); };

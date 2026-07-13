@@ -29,21 +29,28 @@ namespace {
 // 返回的 image 拥有 buffer 所有权，调用方负责 FreeImage。
 CipherShell::CS_PE_IMAGE* BuildMinimalImage() {
     constexpr DWORD kSize = 0x400;
+    constexpr size_t kNtOffset = 0x40;
+    // Computed, not hardcoded: IMAGE_NT_HEADERS64 is Signature(4) + FileHeader
+    // + OptionalHeader back-to-back, so a wrong literal silently overlaps
+    // OptionalHeader with the FileHeader tail and corrupts Magic/NumberOf-
+    // RvaAndSizes with whatever garbage sits between them.
+    constexpr size_t kFileHeaderOffset = kNtOffset + sizeof(DWORD);
+    constexpr size_t kOptionalHeaderOffset = kFileHeaderOffset + sizeof(IMAGE_FILE_HEADER);
     BYTE* buf = new BYTE[kSize];
     std::memset(buf, 0, kSize);
 
     auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(buf);
     dos->e_magic = IMAGE_DOS_SIGNATURE;
-    dos->e_lfanew = 0x40;
+    dos->e_lfanew = static_cast<LONG>(kNtOffset);
 
-    std::memcpy(buf + 0x40, "PE\0\0", 4);
+    std::memcpy(buf + kNtOffset, "PE\0\0", 4);
 
-    auto* fh = reinterpret_cast<IMAGE_FILE_HEADER*>(buf + 0x44);
+    auto* fh = reinterpret_cast<IMAGE_FILE_HEADER*>(buf + kFileHeaderOffset);
     fh->Machine = IMAGE_FILE_MACHINE_AMD64;
     fh->NumberOfSections = 1;
     fh->SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
 
-    auto* oh = reinterpret_cast<IMAGE_OPTIONAL_HEADER64*>(buf + 0x64);
+    auto* oh = reinterpret_cast<IMAGE_OPTIONAL_HEADER64*>(buf + kOptionalHeaderOffset);
     oh->Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
     oh->FileAlignment = 0x200;
     oh->SectionAlignment = 0x1000;
@@ -53,7 +60,7 @@ CipherShell::CS_PE_IMAGE* BuildMinimalImage() {
     oh->AddressOfEntryPoint = 0x1000;
     oh->SizeOfImage = 0x2000;
 
-    const size_t secOff = 0x64 + sizeof(IMAGE_OPTIONAL_HEADER64);
+    const size_t secOff = kOptionalHeaderOffset + sizeof(IMAGE_OPTIONAL_HEADER64);
     auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(buf + secOff);
     std::memcpy(sec->Name, ".text", 5);
     sec->VirtualAddress = 0x1000;

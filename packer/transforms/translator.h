@@ -162,6 +162,14 @@ struct VMNativeDifferentialConfig {
     uint32_t timeoutMilliseconds = 1000;
     uint64_t expectedHandlerImageDigest = 0;
     const VMNativeDifferentialEvidenceProvider* evidenceProvider = nullptr;
+    // DIV/IDIV corpora deliberately include divisor=0 and quotient-overflow
+    // inputs so #DE is actually exercised, not just avoided by luck.  When
+    // true, a case where BOTH the native CPU and the synthesized handler
+    // raise the corresponding divide fault counts as a verified match
+    // instead of the default fail-closed "any fault is a mismatch" rule;
+    // one side faulting without the other (or a different fault) still
+    // fails the whole run.
+    bool expectDivideFault = false;
 };
 
 class VMNativeDifferentialEvidenceProvider {

@@ -205,7 +205,36 @@ void ValidateDirectTailUnwindCoverage(
         }
         Require(matches == 1,
             "每个 x64 semantic/junk handler 必须恰有一条 direct-tail unwind 记录");
+
+        // 部分语义（flags/control 类 micro-op、CPUID 桥接等）在核心体内还会调用
+        // flag-materializer 等辅助函数，需要临时调整栈指针；这段调整同样是
+        // 非叶子代码，必须有独立的 UNWIND_INFO 记录才能被 SEH 正确展开。
+        // 这类记录与 direct-tail 记录一样合法，必须一并计入预期集合。
+        for (const auto& funclet : handler->semanticStackFunclets) {
+            const uint64_t fBegin64 =
+                static_cast<uint64_t>(handler->storageOffset) + funclet.offset;
+            const uint64_t fEnd64 = fBegin64 + funclet.size;
+            Require(fEnd64 <= (std::numeric_limits<uint32_t>::max)(),
+                "x64 handler stack-funclet unwind 绝对范围溢出");
+            const std::pair<uint32_t, uint32_t> fRange = {
+                static_cast<uint32_t>(fBegin64), static_cast<uint32_t>(fEnd64)};
+            Require(expectedRanges.insert(fRange).second,
+                "x64 handler stack-funclet unwind 范围重复");
+
+            size_t fMatches = 0;
+            for (const auto& unwind : result.unwindEntries) {
+                if (unwind.beginOffset != fRange.first ||
+                    unwind.endOffset != fRange.second) continue;
+                ++fMatches;
+            }
+            Require(fMatches == 1,
+                "每条语义 stack-funclet 必须恰有一条对应的 unwind 记录");
+        }
     }
+
+    size_t expectedFuncletCount = 0;
+    for (const auto* handler : handlers)
+        expectedFuncletCount += handler->semanticStackFunclets.size();
 
     size_t physicalTailEntries = 0;
     const uint64_t encryptedEnd =
@@ -218,8 +247,8 @@ void ValidateDirectTailUnwindCoverage(
         Require(expectedRanges.count({unwind.beginOffset, unwind.endOffset}) == 1,
             "handler 密文区存在未绑定 semantic/junk tail 的 unwind 记录");
     }
-    Require(physicalTailEntries == handlers.size(),
-        "x64 handler direct-tail unwind 物理覆盖数量不完整");
+    Require(physicalTailEntries == handlers.size() + expectedFuncletCount,
+        "x64 handler direct-tail/stack-funclet unwind 物理覆盖数量不完整");
 }
 
 std::vector<const VMSynthesizedHandler*> SortedHandlers(
