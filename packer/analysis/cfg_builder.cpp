@@ -194,7 +194,7 @@ void CFGBuilder::ComputeDominatorTree(ControlFlowGraph& cfg) {
             // 添加到支配者的被支配列表
             uint64_t domId = idom[node.id];
             if (domId != UNDEFINED && domId < cfg.nodes.size()) {
-                cfg.nodes[domId].dominated.push_back(node.id);
+                cfg.nodes[static_cast<size_t>(domId)].dominated.push_back(node.id);
             }
         }
     }
@@ -217,7 +217,8 @@ void CFGBuilder::IdentifyLoops(ControlFlowGraph& cfg) {
             uint32_t maxDepth = 0;
             for (uint64_t member : node.loopMembers) {
                 if (member < cfg.nodes.size()) {
-                    maxDepth = std::max(maxDepth, cfg.nodes[member].loopDepth);
+                    maxDepth = std::max(maxDepth,
+                        cfg.nodes[static_cast<size_t>(member)].loopDepth);
                 }
             }
             node.loopDepth = maxDepth + 1;
@@ -438,8 +439,8 @@ void CFGBuilder::CollectLoopMembers(ControlFlowGraph& cfg, const CFGEdge& backEd
 
     // 标记循环头
     if (headerId < cfg.nodes.size()) {
-        cfg.nodes[headerId].isLoopHeader = true;
-        cfg.nodes[headerId].loopMembers.push_back(headerId);
+        cfg.nodes[static_cast<size_t>(headerId)].isLoopHeader = true;
+        cfg.nodes[static_cast<size_t>(headerId)].loopMembers.push_back(headerId);
     }
 
     // 从 latch 向前遍历，收集循环成员
@@ -455,10 +456,10 @@ void CFGBuilder::CollectLoopMembers(ControlFlowGraph& cfg, const CFGEdge& backEd
 
         if (current != headerId) {
             if (headerId < cfg.nodes.size()) {
-                cfg.nodes[headerId].loopMembers.push_back(current);
+                cfg.nodes[static_cast<size_t>(headerId)].loopMembers.push_back(current);
             }
             if (current < cfg.nodes.size()) {
-                cfg.nodes[current].loopDepth++;
+                cfg.nodes[static_cast<size_t>(current)].loopDepth++;
             }
         }
 

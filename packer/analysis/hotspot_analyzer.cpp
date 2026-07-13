@@ -28,7 +28,7 @@ std::vector<HotspotInfo> HotspotAnalyzer::Analyze(
     std::vector<HotspotInfo> hotspots;
 
     for (const auto& node : cfg.nodes) {
-        HotspotInfo info;
+        HotspotInfo info{};
         info.address = node.startAddress;
         info.functionName = "";
         info.estimatedFrequency = 0;
@@ -67,7 +67,7 @@ std::vector<HotspotInfo> HotspotAnalyzer::AnalyzeFunctions(
     std::vector<HotspotInfo> hotspots;
 
     for (const auto& func : functions) {
-        HotspotInfo info;
+        HotspotInfo info{};
         info.address = func.entryAddress;
         info.functionName = func.name;
         info.currentLevel = func.assignedLevel;
@@ -127,9 +127,15 @@ std::vector<HotspotInfo> HotspotAnalyzer::AnalyzeFunctions(
 
 std::vector<HotspotInfo> HotspotAnalyzer::GenerateSuggestions(
     std::vector<HotspotInfo>& hotspots,
-    uint32_t defaultLevel)
+    uint32_t defaultLevel,
+    const HotspotConfig& config)
 {
     for (auto& info : hotspots) {
+        if (!config.autoDowngrade) {
+            info.suggestedLevel = info.currentLevel;
+            continue;
+        }
+
         double score = CalculateHotspotScore(info);
 
         // 根据评分决定建议等级
@@ -147,6 +153,10 @@ std::vector<HotspotInfo> HotspotAnalyzer::GenerateSuggestions(
         if (info.isCritical && info.suggestedLevel > 2) {
             info.suggestedLevel = 2;
         }
+
+        info.suggestedLevel = std::min(
+            info.suggestedLevel,
+            std::min(info.currentLevel, config.maxAllowedLevel));
     }
 
     return hotspots;

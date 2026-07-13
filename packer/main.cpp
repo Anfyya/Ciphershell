@@ -47,7 +47,9 @@
 #include "transforms/function_trampoline_patcher.h"
 #include "transforms/vm_runtime_builder.h"
 #include "transforms/vm_instruction_bridge_builder.h"
+#include "transforms/loader_import_builder.h"
 #include "analysis/capability_checker.h"
+#include "analysis/hotspot_analyzer.h"
 #include "config/protection_build_context.h"
 #include "vm/vm_verifier.h"
 #include "cli_options.h"
@@ -103,12 +105,13 @@ static bool IsRuntimeInterpreterOpcode(uint8_t opcode, bool is64Bit) {
 }
 
 static bool IsRuntimeInterpreterProgram(
-    const std::vector<CipherShell::BytecodeInstr>& instructions,
+    const std::vector<CipherShell::MicroInstruction>& instructions,
     bool is64Bit,
     std::string& reason)
 {
     for (const auto& instr : instructions) {
-        if (!IsRuntimeInterpreterOpcode(instr.opcode, is64Bit)) {
+        if (!IsRuntimeInterpreterOpcode(
+                static_cast<uint8_t>(instr.opcode), is64Bit)) {
             reason = "runtime_handler_missing_for_opcode_" +
                 std::to_string(static_cast<unsigned>(instr.opcode));
             return false;
@@ -282,8 +285,19 @@ static bool ValidateVMStaticLink(
 {
     opcodeCounts.clear();
     if (!runtimeResult.executionReady || !runtimeResult.keySharePatched ||
-        !runtimeResult.cfgVerified || !runtimeResult.relocationsVerified) {
+        !runtimeResult.cfgVerified || !runtimeResult.relocationsVerified ||
+        !runtimeResult.handlerSynthesisVerified ||
+        !runtimeResult.directThreadedVerified ||
+        !runtimeResult.handlerEncryptionVerified ||
+        !runtimeResult.runtimeContentVerified ||
+        !runtimeResult.referenceRuntimeBlobFreeVerified) {
         reason = "runtime_not_execution_ready_or_linkage_unverified";
+        return false;
+    }
+    std::string runtimeIntegrityReason;
+    if (!CipherShell::VMRuntimeBuilder::VerifyRuntimeContents(
+            image, runtimeResult, runtimeIntegrityReason)) {
+        reason = "runtime_content_integrity_failed: " + runtimeIntegrityReason;
         return false;
     }
     if (!bridgeResult.success || !bridgeResult.cfgTableVerified || !bridgeResult.unwindVerified) {
@@ -408,7 +422,8 @@ static bool ValidateVMStaticLink(
         }
 
         const auto verification = CipherShell::VMBytecodeVerifier::VerifyPlainRecord(
-            record, bytecode, opcodeMap, registerMap, registerCount,
+            record, bytecode, opcodeMap, registerMap,
+            emitResult.operandCodecSeed, registerCount,
             runtimeResult.architecture == VM_ARCH_X64);
         if (!verification.success) {
             reason = "bytecode_decoder_check_failed: " + verification.error;
@@ -416,49 +431,43 @@ static bool ValidateVMStaticLink(
         }
         opcodeCounts[record.functionRVA] = verification.instructionCount;
 
-        for (uint32_t offset = 0; offset < record.bytecodeSize;
-             offset += CipherShell::VMSchema::InstructionSize()) {
-            CipherShell::BytecodeInstr instruction{};
-            std::string decodeReason;
-            if (!CipherShell::VMSchema::Decode(
-                    bytecode.data() + record.bytecodeOffset + offset,
-                    CipherShell::VMSchema::InstructionSize(), reverseOpcodeMap.data(),
-                    instruction, decodeReason)) {
-                reason = "bridge_static_decode_failed: " + decodeReason;
+        const VM_OPERAND_CODEC codec = CipherShell::VMSchema::DeriveOperandCodec(
+            emitResult.operandCodecSeed, record.functionRVA);
+        std::vector<CipherShell::DecodedMicroInstruction> decoded;
+        std::string decodeReason;
+        if (!CipherShell::VMSchema::DecodeStream(
+                bytecode.data() + record.bytecodeOffset,
+                record.bytecodeSize,
+                reverseOpcodeMap.data(),
+                codec,
+                decoded,
+                decodeReason)) {
+            reason = "micro_stream_static_decode_failed: " + decodeReason;
+            return false;
+        }
+        for (const auto& decodedInstruction : decoded) {
+            const auto& instruction = decodedInstruction.instruction;
+            if (instruction.handlerVariant >= VM_HANDLER_VARIANT_COUNT) {
+                reason = "micro_stream_handler_variant_out_of_range";
                 return false;
             }
-            if (instruction.opcode == VM_CALL_NATIVE) {
-                if (instruction.immediate > 0xFFFFFFFFULL ||
-                    !IsReadOnlyExecutableRva(image,
-                        static_cast<uint32_t>(instruction.immediate))) {
-                    reason = "direct_native_call_target_is_not_read_only_executable";
-                    return false;
-                }
-            } else if (instruction.opcode == VM_CALL_IMPORT) {
-                const uint32_t pointerSize = image->is64Bit ? 8u : 4u;
-                if (instruction.immediate > 0xFFFFFFFFULL ||
-                    !RvaRangeHasPermissions(image,
-                        static_cast<uint32_t>(instruction.immediate), pointerSize,
-                        IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_EXECUTE)) {
-                    reason = "import_call_iat_slot_permissions_invalid";
-                    return false;
-                }
-            }
-            if (instruction.opcode != VM_BRIDGE_SIMD && instruction.opcode != VM_BRIDGE_X87) continue;
+            if (instruction.opcode != VM_UOP_BRIDGE_EXTENDED) continue;
+            const uint32_t thunkRVA = static_cast<uint32_t>(instruction.operands[0]);
+            const uint32_t bridgeFlags = static_cast<uint32_t>(instruction.operands[1]);
             const auto linked = std::find_if(bridgeResult.links.begin(), bridgeResult.links.end(),
                 [&](const CipherShell::VMInstructionBridgeLink& link) {
                     return link.functionRVA == record.functionRVA &&
-                        link.thunkRVA == instruction.immediate;
+                        link.thunkRVA == thunkRVA;
                 });
             if (linked == bridgeResult.links.end() ||
                 !IsReadOnlyExecutableRva(image, linked->thunkRVA) ||
                 !IsReadOnlyExecutableRva(image, linked->nativeInstructionRVA) ||
-                (instruction.flags & VM_OPERAND_BRIDGE_LINKED) == 0 ||
+                (bridgeFlags & VM_MICRO_BRIDGE_LINKED) == 0 ||
                 (linked->usesAvx && (record.flags & VM_RECORD_FLAG_USES_AVX) == 0)) {
                 reason = "bridge_target_or_record_flags_not_linked";
                 return false;
             }
-            if (instruction.opcode == VM_BRIDGE_X87) {
+            if (linked->usesX87) {
                 if (!linked->usesX87 || (record.flags & VM_RECORD_FLAG_USES_X87) == 0) {
                     reason = "x87_bridge_record_flag_missing";
                     return false;
@@ -778,6 +787,7 @@ int main(int argc, char* argv[]) {
 
     bool vmApplied = false;
     uint32_t vmRegisterCount = 0;
+    uint64_t vmOperandCodecSeed = 0;
     std::vector<uint8_t> vmBytecodeBlob;
     std::vector<CipherShell::VMFunctionRecord> vmRecords;
     std::vector<CipherShell::Function> protectedFunctions;
@@ -785,10 +795,21 @@ int main(int argc, char* argv[]) {
     CipherShell::VMEmitResult emitResult{};
     CipherShell::VMRuntimeBuildResult runtimeResult{};
     std::vector<CipherShell::FunctionPatchResult> patchResults;
+    CipherShell::LoaderImportBuildResult vmRuntimeImports{};
 
     // Phase E: 函数级 VM 保护。这里只允许完整落盘的数据进入下一步，失败必须明确诊断。
     if (buildCtx.vm.enabled) {
         std::cout << "  应用代码虚拟化 (Mirage VM)..." << std::endl;
+
+        if (!config.vm.opcodeRandomization || !config.vm.handlerMutation ||
+            !config.vm.embedJunkHandlers) {
+            std::cerr << "VM_INIT_FAIL module=VMGenerationPolicy"
+                      << " reason=opcode_handler_and_junk_mutation_are_mandatory"
+                      << std::endl;
+            PrintFeatureStatus("vm", "failed",
+                "mandatory_per_build_mutation_disabled");
+            return 1;
+        }
 
         VM_CALL_ABI configuredX86CallAbi = VM_ABI_X86_AUTO;
         if (!config.vm.bytecodeEncryption || config.vm.nativeBodyPolicy != "destroy" ||
@@ -813,15 +834,21 @@ int main(int argc, char* argv[]) {
 
         CipherShell::MutationEngine mutEngine;
         CipherShell::MutationConfig mutConfig;
-        mutConfig.randomizeOpcodeMap = config.vm.opcodeRandomization;
+        mutConfig.randomizeOpcodeMap = true;
         mutConfig.randomizeRegisterMap = true;
         mutConfig.registerCount = static_cast<uint32_t>(config.vm.registerCount);
         mutConfig.seed = buildCtx.isaSeed;
-        mutConfig.mutateHandlers = config.vm.handlerMutation;
-        mutConfig.embedJunkHandlers = config.vm.embedJunkHandlers;
-        mutConfig.requestedJunkHandlerCount = config.vm.embedJunkHandlers ? 16u : 0u;
+        mutConfig.mutateHandlers = true;
+        mutConfig.embedJunkHandlers = true;
+        mutConfig.requestedJunkHandlerCount = 16u;
         for (const auto& descriptor : CipherShell::VMSchema::Opcodes()) {
-            mutConfig.validOpcodes.push_back(descriptor.opcode);
+            const bool runtimeSupported = image->is64Bit
+                ? descriptor.runtimeSupportedX64
+                : descriptor.runtimeSupportedX86;
+            if (runtimeSupported) {
+                mutConfig.validOpcodes.push_back(
+                    static_cast<uint8_t>(descriptor.opcode));
+            }
         }
         if (!mutEngine.Initialize(mutConfig)) {
             std::cerr << "VM_INIT_FAIL module=MutationEngine reason=register_count_must_be_16_to_32" << std::endl;
@@ -830,6 +857,7 @@ int main(int argc, char* argv[]) {
         }
 
         CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
+        vmOperandCodecSeed = mutEngine.GetSeedFingerprint();
         buildCtx.opcodeMap = mutatedISA.opcodeMap;
         buildCtx.registerMap = mutatedISA.registerMap;
         std::string registerMapReason;
@@ -839,7 +867,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::cout << "    ISA seed fingerprint: 0x" << std::hex
-                  << mutEngine.GetSeedFingerprint() << std::dec << std::endl;
+                  << vmOperandCodecSeed << std::dec << std::endl;
         std::cout << "VM_HANDLER_LAYOUT mutated="
                   << (mutatedISA.handlerMutationEnabled ? "true" : "false")
                   << " junk_handlers=" << mutatedISA.junkHandlerCount
@@ -848,6 +876,9 @@ int main(int argc, char* argv[]) {
         CipherShell::Translator translator;
         CipherShell::TranslationConfig transConfig;
         transConfig.virtualRegisterCount = mutConfig.registerCount;
+        transConfig.buildSeed = vmOperandCodecSeed;
+        transConfig.density = CipherShell::VMMicroDensity::Heavy;
+        transConfig.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
         transConfig.x86CallAbi = configuredX86CallAbi;
         transConfig.enableSimdBridge = config.vm.simdBridge;
         transConfig.enableX87Bridge = config.vm.x87Bridge;
@@ -863,6 +894,15 @@ int main(int argc, char* argv[]) {
         }
         translator.SetOpcodeMap(buildCtx.opcodeMap);
         translator.SetRegisterMap(buildCtx.registerMap);
+        CipherShell::Translator lightTranslator;
+        CipherShell::TranslationConfig lightConfig = transConfig;
+        lightConfig.density = CipherShell::VMMicroDensity::Light;
+        if (!lightTranslator.Initialize(lightConfig)) {
+            std::cerr << "VM_INIT_FAIL module=Translator reason=light_initialize_failed" << std::endl;
+            return 1;
+        }
+        lightTranslator.SetOpcodeMap(buildCtx.opcodeMap);
+        lightTranslator.SetRegisterMap(buildCtx.registerMap);
         PrintVMRegisterMapReport(buildCtx.registerMap);
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
@@ -881,6 +921,24 @@ int main(int argc, char* argv[]) {
                       << discoveryResult.error << std::endl;
             PrintFeatureStatus("vm", "failed", discoveryResult.error);
             return 1;
+        }
+        for (auto& function : discoveryResult.functions) {
+            function.assignedLevel = static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel));
+        }
+        if (config.performance.autoHotspotAnalysis) {
+            CipherShell::HotspotAnalyzer hotspotAnalyzer;
+            CipherShell::HotspotConfig hotspotConfig;
+            hotspotConfig.maxAllowedLevel = 2;
+            auto hotspots = hotspotAnalyzer.AnalyzeFunctions(
+                discoveryResult.functions, hotspotConfig);
+            hotspotAnalyzer.GenerateSuggestions(
+                hotspots,
+                static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel)),
+                hotspotConfig);
+            hotspotAnalyzer.ApplySuggestions(discoveryResult.functions, hotspots);
+            std::cout << "VM_HOTSPOT_PROFILE analyzed="
+                      << discoveryResult.functions.size()
+                      << " downgraded=" << hotspots.size() << std::endl;
         }
         for (const auto& issue : discoveryResult.issues) {
             std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x" << std::hex
@@ -928,6 +986,15 @@ int main(int argc, char* argv[]) {
                 if (!FunctionSelected(func, buildCtx.vm.targetFunctions,
                         buildCtx.vm.targetRVAs)) continue;
                 ++selectedCount;
+                const bool explicitlySelected =
+                    !buildCtx.vm.targetFunctions.empty() ||
+                    !buildCtx.vm.targetRVAs.empty();
+                if (!explicitlySelected && func.assignedLevel <= 1) {
+                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " mode=cfg_only vm=skipped" << std::endl;
+                    continue;
+                }
                 if (func.size < 5) {
                     ++rejectedCount;
                     std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex
@@ -950,7 +1017,10 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                auto transResult = translator.TranslateFunction(func);
+                CipherShell::Translator& selectedTranslator =
+                    (!explicitlySelected && func.assignedLevel <= 2)
+                    ? lightTranslator : translator;
+                auto transResult = selectedTranslator.TranslateFunction(func);
                 if (!transResult.success || transResult.instructions.empty()) {
                     rejectedCount++;
                     if (!transResult.failures.empty()) {
@@ -967,6 +1037,14 @@ int main(int argc, char* argv[]) {
                     }
                     continue;
                 }
+                std::cout << "VM_PROFILE function_rva=0x" << std::hex
+                          << func.entryAddress << std::dec
+                          << " mode="
+                          << (transResult.density == CipherShell::VMMicroDensity::Heavy
+                              ? "heavy_micro" : "light_micro")
+                          << " native_insn=" << transResult.nativeInstructionCount
+                          << " micro_ops=" << transResult.microOpCount
+                          << " ratio=" << transResult.microOpRatio << std::endl;
 
                 std::string interpreterRejectReason;
                 if (!IsRuntimeInterpreterProgram(transResult.instructions, is64, interpreterRejectReason)) {
@@ -976,6 +1054,59 @@ int main(int argc, char* argv[]) {
                     rejectedCount++;
                     continue;
                 }
+
+                CipherShell::VMIRModelPreflightConfig modelConfig{};
+                modelConfig.corpusSeed =
+                    vmOperandCodecSeed ^ func.entryAddress;
+                modelConfig.corpusCount = 256;
+                const auto modelPreflight =
+                    CipherShell::VMIRModelPreflightVerifier::Verify(
+                    func, transResult, buildCtx.opcodeMap,
+                    buildCtx.registerMap, modelConfig);
+                if (!modelPreflight.success) {
+                    std::cerr << "VM_IR_MODEL_PREFLIGHT_FAIL module=VMIRModelPreflightVerifier"
+                              << " function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " case=" << modelPreflight.failingCase
+                              << " reason=" << modelPreflight.error << std::endl;
+                    ++rejectedCount;
+                    continue;
+                }
+                std::cout << "VM_IR_MODEL_PREFLIGHT_PASS function_rva=0x" << std::hex
+                          << func.entryAddress << std::dec
+                          << " cases=" << modelPreflight.casesExecuted
+                          << " evidence=software_model_only" << std::endl;
+
+                CipherShell::VMNativeDifferentialConfig nativeConfig{};
+                nativeConfig.corpusSeed = modelConfig.corpusSeed;
+                nativeConfig.corpusCount = modelConfig.corpusCount;
+                nativeConfig.memorySize = modelConfig.memorySize;
+                nativeConfig.timeoutMilliseconds = 1000;
+                // 当前生产链没有隔离的同架构 native/handler worker，也尚未绑定
+                // 本次 handler image。这里必须显式缺席并 fail-closed；软件 IR
+                // 预检绝不能代替真实 CPU 与合成 handler 的逐例证据。
+                nativeConfig.expectedHandlerImageDigest = 0;
+                nativeConfig.evidenceProvider = nullptr;
+                const auto nativeDifferential =
+                    CipherShell::VMNativeDifferentialVerifier::Verify(
+                        func, transResult, buildCtx.opcodeMap,
+                        buildCtx.registerMap, nativeConfig);
+                if (!nativeDifferential.success ||
+                    !nativeDifferential.nativeCpuEvidenceVerified ||
+                    !nativeDifferential.synthesizedHandlerEvidenceVerified) {
+                    std::cerr << "VM_NATIVE_DIFFERENTIAL_FAIL"
+                              << " module=VMNativeDifferentialVerifier"
+                              << " function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " case=" << nativeDifferential.failingCase
+                              << " reason=" << nativeDifferential.error << std::endl;
+                    ++rejectedCount;
+                    continue;
+                }
+                std::cout << "VM_NATIVE_DIFFERENTIAL_PASS function_rva=0x" << std::hex
+                          << func.entryAddress << std::dec
+                          << " cases=" << nativeDifferential.casesVerified
+                          << " native_cpu=true synthesized_handlers=true" << std::endl;
 
                 protectedFunctions.push_back(func);
                 pendingTranslations.push_back(std::move(transResult));
@@ -1034,12 +1165,26 @@ int main(int argc, char* argv[]) {
         }
 
         if (!vmRecords.empty()) {
+            CipherShell::LoaderImportBuilder runtimeImportBuilder;
+            vmRuntimeImports = runtimeImportBuilder.Build(
+                image.get(), buildCtx.vmRuntimeApiSectionName);
+            if (!vmRuntimeImports.success ||
+                vmRuntimeImports.virtualProtectIatRVA == 0 ||
+                vmRuntimeImports.flushInstructionCacheIatRVA == 0) {
+                std::cerr << "VM_INIT_FAIL module=LoaderImportBuilder reason="
+                          << vmRuntimeImports.error << std::endl;
+                PrintFeatureStatus("vm", "failed",
+                    "runtime_api_imports_unavailable");
+                return 1;
+            }
+
             CipherShell::VMSectionEmitter vmEmitter;
             emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
                 buildCtx.opcodeMap, buildCtx.registerMap,
                 mutatedISA.handlerSemanticToSlot, mutatedISA.handlerSlotToSemantic,
                 mutatedISA.handlerVariants, mutatedISA.junkHandlerCount,
                 mutatedISA.handlerMutationEnabled, mutatedISA.junkHandlersEnabled,
+                vmOperandCodecSeed,
                 0, buildCtx.vmSectionName);
             if (!emitResult.success) {
                 std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
@@ -1049,20 +1194,50 @@ int main(int argc, char* argv[]) {
             vmRecords = emitResult.records;
 
             CipherShell::VMRuntimeBuilder runtimeBuilder;
+            CipherShell::VMHandlerSynthesisConfig synthesisConfig{};
+            synthesisConfig.architecture = is64
+                ? CipherShell::VMHandlerArchitecture::X64
+                : CipherShell::VMHandlerArchitecture::X86;
+            synthesisConfig.buildSeed = buildCtx.isaSeed;
+            synthesisConfig.handlerSemanticToSlot =
+                emitResult.handlerSemanticToSlot;
+            synthesisConfig.handlerSlotToSemantic =
+                emitResult.handlerSlotToSemantic;
+            synthesisConfig.handlerVariants = emitResult.handlerVariants;
+            synthesisConfig.variantCount = VM_HANDLER_VARIANT_COUNT;
+            synthesisConfig.operandCodec.opcodeXor =
+                static_cast<uint8_t>(buildCtx.isaSeed[3] | 1u);
+            synthesisConfig.operandCodec.opcodeAdd =
+                static_cast<uint8_t>(buildCtx.isaSeed[7] | 1u);
+            synthesisConfig.operandCodec.opcodeRotate =
+                static_cast<uint8_t>((buildCtx.isaSeed[11] % 7u) + 1u);
+            synthesisConfig.virtualProtectIatRVA =
+                vmRuntimeImports.virtualProtectIatRVA;
+            synthesisConfig.flushInstructionCacheIatRVA =
+                vmRuntimeImports.flushInstructionCacheIatRVA;
             runtimeResult = runtimeBuilder.Build(image.get(), vmRecords,
                 emitResult.metadataRVA, emitResult.runtimeKeyShare,
+                synthesisConfig,
                 buildCtx.vmRuntimeSectionName,
                 buildCtx.vmUnwindSectionName,
                 buildCtx.vmRelocSectionName);
-            if (!runtimeResult.success) {
+            if (!runtimeResult.success ||
+                !runtimeResult.handlerSynthesisVerified ||
+                !runtimeResult.directThreadedVerified ||
+                !runtimeResult.handlerEncryptionVerified ||
+                !runtimeResult.runtimeContentVerified) {
                 std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
                                 PrintFeatureStatus("vm", "failed", runtimeResult.error);
                 return 1;
             }
 
             std::string patchError;
-            const uint32_t runtimeVerifiedFlags = runtimeResult.unwindVerified
-                ? static_cast<uint32_t>(VM_METADATA_FLAG_UNWIND_VERIFIED) : 0u;
+            const uint32_t runtimeVerifiedFlags =
+                (runtimeResult.unwindVerified
+                    ? static_cast<uint32_t>(VM_METADATA_FLAG_UNWIND_VERIFIED) : 0u) |
+                VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
+                VM_METADATA_FLAG_DIRECT_THREADED |
+                VM_METADATA_FLAG_HANDLER_ENCRYPTED;
             const uint32_t linkageVerifiedFlags = runtimeVerifiedFlags |
                 (runtimeResult.cfgVerified
                     ? static_cast<uint32_t>(VM_METADATA_FLAG_CFG_VERIFIED) : 0u);
@@ -1375,4 +1550,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-

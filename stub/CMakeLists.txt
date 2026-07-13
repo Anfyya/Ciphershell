@@ -39,27 +39,5 @@ if(MSVC)
     )
 endif()
 
-# ============================================================================
-# VM 引擎 (Mirage)
-# ============================================================================
-
-# VM 引擎 (Mirage) - C 语言实现
-add_library(mirage_vm STATIC
-    vm/vm_context.c
-    vm/dispatcher.c
-    vm/flags_emu.c
-)
-
-# 明确指定为 C 语言
-set_source_files_properties(
-    vm/vm_context.c
-    vm/dispatcher.c
-    vm/flags_emu.c
-    PROPERTIES LANGUAGE C
-)
-
-# 包含目录
-target_include_directories(mirage_vm PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-)
+# VM 内核不再由 stub 静态链接固定 dispatcher。所有微操作 handler 与
+# direct-threaded 分发尾均由 packer 按本次 build seed 现场发射。

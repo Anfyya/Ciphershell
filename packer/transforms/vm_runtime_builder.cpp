@@ -1,17 +1,10 @@
 #include "vm_runtime_builder.h"
 
 #include "../pe_parser/pe_emitter.h"
+#include "../pe_parser/pe_utils.h"
+#include "../vm/vm_schema.h"
 #include "../../runtime/common/vm_metadata.h"
-#include "../../runtime/common/vm_runtime_core.h"
-#ifdef _WIN32
-#include "vm_runtime_x64_image.h"
-#include "vm_runtime_x86_image.h"
-#else
-static const uint8_t kVMRuntimeX64Image[] = {0};
-static const size_t kVMRuntimeX64ImageSize = 0;
-static const uint8_t kVMRuntimeX86Image[] = {0};
-static const size_t kVMRuntimeX86ImageSize = 0;
-#endif
+#include "../../runtime/common/vm_micro_runtime_abi.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -38,6 +31,225 @@ struct MappedRuntimeImage {
 
 bool RangeValid(size_t offset, size_t size, size_t total) {
     return offset <= total && size <= total - offset;
+}
+
+constexpr uint64_t kRuntimeSectionDigestDomain = 0x4353564D53454354ULL;
+constexpr uint64_t kRuntimeImageDigestDomain = 0x4353564D494D4147ULL;
+constexpr uint64_t kEncryptedHandlerDigestDomain = 0x4353564D48444C52ULL;
+constexpr uint64_t kDispatchTableDigestDomain = 0x4353564D44535054ULL;
+constexpr uint64_t kDispatchKeyDomain = 0x4449535041544348ULL;
+
+struct ReferenceRuntimeFingerprint {
+    uint32_t size = 0;
+    uint64_t rollingHash = 0;
+    uint64_t leadingPower = 0;
+    std::array<uint8_t, 32> sha256{};
+    const char* name = nullptr;
+};
+
+/*
+ * SHA-256 fingerprints of the file-backed .text bytes from every retired
+ * runtime image that was previously accepted as a production interpreter.
+ * Keeping only digests (never the old machine-code bytes) lets the final PE
+ * gate reject an exact embedded legacy interpreter without recreating a
+ * fixed-runtime-blob source path.
+ */
+constexpr std::array<ReferenceRuntimeFingerprint, 4> kReferenceRuntimes = {{
+    {23552u, 0x2C5FC69EE2383E78ULL, 0xE6224086755CFF01ULL,
+        {0xFA,0x0C,0x6F,0x3E,0x27,0x5F,0x62,0x0B,
+         0xF5,0x1F,0x19,0xAF,0x5F,0x1C,0xD3,0xA4,
+         0x6E,0xC1,0x04,0x31,0x17,0x6D,0x53,0xEB,
+         0x42,0x96,0x63,0x7A,0xCC,0x5A,0x26,0xDC},
+        "retired-x64-runtime-text"},
+    {24064u, 0xA15835EC2011743AULL, 0xA9A6C919725EFF01ULL,
+        {0xBB,0x84,0x3D,0x65,0x55,0xCF,0x8D,0xFC,
+         0x53,0x1A,0xE4,0x04,0xC7,0x97,0x4C,0x21,
+         0xD1,0xBF,0xEA,0xC3,0x6F,0xC6,0x36,0x29,
+         0x86,0x56,0x57,0x24,0xA3,0xD3,0x43,0x98},
+        "retired-x86-runtime-text"},
+    {11776u, 0x72544B6CBFEC2E4FULL, 0xC3455FA1BA2EFF01ULL,
+        {0x0B,0xCA,0x07,0x48,0xCC,0x32,0xC7,0x13,
+         0xF4,0x15,0x56,0x3C,0xC8,0x2E,0xD9,0x3D,
+         0x62,0x1C,0x53,0xE5,0x9B,0xA9,0xF6,0x79,
+         0x98,0xAF,0x98,0xDA,0x36,0xDB,0xFD,0xD0},
+        "retired-x64-runtime-probe-text"},
+    {11776u, 0xB58E1DFE08EE6C7EULL, 0xC3455FA1BA2EFF01ULL,
+        {0x2B,0x25,0xCE,0x27,0x79,0xB5,0x0E,0x4D,
+         0x4E,0x43,0x40,0xF6,0x38,0x77,0x3E,0x5C,
+         0x76,0xCD,0xBD,0xCB,0x3C,0x93,0xD9,0xF7,
+         0x68,0xFE,0x49,0x11,0xB3,0x6A,0xF7,0xFF},
+        "retired-x86-runtime-probe-text"}
+}};
+
+uint32_t RotateRight32(uint32_t value, uint32_t count) {
+    return (value >> count) | (value << (32u - count));
+}
+
+void Sha256Transform(
+    std::array<uint32_t, 8>& state,
+    const uint8_t block[64])
+{
+    static constexpr std::array<uint32_t, 64> constants = {
+        0x428A2F98u,0x71374491u,0xB5C0FBCFu,0xE9B5DBA5u,
+        0x3956C25Bu,0x59F111F1u,0x923F82A4u,0xAB1C5ED5u,
+        0xD807AA98u,0x12835B01u,0x243185BEu,0x550C7DC3u,
+        0x72BE5D74u,0x80DEB1FEu,0x9BDC06A7u,0xC19BF174u,
+        0xE49B69C1u,0xEFBE4786u,0x0FC19DC6u,0x240CA1CCu,
+        0x2DE92C6Fu,0x4A7484AAu,0x5CB0A9DCu,0x76F988DAu,
+        0x983E5152u,0xA831C66Du,0xB00327C8u,0xBF597FC7u,
+        0xC6E00BF3u,0xD5A79147u,0x06CA6351u,0x14292967u,
+        0x27B70A85u,0x2E1B2138u,0x4D2C6DFCu,0x53380D13u,
+        0x650A7354u,0x766A0ABBu,0x81C2C92Eu,0x92722C85u,
+        0xA2BFE8A1u,0xA81A664Bu,0xC24B8B70u,0xC76C51A3u,
+        0xD192E819u,0xD6990624u,0xF40E3585u,0x106AA070u,
+        0x19A4C116u,0x1E376C08u,0x2748774Cu,0x34B0BCB5u,
+        0x391C0CB3u,0x4ED8AA4Au,0x5B9CCA4Fu,0x682E6FF3u,
+        0x748F82EEu,0x78A5636Fu,0x84C87814u,0x8CC70208u,
+        0x90BEFFFAu,0xA4506CEBu,0xBEF9A3F7u,0xC67178F2u
+    };
+    std::array<uint32_t, 64> words{};
+    for (size_t index = 0; index < 16u; ++index) {
+        const size_t offset = index * 4u;
+        words[index] = (static_cast<uint32_t>(block[offset]) << 24u) |
+            (static_cast<uint32_t>(block[offset + 1u]) << 16u) |
+            (static_cast<uint32_t>(block[offset + 2u]) << 8u) |
+            static_cast<uint32_t>(block[offset + 3u]);
+    }
+    for (size_t index = 16u; index < words.size(); ++index) {
+        const uint32_t s0 = RotateRight32(words[index - 15u], 7u) ^
+            RotateRight32(words[index - 15u], 18u) ^
+            (words[index - 15u] >> 3u);
+        const uint32_t s1 = RotateRight32(words[index - 2u], 17u) ^
+            RotateRight32(words[index - 2u], 19u) ^
+            (words[index - 2u] >> 10u);
+        words[index] = words[index - 16u] + s0 + words[index - 7u] + s1;
+    }
+
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
+    for (size_t index = 0; index < words.size(); ++index) {
+        const uint32_t big1 = RotateRight32(e, 6u) ^
+            RotateRight32(e, 11u) ^ RotateRight32(e, 25u);
+        const uint32_t choose = (e & f) ^ ((~e) & g);
+        const uint32_t temp1 = h + big1 + choose + constants[index] + words[index];
+        const uint32_t big0 = RotateRight32(a, 2u) ^
+            RotateRight32(a, 13u) ^ RotateRight32(a, 22u);
+        const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t temp2 = big0 + majority;
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
+
+std::array<uint8_t, 32> Sha256Digest(const uint8_t* bytes, size_t size) {
+    std::array<uint32_t, 8> state = {
+        0x6A09E667u,0xBB67AE85u,0x3C6EF372u,0xA54FF53Au,
+        0x510E527Fu,0x9B05688Cu,0x1F83D9ABu,0x5BE0CD19u
+    };
+    const size_t fullBlocks = size / 64u;
+    for (size_t index = 0; index < fullBlocks; ++index)
+        Sha256Transform(state, bytes + index * 64u);
+
+    std::array<uint8_t, 128> tail{};
+    const size_t remainder = size % 64u;
+    if (remainder != 0)
+        std::memcpy(tail.data(), bytes + fullBlocks * 64u, remainder);
+    tail[remainder] = 0x80u;
+    const size_t tailSize = remainder < 56u ? 64u : 128u;
+    const uint64_t bitLength = static_cast<uint64_t>(size) * 8u;
+    for (size_t index = 0; index < 8u; ++index) {
+        tail[tailSize - 1u - index] =
+            static_cast<uint8_t>(bitLength >> (index * 8u));
+    }
+    Sha256Transform(state, tail.data());
+    if (tailSize == 128u) Sha256Transform(state, tail.data() + 64u);
+
+    std::array<uint8_t, 32> digest{};
+    for (size_t index = 0; index < state.size(); ++index) {
+        digest[index * 4u] = static_cast<uint8_t>(state[index] >> 24u);
+        digest[index * 4u + 1u] = static_cast<uint8_t>(state[index] >> 16u);
+        digest[index * 4u + 2u] = static_cast<uint8_t>(state[index] >> 8u);
+        digest[index * 4u + 3u] = static_cast<uint8_t>(state[index]);
+    }
+    return digest;
+}
+
+bool VerifyNoReferenceRuntimeBlob(
+    const uint8_t* bytes,
+    size_t size,
+    std::string& error)
+{
+    static constexpr std::array<uint8_t, 32> emptyDigest = {
+        0xE3,0xB0,0xC4,0x42,0x98,0xFC,0x1C,0x14,
+        0x9A,0xFB,0xF4,0xC8,0x99,0x6F,0xB9,0x24,
+        0x27,0xAE,0x41,0xE4,0x64,0x9B,0x93,0x4C,
+        0xA4,0x95,0x99,0x1B,0x78,0x52,0xB8,0x55
+    };
+    if (Sha256Digest(nullptr, 0) != emptyDigest) {
+        error = "reference-runtime SHA-256 self-test failed";
+        return false;
+    }
+    if (!bytes && size != 0) {
+        error = "reference-runtime scan received a null image";
+        return false;
+    }
+    for (const ReferenceRuntimeFingerprint& reference : kReferenceRuntimes) {
+        if (reference.size == 0 || reference.size > size) continue;
+        uint64_t rolling = 0;
+        for (size_t index = 0; index < reference.size; ++index)
+            rolling = rolling * 257u + bytes[index];
+        const size_t last = size - reference.size;
+        for (size_t offset = 0; offset <= last; ++offset) {
+            if (rolling == reference.rollingHash &&
+                Sha256Digest(bytes + offset, reference.size) == reference.sha256) {
+                error = std::string("final PE contains exact reference runtime blob: ") +
+                    reference.name;
+                return false;
+            }
+            if (offset == last) break;
+            rolling -= static_cast<uint64_t>(bytes[offset]) * reference.leadingPower;
+            rolling = rolling * 257u + bytes[offset + reference.size];
+        }
+    }
+    return true;
+}
+
+uint64_t HashRuntimeBytes(const uint8_t* bytes, size_t size, uint64_t domain) {
+    uint64_t hash = 1469598103934665603ULL ^ domain;
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+        hash ^= hash >> 29u;
+    }
+    return hash ? hash : (domain | 1ULL);
+}
+
+bool RuntimeRangeValid(
+    const VMRuntimeContentRange& range,
+    size_t total)
+{
+    return range.size != 0 && range.digest != 0 &&
+        RangeValid(range.offset, range.size, total);
 }
 
 constexpr std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> kRuntimeKeyMarker = {
@@ -513,7 +725,8 @@ BuiltX64Trampoline BuildX64Trampoline(
     constexpr uint32_t kXmmOffset = 0xD0;
     constexpr uint32_t kExtendedStorageOffset = 0x200;
     constexpr uint32_t kExtendedPointerSlot = 0x30;
-    constexpr uint32_t kHostStackAllocation = 0x598;
+    constexpr uint32_t kHostStackAllocation =
+        kFrameOffset + VM_RUNTIME_X64_FRAME_TO_SCRATCH;
     const uint32_t kStackAllocation = kHostStackAllocation + guestStackSize;
     constexpr uint32_t kFrameR15 = kFrameOffset + 0;
     constexpr uint32_t kFrameR14 = kFrameOffset + 8;
@@ -646,8 +859,9 @@ std::vector<uint8_t> BuildX86Trampoline(
     uint32_t guestStackSize,
     bool usesAvx)
 {
-    constexpr uint32_t kHostAllocation = 0x500;
     constexpr uint32_t kFrameOffset = 0x40;
+    constexpr uint32_t kHostAllocation =
+        kFrameOffset + VM_RUNTIME_X86_FRAME_TO_SCRATCH;
     constexpr uint32_t kExtendedStorageOffset = 0x100;
     const uint32_t kStackAllocation = kHostAllocation + guestStackSize;
     X86TrampolineAssembler assembler;
@@ -713,13 +927,233 @@ uint64_t GetImageBase(const CS_PE_IMAGE* image) {
                           : image->ntHeaders32->OptionalHeader.ImageBase;
 }
 
+bool ReadMetadataHeader(
+    const CS_PE_IMAGE* image,
+    uint32_t metadataRVA,
+    VM_METADATA_HEADER& header)
+{
+    if (!image || !image->rawData || metadataRVA == 0) return false;
+    uint32_t rawOffset = 0;
+    bool found = false;
+    const uint32_t headersSize = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SizeOfHeaders
+        : image->ntHeaders32->OptionalHeader.SizeOfHeaders;
+    if (metadataRVA < headersSize) {
+        rawOffset = metadataRVA;
+        found = true;
+    } else {
+        for (WORD i = 0; i < image->numSections; ++i) {
+            const auto& section = image->sections[i];
+            const uint32_t span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+            if (metadataRVA >= section.VirtualAddress &&
+                metadataRVA - section.VirtualAddress < span) {
+                rawOffset = section.PointerToRawData + metadataRVA - section.VirtualAddress;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found || rawOffset > image->rawSize ||
+        sizeof(header) > image->rawSize - rawOffset) return false;
+    std::memcpy(&header, image->rawData + rawOffset, sizeof(header));
+    return header.headerSize == sizeof(VM_METADATA_HEADER) &&
+        header.layoutSeed != 0 && header.operandCodecSeed != 0 &&
+        header.schemaVersion == VM_SCHEMA_VERSION;
+}
+
 } // namespace
+
+bool VMRuntimeBuilder::VerifyRuntimeContents(
+    const CS_PE_IMAGE* image,
+    const VMRuntimeBuildResult& result,
+    std::string& error)
+{
+    error.clear();
+    const auto fail = [&](const char* message) -> bool {
+        error = message;
+        return false;
+    };
+
+    if (!image || !image->isValid || !image->rawData || !image->sections ||
+        image->numSections == 0) {
+        return fail("runtime integrity verification requires a valid parsed PE");
+    }
+    if ((image->is64Bit && image->ntHeaders64 == nullptr) ||
+        (!image->is64Bit && image->ntHeaders32 == nullptr)) {
+        return fail("runtime integrity verification requires parsed NT headers");
+    }
+    const bool expected64 = result.architecture == VM_ARCH_X64;
+    if ((result.architecture != VM_ARCH_X64 && result.architecture != VM_ARCH_X86) ||
+        expected64 != (image->is64Bit != 0)) {
+        return fail("runtime integrity architecture does not match the current PE");
+    }
+    if (result.sectionRVA == 0 || result.sectionSize == 0 ||
+        result.runtimeImageSize == 0 || result.runtimeEntryRVA < result.sectionRVA) {
+        return fail("runtime integrity linkage range is incomplete");
+    }
+
+    const VMRuntimeIntegrityExpectation& expectation = result.integrityExpectation;
+    if (expectation.version != VM_RUNTIME_INTEGRITY_EXPECTATION_VERSION ||
+        expectation.expectedSectionBytes.size() != result.sectionSize ||
+        expectation.sectionContentSize < result.runtimeImageSize ||
+        expectation.sectionContentSize > expectation.expectedSectionBytes.size()) {
+        return fail("runtime integrity expectation is missing or malformed");
+    }
+    if (expectation.synthesizedImage.offset != 0 ||
+        expectation.synthesizedImage.size != result.runtimeImageSize ||
+        !RuntimeRangeValid(expectation.synthesizedImage,
+            expectation.sectionContentSize) ||
+        !RuntimeRangeValid(expectation.encryptedHandlers,
+            expectation.synthesizedImage.size) ||
+        !RuntimeRangeValid(expectation.dispatchTable,
+            expectation.synthesizedImage.size)) {
+        return fail("runtime integrity synthesized subrange is invalid");
+    }
+    const uint64_t dispatchEnd = static_cast<uint64_t>(
+        expectation.dispatchTable.offset) + expectation.dispatchTable.size;
+    if (dispatchEnd > expectation.encryptedHandlers.offset) {
+        return fail("runtime integrity dispatch and encrypted-handler ranges overlap");
+    }
+    const uint32_t entryOffset = result.runtimeEntryRVA - result.sectionRVA;
+    if (entryOffset >= expectation.synthesizedImage.size) {
+        return fail("runtime entry lies outside the synthesized image");
+    }
+    if (expectation.sectionDigest == 0 || expectation.dispatchDigestDomain == 0 ||
+        result.opcodeMapDigest == 0 || result.handlerBodyDigest == 0 ||
+        result.dispatchKeyDigest == 0 || result.variantSelectorDigest == 0 ||
+        expectation.opcodeMapDigest != result.opcodeMapDigest ||
+        expectation.handlerBodyDigest != result.handlerBodyDigest ||
+        expectation.dispatchKeyDigest != result.dispatchKeyDigest ||
+        expectation.variantSelectorDigest != result.variantSelectorDigest) {
+        return fail("runtime diversity digest contract is inconsistent");
+    }
+
+    const uint8_t* expected = expectation.expectedSectionBytes.data();
+    if (HashRuntimeBytes(expected, expectation.expectedSectionBytes.size(),
+            kRuntimeSectionDigestDomain) != expectation.sectionDigest ||
+        HashRuntimeBytes(expected + expectation.synthesizedImage.offset,
+            expectation.synthesizedImage.size, kRuntimeImageDigestDomain) !=
+                expectation.synthesizedImage.digest ||
+        HashRuntimeBytes(expected + expectation.encryptedHandlers.offset,
+            expectation.encryptedHandlers.size, kEncryptedHandlerDigestDomain) !=
+                expectation.encryptedHandlers.digest ||
+        HashRuntimeBytes(expected + expectation.dispatchTable.offset,
+            expectation.dispatchTable.size, kDispatchTableDigestDomain) !=
+                expectation.dispatchTable.digest) {
+        return fail("runtime integrity expectation digest does not match expected bytes");
+    }
+    if (!std::all_of(
+            expectation.expectedSectionBytes.begin() + expectation.sectionContentSize,
+            expectation.expectedSectionBytes.end(),
+            [](uint8_t value) { return value == 0; })) {
+        return fail("runtime integrity expected section padding is non-zero");
+    }
+
+    const IMAGE_SECTION_HEADER* runtimeSection = nullptr;
+    for (WORD index = 0; index < image->numSections; ++index) {
+        const IMAGE_SECTION_HEADER& section = image->sections[index];
+        if (section.VirtualAddress != result.sectionRVA) continue;
+        if (runtimeSection != nullptr) {
+            return fail("runtime integrity section RVA is duplicated");
+        }
+        runtimeSection = &section;
+    }
+    if (!runtimeSection || runtimeSection->SizeOfRawData != result.sectionSize ||
+        runtimeSection->Misc.VirtualSize < expectation.sectionContentSize ||
+        (runtimeSection->Characteristics &
+            (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)) !=
+                (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ) ||
+        (runtimeSection->Characteristics & IMAGE_SCN_MEM_WRITE) != 0 ||
+        !PEUtils::CheckRawBounds(image, runtimeSection->PointerToRawData,
+            runtimeSection->SizeOfRawData)) {
+        return fail("runtime integrity section layout or permissions changed");
+    }
+
+    const uint8_t* current = image->rawData + runtimeSection->PointerToRawData;
+    const auto verifyRange = [&](const VMRuntimeContentRange& range,
+                                 uint64_t domain,
+                                 const char* digestError,
+                                 const char* byteError) -> bool {
+        if (HashRuntimeBytes(current + range.offset, range.size, domain) != range.digest) {
+            error = digestError;
+            return false;
+        }
+        if (std::memcmp(current + range.offset, expected + range.offset,
+                range.size) != 0) {
+            error = byteError;
+            return false;
+        }
+        return true;
+    };
+    if (!verifyRange(expectation.encryptedHandlers,
+            kEncryptedHandlerDigestDomain,
+            "runtime encrypted-handler digest mismatch",
+            "runtime encrypted-handler bytes mismatch") ||
+        !verifyRange(expectation.dispatchTable,
+            kDispatchTableDigestDomain,
+            "runtime dispatch-table digest mismatch",
+            "runtime dispatch-table bytes mismatch") ||
+        !verifyRange(expectation.synthesizedImage,
+            kRuntimeImageDigestDomain,
+            "runtime synthesized-image digest mismatch",
+            "runtime synthesized-image bytes mismatch")) {
+        return false;
+    }
+    if (HashRuntimeBytes(current, expectation.expectedSectionBytes.size(),
+            kRuntimeSectionDigestDomain) != expectation.sectionDigest) {
+        return fail("runtime section digest mismatch");
+    }
+    if (std::memcmp(current, expected,
+            expectation.expectedSectionBytes.size()) != 0) {
+        return fail("runtime section bytes mismatch");
+    }
+
+    const uint32_t pointerSize = expected64 ? 8u : 4u;
+    if (expectation.dispatchTable.size % pointerSize != 0) {
+        return fail("runtime dispatch-table width is invalid");
+    }
+    const uint64_t mappedBase = GetImageBase(image) + result.sectionRVA;
+    if ((!expected64 && mappedBase > (std::numeric_limits<uint32_t>::max)()) ||
+        mappedBase < GetImageBase(image)) {
+        return fail("runtime mapped base overflows the target architecture");
+    }
+    std::vector<uint8_t> normalizedDispatch(expectation.dispatchTable.size, 0);
+    for (uint32_t offset = 0; offset < expectation.dispatchTable.size;
+         offset += pointerSize) {
+        uint64_t target = 0;
+        std::memcpy(&target,
+            current + expectation.dispatchTable.offset + offset, pointerSize);
+        if (target == 0) continue;
+        if (target < mappedBase) {
+            return fail("runtime dispatch target precedes the runtime image");
+        }
+        const uint64_t relative = target - mappedBase;
+        const uint64_t handlerEnd = static_cast<uint64_t>(
+            expectation.encryptedHandlers.offset) +
+            expectation.encryptedHandlers.size;
+        if (relative < expectation.encryptedHandlers.offset ||
+            relative >= handlerEnd ||
+            relative > (std::numeric_limits<uint32_t>::max)()) {
+            return fail("runtime dispatch target is outside encrypted handlers");
+        }
+        std::memcpy(normalizedDispatch.data() + offset, &relative, pointerSize);
+    }
+    if (HashRuntimeBytes(normalizedDispatch.data(), normalizedDispatch.size(),
+            expectation.dispatchDigestDomain) != result.dispatchKeyDigest) {
+        return fail("runtime dispatch-key digest does not match physical targets");
+    }
+    if (!VerifyNoReferenceRuntimeBlob(image->rawData, image->rawSize, error)) {
+        return false;
+    }
+    return true;
+}
 
 VMRuntimeBuildResult VMRuntimeBuilder::Build(
     CS_PE_IMAGE* image,
     const std::vector<VMFunctionRecord>& records,
     uint32_t metadataRVA,
     const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
+    const VMHandlerSynthesisConfig& requestedSynthesisConfig,
     const char sectionName[8],
     const char unwindSectionName[8],
     const char relocationSectionName[8])
@@ -730,18 +1164,81 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
         return result;
     }
 
-    MappedRuntimeImage runtime;
-    const uint8_t* embedded = image->is64Bit ? kVMRuntimeX64Image : kVMRuntimeX86Image;
-    const size_t embeddedSize = image->is64Bit ? kVMRuntimeX64ImageSize : kVMRuntimeX86ImageSize;
-    if (!ParseRuntimeImage(embedded, embeddedSize, image->is64Bit != 0, runtime, result.error)) {
-        result.error = "VM_RUNTIME: " + result.error;
+    VMHandlerSynthesisConfig synthesisConfig = requestedSynthesisConfig;
+    synthesisConfig.architecture = image->is64Bit
+        ? VMHandlerArchitecture::X64 : VMHandlerArchitecture::X86;
+    if (synthesisConfig.virtualProtectIatRVA == 0 ||
+        synthesisConfig.flushInstructionCacheIatRVA == 0) {
+        result.error = "VM_RUNTIME: handler RX decryption API IAT RVAs are missing";
         return result;
+    }
+    if (synthesisConfig.functionDecodePlans.empty()) {
+        VM_METADATA_HEADER metadataHeader{};
+        if (!ReadMetadataHeader(image, metadataRVA, metadataHeader)) {
+            result.error = "VM_RUNTIME: micro metadata header cannot seed operand decode plans";
+            return result;
+        }
+        synthesisConfig.functionDecodePlans.reserve(records.size());
+        for (const auto& record : records) {
+            VMHandlerFunctionDecodePlans plans{};
+            plans.functionRVA = record.functionRVA;
+            plans.codec = VMSchema::DeriveOperandCodec(
+                metadataHeader.operandCodecSeed, record.functionRVA);
+            std::string planError;
+            if (!VMSchema::BuildRuntimeDecodePlans(
+                    plans.codec, plans.plans.data(), planError)) {
+                result.error = "VM_RUNTIME: operand decode plan failed for function: " + planError;
+                return result;
+            }
+            synthesisConfig.functionDecodePlans.push_back(std::move(plans));
+        }
+    }
+    VMHandlerSynthesizer synthesizer;
+    VMHandlerSynthesisResult synthesized = synthesizer.Synthesize(synthesisConfig);
+    if (!synthesized.success) {
+        result.error = "VM_RUNTIME: handler synthesis failed: " + synthesized.error;
+        return result;
+    }
+    std::string synthesisError;
+    if (!VMHandlerSynthesizer::Validate(synthesisConfig, synthesized, synthesisError)) {
+        result.error = "VM_RUNTIME: synthesized handler validation failed: " + synthesisError;
+        return result;
+    }
+    if (!synthesized.directThreaded || !synthesized.handlerBodiesEncrypted ||
+        synthesized.fixedRuntimeBlobUsed || !synthesized.usesTemporaryPageWrite ||
+        !synthesized.restoresExecuteRead || !synthesized.publicEntryReady ||
+        !synthesized.validationEntryReady) {
+        result.error = "VM_RUNTIME: synthesized handler security contract is incomplete";
+        return result;
+    }
+
+    MappedRuntimeImage runtime;
+    runtime.bytes = synthesized.image;
+    runtime.preferredBase = 0;
+    runtime.entryRVA = synthesized.entryOffset;
+    runtime.headersSize = 0;
+    runtime.is64Bit = image->is64Bit != 0;
+    runtime.relocations.reserve(synthesized.relocations.size());
+    for (const auto& relocation : synthesized.relocations) {
+        runtime.relocations.push_back({relocation.offset, relocation.type});
+    }
+    runtime.unwindEntries.reserve(synthesized.unwindEntries.size());
+    for (const auto& unwind : synthesized.unwindEntries) {
+        runtime.unwindEntries.push_back({
+            unwind.beginOffset, unwind.endOffset, unwind.unwindOffset});
     }
     if (!PatchRuntimeKeyShare(runtime, runtimeKeyShare, result.error)) {
         result.error = "VM_RUNTIME: " + result.error;
         return result;
     }
     result.keySharePatched = true;
+    result.handlerSynthesisVerified = true;
+    result.directThreadedVerified = true;
+    result.handlerEncryptionVerified = true;
+    result.opcodeMapDigest = synthesized.opcodeMapDigest;
+    result.handlerBodyDigest = synthesized.microSelectionDigest;
+    result.dispatchKeyDigest = synthesized.dispatchKeyDigest;
+    result.variantSelectorDigest = synthesized.variantSelectorDigest;
     if (image->loadConfig.hasCFG) {
         if (!image->loadConfig.valid ||
             (image->is64Bit && image->loadConfig.guardCFDispatchFunctionPointer == 0) ||
@@ -757,11 +1254,17 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     std::vector<uint8_t> blob = runtime.bytes;
     const uint32_t runtimeImageSize = static_cast<uint32_t>(runtime.bytes.size());
     std::unordered_set<uint32_t> functionRVAs;
+    constexpr uint32_t kRuntimeContextReserve =
+        (static_cast<uint32_t>(sizeof(VM_MICRO_EXECUTION_CONTEXT)) + 15u) & ~15u;
     for (const auto& record : records) {
         if (!functionRVAs.insert(record.functionRVA).second || record.functionSize < 5 ||
             record.guestStackSize < 0x4000u || record.guestStackSize > 0x70000u ||
             (record.guestStackSize & 0x0FFFu) != 0 ||
-            record.guestStackSize + 0x598u > 0x7FFF8u) {
+            record.guestStackSize +
+                (0x40u + VM_RUNTIME_X64_FRAME_TO_SCRATCH) > 0x7FFF8u ||
+            record.bytecodeSize == 0 ||
+            kRuntimeContextReserve > record.guestStackSize ||
+            record.bytecodeSize > record.guestStackSize - kRuntimeContextReserve) {
             result.error = "VM_RUNTIME: function record or guest stack reserve is invalid";
             return result;
         }
@@ -821,7 +1324,7 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     }
 
     const uint64_t mappedBase = GetImageBase(image) + appended.rva;
-    if (!image->is64Bit && mappedBase > std::numeric_limits<uint32_t>::max()) {
+    if (!image->is64Bit && mappedBase > (std::numeric_limits<uint32_t>::max)()) {
         result.error = "VM_RUNTIME: x86 runtime mapping exceeds the 32-bit address range";
         return result;
     }
@@ -907,6 +1410,50 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
 
     result.sectionRawOffset = image->sections[appended.sectionIndex].PointerToRawData;
     result.sectionSize = image->sections[appended.sectionIndex].SizeOfRawData;
+
+    if (blob.size() > result.sectionSize) {
+        result.error = "VM_RUNTIME: emitted runtime content exceeds its raw section";
+        return result;
+    }
+    VMRuntimeIntegrityExpectation& expectation = result.integrityExpectation;
+    expectation.version = VM_RUNTIME_INTEGRITY_EXPECTATION_VERSION;
+    expectation.sectionContentSize = static_cast<uint32_t>(blob.size());
+    expectation.dispatchDigestDomain = HashRuntimeBytes(
+        synthesisConfig.buildSeed.data(), synthesisConfig.buildSeed.size(),
+        kDispatchKeyDomain);
+    expectation.opcodeMapDigest = result.opcodeMapDigest;
+    expectation.handlerBodyDigest = result.handlerBodyDigest;
+    expectation.dispatchKeyDigest = result.dispatchKeyDigest;
+    expectation.variantSelectorDigest = result.variantSelectorDigest;
+    expectation.expectedSectionBytes.assign(result.sectionSize, 0);
+    std::copy(blob.begin(), blob.end(), expectation.expectedSectionBytes.begin());
+    expectation.synthesizedImage.offset = 0;
+    expectation.synthesizedImage.size = result.runtimeImageSize;
+    expectation.synthesizedImage.digest = HashRuntimeBytes(
+        expectation.expectedSectionBytes.data(), result.runtimeImageSize,
+        kRuntimeImageDigestDomain);
+    expectation.encryptedHandlers.offset = synthesized.encryptedHandlerOffset;
+    expectation.encryptedHandlers.size = synthesized.encryptedHandlerSize;
+    expectation.encryptedHandlers.digest = HashRuntimeBytes(
+        expectation.expectedSectionBytes.data() + synthesized.encryptedHandlerOffset,
+        synthesized.encryptedHandlerSize, kEncryptedHandlerDigestDomain);
+    expectation.dispatchTable.offset = synthesized.dispatchTableOffset;
+    expectation.dispatchTable.size = synthesized.dispatchTableSize;
+    expectation.dispatchTable.digest = HashRuntimeBytes(
+        expectation.expectedSectionBytes.data() + synthesized.dispatchTableOffset,
+        synthesized.dispatchTableSize, kDispatchTableDigestDomain);
+    expectation.sectionDigest = HashRuntimeBytes(
+        expectation.expectedSectionBytes.data(),
+        expectation.expectedSectionBytes.size(), kRuntimeSectionDigestDomain);
+
+    std::string integrityError;
+    if (!VerifyRuntimeContents(image, result, integrityError)) {
+        result.error = "VM_RUNTIME: emitted runtime integrity verification failed: " +
+            integrityError;
+        return result;
+    }
+    result.runtimeContentVerified = true;
+    result.referenceRuntimeBlobFreeVerified = true;
 
     result.unwindVerified = true;
     result.executionReady = true;

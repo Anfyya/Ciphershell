@@ -122,6 +122,7 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
         MakeSectionName(ctx.vmBridgeUnwindSectionName, ctx.isaSeed, 0xB117u);
         MakeSectionName(ctx.vmGuardSectionName, ctx.isaSeed, 0x6CF7u);
         MakeSectionName(ctx.vmRelocSectionName, ctx.isaSeed, 0x2E10u);
+        MakeSectionName(ctx.vmRuntimeApiSectionName, ctx.isaSeed, 0xA91Fu);
     } else {
         CopyName(ctx.vmSectionName, ".csvm");
         CopyName(ctx.vmRuntimeSectionName, ".csvx");
@@ -130,6 +131,7 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
         CopyName(ctx.vmBridgeUnwindSectionName, ".csbuw");
         CopyName(ctx.vmGuardSectionName, ".csgft");
         CopyName(ctx.vmRelocSectionName, ".csrlc");
+        CopyName(ctx.vmRuntimeApiSectionName, ".csvapi");
     }
 
     return ctx;

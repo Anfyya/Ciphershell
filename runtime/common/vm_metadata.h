@@ -8,8 +8,8 @@
 extern "C" {
 #endif
 
-#define VM_METADATA_VERSION 0x00030002u
-#define VM_RUNTIME_VERSION  0x00030004u
+#define VM_METADATA_VERSION 0x00040000u
+#define VM_RUNTIME_VERSION  0x00040000u
 #define VM_KEY_ENCODING_VERSION 0x00010000u
 #define VM_RUNTIME_KEY_SHARE_SIZE 32u
 #define VM_ARCH_X86 0x00000086u
@@ -30,7 +30,12 @@ enum {
     VM_METADATA_FLAG_UNWIND_VERIFIED = 0x00000010u,
     VM_METADATA_FLAG_CFG_ENABLED = 0x00000020u,
     VM_METADATA_FLAG_HANDLER_MUTATED = 0x00000040u,
-    VM_METADATA_FLAG_JUNK_HANDLERS = 0x00000080u
+    VM_METADATA_FLAG_JUNK_HANDLERS = 0x00000080u,
+    VM_METADATA_FLAG_MICRO_STREAM = 0x00000100u,
+    VM_METADATA_FLAG_LAZY_FLAGS = 0x00000200u,
+    VM_METADATA_FLAG_HANDLER_SYNTHESIZED = 0x00000400u,
+    VM_METADATA_FLAG_DIRECT_THREADED = 0x00000800u,
+    VM_METADATA_FLAG_HANDLER_ENCRYPTED = 0x00001000u
 };
 
 enum {
@@ -67,6 +72,7 @@ typedef struct VM_METADATA_HEADER {
     uint32_t guardCFCheckPointerRVA;
     uint32_t guardCFDispatchPointerRVA;
     uint32_t layoutSeed;
+    uint64_t operandCodecSeed;
     uint32_t keyEncodingVersion;
     uint32_t opcodeMapSize;
     uint32_t registerMapSize;
@@ -112,7 +118,7 @@ typedef struct VM_TRACE_STATE {
 
 #ifdef __cplusplus
 }
-static_assert(sizeof(VM_METADATA_HEADER) == 184, "VM metadata header size mismatch");
+static_assert(sizeof(VM_METADATA_HEADER) == 192, "VM metadata header size mismatch");
 static_assert(sizeof(VM_FUNCTION_RECORD) == 64, "VM function record size mismatch");
 static_assert(sizeof(VM_TRACE_STATE) == 32, "VM trace state size mismatch");
 #endif

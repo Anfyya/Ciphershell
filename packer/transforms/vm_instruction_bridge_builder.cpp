@@ -3,7 +3,7 @@
 #include "../analysis/disassembler.h"
 #include "../pe_parser/pe_utils.h"
 #include "../vm/vm_schema.h"
-#include "../../runtime/common/vm_runtime_core.h"
+#include "../../runtime/common/vm_micro_runtime_abi.h"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -372,7 +372,7 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
         for (size_t requestIndex = 0; requestIndex < translation.bridgeRequests.size(); ++requestIndex) {
             const auto& request = translation.bridgeRequests[requestIndex];
             if (request.functionRVA != functions[functionIndex].entryAddress ||
-                request.instructionIndex >= translation.instructions.size() ||
+                request.microOpIndex >= translation.instructions.size() ||
                 request.hiddenNativeRegister >= (image->is64Bit ? 16u : 8u) ||
                 (image->is64Bit && request.instruction.machineMode != MachineMode::X64) ||
                 (!image->is64Bit && request.instruction.machineMode != MachineMode::X86)) {
@@ -484,9 +484,17 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
             }
         }
 
-        BytecodeInstr& bytecode = translation.instructions[request.instructionIndex];
-        bytecode.immediate = appended.rva + item.thunkOffset;
-        bytecode.flags |= VM_OPERAND_BRIDGE_LINKED;
+        if (request.microOpIndex >= translation.instructions.size()) {
+            result.error = "VM_BRIDGE: linked micro-op index is outside translation";
+            return result;
+        }
+        MicroInstruction& bytecode = translation.instructions[request.microOpIndex];
+        if (bytecode.opcode != VM_UOP_BRIDGE_EXTENDED || bytecode.operandCount != 3) {
+            result.error = "VM_BRIDGE: linked request does not reference BRIDGE_EXTENDED";
+            return result;
+        }
+        bytecode.operands[0] = appended.rva + item.thunkOffset;
+        bytecode.operands[1] |= VM_MICRO_BRIDGE_LINKED;
         std::string schemaError;
         if (!VMSchema::ValidateInstruction(bytecode, translation.registerCount, schemaError)) {
             result.error = "VM_BRIDGE: linked bytecode violates schema: " + schemaError;

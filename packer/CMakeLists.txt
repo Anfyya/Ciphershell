@@ -38,9 +38,13 @@ add_library(ciphershell_packer STATIC
 
     # 转译器 — Phase 4
     vm/vm_schema.cpp
+    vm/micro_semantics.cpp
     vm/vm_verifier.cpp
     transforms/translator.cpp
     transforms/vm_section_emitter.cpp
+    transforms/vm_handler_synthesizer.cpp
+    transforms/vm_handler_semantic_codegen.cpp
+    transforms/vm_handler_entry_codegen.cpp
     transforms/vm_runtime_builder.cpp
     transforms/vm_instruction_bridge_builder.cpp
     transforms/function_trampoline_patcher.cpp
@@ -67,11 +71,6 @@ target_include_directories(ciphershell_packer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
-
-if(WIN32)
-    add_dependencies(ciphershell_packer vm_runtime_blobs)
-    target_include_directories(ciphershell_packer PRIVATE "${CS_RUNTIME_GENERATED_DIR}")
-endif()
 
 # 链接依赖
 if(WIN32)

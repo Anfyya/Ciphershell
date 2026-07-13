@@ -434,6 +434,7 @@ bool Disassembler::DecodeInstruction(
     out.machineMode = m_is64Bit ? MachineMode::X64 : MachineMode::X86;
     out.encoding = MapEncoding(decoded.encoding);
     out.instructionSet = ClassifyInstructionSet(decoded);
+    out.addressWidth = decoded.address_width;
     out.operandWidth = decoded.operand_width;
     out.stackWidth = decoded.stack_width;
     out.displacementOffset = decoded.raw.disp.offset;

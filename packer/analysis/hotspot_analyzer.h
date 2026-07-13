@@ -88,7 +88,8 @@ public:
      */
     std::vector<HotspotInfo> GenerateSuggestions(
         std::vector<HotspotInfo>& hotspots,
-        uint32_t defaultLevel
+        uint32_t defaultLevel,
+        const HotspotConfig& config
     );
 
     /**

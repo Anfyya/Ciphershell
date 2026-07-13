@@ -25,6 +25,7 @@ public:
         const std::vector<uint8_t>& bytecode,
         const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
         const std::unordered_map<uint8_t, uint8_t>& registerMap,
+        uint64_t operandCodecSeed,
         uint32_t registerCount,
         bool is64Bit);
 

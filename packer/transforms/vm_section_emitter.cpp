@@ -29,7 +29,12 @@ constexpr uint32_t kKnownHeaderFlags = VM_METADATA_FLAG_AUTHENTICATED |
     VM_METADATA_FLAG_UNWIND_VERIFIED |
     VM_METADATA_FLAG_CFG_ENABLED |
     VM_METADATA_FLAG_HANDLER_MUTATED |
-    VM_METADATA_FLAG_JUNK_HANDLERS;
+    VM_METADATA_FLAG_JUNK_HANDLERS |
+    VM_METADATA_FLAG_MICRO_STREAM |
+    VM_METADATA_FLAG_LAZY_FLAGS |
+    VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
+    VM_METADATA_FLAG_DIRECT_THREADED |
+    VM_METADATA_FLAG_HANDLER_ENCRYPTED;
 constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
     VM_RECORD_FLAG_UNWIND_VERIFIED |
@@ -151,17 +156,30 @@ bool ValidateHandlerLayout(
     const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& slotToSemantic,
     const std::array<uint8_t, VM_HANDLER_TABLE_SIZE>& variants,
     uint32_t expectedJunkCount,
+    bool is64Bit,
     std::string& error)
 {
     std::array<uint8_t, VM_HANDLER_TABLE_SIZE> usedSlots{};
     std::array<uint8_t, VM_HANDLER_TABLE_SIZE> validSemantics{};
     uint32_t junkCount = 0;
+    uint32_t validCount = 0;
     for (const auto& descriptor : VMSchema::Opcodes()) {
         if (descriptor.opcode == VM_HANDLER_INVALID || descriptor.opcode == VM_HANDLER_JUNK) {
             error = "VM_EMIT: production opcode collides with a handler sentinel";
             return false;
         }
+        const bool supported = is64Bit
+            ? descriptor.runtimeSupportedX64
+            : descriptor.runtimeSupportedX86;
+        if (!supported) {
+            if (semanticToSlot[descriptor.opcode] != VM_HANDLER_INVALID) {
+                error = "VM_EMIT: runtime-unsupported semantic owns a handler slot";
+                return false;
+            }
+            continue;
+        }
         validSemantics[descriptor.opcode] = 1;
+        ++validCount;
         const uint8_t slot = semanticToSlot[descriptor.opcode];
         if (slot == VM_HANDLER_INVALID || slot >= VM_HANDLER_USABLE_SLOT_COUNT ||
             usedSlots[slot] || slotToSemantic[slot] != descriptor.opcode) {
@@ -204,7 +222,7 @@ bool ValidateHandlerLayout(
         }
     }
     if (junkCount != expectedJunkCount ||
-        junkCount > VM_HANDLER_USABLE_SLOT_COUNT - VMSchema::Opcodes().size()) {
+        junkCount > VM_HANDLER_USABLE_SLOT_COUNT - validCount) {
         error = "VM_EMIT: junk handler count does not match the usable handler table";
         return false;
     }
@@ -231,6 +249,7 @@ VMEmitResult VMSectionEmitter::Emit(
     uint32_t junkHandlerCount,
     bool handlerMutationEnabled,
     bool junkHandlersEnabled,
+    uint64_t operandCodecSeed,
     uint32_t runtimeEntryRVA,
     const char sectionName[8])
 {
@@ -250,7 +269,8 @@ VMEmitResult VMSectionEmitter::Emit(
     if (!BuildReverseOpcodeMap(opcodeMap, reverseOpcode, result.error) ||
         !BuildRegisterMap(registerMap, encodedRegisterMap, result.error) ||
         !ValidateHandlerLayout(handlerSemanticToSlot, handlerSlotToSemantic,
-            handlerVariants, junkHandlerCount, result.error)) return result;
+            handlerVariants, junkHandlerCount, image->is64Bit != 0,
+            result.error)) return result;
 
     VM_METADATA_HEADER header{};
     uint8_t masterKey[32]{};
@@ -264,6 +284,12 @@ VMEmitResult VMSectionEmitter::Emit(
         return result;
     }
     if (header.cookie == 0) header.cookie = 1;
+    if (operandCodecSeed == 0) {
+        result.error = "VM_EMIT: operand codec seed is zero";
+        std::memset(masterKey, 0, sizeof(masterKey));
+        return result;
+    }
+    header.operandCodecSeed = operandCodecSeed;
 
     header.headerSize = sizeof(VM_METADATA_HEADER);
     header.metadataVersion = VM_METADATA_VERSION;
@@ -271,7 +297,10 @@ VMEmitResult VMSectionEmitter::Emit(
     header.runtimeVersion = VM_RUNTIME_VERSION;
     header.keyEncodingVersion = VM_KEY_ENCODING_VERSION;
     header.architecture = image->is64Bit ? VM_ARCH_X64 : VM_ARCH_X86;
-    header.flags = VM_METADATA_FLAG_AUTHENTICATED | VM_METADATA_FLAG_BYTECODE_CHACHA20;
+    header.flags = VM_METADATA_FLAG_AUTHENTICATED |
+        VM_METADATA_FLAG_BYTECODE_CHACHA20 |
+        VM_METADATA_FLAG_MICRO_STREAM |
+        VM_METADATA_FLAG_LAZY_FLAGS;
     if (image->loadConfig.hasCFG) header.flags |= VM_METADATA_FLAG_CFG_ENABLED;
     if (handlerMutationEnabled) header.flags |= VM_METADATA_FLAG_HANDLER_MUTATED;
     if (junkHandlersEnabled) header.flags |= VM_METADATA_FLAG_JUNK_HANDLERS;
@@ -386,8 +415,8 @@ VMEmitResult VMSectionEmitter::Emit(
         }
         if (record.bytecodeOffset > encryptedBytecode.size() ||
             record.bytecodeSize > encryptedBytecode.size() - record.bytecodeOffset ||
-            record.bytecodeSize == 0 || record.bytecodeSize % VMSchema::InstructionSize() != 0) {
-            result.error = "VM_EMIT: function bytecode range violates fixed schema";
+            record.bytecodeSize == 0) {
+            result.error = "VM_EMIT: function micro-bytecode range is invalid";
             std::memset(masterKey, 0, sizeof(masterKey));
             return result;
         }
@@ -458,6 +487,7 @@ VMEmitResult VMSectionEmitter::Emit(
     result.trampolineRVA = runtimeEntryRVA;
     result.architecture = header.architecture;
     result.schemaVersion = header.schemaVersion;
+    result.operandCodecSeed = header.operandCodecSeed;
     std::copy(std::begin(header.buildId), std::end(header.buildId), result.buildId.begin());
     result.runtimeKeyShare = runtimeKeyShare;
     result.handlerSemanticToSlot = handlerSemanticToSlot;
@@ -489,6 +519,14 @@ bool VMSectionEmitter::VerifyMetadata(
         header.keyEncodingVersion != VM_KEY_ENCODING_VERSION ||
         (header.architecture != VM_ARCH_X86 && header.architecture != VM_ARCH_X64) ||
         (header.flags & ~kKnownHeaderFlags) != 0 ||
+        (header.flags & (VM_METADATA_FLAG_AUTHENTICATED |
+                         VM_METADATA_FLAG_BYTECODE_CHACHA20 |
+                         VM_METADATA_FLAG_MICRO_STREAM |
+                         VM_METADATA_FLAG_LAZY_FLAGS)) !=
+            (VM_METADATA_FLAG_AUTHENTICATED |
+             VM_METADATA_FLAG_BYTECODE_CHACHA20 |
+             VM_METADATA_FLAG_MICRO_STREAM |
+             VM_METADATA_FLAG_LAZY_FLAGS) ||
         header.opcodeMapSize != VM_OPCODE_MAP_SIZE ||
         header.registerMapSize != VM_REGISTER_MAP_SIZE ||
         header.handlerTableSize != VM_HANDLER_TABLE_SIZE ||
@@ -514,7 +552,7 @@ bool VMSectionEmitter::VerifyMetadata(
         header.handlerVariantOffset > header.bytecodeOffset ||
         VM_HANDLER_TABLE_SIZE > header.bytecodeOffset - header.handlerVariantOffset ||
         header.junkHandlerCount > VM_HANDLER_USABLE_SLOT_COUNT ||
-        header.layoutSeed == 0 || header.imageSize == 0 ||
+        header.layoutSeed == 0 || header.operandCodecSeed == 0 || header.imageSize == 0 ||
         ((header.runtimeBaseRVA == 0 || header.runtimeEntryRVA == 0 || header.runtimeSize == 0) &&
             (header.runtimeBaseRVA != 0 || header.runtimeEntryRVA != 0 || header.runtimeSize != 0)) ||
         (header.runtimeBaseRVA != 0 &&
@@ -541,7 +579,6 @@ bool VMSectionEmitter::VerifyMetadata(
         if (!functionRVAs.insert(record.functionRVA).second ||
             record.functionRVA == 0 || record.functionSize < 5 ||
             record.bytecodeSize == 0 ||
-            record.bytecodeSize % VM_INSTRUCTION_SIZE != 0 ||
             record.bytecodeOffset > header.bytecodeSize ||
             record.bytecodeSize > header.bytecodeSize - record.bytecodeOffset ||
             record.opcodeMapOffset != header.reverseOpcodeMapOffset ||
@@ -602,10 +639,18 @@ bool VMSectionEmitter::VerifyMetadata(
         slotToSemantic.size());
     std::memcpy(variants.data(), metadata + header.handlerVariantOffset, variants.size());
     if (!ValidateHandlerLayout(semanticToSlot, slotToSemantic, variants,
-            header.junkHandlerCount, error)) return false;
+            header.junkHandlerCount, header.architecture == VM_ARCH_X64,
+            error)) return false;
     if (((header.flags & VM_METADATA_FLAG_HANDLER_MUTATED) != 0) ==
             std::all_of(VMSchema::Opcodes().begin(), VMSchema::Opcodes().end(),
                 [&](const VMOpcodeDescriptor& descriptor) {
+                    const bool supported = header.architecture == VM_ARCH_X64
+                        ? descriptor.runtimeSupportedX64
+                        : descriptor.runtimeSupportedX86;
+                    if (!supported) {
+                        return semanticToSlot[descriptor.opcode] ==
+                            VM_HANDLER_INVALID;
+                    }
                     return semanticToSlot[descriptor.opcode] == descriptor.opcode;
                 })) {
         error = "handler mutation flag does not match the emitted handler entry layout";

@@ -45,6 +45,7 @@ struct ProtectionBuildContext {
     char vmBridgeUnwindSectionName[8] = {'.','c','s','b','u','w',0,0};
     char vmGuardSectionName[8] = {'.','c','s','g','f','t',0,0};
     char vmRelocSectionName[8] = {'.','c','s','r','l','c',0,0};
+    char vmRuntimeApiSectionName[8] = {'.','c','s','v','a','p','i',0};
 
     std::unordered_map<uint8_t, uint8_t> opcodeMap;
     std::unordered_map<uint8_t, uint8_t> registerMap;

@@ -30,6 +30,7 @@ struct VMEmitResult {
     uint32_t trampolineRVA = 0;
     uint32_t architecture = 0;
     uint32_t schemaVersion = 0;
+    uint64_t operandCodecSeed = 0;
     std::array<uint8_t, 16> buildId{};
     std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> runtimeKeyShare{};
     std::array<uint8_t, VM_HANDLER_TABLE_SIZE> handlerSemanticToSlot{};
@@ -56,6 +57,7 @@ public:
         uint32_t junkHandlerCount,
         bool handlerMutationEnabled,
         bool junkHandlersEnabled,
+        uint64_t operandCodecSeed,
         uint32_t runtimeEntryRVA = 0,
         const char sectionName[8] = nullptr);
 

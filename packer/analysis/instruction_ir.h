@@ -267,6 +267,7 @@ struct InstructionIR {
     MachineMode machineMode = MachineMode::X64;
     InstructionEncoding encoding = InstructionEncoding::Invalid;
     InstructionSetClass instructionSet = InstructionSetClass::Scalar;
+    uint16_t addressWidth = 0;
     uint16_t operandWidth = 0;
     uint16_t stackWidth = 0;
     uint8_t displacementOffset = 0;

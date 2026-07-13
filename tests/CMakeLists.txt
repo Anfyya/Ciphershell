@@ -15,14 +15,52 @@ target_link_libraries(test_pe_parser PRIVATE
 
 target_include_directories(test_pe_parser PRIVATE ${CMAKE_SOURCE_DIR})
 
-# VM 正确性测试
-add_executable(test_vm_correctness
-    test_vm_correctness.cpp
+# Pack-time handler 合成：检查机器码/密文/差异度，并在主机架构执行
+# direct-threaded 语义与 #DE 门禁；不加载或运行任何样例/原始/加壳 PE。
+add_executable(test_vm_handler_synthesis
+    test_vm_handler_synthesis.cpp
 )
 
-target_link_libraries(test_vm_correctness PRIVATE
+target_link_libraries(test_vm_handler_synthesis PRIVATE
     ciphershell_packer
 )
+
+target_include_directories(test_vm_handler_synthesis PRIVATE ${CMAKE_SOURCE_DIR})
+
+# 公开五参数入口：在匿名内存中构造最小合法 PE/metadata/record，执行
+# crypto/auth/ABI/W^X 闭环；不加载或运行任何样例/原始/加壳 PE。
+add_executable(test_vm_public_entry
+    test_vm_public_entry.cpp
+)
+
+target_link_libraries(test_vm_public_entry PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_vm_public_entry PRIVATE ${CMAKE_SOURCE_DIR})
+
+# 微操作紧凑流、生产语义 executor 与差分等价硬门禁。
+add_executable(test_vm_micro_core
+    test_vm_micro_core.cpp
+)
+
+target_link_libraries(test_vm_micro_core PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_vm_micro_core PRIVATE ${CMAKE_SOURCE_DIR})
+
+# 最终 PE runtime/handler 内容硬校验：覆盖 section 原始偏移移动、完整
+# synth image、handler 密文、dispatch 表和关键 digest 的篡改拒绝。
+add_executable(test_vm_runtime_integrity
+    test_vm_runtime_integrity.cpp
+)
+
+target_link_libraries(test_vm_runtime_integrity PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_vm_runtime_integrity PRIVATE ${CMAKE_SOURCE_DIR})
 
 # 性能基准测试
 add_executable(benchmark
@@ -89,3 +127,24 @@ add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
 add_test(NAME fail_closed_baseline COMMAND test_fail_closed)
 add_test(NAME pe_hardening_regression COMMAND test_pe_hardening)
+add_test(NAME vm_handler_synthesis COMMAND test_vm_handler_synthesis)
+set_tests_properties(vm_handler_synthesis PROPERTIES LABELS "vm;hard-gate")
+add_test(NAME vm_public_entry COMMAND test_vm_public_entry)
+set_tests_properties(vm_public_entry PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 30
+)
+add_test(NAME vm_micro_core COMMAND test_vm_micro_core)
+set_tests_properties(vm_micro_core PROPERTIES LABELS "vm;hard-gate")
+add_test(NAME vm_runtime_integrity COMMAND test_vm_runtime_integrity)
+set_tests_properties(vm_runtime_integrity PROPERTIES LABELS "vm;hard-gate")
+
+# 微操作内核源码硬门禁：只读源码，不运行原始/加壳/样例 PE。
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(
+    NAME vm_kernel_static_gate
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vm_kernel_static_gate.py"
+        --source-root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties(vm_kernel_static_gate PROPERTIES LABELS "vm;hard-gate")
