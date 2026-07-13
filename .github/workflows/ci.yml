@@ -92,13 +92,15 @@ jobs:
         # --output-on-failure:失败用例在日志里打印完整输出;不加任何 -E/-R 排除、
         # 不跳过任何测试、不把任何失败标记成预期失败。任意一个测试失败 ctest 即
         # 非零退出,本步骤变红。
-        # --output-log-filename 把完整测试输出(每个用例的 stdout/stderr)写进
-        # ctest_full.log,作为本次运行的附件留存,方便事后翻看到底是哪个测试、
-        # 哪一行报错。build/Testing/ 是 ctest 自带的完整日志目录,一并上传。
+        # --output-log(注意:不是 --output-log-filename,后者不是真实 ctest 选项,
+        # runner 上的 ctest 会报 "Unknown argument" —— 这正是上一轮 CI 红的原因)
+        # 把完整测试输出(每个用例的 stdout/stderr)写进 ctest_full.log,作为本次
+        # 运行的附件留存,方便事后翻看到底是哪个测试、哪一行报错。build/Testing/
+        # 是 ctest 自带的完整日志目录,一并上传。
         shell: pwsh
         run: |
           ctest --test-dir build -C Release --output-on-failure `
-            --output-log-filename ctest_full.log --timeout 300
+            --output-log ctest_full.log --timeout 300
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 上传完整测试输出
