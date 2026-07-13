@@ -314,11 +314,11 @@ def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
 
 
 # Coverage floor for genuinely branching (not just name-existence) K variants.
-# ADD/SUB/AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET already satisfy
+# ADD/SUB/AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET/SHL/SHR satisfy
 # this today; the assertion exists so future work on the remaining micro-op
 # semantics is forced through the same structural bar instead of being
 # reported done via a string-presence check alone.
-MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = 11
+MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = 13
 
 
 def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]) -> list[Violation]:
@@ -439,6 +439,19 @@ def main() -> int:
             "IR model/native evidence boundary"))
 
     violations.extend(require_markers(root, files, code_by_path))
+
+    # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
+    # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，
+    # 不用再问 AI。即便本次运行 FAIL 也照打，便于定位是覆盖率不足还是别的。
+    semantic_path = root / "packer" / "transforms" / "vm_handler_semantic_codegen.cpp"
+    real_variant_semantics = real_strategy_variant_semantics(
+        code_by_path.get(semantic_path, ""))
+    achieved = sorted(real_variant_semantics)
+    print(
+        f"[progress] 双策略语义覆盖 {len(achieved)}/{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}"
+        f"（达标阈值 {MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}）："
+        f"{', '.join(achieved) if achieved else 'none'}"
+    )
     if violations:
         print(f"[FAIL] 微操作 VM 静态门禁发现 {len(violations)} 个违规点：", file=sys.stderr)
         maximum_reported = 250

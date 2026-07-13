@@ -401,6 +401,8 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
         case VM_UOP_BIT_TEST:
         case VM_UOP_BIT_SET:
         case VM_UOP_BIT_RESET:
+        case VM_UOP_SHL:
+        case VM_UOP_SHR:
             return true;
         default:
             return false;
@@ -731,6 +733,45 @@ void EmitSemanticIdentityPath(
     }
 }
 
+// 操作数宽度分派:SHL/SHR 等 K 变体核心与后段的多处 sized 发射都依赖它,
+// 故定义在 EmitBusinessCoreVariant 之前。
+struct WidthLabels {
+    CodeBuffer::Label width1;
+    CodeBuffer::Label width2;
+    CodeBuffer::Label width4;
+    CodeBuffer::Label width8;
+    CodeBuffer::Label invalid;
+};
+
+WidthLabels MakeWidthLabels(CodeBuffer& c) {
+    return {c.NewLabel(), c.NewLabel(), c.NewLabel(), c.NewLabel(), c.NewLabel()};
+}
+
+void X64DispatchWidth(
+    CodeBuffer& c,
+    uint8_t operand,
+    const WidthLabels& labels)
+{
+    X64LoadByte(c, 11, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
+    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, labels.width1);
+    c.Raw({0x41,0x83,0xFB,0x02}); c.Jcc(JccE, labels.width2);
+    c.Raw({0x41,0x83,0xFB,0x04}); c.Jcc(JccE, labels.width4);
+    c.Raw({0x41,0x83,0xFB,0x08}); c.Jcc(JccE, labels.width8);
+    c.Jmp(labels.invalid);
+}
+
+void X86DispatchWidth(
+    CodeBuffer& c,
+    uint8_t operand,
+    const WidthLabels& labels)
+{
+    X86LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
+    c.Raw({0x83,0xF9,0x01}); c.Jcc(JccE, labels.width1);
+    c.Raw({0x83,0xF9,0x02}); c.Jcc(JccE, labels.width2);
+    c.Raw({0x83,0xF9,0x04}); c.Jcc(JccE, labels.width4);
+    c.Jmp(labels.invalid);
+}
+
 bool EmitBusinessCoreVariant(
     CodeBuffer& c,
     bool x64,
@@ -857,6 +898,47 @@ bool EmitBusinessCoreVariant(
                     c.Raw({0x41,0x0F,0x92,0xC2});
                 }
                 return true;
+            case VM_UOP_SHL: {
+                // strategy 0: native SHL rax,cl.
+                // strategy 1: SHLD rax, r10(=0), cl — a zero source makes shld
+                //   pull zeroes into the top, so dst = dst<<cl ≡ SHL.  r10 is
+                //   zeroed by the binary-ALU prologue (auxiliary=0) and shld
+                //   leaves its source untouched, so auxiliary stays 0.
+                //
+                // x86 masks the shift count to 5 bits for 1/2/4-byte operands
+                // and 6 bits for 8-byte.  The width mask r9 is all-ones ONLY for
+                // width 8, so (sar r9,63) & 32 is 32 for width 8 and 0 otherwise;
+                // OR 31 yields exactly the 5/6-bit count mask with no width
+                // branch.  Pre-masking cl that way lets a single 64-bit
+                // shl/shld cover every width (operand is zero-extended; the outer
+                // `and rax,r9` trims to width).  This is label-free — every byte
+                // is a fixed Raw — so the variant kernel validator's isolated
+                // re-emission matches the inline bytes exactly.
+                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
+                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
+                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
+                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
+                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
+                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
+                if (strategy == 0u) c.Raw({0x48,0xD3,0xE0});      // shl rax, cl
+                else                c.Raw({0x4C,0x0F,0xA5,0xD0}); // shld rax, r10, cl
+                return true;
+            }
+            case VM_UOP_SHR: {
+                // Same count pre-mask as SHL.
+                // strategy 0: native SHR rax,cl.
+                // strategy 1: SHRD rax, r10(=0), cl pulls zeroes into the bottom
+                //   so dst = dst>>cl ≡ SHR.
+                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
+                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
+                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
+                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
+                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
+                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
+                if (strategy == 0u) c.Raw({0x48,0xD3,0xE8});      // shr rax, cl
+                else                c.Raw({0x4C,0x0F,0xAC,0xD0}); // shrd rax, r10, cl
+                return true;
+            }
             default:
                 return false;
         }
@@ -950,6 +1032,38 @@ bool EmitBusinessCoreVariant(
             }
             X86StoreD(c, CtxMutationScratch + 4u, 2);
             return true;
+        case VM_UOP_SHL: {
+            // strategy 0: native SHL eax,cl.  strategy 1: SHLD eax,ebx(=0),cl ≡
+            //   SHL (zero source pulls zeroes into the top).  32-bit mode has no
+            //   8-byte operand, so every width (1/2/4) masks the count to 5
+            //   bits; a single `and cl,31` then one 32-bit shl/shld covers all
+            //   widths (operand zero-extended, outer `and eax,[scratch]` trims
+            //   to width).  Label-free so the validator's isolated re-emission
+            //   matches byte-for-byte.  ebx is free across EmitX86BinaryAlu.
+            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
+            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
+            if (strategy == 0u) {
+                c.Raw({0xD3,0xE0});        // shl eax, cl
+            } else {
+                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
+                c.Raw({0x0F,0xA5,0xD8});   // shld eax, ebx, cl
+            }
+            return true;
+        }
+        case VM_UOP_SHR: {
+            // Same count pre-mask as SHL.
+            // strategy 0: native SHR eax,cl.  strategy 1: SHRD eax,ebx(=0),cl ≡
+            //   SHR (zero source pulls zeroes into the bottom).
+            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
+            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
+            if (strategy == 0u) {
+                c.Raw({0xD3,0xE8});        // shr eax, cl
+            } else {
+                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
+                c.Raw({0x0F,0xAC,0xD8});   // shrd eax, ebx, cl
+            }
+            return true;
+        }
         default:
             return false;
     }
@@ -1149,43 +1263,6 @@ void X86PushTwo(
     c.Raw({0xC7,0x84,0xCF}); c.U32(CtxValues + 12u); c.U32(0);
     c.Raw({0x83,0xC1,0x02});
     X86StoreD(c, CtxValueDepth, 1);
-}
-
-struct WidthLabels {
-    CodeBuffer::Label width1;
-    CodeBuffer::Label width2;
-    CodeBuffer::Label width4;
-    CodeBuffer::Label width8;
-    CodeBuffer::Label invalid;
-};
-
-WidthLabels MakeWidthLabels(CodeBuffer& c) {
-    return {c.NewLabel(), c.NewLabel(), c.NewLabel(), c.NewLabel(), c.NewLabel()};
-}
-
-void X64DispatchWidth(
-    CodeBuffer& c,
-    uint8_t operand,
-    const WidthLabels& labels)
-{
-    X64LoadByte(c, 11, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x41,0x83,0xFB,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x41,0x83,0xFB,0x04}); c.Jcc(JccE, labels.width4);
-    c.Raw({0x41,0x83,0xFB,0x08}); c.Jcc(JccE, labels.width8);
-    c.Jmp(labels.invalid);
-}
-
-void X86DispatchWidth(
-    CodeBuffer& c,
-    uint8_t operand,
-    const WidthLabels& labels)
-{
-    X86LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x83,0xF9,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x83,0xF9,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x83,0xF9,0x04}); c.Jcc(JccE, labels.width4);
-    c.Jmp(labels.invalid);
 }
 
 void X64DispatchPendingWidth(CodeBuffer& c, const WidthLabels& labels) {

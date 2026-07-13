@@ -312,6 +312,92 @@ void TestBitOperationsNativeDifferentialMatchesRealCpu() {
         "native=ADD vs VM-bytecode=BIT_SET 必须被判定语义分歧");
 }
 
+void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
+    // 覆盖新加入的 VM_UOP_SHL/SHR 双策略业务核心(EmitBusinessCoreVariant 的
+    // 原生 SHL/SHR 与 SHLD/SHRD-零源 两条真实不同字节序列)。逻辑移位的关键
+    // 边界是 count 掩码:1/2/4 字节操作数把 count 掩到 5 位,8 字节掩到 6 位,
+    // 而 8 位操作数还要走 shld 的 16 位提升。shl/shr 的 CL 计数被 Zydis 标成
+    // implicit(只剩一个显式操作数,翻译器拒收),所以这里用立即数计数形式
+    // (C0/C1 立即数是显式操作数),并刻意挑能暴露"操作数尺寸选错"的计数:
+    //   width4 count=33 —— 32 位 shl 把 33 掩成 1,若错用 64 位 shld(掩到 6 位)
+    //     会得到 33,结果天差地别,正好抓住策略臂里尺寸选错;
+    //   width8 count=40 —— 落在 32<40<63 之间,验证 6 位掩码路径。
+    // 每个用例的值(eax/rax)由差分语料随机化,故 count 固定、值随机,足以在
+    // 这些边界上证明无论 build 的 seed/variant 选中哪一支策略,合成 handler 链
+    // 的移位结果都与真实 CPU 逐字节一致,而非仅结构层面字节模式检查。
+    //
+    // 注:只覆盖 4/8 字节宽度,与既有 MUL/BIT/ADD 差分一致(差分语料按整寄存器
+    // 喂随机值,8/16 位原生移位会保留寄存器高位字节,而 VM 8/16 位写回语义不
+    // 与之逐字节对齐——这是 VM 执行器的既有约束,非本批变体引入;8/16 位路径
+    // 由静态门禁保证双策略字节真实不同,执行级覆盖留到差分语料支持窄位写回后)。
+    const auto seed = MakeSeed(0x9A);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // shl/shr rAX, imm8 ; <add rAX, 0> ; ret.  SHL/SHR 在 count!=1 时把 OF 留作
+    // 架构未定义,所以尾部那个值无副作用的 `add rAX, 0` 必须把六个状态位全部
+    // 重新定义,关掉这扇未定义 flags 窗口,翻译器的终态 RET 检查才放行(与
+    // MUL/BIT 的处理一致)。
+    const std::vector<uint8_t> shl4 = {
+        0xC1, 0xE0, 0x05, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};  // shl eax,5
+    const std::vector<uint8_t> shl4mask = {
+        0xC1, 0xE0, 0x21, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};  // shl eax,33
+    const std::vector<uint8_t> shl8 = {
+        0x48, 0xC1, 0xE0, 0x28, 0x48, 0x83, 0xC0, 0x00, 0xC3};        // shl rax,40
+    const std::vector<uint8_t> shr4 = {
+        0xC1, 0xE8, 0x05, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};  // shr eax,5
+    const std::vector<uint8_t> shr4mask = {
+        0xC1, 0xE8, 0x21, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};  // shr eax,33
+    const std::vector<uint8_t> shr8 = {
+        0x48, 0xC1, 0xE8, 0x28, 0x48, 0x83, 0xC0, 0x00, 0xC3};        // shr rax,40
+
+    const struct { const std::vector<uint8_t>* bytes; uint64_t preflightSeed; const char* name; } cases[] = {
+        {&shl4, 0x9A04ULL, "SHL(shl eax,5) width4"},
+        {&shl4mask, 0x9A14ULL, "SHL(shl eax,33) width4 count-mask"},
+        {&shl8, 0x9A08ULL, "SHL(shl rax,40) width8"},
+        {&shr4, 0x9A24ULL, "SHR(shr eax,5) width4"},
+        {&shr4mask, 0x9A34ULL, "SHR(shr eax,33) width4 count-mask"},
+        {&shr8, 0x9A18ULL, "SHR(shr rax,40) width8"},
+    };
+
+    for (const auto& testCase : cases) {
+        const Function shiftFunction =
+            DecodeStandaloneFunction(disassembler, *testCase.bytes, kEntry);
+        Translator translator;
+        const TranslationResult shiftTranslation =
+            TranslateStandaloneFunction(shiftFunction, build, translator);
+        Require(shiftTranslation.success, std::string(testCase.name) +
+            " 翻译失败:移位立即数形式意外不被翻译器支持");
+
+        VMIRModelPreflightConfig preflightConfig{};
+        preflightConfig.corpusSeed = testCase.preflightSeed;
+        preflightConfig.corpusCount = 8;
+        const auto preflight = VMIRModelPreflightVerifier::Verify(
+            shiftFunction, shiftTranslation, build.isa.opcodeMap, build.isa.registerMap, preflightConfig);
+        std::cout << "[preflight " << testCase.name << "] success=" << preflight.success
+                  << " cases=" << preflight.casesExecuted << " error=" << preflight.error << '\n';
+        Require(preflight.success, std::string(testCase.name) +
+            " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
+            preflight.error);
+
+        RunDifferentialCase(shiftFunction, shiftTranslation, build, 32, true,
+            (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
+    }
+
+    // 跨语义负控制:native=SHL 的求值结果绝不能被误判为与 VM-bytecode=SHR 一致,
+    // 证明差分验证器确实在比较真实移位语义而非结构存在性。
+    const Function shl4Function = DecodeStandaloneFunction(disassembler, shl4, kEntry);
+    Translator shrTranslator;
+    const TranslationResult shrTranslation =
+        TranslateStandaloneFunction(
+            DecodeStandaloneFunction(disassembler, shr4, kEntry), build, shrTranslator);
+    RunDifferentialCase(shl4Function, shrTranslation, build, 8, false,
+        "native=SHL vs VM-bytecode=SHR 必须被判定语义分歧");
+}
+
 void TestWideDivideNativeDifferentialAndDivideFault() {
     // 生产级 DIV/IDIV(UDIV_WIDE/IDIV_WIDE)差分证据：直接复用 packer/differential/
     // 的隔离原生 worker，而不是另起一套验证机制。dividend 是完整的
@@ -394,6 +480,8 @@ int main() {
         &TestMulNativeDifferentialMatchesRealCpu, failures);
     Run("BIT_TEST/BIT_SET/BIT_RESET 真 K 变体: 真实 CPU BT/BTS/BTR 与合成 handler 链一致性/分歧检测",
         &TestBitOperationsNativeDifferentialMatchesRealCpu, failures);
+    Run("SHL/SHR 真 K 变体: 真实 CPU 移位与合成 handler 链一致性/分歧检测",
+        &TestShiftOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
         &TestWideDivideNativeDifferentialAndDivideFault, failures);
 #else

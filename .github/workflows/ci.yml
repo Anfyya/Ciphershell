@@ -1,0 +1,95 @@
+name: CI
+
+# 每次往 main 推代码、或开 PR 自动触发,不需要人手动点。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # 任务一(Linux):跑微操作 VM 内核源码硬门禁。脚本说不通过,整个 CI 就红。
+  # 同时把当前真正达到双策略的语义有哪些、一共几个,打印到本次运行的日志与
+  # 作业摘要里,让人一眼看到进度,不用再问 AI 现在做到哪了。
+  static-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 运行 VM 内核静态门禁
+        # pipefail 让 python 的非零退出码穿透 tee,使本步骤变红(默认 bash -e pipefail)。
+        # 门禁脚本在判定前就把 [progress] 行打印到 stdout,tee 一并存进 gate.log。
+        run: |
+          python3 tests/scripts/vm_kernel_static_gate.py --source-root . 2>&1 | tee gate.log
+
+      - name: 把双策略覆盖进度写入作业摘要
+        if: always()
+        run: |
+          {
+            echo '## 微操作 VM 双策略语义覆盖进度'
+            echo
+            echo '```'
+            grep '\[progress\]' gate.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传门禁日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-gate-log
+          path: gate.log
+          if-no-files-found: error
+
+  # 任务二+三(Windows):用 MSVC + NASM 把整个项目从源码完整编译一遍
+  # (含 vm_native_differential_worker 这类需要 NASM 与 Windows 才能编译的部分),
+  # 编译失败即红;编译成功后立刻在同一台机器上把全部测试跑一遍(ctest),
+  # 只要有一个测试没过就红,并把完整测试输出作为附件保存,方便事后翻看是哪个
+  # 测试、哪一行报错。
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 NASM
+        run: choco install nasm -y --no-progress
+
+      - name: 把 NASM 加入 PATH
+        # CMake 用 check_language(ASM_NASM) 自动从 PATH 找 nasm,所以只需让它可见。
+        run: echo "C:\Program Files\NASM" >> "$env:GITHUB_PATH"
+
+      - name: 配置 CMake (Visual Studio 17 2022 x64)
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: 完整编译(Release,含 NASM 汇编与 worker)
+        # /m 并行编译全部目标。/WX 已在 CMakeLists 开启,警告即错误。
+        run: cmake --build build --config Release -- /m
+
+      - name: 运行全部测试 (ctest)
+        # --output-on-failure:失败用例在日志里打印完整输出;不加任何 -E/-R 排除、
+        # 不跳过任何测试、不把任何失败标记成预期失败。任意一个测试失败 ctest 即
+        # 非零退出,本步骤变红。
+        # --output-log-filename 把完整测试输出(每个用例的 stdout/stderr)写进
+        # ctest_full.log,作为本次运行的附件留存,方便事后翻看到底是哪个测试、
+        # 哪一行报错。build/Testing/ 是 ctest 自带的完整日志目录,一并上传。
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure `
+            --output-log-filename ctest_full.log --timeout 300
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 上传完整测试输出
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-full-output
+          path: |
+            ctest_full.log
+            build/Testing/
+          if-no-files-found: warn
