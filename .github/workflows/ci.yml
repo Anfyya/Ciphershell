@@ -17,6 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 静态门禁只扫 packer/tests 源码,本身不需要 zydis;但保持与 Windows
+          # 作业一致的递归拉取,避免日后门禁扩展到 third_party 时再次踩空目录。
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -61,6 +65,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 必须 recursive:CMakeLists 里 add_subdirectory(third_party/zydis),
+          # 而 zydis 是 git submodule(指向 zyantific/zydis 固定 commit),zydis
+          # 内部还嵌套 dependencies/zycore(zyantific/zycore-c) submodule。
+          # checkout 默认不拉 submodule,会导致 third_party/zydis 是空目录,
+          # add_subdirectory 报 "does not contain a CMakeLists.txt file"。
+          submodules: recursive
 
       - name: 安装 NASM
         run: choco install nasm -y --no-progress
