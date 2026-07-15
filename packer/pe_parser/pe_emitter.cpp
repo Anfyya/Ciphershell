@@ -82,6 +82,45 @@ uint32_t PEEmitter::RvaToOffset(uint32_t rva) const {
     return PEUtils::RvaToOffset(m_image, rva);
 }
 
+bool PEEmitter::PredictNextSectionRVA(uint32_t& rva, std::string* error) const {
+    rva = 0;
+    if (!IsValid()) {
+        if (error) *error = "invalid PE image";
+        return false;
+    }
+    const uint32_t sectionAlignment = GetSectionAlignment();
+    if (sectionAlignment == 0u ||
+        (sectionAlignment & (sectionAlignment - 1u)) != 0u) {
+        if (error) *error = "invalid PE section alignment";
+        return false;
+    }
+    uint32_t lastVirtualEnd = 0;
+    for (WORD index = 0; index < m_image->numSections; ++index) {
+        const IMAGE_SECTION_HEADER& section = m_image->sections[index];
+        const uint32_t span = PEUtils::SectionMappedSpan(section);
+        if (span > (std::numeric_limits<uint32_t>::max)() -
+                (sectionAlignment - 1u)) {
+            if (error) *error = "existing section virtual span alignment overflows";
+            return false;
+        }
+        const uint32_t alignedSpan = AlignUp(span, sectionAlignment);
+        if (section.VirtualAddress >
+                (std::numeric_limits<uint32_t>::max)() - alignedSpan) {
+            if (error) *error = "existing section virtual end overflows";
+            return false;
+        }
+        lastVirtualEnd = (std::max)(lastVirtualEnd,
+            section.VirtualAddress + alignedSpan);
+    }
+    if (lastVirtualEnd > (std::numeric_limits<uint32_t>::max)() -
+            (sectionAlignment - 1u)) {
+        if (error) *error = "next section RVA alignment overflows";
+        return false;
+    }
+    rva = AlignUp(lastVirtualEnd, sectionAlignment);
+    return rva != 0u;
+}
+
 PEAppendSectionResult PEEmitter::AppendSection(
     const char name[8],
     const std::vector<uint8_t>& data,
@@ -681,5 +720,4 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
 }
 
 } // namespace CipherShell
-
 

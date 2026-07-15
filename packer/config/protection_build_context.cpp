@@ -67,10 +67,11 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
 
     // 以下模块当前不具备完整生产语义闭环，预设绝不隐式开启：
     //   section encryption / startup string encryption / import protection /
-    //   CFG flattening / bogus flow
+    //   bogus flow
     // 仅当用户在配置中显式设置 enabled 时才会被打开，并由 CapabilityChecker
     // 在任何 PE 修改之前以 fatal issue 拒绝。
-    // strength 仍然按等级预设，仅在显式开启时才参与（随后即被拒绝）。
+    // CFG flattening 现在有独立的本地代码/重定位/unwind/入口修补闭环，
+    // 但仍只在用户显式开启时使用，不改变现有等级预设。
     ctx.sectionEncryption = PresetFeature(false, 50 + ctx.quickLevel * 8, "startup");
     ctx.stringEncryption = PresetFeature(false, 60, "startup");
     ctx.importProtection = PresetFeature(false, 50, "metadata");
@@ -123,6 +124,10 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
         MakeSectionName(ctx.vmGuardSectionName, ctx.isaSeed, 0x6CF7u);
         MakeSectionName(ctx.vmRelocSectionName, ctx.isaSeed, 0x2E10u);
         MakeSectionName(ctx.vmRuntimeApiSectionName, ctx.isaSeed, 0xA91Fu);
+        MakeSectionName(ctx.cfgCodeSectionName, ctx.isaSeed, 0xCF61u);
+        MakeSectionName(ctx.cfgUnwindSectionName, ctx.isaSeed, 0xCF62u);
+        MakeSectionName(ctx.cfgExceptionSectionName, ctx.isaSeed, 0xCF63u);
+        MakeSectionName(ctx.cfgRelocSectionName, ctx.isaSeed, 0xCF64u);
     } else {
         CopyName(ctx.vmSectionName, ".csvm");
         CopyName(ctx.vmRuntimeSectionName, ".csvx");
@@ -132,6 +137,10 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
         CopyName(ctx.vmGuardSectionName, ".csgft");
         CopyName(ctx.vmRelocSectionName, ".csrlc");
         CopyName(ctx.vmRuntimeApiSectionName, ".csvapi");
+        CopyName(ctx.cfgCodeSectionName, ".cfgx");
+        CopyName(ctx.cfgUnwindSectionName, ".cfguw");
+        CopyName(ctx.cfgExceptionSectionName, ".cfgpd");
+        CopyName(ctx.cfgRelocSectionName, ".cfgrl");
     }
 
     return ctx;

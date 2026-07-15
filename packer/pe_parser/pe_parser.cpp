@@ -1127,6 +1127,10 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
     // 5. 先解析到局部 vector，全部成功后再写入。
     std::vector<CS_DEBUG_ENTRY> local;
     local.reserve(entryCount);
+    constexpr DWORD kDebugTypeExtendedDllCharacteristics = 20u;
+    constexpr WORD kExtendedDllCharacteristicsCetCompat = 0x0001u;
+    WORD extendedDllCharacteristics = 0u;
+    bool sawExtendedDllCharacteristics = false;
 
     for (DWORD i = 0; i < entryCount; i++) {
         const IMAGE_DEBUG_DIRECTORY& src = debugEntries[i];
@@ -1160,11 +1164,30 @@ bool PEParser::ParseDebugDirectory(CS_PE_IMAGE* image) {
             }
         }
 
+        if (entry.type == kDebugTypeExtendedDllCharacteristics) {
+            // PE/COFF defines this payload as the extended DLL-characteristic
+            // bit word.  Duplicate entries are ambiguous security metadata;
+            // accepting the first or last one would let a malformed image
+            // hide CET compatibility from transforms that rewrite returns.
+            if (sawExtendedDllCharacteristics ||
+                entry.sizeOfData < sizeof(WORD)) {
+                return false;
+            }
+            std::memcpy(&extendedDllCharacteristics,
+                image->rawData + entry.pointerToRawData, sizeof(WORD));
+            sawExtendedDllCharacteristics = true;
+        }
+
         local.push_back(entry);
     }
 
     // 6. 任一条目失败，整个目录解析失败（已在循环中 return false）。
     image->debugDir.entries = std::move(local);
+    image->debugDir.extendedDllCharacteristics =
+        extendedDllCharacteristics;
+    image->debugDir.hasCetCompat =
+        (extendedDllCharacteristics &
+            kExtendedDllCharacteristicsCetCompat) != 0u;
     return true;
 }
 

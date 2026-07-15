@@ -63,6 +63,10 @@ jobs:
     # 一致。这不是糊弄(没跳测试/没降阈/没标记预期失败),只是选了带正确工具链的
     # 受支持镜像。
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, Win32]
     # CTest 启动 Python 时不会继承 PowerShell 的 UTF-8 控制台设置。GitHub
     # Windows runner 的 Python 3.14 stdout 默认可能落到 cp1252，静态门禁打印中文
     # 进度就会在真正执行规则前抛 UnicodeEncodeError。强制 Python 标准流使用
@@ -87,9 +91,9 @@ jobs:
         # CMake 用 check_language(ASM_NASM) 自动从 PATH 找 nasm,所以只需让它可见。
         run: echo "C:\Program Files\NASM" >> "$env:GITHUB_PATH"
 
-      - name: 配置 CMake (Visual Studio 17 2022 x64)
+      - name: 配置 CMake (Visual Studio 17 2022 ${{ matrix.platform }})
         run: >
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.platform }}
 
       - name: 完整编译(Release,含 NASM 汇编与 worker)
         # /m 并行编译全部目标。/WX 已在 CMakeLists 开启,警告即错误。
@@ -114,7 +118,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ctest-full-output
+          name: ctest-full-output-${{ matrix.platform }}
           path: |
             ctest_full.log
             build/Testing/

@@ -854,6 +854,8 @@ fake_imports = true
 hide_real_imports = true
 
 [control_flow.flattening]
+# 独立本地 CFG 档：真实块体由编码状态分发器调度，不依赖 VM。
+# 显式目标无法完成重定位/unwind/入口修补时整个构建 fail-closed。
 enabled = false
 strength = 70
 

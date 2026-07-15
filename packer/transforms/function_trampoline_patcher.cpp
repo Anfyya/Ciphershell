@@ -221,29 +221,46 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
     const std::vector<Function>& functions,
     bool destroyNativeBody)
 {
+    std::unordered_map<uint32_t, uint32_t> sizes;
+    for (const VMFunctionRecord& record : records)
+        sizes[record.functionRVA] = record.functionSize;
+    std::vector<FunctionPatchTarget> targets;
+    targets.reserve(trampolines.size());
+    for (const VMTrampolineRecord& trampoline : trampolines) {
+        const auto found = sizes.find(trampoline.functionRVA);
+        targets.push_back({trampoline.functionRVA, trampoline.trampolineRVA,
+            found == sizes.end() ? 0u : found->second});
+    }
+    return PatchNativeFunctions(image, targets, functions, destroyNativeBody);
+}
+
+std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchNativeFunctions(
+    CS_PE_IMAGE* image,
+    const std::vector<FunctionPatchTarget>& targets,
+    const std::vector<Function>& functions,
+    bool destroyNativeBody)
+{
     std::vector<FunctionPatchResult> results;
     PEEmitter emitter(image);
     if (!emitter.IsValid()) return results;
 
-    std::unordered_map<uint32_t, VMFunctionRecord> byRva;
-    for (const auto& record : records) byRva[record.functionRVA] = record;
     std::unordered_map<uint32_t, const Function*> functionByRva;
     for (const auto& function : functions) {
         functionByRva[static_cast<uint32_t>(function.entryAddress)] = &function;
     }
 
-    for (const auto& tr : trampolines) {
+    for (const FunctionPatchTarget& target : targets) {
         FunctionPatchResult r;
-        r.functionRVA = tr.functionRVA;
-        r.trampolineRVA = tr.trampolineRVA;
+        r.functionRVA = target.functionRVA;
+        r.trampolineRVA = target.trampolineRVA;
 
-        auto it = byRva.find(tr.functionRVA);
-        if (it == byRva.end()) {
-            r.error = "missing VM function record";
+        if (target.functionRVA == 0u || target.trampolineRVA == 0u ||
+            target.functionSize == 0u) {
+            r.error = "native patch target is incomplete";
             results.push_back(r);
             continue;
         }
-        auto functionIt = functionByRva.find(tr.functionRVA);
+        auto functionIt = functionByRva.find(target.functionRVA);
         if (functionIt == functionByRva.end() || !functionIt->second ||
             !functionIt->second->boundaryTrusted) {
             r.error = "missing trusted decoded function plan";
@@ -253,7 +270,7 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
 
         std::vector<uint8_t> patch;
         std::string error;
-        const uint32_t functionOffset = emitter.RvaToOffset(tr.functionRVA);
+        const uint32_t functionOffset = emitter.RvaToOffset(target.functionRVA);
         if (functionOffset == 0 || functionOffset >= image->rawSize) {
             r.error = "function RVA is outside file while measuring patch span";
             results.push_back(r);
@@ -261,12 +278,12 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
         }
         const uint32_t entryPrefixSize = HasEndbrPrefix(image, functionOffset) ? 4u : 0u;
         r.preservedEndbr = entryPrefixSize != 0;
-        r.patchRVA = tr.functionRVA + entryPrefixSize;
+        r.patchRVA = target.functionRVA + entryPrefixSize;
 
         patch.clear();
-        if (it->second.functionSize <= entryPrefixSize ||
-            !BuildEntryPatch(image, r.patchRVA, tr.trampolineRVA,
-                it->second.functionSize - entryPrefixSize, patch, r.patchKind, error)) {
+        if (target.functionSize <= entryPrefixSize ||
+            !BuildEntryPatch(image, r.patchRVA, target.trampolineRVA,
+                target.functionSize - entryPrefixSize, patch, r.patchKind, error)) {
             r.error = error.empty() ? "function is too small after preserving ENDBR" : error;
             results.push_back(r);
             continue;
@@ -276,7 +293,7 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
         uint32_t overwriteSpan = 0;
         const uint32_t patchOffset = functionOffset + entryPrefixSize;
         const uint32_t available = (std::min)(
-            static_cast<uint32_t>(it->second.functionSize - entryPrefixSize),
+            static_cast<uint32_t>(target.functionSize - entryPrefixSize),
             static_cast<uint32_t>(image->rawSize - patchOffset));
         if (!decoder.MeasureInstructionSpan(image->rawData + patchOffset,
                 available, r.patchRVA, static_cast<uint32_t>(patch.size()), overwriteSpan)) {
@@ -314,7 +331,7 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
         r.patchedBytes = overwriteSpan;
         r.entryPatchBytes = overwriteSpan;
 
-        if (!VerifyPatch(image, r.patchRVA, tr.trampolineRVA, r.patchKind, patch, error)) {
+        if (!VerifyPatch(image, r.patchRVA, target.trampolineRVA, r.patchKind, patch, error)) {
             r.error = error;
             results.push_back(r);
             continue;
@@ -328,8 +345,8 @@ std::vector<FunctionPatchResult> FunctionTrampolinePatcher::PatchFunctions(
                 for (const auto& instruction : block.instructions) {
                     const uint32_t begin = instruction.rva;
                     const uint32_t end = begin + instruction.length;
-                    if (begin < tr.functionRVA || end < begin ||
-                        end > tr.functionRVA + it->second.functionSize) {
+                    if (begin < target.functionRVA || end < begin ||
+                        end > target.functionRVA + target.functionSize) {
                         r.error = "decoded instruction is outside the trusted function envelope";
                         rangeFailure = true;
                         break;

@@ -33,8 +33,20 @@ struct FunctionPatchResult {
     std::string error;
 };
 
+struct FunctionPatchTarget {
+    uint32_t functionRVA = 0;
+    uint32_t trampolineRVA = 0;
+    uint32_t functionSize = 0;
+};
+
 class FunctionTrampolinePatcher {
 public:
+    std::vector<FunctionPatchResult> PatchNativeFunctions(
+        CS_PE_IMAGE* image,
+        const std::vector<FunctionPatchTarget>& targets,
+        const std::vector<Function>& functions,
+        bool destroyNativeBody);
+
     std::vector<FunctionPatchResult> PatchFunctions(
         CS_PE_IMAGE* image,
         const std::vector<VMTrampolineRecord>& trampolines,

@@ -206,7 +206,11 @@ def arithmetic_bridge_hits(path: Path, code: str) -> list[Violation]:
 def extract_function_body(code: str, name: str) -> str | None:
     """Brace-matched extraction so the coverage check survives reformatting
     without depending on a single brittle multi-line regex."""
-    match = re.search(re.escape(name) + r"\s*\([^{]*\)\s*\{", code)
+    match = re.search(
+        re.escape(name) +
+        r"\s*\([^;{]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{",
+        code,
+    )
     if not match:
         return None
     depth = 1
@@ -364,6 +368,322 @@ MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = len(
 TARGET_REAL_STRATEGY_VARIANT_SEMANTICS = 54
 
 
+def reference_runtime_fingerprint_gate(root: Path) -> list[Violation]:
+    """Parse every fingerprint tuple, verify its rolling-window arithmetic,
+    bind it one-to-one to the provenance manifest, and inspect the actual
+    rolling SHA-256 scan.  Merely retaining the old symbol names is not
+    evidence."""
+    source_path = root / "packer" / "transforms" / "vm_runtime_builder.cpp"
+    document_path = root / "docs" / "reference_runtime_fingerprints.md"
+    violations: list[Violation] = []
+    if not source_path.is_file() or not document_path.is_file():
+        missing = source_path if not source_path.is_file() else document_path
+        return [Violation(missing, 1, "reference-runtime-fingerprint-gate",
+                          "source or provenance manifest is missing")]
+    raw = source_path.read_text(encoding="utf-8", errors="strict")
+    document = document_path.read_text(encoding="utf-8", errors="strict")
+    begin = raw.find("kReferenceRuntimes")
+    end = raw.find("}};", begin)
+    if begin < 0 or end < 0:
+        return [Violation(source_path, 1, "reference-runtime-fingerprint-gate",
+                          "fingerprint initializer is not brace-complete")]
+    initializer = raw[begin:end + 3]
+    entry_pattern = re.compile(
+        r"\{\s*(\d+)u\s*,\s*0x([0-9A-Fa-f]+)ULL\s*,\s*"
+        r"0x([0-9A-Fa-f]+)ULL\s*,\s*\{([^}]+)\}\s*,\s*"
+        r'"([^"]+)"\s*,\s*"([^"]+)"\s*\}',
+        re.DOTALL,
+    )
+    entries: list[dict[str, object]] = []
+    for match in entry_pattern.finditer(initializer):
+        sha_bytes = [int(value, 16) for value in
+                     re.findall(r"0x([0-9A-Fa-f]{2})", match.group(4))]
+        entries.append({
+            "size": int(match.group(1)),
+            "rolling": int(match.group(2), 16),
+            "power": int(match.group(3), 16),
+            "sha": "".join(f"{value:02x}" for value in sha_bytes),
+            "sha_count": len(sha_bytes),
+            "name": match.group(5),
+            "id": match.group(6),
+        })
+    expected_rows = {
+        "legacy-msvc-x64-full-bb01871": (
+            "retired-x64-runtime-text", 23552, 0x2C5FC69EE2383E78,
+            0xE6224086755CFF01,
+            "fa0c6f3e275f620bf51f19af5f1cd3a46ec10431176d53eb4296637acc5a26dc"),
+        "legacy-msvc-x86-full-bb01871": (
+            "retired-x86-runtime-text", 24064, 0xA15835EC2011743A,
+            0xA9A6C919725EFF01,
+            "bb843d6555cf8dfc531ae404c7974c21d1bfeac36fc6362986565724a3d34398"),
+        "legacy-msvc-x64-probe-bb01871": (
+            "retired-x64-runtime-probe-text", 11776, 0x72544B6CBFEC2E4F,
+            0xC3455FA1BA2EFF01,
+            "0bca0748cc32c713f415563cc82ed93d621c53e59ba9f67998af98da36dbfdd0"),
+        "legacy-msvc-x86-probe-bb01871": (
+            "retired-x86-runtime-probe-text", 11776, 0xB58E1DFE08EE6C7E,
+            0xC3455FA1BA2EFF01,
+            "2b25ce2779b50e4d4e4340f638773e5c76cdbdcb3c93d9f768fe4911b36af7ff"),
+    }
+    expected_ids = set(expected_rows)
+    actual_ids = {str(entry["id"]) for entry in entries}
+    if len(entries) != 4 or actual_ids != expected_ids:
+        violations.append(Violation(
+            source_path, 1, "reference-runtime-fingerprint-gate",
+            f"expected exactly four provenance-bound rows; got {sorted(actual_ids)}"))
+    if len({str(entry["sha"]) for entry in entries}) != len(entries) or \
+       len({str(entry["name"]) for entry in entries}) != len(entries):
+        violations.append(Violation(
+            source_path, 1, "reference-runtime-fingerprint-gate",
+            "fingerprint SHA/name values are duplicated"))
+
+    table_pattern = re.compile(
+        r"^\| `([^`]+)` \|[^|]*\|\s*(\d+)\s*\|\s*"
+        r"`([0-9a-fA-F]{16})`\s*\|\s*`([0-9a-fA-F]{16})`\s*\|\s*"
+        r"`([0-9a-fA-F]{64})`\s*\|$",
+        re.MULTILINE,
+    )
+    documented = {
+        match.group(1): (
+            int(match.group(2)), int(match.group(3), 16),
+            int(match.group(4), 16), match.group(5).lower())
+        for match in table_pattern.finditer(document)
+    }
+    for entry in entries:
+        size = int(entry["size"])
+        expected_power = pow(257, size - 1, 1 << 64) if size else 0
+        if int(entry["sha_count"]) != 32 or size == 0 or \
+           int(entry["power"]) != expected_power:
+            violations.append(Violation(
+                source_path, 1, "reference-runtime-fingerprint-gate",
+                f"{entry['id']} has malformed SHA/size/rolling leading power"))
+        documented_row = documented.get(str(entry["id"]))
+        code_row = (size, int(entry["rolling"]), int(entry["power"]),
+                    str(entry["sha"]))
+        expected_row = expected_rows.get(str(entry["id"]))
+        full_code_row = (str(entry["name"]),) + code_row
+        if expected_row != full_code_row:
+            violations.append(Violation(
+                source_path, 1, "reference-runtime-fingerprint-gate",
+                f"historical byte fingerprint changed: {entry['id']}"))
+        if documented_row != code_row:
+            violations.append(Violation(
+                document_path, 1, "reference-runtime-fingerprint-gate",
+                f"manifest row does not byte-match C++ tuple: {entry['id']}"))
+    for required_text in (
+        "bb01871c9ec0037270b3d1bcf9346a190ee252ff",
+        "36c261f3c6cd6354df966c04438330032f8bfc40",
+        "/NODEFAULTLIB", "/MACHINE:X64", "/MACHINE:X86",
+        "file-backed `.text`", "temporary extraction utility",
+    ):
+        if required_text not in document:
+            violations.append(Violation(
+                document_path, 1, "reference-runtime-fingerprint-gate",
+                f"provenance manifest omits {required_text}"))
+
+    code = strip_comments_and_literals(raw)
+    body = extract_function_body(code, "bool VerifyNoReferenceRuntimeBlob")
+    normalized = re.sub(r"\s+", "", body or "")
+    scan_requirements = (
+        "rolling==reference.rollingHash",
+        "Sha256Digest(bytes+offset,reference.size)==reference.sha256",
+        "rolling-=static_cast<uint64_t>(bytes[offset])*reference.leadingPower",
+        "reference.provenanceId",
+    )
+    for evidence in scan_requirements:
+        if evidence not in normalized:
+            violations.append(Violation(
+                source_path, 1, "reference-runtime-fingerprint-gate",
+                f"real rolling/SHA/provenance scan evidence missing: {evidence}"))
+    final_verify = extract_function_body(
+        code, "bool VMRuntimeBuilder::VerifyRuntimeContents") or ""
+    if "VerifyNoReferenceRuntimeBlob(image->rawData,image->rawSize,error)" not in \
+            re.sub(r"\s+", "", final_verify):
+        violations.append(Violation(
+            source_path, 1, "reference-runtime-fingerprint-gate",
+            "the final-image verifier does not execute the fingerprint scan"))
+    return violations
+
+
+def decryptor_coverage_gate(root: Path) -> list[Violation]:
+    """Verify production choice cardinality, exact-byte self-validation and
+    exhaustive native execution coverage.  Digest/result field names alone do
+    not satisfy either decryptor rule."""
+    header_path = root / "packer" / "transforms" / "vm_handler_entry_codegen.h"
+    entry_path = root / "packer" / "transforms" / "vm_handler_entry_codegen.cpp"
+    synth_path = root / "packer" / "transforms" / "vm_handler_synthesizer.cpp"
+    test_path = root / "tests" / "test_vm_decryptor_coverage.cpp"
+    cmake_path = root / "tests" / "CMakeLists.txt"
+    document_path = root / "docs" / "decryptor_mutation_coverage.md"
+    workflow_path = root / ".github" / "workflows" / "ci.yml"
+    paths = (header_path, entry_path, synth_path, test_path, cmake_path,
+             document_path, workflow_path)
+    for path in paths:
+        if not path.is_file():
+            return [Violation(path, 1, "per-build-decryptor-live-code",
+                              "production or execution-coverage source is missing")]
+    header = header_path.read_text(encoding="utf-8", errors="strict")
+    entry_raw = entry_path.read_text(encoding="utf-8", errors="strict")
+    synth = strip_comments_and_literals(
+        synth_path.read_text(encoding="utf-8", errors="strict"))
+    test = test_path.read_text(encoding="utf-8", errors="strict")
+    cmake = cmake_path.read_text(encoding="utf-8", errors="strict")
+    document = document_path.read_text(encoding="utf-8", errors="strict")
+    workflow = workflow_path.read_text(encoding="utf-8", errors="strict")
+    violations: list[Violation] = []
+
+    shift_region_match = re.search(
+        r"VM_DECRYPTOR_SHIFT_PLANS\s*=\s*\{\{(.*?)\}\};", header,
+        re.DOTALL)
+    shifts = [] if not shift_region_match else [
+        tuple(int(value) for value in triple)
+        for triple in re.findall(
+            r"\{\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}\}",
+            shift_region_match.group(1))
+    ]
+    expected_shifts = [
+        (13, 7, 17), (7, 9, 13), (17, 11, 5), (5, 15, 21),
+        (11, 5, 23), (19, 3, 7), (23, 13, 9), (3, 17, 25),
+    ]
+    if shifts != expected_shifts:
+        violations.append(Violation(
+            header_path, 1, "per-build-decryptor-plan",
+            f"eight concrete xorshift triples changed or are not parseable: {shifts}"))
+    if not re.search(
+            r"VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT\s*=\s*48u", header):
+        violations.append(Violation(
+            header_path, 1, "per-build-decryptor-plan",
+            "dense 48-layout instruction-plan cardinality is missing"))
+
+    entry_code = strip_comments_and_literals(entry_raw)
+    decode_body = extract_function_body(
+        entry_code, "DecryptorInstructionChoices DecodeDecryptorInstructionPlan")
+    decode_normalized = re.sub(r"\s+", "", decode_body or "")
+    for field in ("rotateInverse", "addInverse", "xorLoad",
+                  "pointerIncrement", "counterDecrement"):
+        if f"choices.{field}" not in decode_normalized:
+            violations.append(Violation(
+                entry_path, 1, "per-build-decryptor-plan",
+                f"dense instruction plan does not drive {field}"))
+    if decode_normalized.count("%2u") != 4 or \
+       decode_normalized.count("%3u") != 1 or \
+       decode_normalized.count("/2u") != 3 or \
+       decode_normalized.count("/3u") != 1:
+        violations.append(Violation(
+            entry_path, 1, "per-build-decryptor-plan",
+            "instruction plan is not the declared 2*2*2*3*2 Cartesian product"))
+
+    build_body = extract_function_body(entry_code, "bool BuildDecryptor") or ""
+    for field in ("rotateInverse", "addInverse", "xorLoad",
+                  "pointerIncrement", "counterDecrement"):
+        if f"instructionPlan.{field}" not in build_body:
+            violations.append(Violation(
+                entry_path, 1, "per-build-decryptor-live-code",
+                f"generated live loop does not branch on {field}"))
+    # Both architectures must contain every alternative byte form. These are
+    # emitted bytes, not comments or symbol names.
+    byte_forms = (
+        "{0xC0,0xC8}", "{0xC0,0xC0}", "0x2C", "0x04",
+        "{0x44,0x30,0xE0}", "{0x44,0x89,0xE2,0x30,0xD0}",
+        "{0x48,0xFF,0xC6}", "{0x48,0x83,0xC6,0x01}",
+        "{0x48,0x8D,0x76,0x01}", "{0xFF,0xCF}", "{0x83,0xEF,0x01}",
+        "{0x32,0x45,0xEC}", "{0x8A,0x55,0xEC,0x30,0xD0}",
+        "0x46", "{0x83,0xC6,0x01}", "{0x8D,0x76,0x01}",
+        "{0xFF,0x4D,0xE4}", "{0x83,0x6D,0xE4,0x01}",
+    )
+    compact_entry = re.sub(r"\s+", "", entry_raw)
+    for form in byte_forms:
+        if re.sub(r"\s+", "", form) not in compact_entry:
+            violations.append(Violation(
+                entry_path, 1, "per-build-decryptor-live-code",
+                f"emitted instruction form is missing: {form}"))
+    validate_body = extract_function_body(
+        entry_code,
+        "bool VMHandlerEntryCodegen::ValidateDecryptorMutationEncoding") or ""
+    for evidence in (
+        "VM_DECRYPTOR_SHIFT_PLANS", "VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT",
+        "DecryptorShiftEvidence", "DecryptorInstructionEvidence",
+        "CountByteSequence", "occurrences != 1u", "occurrences != 0u",
+    ):
+        if evidence not in validate_body:
+            violations.append(Violation(
+                entry_path, 1, "per-build-decryptor-live-code",
+                f"exact active-loop byte validator omits {evidence}"))
+    main_validate = extract_function_body(
+        entry_code, "bool VMHandlerEntryCodegen::Validate") or ""
+    if "ValidateDecryptorMutationEncoding" not in main_validate:
+        violations.append(Violation(
+            entry_path, 1, "per-build-decryptor-live-code",
+            "production entry validation does not invoke exact-byte validation"))
+    generate_body = extract_function_body(
+        entry_code, "VMHandlerEntryCodegenResult VMHandlerEntryCodegen::Generate") or ""
+    generate_normalized = re.sub(r"\s+", "", generate_body)
+    if "BuildDecryptor(config,result)" not in generate_normalized or \
+       "Validate(config,result,validationError)" not in generate_normalized:
+        violations.append(Violation(
+            entry_path, 1, "per-build-decryptor-live-code",
+            "production generation does not build and exact-validate the decryptor"))
+
+    derive_body = extract_function_body(synth, "CipherParameters DeriveCipher") or ""
+    for evidence in (
+        "VM_DECRYPTOR_SHIFT_PLANS", "VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT",
+        "parameters.shiftLeftA", "parameters.shiftRightB",
+        "parameters.shiftLeftC", "parameters.instructionVariant",
+    ):
+        if evidence not in derive_body:
+            violations.append(Violation(
+                synth_path, 1, "per-build-decryptor-plan",
+                f"per-build derivation omits {evidence}"))
+    pack_body = extract_function_body(synth, "uint32_t PackCipherMutationPlan") or ""
+    for field in ("shiftLeftA", "shiftRightB", "shiftLeftC",
+                  "instructionVariant"):
+        if field not in pack_body:
+            violations.append(Violation(
+                synth_path, 1, "per-build-decryptor-plan",
+                f"published mutation plan omits {field}"))
+
+    test_evidence = (
+        "expectedPairs == 384u",
+        "shiftPlan < VM_DECRYPTOR_SHIFT_PLANS.size()",
+        "instructionPlan < VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT",
+        "generator.Generate(config)",
+        "ValidateDecryptorMutationEncoding",
+        "ExecutePlan(config, generated)",
+        "activeLoops.size() == expectedPairs",
+        "std::equal(plaintext.begin(), plaintext.end()",
+        "gTrace.protectCalls == 2u", "gTrace.flushCalls == 1u",
+        "requestedProtections[0] == 0x04u",
+        "requestedProtections[1] == 0x20u",
+        "firstShiftImmediate",
+        "shift-immediate corruption escaped byte validation",
+        "instruction-form corruption escaped byte validation",
+    )
+    for evidence in test_evidence:
+        if evidence not in test:
+            violations.append(Violation(
+                test_path, 1, "per-build-decryptor-live-code",
+                f"exhaustive native execution/negative evidence missing: {evidence}"))
+    if "add_test(NAME vm_decryptor_coverage" not in cmake or \
+       'LABELS "vm;decryptor;hard-gate"' not in cmake:
+        violations.append(Violation(
+            cmake_path, 1, "per-build-decryptor-live-code",
+            "exhaustive decryptor execution test is not a registered hard gate"))
+    for evidence in (
+        "rotate(2) * add(2) * xor-load(2) * pointer(3) * counter(2) = 48",
+        "384 active", "0x301-byte corpus", "RW -> instruction-cache flush -> RX",
+    ):
+        if evidence not in document:
+            violations.append(Violation(
+                document_path, 1, "per-build-decryptor-plan",
+                f"decryptor combination/evidence manifest omits {evidence}"))
+    if "platform: [x64, Win32]" not in workflow or \
+       '-A ${{ matrix.platform }}' not in workflow:
+        violations.append(Violation(
+            workflow_path, 1, "per-build-decryptor-live-code",
+            "Windows CI does not execute the hard gate on both x64 and x86"))
+    return violations
+
+
 def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]) -> list[Violation]:
     joined = "\n".join(code_by_path[path] for path in files)
     required = {
@@ -375,11 +695,6 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
         ),
         "pack-time-handler-synth": ("VMHandlerSynthesizer",),
         "direct-threaded-tail": ("dispatchTailOffset", "dispatch_tail_offset"),
-        "reference-runtime-fingerprint-gate": (
-            "kReferenceRuntimes", "VerifyNoReferenceRuntimeBlob",
-        ),
-        "per-build-decryptor-plan": ("decryptorMutationPlan",),
-        "per-build-decryptor-live-code": ("decryptorLogicDigest",),
         "ir-model-preflight-is-explicit": ("VMIRModelPreflightVerifier",),
         "native-evidence-provider-contract": (
             "VMNativeDifferentialEvidenceProvider",
@@ -494,6 +809,8 @@ def main() -> int:
             "IR model/native evidence boundary"))
 
     violations.extend(require_markers(root, files, code_by_path))
+    violations.extend(reference_runtime_fingerprint_gate(root))
+    violations.extend(decryptor_coverage_gate(root))
 
     # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
     # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，

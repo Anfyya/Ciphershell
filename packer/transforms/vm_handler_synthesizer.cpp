@@ -516,15 +516,13 @@ CipherParameters DeriveCipher(const VMHandlerSynthesisConfig& config) {
     parameters.addend = static_cast<uint64_t>(random.Next32() & 0x7FFFFFFFu);
     parameters.addByte = static_cast<uint8_t>(random.Next8() | 1u);
     parameters.rotate = static_cast<uint8_t>((random.Next8() % 7u) + 1u);
-    static constexpr std::array<std::array<uint8_t, 3>, 8> shiftPlans = {{
-        {{13, 7, 17}}, {{7, 9, 13}}, {{17, 11, 5}}, {{5, 15, 21}},
-        {{11, 5, 23}}, {{19, 3, 7}}, {{23, 13, 9}}, {{3, 17, 25}}
-    }};
-    const auto& shiftPlan = shiftPlans[random.Next8() % shiftPlans.size()];
+    const auto& shiftPlan = VM_DECRYPTOR_SHIFT_PLANS[
+        random.Next8() % VM_DECRYPTOR_SHIFT_PLANS.size()];
     parameters.shiftLeftA = shiftPlan[0];
     parameters.shiftRightB = shiftPlan[1];
     parameters.shiftLeftC = shiftPlan[2];
-    parameters.instructionVariant = random.Next8();
+    parameters.instructionVariant = static_cast<uint8_t>(
+        random.Next8() % VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT);
     return parameters;
 }
 

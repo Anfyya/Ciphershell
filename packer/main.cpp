@@ -765,16 +765,106 @@ int main(int argc, char* argv[]) {
     }
     PrintFeatureStatus("import_protection", "skipped", "disabled");
 
-    // Phase C: 控制流平坦化 —— 缺少 RIP-relative/CALL 重定位、ABI、unwind、CFG 修复，
-    // 无法保证原函数语义。由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；
-    // 此处保留显式 fail-closed 守卫，绝不应用。
+    // Phase C: 先建立独立 CFG 保护计划，此时不修改原始代码。
+    // 真正的本地块拷贝/分发/入口修补放在 VM 之后一次性提交，
+    // 使 CFG-only 与 VM+CFG 都走同一条完整闭环。
+    bool cfgApplied = false;
+    CipherShell::CFGProtectionResult cfgProtectionResult{};
+    std::vector<CipherShell::Function> cfgProtectedFunctions;
+    std::unordered_set<uint32_t> cfgFunctionRVAs;
     if (buildCtx.flattening.enabled) {
-        std::cerr << "CFG_FLATTEN_REJECT module=ControlFlow"
-                  << " reason=fail_closed_no_relocation_abi_unwind_cfg_repair" << std::endl;
-        PrintFeatureStatus("control_flow.flattening", "rejected", "fail_closed_unfinished_closure");
-        return 1;
+        CipherShell::Disassembler cfgDisassembler;
+        const bool cfgIs64 = image->is64Bit != 0;
+        cfgDisassembler.Initialize(cfgIs64,
+            cfgIs64 ? image->ntHeaders64->OptionalHeader.ImageBase
+                    : image->ntHeaders32->OptionalHeader.ImageBase);
+        CipherShell::FunctionDiscovery cfgDiscovery;
+        auto cfgDiscoveryResult = cfgDiscovery.Discover(
+            image.get(), cfgDisassembler, buildCtx.flattening.targetRVAs);
+        if (!cfgDiscoveryResult.success) {
+            std::cerr << "CFG_DISCOVERY_FAIL module=FunctionDiscovery reason="
+                      << cfgDiscoveryResult.error << std::endl;
+            PrintFeatureStatus("control_flow.flattening", "failed",
+                cfgDiscoveryResult.error);
+            return 1;
+        }
+        for (const auto& issue : cfgDiscoveryResult.issues) {
+            std::cerr << "CFG_DISCOVERY_REJECT module=FunctionDiscovery rva=0x"
+                      << std::hex << issue.rva << std::dec
+                      << " reason=" << issue.reason << std::endl;
+        }
+        for (const auto& pattern : buildCtx.flattening.targetFunctions) {
+            const bool matched = std::any_of(cfgDiscoveryResult.functions.begin(),
+                cfgDiscoveryResult.functions.end(), [&](const CipherShell::Function& function) {
+                    std::ostringstream rva;
+                    rva << "0x" << std::hex << function.entryAddress;
+                    return WildcardMatchInsensitive(pattern, function.name) ||
+                        WildcardMatchInsensitive(pattern, rva.str());
+                });
+            if (!matched) {
+                std::cerr << "CFG_BUILD_FAIL module=FunctionSelect"
+                          << " reason=target_pattern_matched_none pattern="
+                          << pattern << std::endl;
+                PrintFeatureStatus("control_flow.flattening", "failed",
+                    "target_pattern_matched_none");
+                return 1;
+            }
+        }
+        const bool cfgExplicitSelection =
+            !buildCtx.flattening.targetFunctions.empty() ||
+            !buildCtx.flattening.targetRVAs.empty();
+        uint32_t cfgRejected = 0u;
+        for (const CipherShell::Function& function : cfgDiscoveryResult.functions) {
+            if (!FunctionSelected(function, buildCtx.flattening.targetFunctions,
+                    buildCtx.flattening.targetRVAs)) continue;
+            std::string safetyReason;
+            if (!capabilityChecker.IsFunctionCfgSafe(
+                    image.get(), function, safetyReason)) {
+                ++cfgRejected;
+                std::cerr << "CFG_REJECT module=CapabilityChecker rva=0x"
+                          << std::hex << function.entryAddress << std::dec
+                          << " reason=" << safetyReason << std::endl;
+                if (cfgExplicitSelection) {
+                    PrintFeatureStatus("control_flow.flattening", "failed",
+                        "explicit_target_not_cfg_safe");
+                    return 1;
+                }
+                continue;
+            }
+            const uint32_t rva = static_cast<uint32_t>(function.entryAddress);
+            cfgFunctionRVAs.insert(rva);
+            cfgProtectedFunctions.push_back(function);
+        }
+        if (cfgProtectedFunctions.empty()) {
+            std::cerr << "CFG_BUILD_FAIL module=FunctionSelect"
+                      << " reason=no_cfg_safe_functions rejected=" << cfgRejected
+                      << std::endl;
+            PrintFeatureStatus("control_flow.flattening", "failed",
+                "no_cfg_safe_functions");
+            return 1;
+        }
+        const bool vmExplicitSelection = !buildCtx.vm.targetFunctions.empty() ||
+            !buildCtx.vm.targetRVAs.empty();
+        if (buildCtx.vm.enabled && vmExplicitSelection) {
+            for (const CipherShell::Function& function : cfgProtectedFunctions) {
+                if (FunctionSelected(function, buildCtx.vm.targetFunctions,
+                        buildCtx.vm.targetRVAs)) {
+                    std::cerr << "CFG_BUILD_FAIL module=FunctionSelect rva=0x"
+                              << std::hex << function.entryAddress << std::dec
+                              << " reason=explicit_vm_cfg_target_overlap" << std::endl;
+                    PrintFeatureStatus("control_flow.flattening", "failed",
+                        "explicit_vm_cfg_target_overlap");
+                    return 1;
+                }
+            }
+        }
+        std::cout << "CFG_PLAN_PASS module=CFGFlattener functions="
+                  << cfgProtectedFunctions.size()
+                  << " rejected=" << cfgRejected
+                  << " vm_independent=true" << std::endl;
+    } else {
+        PrintFeatureStatus("control_flow.flattening", "skipped", "disabled");
     }
-    PrintFeatureStatus("control_flow.flattening", "skipped", "disabled");
 
     // Phase D: 虚假控制流 —— 无法证明原函数语义保持，不具备生产闭环。
     // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫。
@@ -1019,6 +1109,13 @@ int main(int argc, char* argv[]) {
         for (const auto& func : discoveryResult.functions) {
                 if (!FunctionSelected(func, buildCtx.vm.targetFunctions,
                         buildCtx.vm.targetRVAs)) continue;
+                if (func.entryAddress <= 0xFFFFFFFFULL &&
+                    cfgFunctionRVAs.count(static_cast<uint32_t>(func.entryAddress)) != 0u) {
+                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " mode=cfg_flatten vm=skipped" << std::endl;
+                    continue;
+                }
                 ++selectedCount;
                 const bool explicitlySelected =
                     !buildCtx.vm.targetFunctions.empty() ||
@@ -1026,7 +1123,7 @@ int main(int argc, char* argv[]) {
                 if (!explicitlySelected && func.assignedLevel <= 1) {
                     std::cout << "VM_PROFILE function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
-                              << " mode=cfg_only vm=skipped" << std::endl;
+                              << " mode=native_unprotected vm=skipped" << std::endl;
                     continue;
                 }
                 if (func.size < 5) {
@@ -1402,6 +1499,55 @@ int main(int argc, char* argv[]) {
                   << "，拒绝函数数: " << rejectedCount << std::endl;
 
     }
+
+    if (buildCtx.flattening.enabled) {
+        CipherShell::FlatteningConfig flatteningConfig{};
+        static_assert(sizeof(flatteningConfig.buildSeed) <=
+            std::tuple_size<decltype(buildCtx.isaSeed)>::value,
+            "CFG seed must fit the per-build entropy buffer");
+        std::memcpy(&flatteningConfig.buildSeed, buildCtx.isaSeed.data(),
+            sizeof(flatteningConfig.buildSeed));
+        if (flatteningConfig.buildSeed == 0u)
+            flatteningConfig.buildSeed = 0x434647464C415454ULL;
+        flatteningConfig.junkCaseCount = static_cast<uint32_t>((std::max)(2,
+            (std::min)(16, buildCtx.flattening.strength / 8)));
+
+        CipherShell::CFGFlattener cfgFlattener;
+        cfgProtectionResult = cfgFlattener.Protect(
+            image.get(), cfgProtectedFunctions, flatteningConfig,
+            buildCtx.cfgCodeSectionName, buildCtx.cfgUnwindSectionName,
+            buildCtx.cfgExceptionSectionName, buildCtx.cfgRelocSectionName);
+        if (!cfgProtectionResult.success) {
+            std::cerr << "CFG_BUILD_FAIL module=CFGFlattener reason="
+                      << cfgProtectionResult.error << std::endl;
+            PrintFeatureStatus("control_flow.flattening", "failed",
+                cfgProtectionResult.error);
+            return 1;
+        }
+        std::string cfgVerifyReason;
+        if (!CipherShell::CFGFlattener::VerifyAppliedProtection(
+                image.get(), cfgProtectionResult, cfgVerifyReason)) {
+            std::cerr << "CFG_STATIC_CHECK_FAIL module=CFGFlattener reason="
+                      << cfgVerifyReason << std::endl;
+            PrintFeatureStatus("control_flow.flattening", "failed",
+                cfgVerifyReason);
+            return 1;
+        }
+        cfgApplied = true;
+        std::cout << "CFG_STATIC_CHECK_PASS module=CFGFlattener functions="
+                  << cfgProtectionResult.functions.size()
+                  << " section_rva=0x" << std::hex
+                  << cfgProtectionResult.codeSectionRVA << std::dec << std::endl;
+        for (const auto& function : cfgProtectionResult.functions) {
+            std::cout << "CFG_RECORD function_rva=0x" << std::hex
+                      << function.flattened.originalFunctionRVA
+                      << " flattened_rva=0x" << function.flattened.codeRVA
+                      << std::dec << " blocks=" << function.flattened.blocks.size()
+                      << " states=" << function.flattened.dispatchCases.size()
+                      << " transitions=" << function.flattened.transitions.size()
+                      << std::endl;
+        }
+    }
     // Phase F: Section 加密 —— 弱加密（未认证算法 + 可恢复密钥），不具备生产语义闭环。
     // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫，
     // 绝不应用，绝不打印 applied/partial。
@@ -1522,6 +1668,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    if (cfgApplied) {
+        std::string finalCfgReason;
+        if (!CipherShell::CFGFlattener::VerifyAppliedProtection(
+                rebuiltImage, cfgProtectionResult, finalCfgReason)) {
+            parser.FreeImage(rebuiltImage);
+            std::cerr << "CFG_FINAL_STATIC_CHECK_FAIL module=CFGFlattener reason="
+                      << finalCfgReason << std::endl;
+            return 1;
+        }
+        std::cout << "CFG_FINAL_STATIC_CHECK_PASS module=CFGFlattener" << std::endl;
+    }
     if (loaderApplied) {
         std::string loaderReason;
         if (!ValidateLoaderStaticLink(rebuiltImage, loaderResult, originalOEP, loaderReason)) {
@@ -1583,6 +1740,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    if (cfgApplied) {
+        std::string writtenCfgReason;
+        if (!CipherShell::CFGFlattener::VerifyAppliedProtection(
+                verifyImage, cfgProtectionResult, writtenCfgReason)) {
+            parser.FreeImage(verifyImage);
+            std::remove(outputFile.c_str());
+            std::cerr << "CFG_WRITE_VERIFY_FAIL module=CFGFlattener reason="
+                      << writtenCfgReason << std::endl;
+            return 1;
+        }
+    }
     if (loaderApplied) {
         std::string loaderReason;
         if (!ValidateLoaderStaticLink(verifyImage, loaderResult, originalOEP, loaderReason)) {
@@ -1612,6 +1780,13 @@ int main(int argc, char* argv[]) {
         std::cout << "VM_PROTECTION_SCOPE_NOTE correctness=verified "
                      "anti_cracking_hardening=incomplete "
                      "reason=k_variant_coverage_below_target" << std::endl;
+    }
+    if (cfgApplied) {
+        PrintFeatureStatus("control_flow.flattening", "applied",
+            "functions=" + std::to_string(cfgProtectionResult.functions.size()));
+        std::cout << "CFG_PROTECTION_SCOPE_NOTE correctness=static_link_verified "
+                     "execution_differential=covered_by_cfg_flattener_differential_test "
+                     "vm_dependency=false" << std::endl;
     }
 
     std::cout << "\n======================================" << std::endl;

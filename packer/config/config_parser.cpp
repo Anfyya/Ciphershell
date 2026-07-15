@@ -131,12 +131,13 @@ strength = 58
 mode = "startup"
 
 [control_flow]
-# Fail-closed: flattening / bogus flow 无法保证原函数语义保持。默认关闭。
-# 显式开启任一子开关会在 CapabilityChecker 阶段被 fatal 拒绝。
+# flattening 是可独立使用的本地 CFG 保护；bogus flow 仍为 fail-closed。
+# 总开关与子开关必须一致。
 enabled = false
 strength = 55
 
 [control_flow.flattening]
+# 真实块体 + 编码状态分发器；不依赖 VM。
 enabled = false
 strength = 55
 target_functions = []

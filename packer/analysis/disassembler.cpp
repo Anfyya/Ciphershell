@@ -439,6 +439,8 @@ bool Disassembler::DecodeInstruction(
     out.stackWidth = decoded.stack_width;
     out.displacementOffset = decoded.raw.disp.offset;
     out.displacementSize = static_cast<uint8_t>(decoded.raw.disp.size / 8u);
+    out.immediateOffset = decoded.raw.imm[0].offset;
+    out.immediateSize = static_cast<uint8_t>(decoded.raw.imm[0].size / 8u);
     out.mnemonic = MapMnemonic(decoded.mnemonic, decoded.meta.category);
     if (out.mnemonic == InstructionMnemonic::Unsupported) {
         if (out.instructionSet == InstructionSetClass::X87) {

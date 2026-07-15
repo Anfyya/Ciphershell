@@ -79,6 +79,32 @@ if(WIN32 AND HAVE_NASM)
     add_dependencies(test_vm_native_differential vm_native_differential_worker)
 endif()
 
+# 独立 CFG-only 闭环：在 RX 内存中分别执行原始函数字节和
+# 平坦化后的真实分发器/块体，对边界语料逐值比较返回结果。
+add_executable(test_cfg_flattener_differential
+    test_cfg_flattener_differential.cpp
+)
+
+target_link_libraries(test_cfg_flattener_differential PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_cfg_flattener_differential PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_cfg_flattener_differential PRIVATE
+    CS_CFG_FULL_PE_TEST=1)
+
+# Per-build decryptor 真实覆盖：8 组 xorshift * 48 个等价但字节不同的
+# 指令布局，每个组合都生成、逐字节验证并在真实 CPU 上解密。
+add_executable(test_vm_decryptor_coverage
+    test_vm_decryptor_coverage.cpp
+)
+
+target_link_libraries(test_vm_decryptor_coverage PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_vm_decryptor_coverage PRIVATE ${CMAKE_SOURCE_DIR})
+
 # 性能基准测试
 add_executable(benchmark
     benchmark.cpp
@@ -158,6 +184,16 @@ set_tests_properties(vm_runtime_integrity PROPERTIES LABELS "vm;hard-gate")
 add_test(NAME vm_native_differential COMMAND test_vm_native_differential)
 set_tests_properties(vm_native_differential PROPERTIES
     LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
+add_test(NAME cfg_flattener_differential COMMAND test_cfg_flattener_differential)
+set_tests_properties(cfg_flattener_differential PROPERTIES
+    LABELS "cfg;hard-gate"
+    TIMEOUT 30
+)
+add_test(NAME vm_decryptor_coverage COMMAND test_vm_decryptor_coverage)
+set_tests_properties(vm_decryptor_coverage PROPERTIES
+    LABELS "vm;decryptor;hard-gate"
     TIMEOUT 120
 )
 

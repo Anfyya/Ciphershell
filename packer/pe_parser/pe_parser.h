@@ -162,6 +162,8 @@ struct CS_DEBUG_ENTRY {
 
 struct CS_DEBUG_DIRECTORY {
     std::vector<CS_DEBUG_ENTRY> entries;
+    WORD extendedDllCharacteristics = 0;
+    bool hasCetCompat = false;
 };
 
 // ============================================================================

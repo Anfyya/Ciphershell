@@ -439,6 +439,151 @@ bool RangeEnd(uint32_t offset, uint32_t size, uint32_t& end) {
     return true;
 }
 
+struct DecryptorInstructionChoices {
+    uint8_t rotateInverse = 0;
+    uint8_t addInverse = 0;
+    uint8_t xorLoad = 0;
+    uint8_t pointerIncrement = 0;
+    uint8_t counterDecrement = 0;
+};
+
+DecryptorInstructionChoices DecodeDecryptorInstructionPlan(uint8_t plan) {
+    DecryptorInstructionChoices choices{};
+    choices.rotateInverse = static_cast<uint8_t>(plan % 2u);
+    plan = static_cast<uint8_t>(plan / 2u);
+    choices.addInverse = static_cast<uint8_t>(plan % 2u);
+    plan = static_cast<uint8_t>(plan / 2u);
+    choices.xorLoad = static_cast<uint8_t>(plan % 2u);
+    plan = static_cast<uint8_t>(plan / 2u);
+    choices.pointerIncrement = static_cast<uint8_t>(plan % 3u);
+    plan = static_cast<uint8_t>(plan / 3u);
+    choices.counterDecrement = static_cast<uint8_t>(plan % 2u);
+    return choices;
+}
+
+void AppendBytes(std::vector<uint8_t>& bytes,
+                 std::initializer_list<uint8_t> values) {
+    bytes.insert(bytes.end(), values.begin(), values.end());
+}
+
+size_t CountByteSequence(
+    const uint8_t* bytes,
+    size_t size,
+    const std::vector<uint8_t>& sequence)
+{
+    if (!bytes || sequence.empty() || sequence.size() > size) return 0u;
+    size_t count = 0u;
+    const uint8_t* current = bytes;
+    const uint8_t* end = bytes + size;
+    while (current != end) {
+        const uint8_t* found = std::search(
+            current, end, sequence.begin(), sequence.end());
+        if (found == end) break;
+        ++count;
+        current = found + 1u;
+    }
+    return count;
+}
+
+std::vector<uint8_t> DecryptorShiftEvidence(
+    bool x64,
+    const std::array<uint8_t, 3>& shifts)
+{
+    std::vector<uint8_t> evidence;
+    const uint8_t leftA = shifts[0];
+    const uint8_t rightB = shifts[1];
+    const uint8_t leftC = shifts[2];
+    if (x64) {
+        AppendBytes(evidence, {0x4C,0x89,0xE0,0x48,0xC1,0xE0});
+        evidence.push_back(leftA);
+        AppendBytes(evidence, {0x49,0x31,0xC4,0x4C,0x89,0xE0,
+            0x48,0xC1,0xE8});
+        evidence.push_back(rightB);
+        AppendBytes(evidence, {0x49,0x31,0xC4,0x4C,0x89,0xE0,
+            0x48,0xC1,0xE0});
+        evidence.push_back(leftC);
+        AppendBytes(evidence, {0x49,0x31,0xC4});
+        return evidence;
+    }
+
+    const auto left = [&](uint8_t count) {
+        AppendBytes(evidence, {0x8B,0x45,0xEC,0x8B,0x55,0xE8,
+            0x89,0xC1,0xC1,0xE1});
+        evidence.push_back(count);
+        AppendBytes(evidence, {0x89,0xD7,0xC1,0xE7});
+        evidence.push_back(count);
+        AppendBytes(evidence, {0xC1,0xE8});
+        evidence.push_back(static_cast<uint8_t>(32u - count));
+        AppendBytes(evidence, {0x09,0xC7,0x31,0x4D,0xEC,0x31,0x7D,0xE8});
+    };
+    left(leftA);
+    AppendBytes(evidence, {0x8B,0x45,0xEC,0x8B,0x55,0xE8,
+        0x89,0xD1,0xC1,0xE9});
+    evidence.push_back(rightB);
+    AppendBytes(evidence, {0x89,0xC7,0xC1,0xEF});
+    evidence.push_back(rightB);
+    AppendBytes(evidence, {0xC1,0xE2});
+    evidence.push_back(static_cast<uint8_t>(32u - rightB));
+    AppendBytes(evidence, {0x09,0xD7,0x31,0x7D,0xEC,0x31,0x4D,0xE8});
+    left(leftC);
+    return evidence;
+}
+
+std::vector<uint8_t> DecryptorInstructionEvidence(
+    bool x64,
+    uint8_t plan,
+    uint8_t rotate,
+    uint8_t addByte)
+{
+    const DecryptorInstructionChoices choices =
+        DecodeDecryptorInstructionPlan(plan);
+    std::vector<uint8_t> evidence = {0x8A,0x06};
+    if (choices.rotateInverse != 0u) {
+        AppendBytes(evidence, {0xC0,0xC8,rotate});
+    } else {
+        AppendBytes(evidence, {0xC0,0xC0,
+            static_cast<uint8_t>(8u - rotate)});
+    }
+    if (choices.addInverse != 0u) {
+        AppendBytes(evidence, {0x2C,addByte});
+    } else {
+        AppendBytes(evidence, {0x04,
+            static_cast<uint8_t>(0u - addByte)});
+    }
+    if (x64) {
+        if (choices.xorLoad != 0u)
+            AppendBytes(evidence, {0x44,0x30,0xE0});
+        else
+            AppendBytes(evidence, {0x44,0x89,0xE2,0x30,0xD0});
+        AppendBytes(evidence, {0x88,0x06});
+        switch (choices.pointerIncrement) {
+            case 0: AppendBytes(evidence, {0x48,0xFF,0xC6}); break;
+            case 1: AppendBytes(evidence, {0x48,0x83,0xC6,0x01}); break;
+            default: AppendBytes(evidence, {0x48,0x8D,0x76,0x01}); break;
+        }
+        if (choices.counterDecrement != 0u)
+            AppendBytes(evidence, {0xFF,0xCF});
+        else
+            AppendBytes(evidence, {0x83,0xEF,0x01});
+    } else {
+        if (choices.xorLoad != 0u)
+            AppendBytes(evidence, {0x32,0x45,0xEC});
+        else
+            AppendBytes(evidence, {0x8A,0x55,0xEC,0x30,0xD0});
+        AppendBytes(evidence, {0x88,0x06});
+        switch (choices.pointerIncrement) {
+            case 0: evidence.push_back(0x46); break;
+            case 1: AppendBytes(evidence, {0x83,0xC6,0x01}); break;
+            default: AppendBytes(evidence, {0x8D,0x76,0x01}); break;
+        }
+        if (choices.counterDecrement != 0u)
+            AppendBytes(evidence, {0xFF,0x4D,0xE4});
+        else
+            AppendBytes(evidence, {0x83,0x6D,0xE4,0x01});
+    }
+    return evidence;
+}
+
 bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) {
     if (config.architecture != VM_ARCH_X86 && config.architecture != VM_ARCH_X64) {
         error = "entry codegen architecture is invalid";
@@ -458,7 +603,9 @@ bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) 
         config.cipher.rotate > 7 || config.cipher.addByte == 0 ||
         config.cipher.shiftLeftA == 0 || config.cipher.shiftLeftA >= 32 ||
         config.cipher.shiftRightB == 0 || config.cipher.shiftRightB >= 32 ||
-        config.cipher.shiftLeftC == 0 || config.cipher.shiftLeftC >= 32) {
+        config.cipher.shiftLeftC == 0 || config.cipher.shiftLeftC >= 32 ||
+        config.cipher.instructionVariant >=
+            VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT) {
         error = "entry codegen handler cipher contract is invalid";
         return false;
     }
@@ -658,6 +805,67 @@ bool VMHandlerEntryCodegen::Validate(
             return false;
         }
     }
+    return ValidateDecryptorMutationEncoding(config, result, error);
+}
+
+bool VMHandlerEntryCodegen::ValidateDecryptorMutationEncoding(
+    const VMHandlerEntryCodegenConfig& config,
+    const VMHandlerEntryCodegenResult& result,
+    std::string& error)
+{
+    if (result.decryptorLoopOffset > result.decryptorCode.size() ||
+        result.decryptorLoopSize == 0u ||
+        result.decryptorLoopSize >
+            result.decryptorCode.size() - result.decryptorLoopOffset ||
+        config.cipher.instructionVariant >=
+            VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT) {
+        error = "decryptor byte-evidence range or instruction plan is invalid";
+        return false;
+    }
+    const uint8_t* loop = result.decryptorCode.data() +
+        result.decryptorLoopOffset;
+    const size_t loopSize = result.decryptorLoopSize;
+    const bool x64 = config.architecture == VM_ARCH_X64;
+
+    size_t selectedShiftPlans = 0u;
+    for (const auto& shifts : VM_DECRYPTOR_SHIFT_PLANS) {
+        const std::vector<uint8_t> evidence =
+            DecryptorShiftEvidence(x64, shifts);
+        const size_t occurrences = CountByteSequence(loop, loopSize, evidence);
+        const bool selected = shifts[0] == config.cipher.shiftLeftA &&
+            shifts[1] == config.cipher.shiftRightB &&
+            shifts[2] == config.cipher.shiftLeftC;
+        if (selected) {
+            ++selectedShiftPlans;
+            if (occurrences != 1u) {
+                error = "decryptor active loop lacks the selected xorshift byte sequence";
+                return false;
+            }
+        } else if (occurrences != 0u) {
+            error = "decryptor active loop contains an unselected xorshift byte sequence";
+            return false;
+        }
+    }
+    if (selectedShiftPlans != 1u) {
+        error = "decryptor xorshift triple is not one of the eight production plans";
+        return false;
+    }
+
+    for (uint8_t plan = 0u;
+            plan < VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT; ++plan) {
+        const std::vector<uint8_t> evidence = DecryptorInstructionEvidence(
+            x64, plan, config.cipher.rotate, config.cipher.addByte);
+        const size_t occurrences = CountByteSequence(loop, loopSize, evidence);
+        if (plan == config.cipher.instructionVariant) {
+            if (occurrences != 1u) {
+                error = "decryptor active loop lacks its selected instruction-plan bytes";
+                return false;
+            }
+        } else if (occurrences != 0u) {
+            error = "decryptor active loop contains bytes for an unselected instruction plan";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -668,6 +876,8 @@ bool BuildDecryptor(
     VMHandlerEntryCodegenResult& result)
 {
     const bool x64 = config.architecture == VM_ARCH_X64;
+    const DecryptorInstructionChoices instructionPlan =
+        DecodeDecryptorInstructionPlan(config.cipher.instructionVariant);
     CodeBuffer code(config.layout.decryptorOffset);
     SeedStream random(config.buildSeed, 0x454E545259444543ULL);
     EmitCet(code, x64, config.emitCetLandingPads);
@@ -755,30 +965,30 @@ bool BuildDecryptor(
         code.U8(config.cipher.shiftLeftC);
         code.Raw({0x49,0x31,0xC4,0x4D,0x0F,0xAF,0xE5,0x4D,0x01,0xF4,
                   0x8A,0x06});
-        if ((config.cipher.instructionVariant & 1u) != 0) {
+        if (instructionPlan.rotateInverse != 0u) {
             code.Raw({0xC0,0xC8}); code.U8(config.cipher.rotate);
         } else {
             code.Raw({0xC0,0xC0});
             code.U8(static_cast<uint8_t>(8u - config.cipher.rotate));
         }
-        if ((config.cipher.instructionVariant & 2u) != 0) {
+        if (instructionPlan.addInverse != 0u) {
             code.U8(0x2C); code.U8(config.cipher.addByte);
         } else {
             code.U8(0x04);
             code.U8(static_cast<uint8_t>(0u - config.cipher.addByte));
         }
-        if ((config.cipher.instructionVariant & 4u) != 0) {
+        if (instructionPlan.xorLoad != 0u) {
             code.Raw({0x44,0x30,0xE0});
         } else {
             code.Raw({0x44,0x89,0xE2,0x30,0xD0});
         }
         code.Raw({0x88,0x06});
-        switch ((config.cipher.instructionVariant >> 3u) % 3u) {
+        switch (instructionPlan.pointerIncrement) {
             case 0: code.Raw({0x48,0xFF,0xC6}); break;
             case 1: code.Raw({0x48,0x83,0xC6,0x01}); break;
             default: code.Raw({0x48,0x8D,0x76,0x01}); break;
         }
-        if ((config.cipher.instructionVariant & 0x20u) != 0)
+        if (instructionPlan.counterDecrement != 0u)
             code.Raw({0xFF,0xCF});
         else
             code.Raw({0x83,0xEF,0x01});
@@ -938,29 +1148,29 @@ bool BuildDecryptor(
                   0x8B,0x45,0xD0,0x03,0x45,0xD8,0x13,0x4D,0xD4,
                   0x89,0x45,0xEC,0x89,0x4D,0xE8});
         code.Raw({0x8A,0x06});
-        if ((config.cipher.instructionVariant & 1u) != 0) {
+        if (instructionPlan.rotateInverse != 0u) {
             code.Raw({0xC0,0xC8}); code.U8(config.cipher.rotate);
         } else {
             code.Raw({0xC0,0xC0});
             code.U8(static_cast<uint8_t>(8u - config.cipher.rotate));
         }
-        if ((config.cipher.instructionVariant & 2u) != 0) {
+        if (instructionPlan.addInverse != 0u) {
             code.U8(0x2C); code.U8(config.cipher.addByte);
         } else {
             code.U8(0x04);
             code.U8(static_cast<uint8_t>(0u - config.cipher.addByte));
         }
-        if ((config.cipher.instructionVariant & 4u) != 0)
+        if (instructionPlan.xorLoad != 0u)
             code.Raw({0x32,0x45,0xEC});
         else
             code.Raw({0x8A,0x55,0xEC,0x30,0xD0});
         code.Raw({0x88,0x06});
-        switch ((config.cipher.instructionVariant >> 3u) % 3u) {
+        switch (instructionPlan.pointerIncrement) {
             case 0: code.U8(0x46); break;
             case 1: code.Raw({0x83,0xC6,0x01}); break;
             default: code.Raw({0x8D,0x76,0x01}); break;
         }
-        if ((config.cipher.instructionVariant & 0x20u) != 0)
+        if (instructionPlan.counterDecrement != 0u)
             code.Raw({0xFF,0x4D,0xE4});
         else
             code.Raw({0x83,0x6D,0xE4,0x01});
@@ -1831,7 +2041,8 @@ bool BuildOperandDecoder(
         put(0x60,0x61707865u); put(0x64,0x3320646Eu);
         put(0x68,0x79622D32u); put(0x6C,0x6B206574u);
         for (uint8_t i = 0; i < 8; ++i) {
-            code.Raw({0x41,0x8B,static_cast<uint8_t>(0x44u | ((i & 0u) << 3u)),0x24,i * 4u});
+            code.Raw({0x41,0x8B,static_cast<uint8_t>(0x44u | ((i & 0u) << 3u)),0x24,
+                      static_cast<uint8_t>(i * 4u)});
             // The previous compact encoding is replaced by the canonical
             // mov eax,[r12+disp8] form.
             code.bytes.resize(code.bytes.size() - 5u);

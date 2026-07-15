@@ -24,6 +24,7 @@ struct CapabilityReport {
 class CapabilityChecker {
 public:
     CapabilityReport CheckImage(const CS_PE_IMAGE* image, const ProtectionBuildContext& ctx) const;
+    bool IsFunctionCfgSafe(const CS_PE_IMAGE* image, const Function& func, std::string& reason) const;
     bool IsFunctionVmSafe(const CS_PE_IMAGE* image, const Function& func, std::string& reason) const;
 };
 

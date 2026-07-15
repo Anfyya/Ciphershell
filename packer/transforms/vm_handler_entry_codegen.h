@@ -10,6 +10,21 @@
 
 namespace CipherShell {
 
+inline constexpr std::array<std::array<uint8_t, 3>, 8>
+    VM_DECRYPTOR_SHIFT_PLANS = {{
+        {{13, 7, 17}}, {{7, 9, 13}}, {{17, 11, 5}}, {{5, 15, 21}},
+        {{11, 5, 23}}, {{19, 3, 7}}, {{23, 13, 9}}, {{3, 17, 25}}
+    }};
+
+/*
+ * instructionVariant is a dense Cartesian-product index, not a bit bag:
+ *   rotate inverse (2) * add inverse (2) * XOR load form (2) *
+ *   pointer increment (3) * counter decrement (2) = 48 live byte layouts.
+ * Together with the eight xorshift triples this yields 384 production plans
+ * per architecture, all covered by native execution tests.
+ */
+inline constexpr uint8_t VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT = 48u;
+
 /*
  * All offsets in this interface are offsets from the beginning of the
  * synthesized runtime image.  The orchestrator is therefore free to append
@@ -95,6 +110,11 @@ public:
         const VMHandlerEntryCodegenConfig& config) const;
 
     static bool Validate(
+        const VMHandlerEntryCodegenConfig& config,
+        const VMHandlerEntryCodegenResult& result,
+        std::string& error);
+
+    static bool ValidateDecryptorMutationEncoding(
         const VMHandlerEntryCodegenConfig& config,
         const VMHandlerEntryCodegenResult& result,
         std::string& error);

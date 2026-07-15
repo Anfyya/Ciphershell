@@ -46,6 +46,10 @@ struct ProtectionBuildContext {
     char vmGuardSectionName[8] = {'.','c','s','g','f','t',0,0};
     char vmRelocSectionName[8] = {'.','c','s','r','l','c',0,0};
     char vmRuntimeApiSectionName[8] = {'.','c','s','v','a','p','i',0};
+    char cfgCodeSectionName[8] = {'.','c','f','g','x',0,0,0};
+    char cfgUnwindSectionName[8] = {'.','c','f','g','u','w',0,0};
+    char cfgExceptionSectionName[8] = {'.','c','f','g','p','d',0,0};
+    char cfgRelocSectionName[8] = {'.','c','f','g','r','l',0,0};
 
     std::unordered_map<uint8_t, uint8_t> opcodeMap;
     std::unordered_map<uint8_t, uint8_t> registerMap;

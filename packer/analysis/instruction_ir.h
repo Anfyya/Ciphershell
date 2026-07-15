@@ -272,6 +272,8 @@ struct InstructionIR {
     uint16_t stackWidth = 0;
     uint8_t displacementOffset = 0;
     uint8_t displacementSize = 0;
+    uint8_t immediateOffset = 0;
+    uint8_t immediateSize = 0;
     std::vector<OperandIR> operands;
 
     BranchKind branchKind = BranchKind::None;

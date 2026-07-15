@@ -85,6 +85,20 @@ PE32 / PE32+
 - SIMD/x87 严格指令桥与 x64 unwind/CFG 静态链接检查
 - final output 重新解析后复验 metadata、bytecode、trampoline、patch、imports、unwind、CFG 与 W^X
 
+每次构建的 decryptor 由 8 组 xorshift 与 48 个真实不同的活指令布局组成；
+组合定义、x86/x64 字节形态和 384 组合执行证据见
+[`docs/decryptor_mutation_coverage.md`](docs/decryptor_mutation_coverage.md)。
+
+CFG flattening 也有一条不依赖 VM 的本地保护链路：可达基本块被复制并
+按每次构建的编码状态重排，每条边通过保存 GPR/算术标志的分发器到达真实块体。
+生成器重定位 rel32 CALL 与 x64 RIP-relative 操作数，复制必要的 ASLR 重定位，
+为 x64 分发器生成 unwind/pdata，最后才修补并销毁原函数体。显式选中不能安全重写的
+函数会 fail-closed；x64 当前保守限定为不在 `.pdata` 中、不修改 RSP 的 leaf 函数。
+采用 CET shadow stack 的输入也会在改写前拒绝，因为当前分发器会改写合成 CALL 的
+返回地址；不会通过清除 CET 标记来掩盖这一不兼容性。
+执行级测试会在 RX 内存中逐个执行原始/平坦化字节，覆盖条件真/假、首尾块目标与
+AF/PF/CF/ZF/SF/OF 跨分发器保持。
+
 ## Fail-closed 模块
 
 以下模块当前不具备完整生产语义闭环，默认关闭，且 protection level / preset 不会隐式开启。
@@ -93,7 +107,6 @@ PE32 / PE32+
 - **section encryption** —— 未认证算法 + 可恢复密钥，无生产闭环
 - **startup string encryption** —— 未认证算法 + 可恢复密钥，无生产闭环
 - **import protection** —— 仅追加假导入并保留真实 IAT，未改写 callsite
-- **CFG flattening** —— 缺少 RIP-relative/CALL 重定位、ABI、unwind、CFG 修复，无法保持原函数语义
 - **bogus flow** —— 无法证明原函数语义保持
 
 `control_flow` 总开关与 `flattening` / `bogus` 子开关必须一致：总开关开启但无子功能（no-op）、或子功能开启却绕过总开关，均被 fatal 拒绝。

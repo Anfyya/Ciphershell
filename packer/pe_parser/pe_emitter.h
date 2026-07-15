@@ -29,6 +29,7 @@ public:
     uint32_t GetEntryPoint() const;
     void SetEntryPoint(uint32_t rva);
     uint32_t RvaToOffset(uint32_t rva) const;
+    bool PredictNextSectionRVA(uint32_t& rva, std::string* error = nullptr) const;
 
     PEAppendSectionResult AppendSection(
         const char name[8],

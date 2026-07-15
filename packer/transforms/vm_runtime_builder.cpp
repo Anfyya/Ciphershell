@@ -45,6 +45,7 @@ struct ReferenceRuntimeFingerprint {
     uint64_t leadingPower = 0;
     std::array<uint8_t, 32> sha256{};
     const char* name = nullptr;
+    const char* provenanceId = nullptr;
 };
 
 /*
@@ -52,7 +53,9 @@ struct ReferenceRuntimeFingerprint {
  * runtime image that was previously accepted as a production interpreter.
  * Keeping only digests (never the old machine-code bytes) lets the final PE
  * gate reject an exact embedded legacy interpreter without recreating a
- * fixed-runtime-blob source path.
+ * fixed-runtime-blob source path.  Every tuple's source/capture commit, build
+ * recipe and byte-range limitation is bound by its provenanceId in
+ * docs/reference_runtime_fingerprints.md and checked by the static gate.
  */
 constexpr std::array<ReferenceRuntimeFingerprint, 4> kReferenceRuntimes = {{
     {23552u, 0x2C5FC69EE2383E78ULL, 0xE6224086755CFF01ULL,
@@ -60,25 +63,25 @@ constexpr std::array<ReferenceRuntimeFingerprint, 4> kReferenceRuntimes = {{
          0xF5,0x1F,0x19,0xAF,0x5F,0x1C,0xD3,0xA4,
          0x6E,0xC1,0x04,0x31,0x17,0x6D,0x53,0xEB,
          0x42,0x96,0x63,0x7A,0xCC,0x5A,0x26,0xDC},
-        "retired-x64-runtime-text"},
+        "retired-x64-runtime-text", "legacy-msvc-x64-full-bb01871"},
     {24064u, 0xA15835EC2011743AULL, 0xA9A6C919725EFF01ULL,
         {0xBB,0x84,0x3D,0x65,0x55,0xCF,0x8D,0xFC,
          0x53,0x1A,0xE4,0x04,0xC7,0x97,0x4C,0x21,
          0xD1,0xBF,0xEA,0xC3,0x6F,0xC6,0x36,0x29,
          0x86,0x56,0x57,0x24,0xA3,0xD3,0x43,0x98},
-        "retired-x86-runtime-text"},
+        "retired-x86-runtime-text", "legacy-msvc-x86-full-bb01871"},
     {11776u, 0x72544B6CBFEC2E4FULL, 0xC3455FA1BA2EFF01ULL,
         {0x0B,0xCA,0x07,0x48,0xCC,0x32,0xC7,0x13,
          0xF4,0x15,0x56,0x3C,0xC8,0x2E,0xD9,0x3D,
          0x62,0x1C,0x53,0xE5,0x9B,0xA9,0xF6,0x79,
          0x98,0xAF,0x98,0xDA,0x36,0xDB,0xFD,0xD0},
-        "retired-x64-runtime-probe-text"},
+        "retired-x64-runtime-probe-text", "legacy-msvc-x64-probe-bb01871"},
     {11776u, 0xB58E1DFE08EE6C7EULL, 0xC3455FA1BA2EFF01ULL,
         {0x2B,0x25,0xCE,0x27,0x79,0xB5,0x0E,0x4D,
          0x4E,0x43,0x40,0xF6,0x38,0x77,0x3E,0x5C,
          0x76,0xCD,0xBD,0xCB,0x3C,0x93,0xD9,0xF7,
          0x68,0xFE,0x49,0x11,0xB3,0x6A,0xF7,0xFF},
-        "retired-x86-runtime-probe-text"}
+        "retired-x86-runtime-probe-text", "legacy-msvc-x86-probe-bb01871"}
 }};
 
 uint32_t RotateRight32(uint32_t value, uint32_t count) {
@@ -214,6 +217,11 @@ bool VerifyNoReferenceRuntimeBlob(
         return false;
     }
     for (const ReferenceRuntimeFingerprint& reference : kReferenceRuntimes) {
+        if (!reference.name || !reference.provenanceId ||
+            reference.name[0] == '\0' || reference.provenanceId[0] == '\0') {
+            error = "reference-runtime fingerprint has no provenance identity";
+            return false;
+        }
         if (reference.size == 0 || reference.size > size) continue;
         uint64_t rolling = 0;
         for (size_t index = 0; index < reference.size; ++index)
