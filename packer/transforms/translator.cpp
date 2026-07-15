@@ -38,9 +38,9 @@ bool OperandWrites(OperandAction action) {
         action == OperandAction::ConditionalReadWrite;
 }
 
-bool IsExtendedRegisterClass(RegisterClass cls) {
-    return cls == RegisterClass::Vector || cls == RegisterClass::X87 ||
-        cls == RegisterClass::Mmx;
+bool IsExtendedRegisterClass(RegisterCategory cls) {
+    return cls == RegisterCategory::Vector || cls == RegisterCategory::X87 ||
+        cls == RegisterCategory::Mmx;
 }
 
 uint64_t Mix64(uint64_t value) {
@@ -309,7 +309,7 @@ bool Translator::EmitAddress(
     }
 
     if (memory.hasBase) {
-        if (memory.baseInfo.registerClass != RegisterClass::GeneralPurpose ||
+        if (memory.baseInfo.registerClass != RegisterCategory::GeneralPurpose ||
             !EmitRegisterRead(instruction, memory.baseInfo.family, addressWidth, 0, result)) {
             return FailInstruction(instruction, "memory base is not a mapped general-purpose register");
         }
@@ -318,7 +318,7 @@ bool Translator::EmitAddress(
     }
 
     if (memory.hasIndex) {
-        if (memory.indexInfo.registerClass != RegisterClass::GeneralPurpose ||
+        if (memory.indexInfo.registerClass != RegisterCategory::GeneralPurpose ||
             !(memory.scale == 1 || memory.scale == 2 || memory.scale == 4 || memory.scale == 8) ||
             !EmitRegisterRead(instruction, memory.indexInfo.family, addressWidth, 0, result)) {
             return FailInstruction(instruction, "memory index/scale is not representable in micro ISA");
@@ -358,7 +358,7 @@ bool Translator::EmitRead(
         return FailInstruction(instruction, "scalar operand width is outside micro ISA");
     }
     if (operand.type == OperandType::Register) {
-        if (operand.regInfo.registerClass != RegisterClass::GeneralPurpose) {
+        if (operand.regInfo.registerClass != RegisterCategory::GeneralPurpose) {
             return FailInstruction(instruction, "non-GPR scalar read is not micro-lowerable");
         }
         return EmitRegisterRead(instruction, operand.regInfo.family, width,
@@ -388,7 +388,7 @@ bool Translator::EmitWrite(
         return FailInstruction(instruction, "scalar destination width is outside micro ISA");
     }
     if (operand.type == OperandType::Register) {
-        if (operand.regInfo.registerClass != RegisterClass::GeneralPurpose) {
+        if (operand.regInfo.registerClass != RegisterCategory::GeneralPurpose) {
             return FailInstruction(instruction, "non-GPR scalar write is not micro-lowerable");
         }
         return EmitRegisterWrite(instruction, operand.regInfo.family, width,
@@ -851,7 +851,7 @@ bool Translator::LowerExtendedBridge(const InstructionIR& instruction, Translati
     for (const auto& operand : instruction.operands) {
         if (operand.type == OperandType::Register) {
             hasExtended = hasExtended || IsExtendedRegisterClass(operand.regInfo.registerClass);
-            if (operand.regInfo.registerClass == RegisterClass::GeneralPurpose && operand.regInfo.family < 16) {
+            if (operand.regInfo.registerClass == RegisterCategory::GeneralPurpose && operand.regInfo.family < 16) {
                 if ((operand.regInfo.family == 4 || operand.regInfo.family == 5) && OperandWrites(operand.action)) {
                     return FailInstruction(instruction, "bridge cannot write stack/frame pointer");
                 }
@@ -1403,12 +1403,12 @@ bool OracleAddress(
     }
     uint64_t value = 0;
     if (memory.hasBase) {
-        if (memory.baseInfo.registerClass != RegisterClass::GeneralPurpose ||
+        if (memory.baseInfo.registerClass != RegisterCategory::GeneralPurpose ||
             memory.baseInfo.family >= state.gpr.size()) return false;
         value = state.gpr[memory.baseInfo.family];
     }
     if (memory.hasIndex) {
-        if (memory.indexInfo.registerClass != RegisterClass::GeneralPurpose ||
+        if (memory.indexInfo.registerClass != RegisterCategory::GeneralPurpose ||
             memory.indexInfo.family >= state.gpr.size() ||
             !(memory.scale == 1 || memory.scale == 2 || memory.scale == 4 || memory.scale == 8)) return false;
         value += state.gpr[memory.indexInfo.family] * memory.scale;
@@ -1429,7 +1429,7 @@ bool OracleReadOperand(
     uint64_t& value)
 {
     if (operand.type == OperandType::Register &&
-        operand.regInfo.registerClass == RegisterClass::GeneralPurpose &&
+        operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
         operand.regInfo.family < state.gpr.size()) {
         value = OracleTruncate(state.gpr[operand.regInfo.family] >>
             operand.regInfo.bitOffset, width);
@@ -1465,7 +1465,7 @@ bool OracleWriteOperand(
 {
     value = OracleTruncate(value, width);
     if (operand.type == OperandType::Register &&
-        operand.regInfo.registerClass == RegisterClass::GeneralPurpose &&
+        operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
         operand.regInfo.family < state.gpr.size()) {
         uint64_t& target = state.gpr[operand.regInfo.family];
         if (operand.regInfo.zeroExtendsOnWrite) target = value;
