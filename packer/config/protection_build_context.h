@@ -55,6 +55,13 @@ struct ProtectionBuildContext {
     std::unordered_map<uint8_t, uint8_t> registerMap;
 
     static ProtectionBuildContext FromConfig(const CipherShellConfig& config, int cliLevel, bool verbose);
+
+    // 多 VM Variant Group 场景下，每个 group 需要一套互不冲突的 section
+    // 名字。groupId==0 与单 Group 场景下的既有派生结果逐字节一致（salt 不
+    // 变），groupId>0 时按 salt^groupId 派生出的名字（随机化模式）或替换
+    // 固定名最后一个字符（debug/固定命名模式）来避免撞名。
+    static void DeriveGroupSectionName(char out[8], const ProtectionBuildContext& ctx,
+        const char base[8], uint32_t salt, uint32_t groupId);
 };
 
 } // namespace CipherShell
