@@ -1856,7 +1856,16 @@ void ExecuteCallHostVariantCases(
                     mutatedStackValue ==
                         (stackValue ^ kCallHostWin64StackMutation),
                 std::string("x64 ") + kindName +
-                    " CALL_HOST 参数、返回值或栈参数回写错误");
+                    " CALL_HOST 参数、返回值或栈参数回写错误 strategy=" +
+                    std::to_string(strategy) + " result=" +
+                    std::to_string(context.vregs[0]) + " rsp=" +
+                    std::to_string(context.vregs[4]) + " args=" +
+                    std::to_string(gCallHostWin64Observed[0]) + "," +
+                    std::to_string(gCallHostWin64Observed[1]) + "," +
+                    std::to_string(gCallHostWin64Observed[2]) + "," +
+                    std::to_string(gCallHostWin64Observed[3]) + "," +
+                    std::to_string(gCallHostWin64Observed[4]) + " stack=" +
+                    std::to_string(mutatedStackValue));
         };
         runCallee(VM_MICRO_CALL_IMPORT_SLOT, kCallHostImportSlotRVA,
             "import slot", 0x100u + strategy);

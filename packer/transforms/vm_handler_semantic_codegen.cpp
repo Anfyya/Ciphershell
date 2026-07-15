@@ -3914,6 +3914,19 @@ void X64LoadMappedVreg(
     X64LoadIndexedQ(c, destination, 1, CtxVregs);
 }
 
+void X64SpillMappedVreg(
+    CodeBuffer& c,
+    uint8_t family,
+    uint32_t stackDisplacement)
+{
+    // Resolve one guest-family mapping at a time while RCX/R11 are still
+    // scratch registers, then freeze the value in the native-call frame.
+    // Loading all call registers directly through X64LoadMappedVreg would
+    // overwrite an already restored guest RCX on the very next mapping lookup.
+    X64LoadMappedVreg(c, 0, family);
+    X64StoreStackQ(c, stackDisplacement, 0);
+}
+
 void X64StoreMappedVregFromStack(
     CodeBuffer& c,
     uint8_t family,
@@ -4067,6 +4080,17 @@ void EmitX64CallHost(
     X64LoadD(c, 1, CtxDecodedOperands + 16u);
     EmitX64ByteCopyLoop(c, 10, 11, 1);
 
+    // Snapshot every volatile guest GPR before the ABI call.  The same frame
+    // slots are overwritten with post-call values below, so no additional
+    // unwind-visible storage is needed.
+    X64SpillMappedVreg(c, 0u, kNativeCallRaxSpill);
+    X64SpillMappedVreg(c, 1u, kNativeCallRcxSpill);
+    X64SpillMappedVreg(c, 2u, kNativeCallRdxSpill);
+    X64SpillMappedVreg(c, 8u, kNativeCallR8Spill);
+    X64SpillMappedVreg(c, 9u, kNativeCallR9Spill);
+    X64SpillMappedVreg(c, 10u, kNativeCallR10Spill);
+    X64SpillMappedVreg(c, 11u, kNativeCallR11Spill);
+
     // Restore guest SIMD/x87 state immediately before the external call.
     X64LoadQ(c, 10, CtxExtendedState);
     c.Raw({0x41,0x8B,0x92}); c.U32(extendedFlags);
@@ -4080,18 +4104,24 @@ void EmitX64CallHost(
     c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE, directCall);
     // Guard-dispatch path: Windows requires the validated target in RAX.
     X64LoadQ(c, 0, CtxVirtualFlags); c.U8(0x50); c.U8(0x9D);
-    X64LoadMappedVreg(c, 1, 1u); X64LoadMappedVreg(c, 2, 2u);
-    X64LoadMappedVreg(c, 8, 8u); X64LoadMappedVreg(c, 9, 9u);
-    X64LoadMappedVreg(c, 10, 10u); X64LoadMappedVreg(c, 11, 11u);
+    X64LoadStackQ(c, 1, kNativeCallRcxSpill);
+    X64LoadStackQ(c, 2, kNativeCallRdxSpill);
+    X64LoadStackQ(c, 8, kNativeCallR8Spill);
+    X64LoadStackQ(c, 9, kNativeCallR9Spill);
+    X64LoadStackQ(c, 10, kNativeCallR10Spill);
+    X64LoadStackQ(c, 11, kNativeCallR11Spill);
     X64LoadStackQ(c, 0, kNativeCallTargetSpill);
     c.Raw({0xFF,0x94,0x24}); c.U32(kNativeCallGuardSpill);
     c.Jmp(callComplete);
     c.Bind(directCall);
     X64LoadQ(c, 0, CtxVirtualFlags); c.U8(0x50); c.U8(0x9D);
-    X64LoadMappedVreg(c, 1, 1u); X64LoadMappedVreg(c, 2, 2u);
-    X64LoadMappedVreg(c, 8, 8u); X64LoadMappedVreg(c, 9, 9u);
-    X64LoadMappedVreg(c, 10, 10u); X64LoadMappedVreg(c, 11, 11u);
-    X64LoadMappedVreg(c, 0, 0u);
+    X64LoadStackQ(c, 1, kNativeCallRcxSpill);
+    X64LoadStackQ(c, 2, kNativeCallRdxSpill);
+    X64LoadStackQ(c, 8, kNativeCallR8Spill);
+    X64LoadStackQ(c, 9, kNativeCallR9Spill);
+    X64LoadStackQ(c, 10, kNativeCallR10Spill);
+    X64LoadStackQ(c, 11, kNativeCallR11Spill);
+    X64LoadStackQ(c, 0, kNativeCallRaxSpill);
     c.Raw({0xFF,0x94,0x24}); c.U32(kNativeCallTargetSpill);
     c.Bind(callComplete);
 
