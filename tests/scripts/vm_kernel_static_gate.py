@@ -182,12 +182,21 @@ def arithmetic_bridge_hits(path: Path, code: str) -> list[Violation]:
     if path.name == "vm_handler_semantic_codegen.cpp":
         # PUSHF/POPF/LAHF/SAHF would turn host EFLAGS into the VM arithmetic
         # result (or vice versa), reopening the exact native-flags bridge that
-        # lazy flags is designed to close.  Handler-internal comparisons may
-        # use Jcc/SETcc, but these four state-transfer instructions are banned.
-        for match in re.finditer(r"0x(?:9C|9D|9E|9F)\b", code, re.IGNORECASE):
+        # lazy flags is designed to close.  CALL_HOST is the sole deliberate
+        # exception: an external native ABI boundary must restore the guest
+        # input flags and capture the callee's output flags.  Its bodies do not
+        # implement arithmetic and are execution-differential tested as a
+        # bridge.  Handler-internal arithmetic remains under the hard ban.
+        arithmetic_code = code
+        for function_name in ("void EmitX64CallHost", "void EmitX86CallHost"):
+            call_host_body = extract_function_body(code, function_name)
+            if call_host_body is not None:
+                arithmetic_code = arithmetic_code.replace(call_host_body, "")
+        for match in re.finditer(
+                r"0x(?:9C|9D|9E|9F)\b", arithmetic_code, re.IGNORECASE):
             hits.append(Violation(
                 path,
-                code.count("\n", 0, match.start()) + 1,
+                arithmetic_code.count("\n", 0, match.start()) + 1,
                 "arithmetic-flags-native-transfer-opcode",
                 match.group(0),
             ))
@@ -313,12 +322,46 @@ def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
     return common
 
 
-# Coverage floor for genuinely branching (not just name-existence) K variants.
-# ADD/SUB/AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET/SHL/SHR satisfy
-# this today; the assertion exists so future work on the remaining micro-op
-# semantics is forced through the same structural bar instead of being
-# reported done via a string-presence check alone.
-MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = 13
+# 只有这四项不适用 K 业务核心，不能把“不好做”追加成第五项：
+# - CPUID/RDTSC 各自只有一条固定硬件编码；软件模拟返回值是另一套工程，
+#   不是同一硬件语义的第二条等价机器码。
+# - TRAP/EXIT 是失败兜底与退出边界，不承载需要隐藏的业务逻辑。
+K_VARIANT_NOT_APPLICABLE = {
+    "VM_UOP_CPUID": "single fixed hardware encoding",
+    "VM_UOP_RDTSC": "single fixed hardware encoding",
+    "VM_UOP_TRAP": "failure boundary, not business logic",
+    "VM_UOP_EXIT": "exit boundary, not business logic",
+}
+EXPECTED_K_VARIANT_NOT_APPLICABLE = {
+    "VM_UOP_CPUID", "VM_UOP_RDTSC", "VM_UOP_TRAP", "VM_UOP_EXIT",
+}
+
+# 逐名锁定已经闭环的真实业务核心，而不是只守一个可被“移除 A、补上 B”
+# 绕过的数量下限。
+REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS = {
+    "VM_UOP_PUSH_VREG", "VM_UOP_PUSH_IMM", "VM_UOP_PUSH_FLAGS",
+    "VM_UOP_PUSH_IP", "VM_UOP_PUSH_IMAGE_BASE", "VM_UOP_POP_VREG",
+    "VM_UOP_LOAD_TEMP", "VM_UOP_STORE_TEMP", "VM_UOP_DUP",
+    "VM_UOP_SWAP", "VM_UOP_ROT", "VM_UOP_DROP", "VM_UOP_LOAD",
+    "VM_UOP_STORE", "VM_UOP_ADD", "VM_UOP_ADD_CARRY", "VM_UOP_SUB",
+    "VM_UOP_SUB_BORROW", "VM_UOP_MUL", "VM_UOP_UMUL_WIDE",
+    "VM_UOP_SMUL_WIDE", "VM_UOP_UDIV_WIDE", "VM_UOP_IDIV_WIDE",
+    "VM_UOP_AND", "VM_UOP_OR", "VM_UOP_XOR", "VM_UOP_NOT",
+    "VM_UOP_NEG", "VM_UOP_SHL", "VM_UOP_SHR", "VM_UOP_SAR",
+    "VM_UOP_ROL", "VM_UOP_ROR", "VM_UOP_BIT_TEST", "VM_UOP_BIT_SET",
+    "VM_UOP_BIT_RESET", "VM_UOP_BSWAP", "VM_UOP_ZERO_EXTEND",
+    "VM_UOP_SIGN_EXTEND", "VM_UOP_FLAGS_LAZY",
+    "VM_UOP_FLAGS_MATERIALIZE", "VM_UOP_FLAGS_WRITE",
+    "VM_UOP_FLAGS_UPDATE", "VM_UOP_FLAGS_PACK_AH",
+    "VM_UOP_FLAGS_UNPACK_AH", "VM_UOP_PUSH_CONDITION", "VM_UOP_SELECT",
+    "VM_UOP_BRANCH", "VM_UOP_BRANCH_IF", "VM_UOP_CALL_VM",
+    "VM_UOP_CALL_HOST", "VM_UOP_RET", "VM_UOP_BRIDGE_EXTENDED",
+    "VM_UOP_INT3",
+}
+MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS = len(
+    REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS)
+# VM_UOP_COUNT 当前为 58；扣除上述四项，最终目标是 54。
+TARGET_REAL_STRATEGY_VARIANT_SEMANTICS = 54
 
 
 def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]) -> list[Violation]:
@@ -373,9 +416,21 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
     # somewhere in the file; it says nothing about how many semantics it
     # actually covers.  Count semantics whose EmitBusinessCoreVariant branch
     # really differs byte-for-byte per strategy in both architectures, and
-    # fail if that count has not grown past the historical ADD/SUB/AND/OR/
-    # XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET baseline of 11.
+    # fail if that count regresses from the historical 13-semantic baseline:
+    # ADD/SUB/AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET/SHL/SHR.
     real_variant_semantics = real_strategy_variant_semantics(semantic)
+    exemption_names = set(K_VARIANT_NOT_APPLICABLE)
+    if exemption_names != EXPECTED_K_VARIANT_NOT_APPLICABLE:
+        violations.append(Violation(
+            semantic_path, 1, "unauthorized-k-variant-exemption",
+            "exemptions must be exactly CPUID/RDTSC/TRAP/EXIT; got " +
+            ", ".join(sorted(exemption_names))))
+    missing_required = (
+        REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS - real_variant_semantics)
+    if missing_required:
+        violations.append(Violation(
+            semantic_path, 1, "missing-required-real-k-variant-semantics",
+            ", ".join(sorted(missing_required))))
     if len(real_variant_semantics) < MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS:
         violations.append(Violation(
             semantic_path, 1, "insufficient-real-k-variant-coverage",
@@ -384,7 +439,7 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
             "strategy-conditioned EmitBusinessCoreVariant branch with two "
             f"distinct emitted byte sequences in both x64 and x86; need >= "
             f"{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}, not just the ADD/SUB/"
-            "AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET baseline"))
+            "AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET historical baseline"))
     if "0x48,0x83,0xEC,0x28,0xFF,0xD0" not in synth or \
        "0x48,0x83,0xC4,0x28" not in synth:
         violations.append(Violation(
@@ -448,7 +503,7 @@ def main() -> int:
         code_by_path.get(semantic_path, ""))
     achieved = sorted(real_variant_semantics)
     print(
-        f"[progress] 双策略语义覆盖 {len(achieved)}/{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}"
+        f"[progress] 双策略语义覆盖 {len(achieved)}/{TARGET_REAL_STRATEGY_VARIANT_SEMANTICS}"
         f"（达标阈值 {MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}）："
         f"{', '.join(achieved) if achieved else 'none'}"
     )

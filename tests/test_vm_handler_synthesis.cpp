@@ -5,6 +5,7 @@
 #include "packer/vm/vm_schema.h"
 
 #include <Windows.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <array>
@@ -52,6 +53,9 @@ public:
 constexpr uint32_t kTestVirtualProtectIatRVA = 0x100u;
 constexpr uint32_t kTestFlushInstructionCacheIatRVA = 0x110u;
 constexpr size_t kTestImageSize = 0x200u;
+constexpr uint32_t kCallHostImportSlotRVA = 0x140u;
+constexpr uint32_t kCallHostNativeTargetRVA = 0x180u;
+constexpr size_t kCallHostImageSize = 0x1000u;
 
 void Require(bool condition, const std::string& message) {
     if (!condition) throw TestFailure(message);
@@ -653,6 +657,120 @@ struct TestRuntimeIatImage {
     }
 };
 
+class CallHostTestImage final {
+public:
+    explicit CallHostTestImage(uintptr_t importTarget) {
+        m_base = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, kCallHostImageSize, MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE));
+        if (!m_base) throw TestFailure("CALL_HOST test image VirtualAlloc 失败");
+        std::memset(m_base, 0, kCallHostImageSize);
+
+        const uintptr_t virtualProtect =
+            reinterpret_cast<uintptr_t>(&GateVirtualProtect);
+        const uintptr_t flushInstructionCache =
+            reinterpret_cast<uintptr_t>(&GateFlushInstructionCache);
+        std::memcpy(m_base + kTestVirtualProtectIatRVA,
+            &virtualProtect, sizeof(virtualProtect));
+        std::memcpy(m_base + kTestFlushInstructionCacheIatRVA,
+            &flushInstructionCache, sizeof(flushInstructionCache));
+        std::memcpy(m_base + kCallHostImportSlotRVA,
+            &importTarget, sizeof(importTarget));
+
+#if defined(_M_X64)
+        constexpr uint64_t nativeResult = 0xC011A05764B17D5EULL;
+        constexpr uint64_t noCarryResult = 0x0BADF00D12345678ULL;
+        const std::array<uint8_t, 30> nativeTarget = {
+            0xF3,0x0F,0x1E,0xFA,             // endbr64
+            0x48,0xB8,                       // mov rax, imm64
+            static_cast<uint8_t>(noCarryResult),
+            static_cast<uint8_t>(noCarryResult >> 8u),
+            static_cast<uint8_t>(noCarryResult >> 16u),
+            static_cast<uint8_t>(noCarryResult >> 24u),
+            static_cast<uint8_t>(noCarryResult >> 32u),
+            static_cast<uint8_t>(noCarryResult >> 40u),
+            static_cast<uint8_t>(noCarryResult >> 48u),
+            static_cast<uint8_t>(noCarryResult >> 56u),
+            0x48,0xBA,                       // mov rdx, imm64
+            static_cast<uint8_t>(nativeResult),
+            static_cast<uint8_t>(nativeResult >> 8u),
+            static_cast<uint8_t>(nativeResult >> 16u),
+            static_cast<uint8_t>(nativeResult >> 24u),
+            static_cast<uint8_t>(nativeResult >> 32u),
+            static_cast<uint8_t>(nativeResult >> 40u),
+            static_cast<uint8_t>(nativeResult >> 48u),
+            static_cast<uint8_t>(nativeResult >> 56u),
+            0x48,0x0F,0x42,0xC2,             // cmovc rax, rdx
+            0xF8,                            // clc: exported CF must clear
+            0xC3
+        };
+#else
+        constexpr uint32_t nativeResult = 0x64B17D5Eu;
+        constexpr uint32_t noCarryResult = 0x12345678u;
+        const std::array<uint8_t, 19> nativeTarget = {
+            0xF3,0x0F,0x1E,0xFB,             // endbr32
+            0xB8,                            // mov eax, imm32
+            static_cast<uint8_t>(noCarryResult),
+            static_cast<uint8_t>(noCarryResult >> 8u),
+            static_cast<uint8_t>(noCarryResult >> 16u),
+            static_cast<uint8_t>(noCarryResult >> 24u),
+            0xBA,                            // mov edx, imm32
+            static_cast<uint8_t>(nativeResult),
+            static_cast<uint8_t>(nativeResult >> 8u),
+            static_cast<uint8_t>(nativeResult >> 16u),
+            static_cast<uint8_t>(nativeResult >> 24u),
+            0x0F,0x42,0xC2,                  // cmovc eax, edx
+            0xF8,                            // clc
+            0xC3
+        };
+#endif
+        std::memcpy(m_base + kCallHostNativeTargetRVA,
+            nativeTarget.data(), nativeTarget.size());
+        m_metadata.imageSize = static_cast<uint32_t>(kCallHostImageSize);
+
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(m_base, kCallHostImageSize, PAGE_EXECUTE_READ,
+                &oldProtection) ||
+            !FlushInstructionCache(GetCurrentProcess(), m_base,
+                kCallHostImageSize)) {
+            const DWORD error = GetLastError();
+            VirtualFree(m_base, 0, MEM_RELEASE);
+            m_base = nullptr;
+            throw TestFailure("CALL_HOST test image 无法转为 RX: " +
+                std::to_string(error));
+        }
+    }
+
+    ~CallHostTestImage() {
+        if (m_base) VirtualFree(m_base, 0, MEM_RELEASE);
+    }
+    CallHostTestImage(const CallHostTestImage&) = delete;
+    CallHostTestImage& operator=(const CallHostTestImage&) = delete;
+
+    uint8_t* Base() const { return m_base; }
+    VM_METADATA_HEADER* Metadata() { return &m_metadata; }
+
+#if defined(_M_X64)
+    static constexpr uint64_t NativeResult() { return 0xC011A05764B17D5EULL; }
+#else
+    static constexpr uint64_t NativeResult() { return 0x64B17D5Eu; }
+#endif
+
+private:
+    uint8_t* m_base = nullptr;
+    VM_METADATA_HEADER m_metadata{};
+};
+
+void CaptureCallHostExtendedState(VM_EXTENDED_STATE& state) {
+    std::memset(&state, 0, sizeof(state));
+#if defined(_M_X64)
+    _fxsave64(state.xsaveArea);
+#else
+    _fxsave(state.xsaveArea);
+#endif
+    state.flags = 0;
+}
+
 VM_MICRO_EXECUTION_CONTEXT MakeRuntimeContext(
     const std::vector<uint8_t>& bytecode,
     const RuntimeEncoding& encoding,
@@ -679,6 +797,149 @@ VM_MICRO_EXECUTION_CONTEXT MakeRuntimeContext(
     context.virtualFlags = initialFlags;
     context.architecture = static_cast<uint32_t>(config.architecture);
     return context;
+}
+
+std::string RuntimeByteWindow(
+    const LoadedSynthImage& loaded,
+    const VMHandlerSynthesisResult& result,
+    uintptr_t address);
+
+uint8_t CoreVariantForStrategy(
+    const VMHandlerSynthesisConfig& config,
+    VM_MICRO_OPCODE semantic,
+    uint8_t wantedStrategy)
+{
+    for (uint8_t variant = 0; variant < config.variantCount; ++variant) {
+        VMHandlerSemanticCodegenConfig codegen{};
+        codegen.architecture = static_cast<uint32_t>(config.architecture);
+        codegen.buildSeed = config.buildSeed;
+        codegen.semantic = semantic;
+        codegen.variant = variant;
+        const auto generated = GenerateVMHandlerSemanticKernel(codegen);
+        Require(generated.success,
+            "无法为执行差分生成 " + std::to_string(semantic) +
+            " 的 handler variant: " + generated.error);
+        if (generated.semanticCoreVariantSize != 0u &&
+            generated.semanticCoreStrategy == wantedStrategy) {
+            return variant;
+        }
+    }
+    throw TestFailure("执行差分未找到 semantic=" +
+        std::to_string(semantic) + " strategy=" +
+        std::to_string(wantedStrategy) + " 的真实业务核心变体");
+}
+
+std::vector<uint32_t> RuntimeInstructionOffsets(
+    const std::vector<MicroInstruction>& program,
+    const RuntimeEncoding& encoding)
+{
+    std::vector<uint32_t> offsets;
+    offsets.reserve(program.size());
+    uint32_t offset = 0;
+    for (const auto& instruction : program) {
+        offsets.push_back(offset);
+        uint32_t size = 0;
+        std::string error;
+        Require(VMSchema::EncodedSize(instruction, encoding.codec, size, error),
+            "执行差分无法计算微操作长度: " + error);
+        Require(size <= (std::numeric_limits<uint32_t>::max)() - offset,
+            "执行差分 bytecode 偏移溢出");
+        offset += size;
+    }
+    return offsets;
+}
+
+void ExecuteOracleEquivalentProgram(
+    const std::string& label,
+    const std::vector<MicroInstruction>& program,
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage,
+    const std::array<uint64_t, 32>& initialGprs,
+    uint64_t initialFlags,
+    std::vector<uint8_t>* memory = nullptr)
+{
+    const std::vector<uint8_t> bytecode =
+        EncodeStraightLineRuntimeProgram(program, encoding);
+    const std::vector<uint8_t> initialMemory = memory
+        ? *memory : std::vector<uint8_t>{};
+
+    VMMicroMachineState oracle{};
+    oracle.gpr = initialGprs;
+    oracle.rflags = initialFlags;
+    oracle.imageBase = reinterpret_cast<uintptr_t>(testImage.bytes.data());
+    VMMicroMemoryView oracleMemory{};
+    if (memory) {
+        oracleMemory.data = memory->data();
+        oracleMemory.size = memory->size();
+        oracleMemory.baseAddress = reinterpret_cast<uintptr_t>(memory->data());
+    }
+    VMMicroExecutionOptions options{};
+    options.registerCount = 24;
+    options.maxSteps = 100000;
+    options.addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
+    std::string oracleError;
+    Require(VMMicroSemanticExecutor::Execute(
+            bytecode.data(), bytecode.size(), encoding.reverse.data(),
+            encoding.codec, oracle, oracleMemory, options, oracleError),
+        label + " 的语义 oracle 执行失败: " + oracleError);
+    const std::vector<uint8_t> expectedMemory = memory
+        ? *memory : std::vector<uint8_t>{};
+    if (memory) *memory = initialMemory;
+
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+    for (uint8_t index = 0; index < registerMap.size(); ++index)
+        registerMap[index] = index;
+    VM_MICRO_EXECUTION_CONTEXT context = MakeRuntimeContext(
+        bytecode, encoding, config, registerMap, testImage,
+        initialGprs, initialFlags);
+    const auto entry = reinterpret_cast<SynthEntry>(
+        loaded.Base() + result.contextEntryOffset);
+    DWORD exceptionCode = 0;
+    const uint32_t runtimeError = InvokeSynthEntry(entry, &context, &exceptionCode);
+    Require(exceptionCode == 0 && runtimeError == VM_MICRO_ERR_NONE &&
+        context.error == VM_MICRO_ERR_NONE,
+        label + " 的合成 handler 执行失败: exception=" +
+            std::to_string(exceptionCode) + " runtime=" +
+            std::to_string(runtimeError) + " context=" +
+            std::to_string(context.error) + " semantic=" +
+            std::to_string(context.currentSemantic) + " variant=" +
+            std::to_string(context.currentVariant) + " vip=" +
+            std::to_string(context.vip - context.bytecodeBegin) + " address=" +
+            std::to_string(gLastExceptionAddress) + " bytes=" +
+            RuntimeByteWindow(loaded, result, gLastExceptionAddress));
+
+    for (size_t index = 0; index < oracle.gpr.size(); ++index) {
+        Require(context.vregs[index] == oracle.gpr[index],
+            label + " vreg[" + std::to_string(index) + "] 不一致: actual=" +
+            std::to_string(context.vregs[index]) + " expected=" +
+            std::to_string(oracle.gpr[index]));
+    }
+    for (size_t index = 0; index < oracle.temporaries.size(); ++index) {
+        Require(context.temps[index] == oracle.temporaries[index],
+            label + " temp[" + std::to_string(index) + "] 不一致");
+    }
+    Require(context.valueDepth == oracle.operandStackDepth,
+        label + " value stack 深度不一致");
+    for (uint32_t index = 0; index < context.valueDepth; ++index) {
+        Require(context.values[index] == oracle.operandStack[index],
+            label + " value stack[" + std::to_string(index) + "] 不一致");
+    }
+    Require(context.callDepth == oracle.callDepth,
+        label + " call stack 深度不一致");
+    Require(context.virtualFlags == oracle.rflags,
+        label + " virtualFlags 不一致: actual=" +
+            std::to_string(context.virtualFlags) + " expected=" +
+            std::to_string(oracle.rflags));
+    Require(context.vip - context.bytecodeBegin == oracle.ip,
+        label + " VIP 与 oracle IP 不一致");
+    Require(context.halted == 1u && oracle.finished,
+        label + " 未在顶层 RET/EXIT 边界停机");
+    if (memory) Require(*memory == expectedMemory,
+        label + " 的内存副作用与 oracle 不一致");
 }
 
 void RequireLazyRecordEqual(
@@ -897,20 +1158,24 @@ void ExecuteDivideFaultCase(
     uint64_t low,
     uint64_t divisor,
     uint8_t width,
+    uint8_t strategy,
     const VMHandlerSynthesisConfig& config,
     const VMHandlerSynthesisResult& result,
     LoadedSynthImage& loaded,
     const RuntimeEncoding& encoding,
     TestRuntimeIatImage& testImage)
 {
+    const auto variant = [&](VM_MICRO_OPCODE semantic) {
+        return CoreVariantForStrategy(config, semantic, strategy);
+    };
     const std::vector<MicroInstruction> program = {
-        Uop(VM_UOP_PUSH_IMM, {high, width}, 0),
-        Uop(VM_UOP_PUSH_IMM, {low, width}, 1),
-        Uop(VM_UOP_PUSH_IMM, {divisor, width}, 2),
-        Uop(divideOpcode, {width}, 3),
-        Uop(VM_UOP_POP_VREG, {1, width, 0, 1}, 0),
-        Uop(VM_UOP_POP_VREG, {2, width, 0, 1}, 1),
-        Uop(VM_UOP_RET, {0}, 0),
+        Uop(VM_UOP_PUSH_IMM, {high, width}, variant(VM_UOP_PUSH_IMM)),
+        Uop(VM_UOP_PUSH_IMM, {low, width}, variant(VM_UOP_PUSH_IMM)),
+        Uop(VM_UOP_PUSH_IMM, {divisor, width}, variant(VM_UOP_PUSH_IMM)),
+        Uop(divideOpcode, {width}, variant(divideOpcode)),
+        Uop(VM_UOP_POP_VREG, {1, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+        Uop(VM_UOP_POP_VREG, {2, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+        Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
     };
     const std::vector<uint8_t> bytecode =
         EncodeStraightLineRuntimeProgram(program, encoding);
@@ -920,7 +1185,8 @@ void ExecuteDivideFaultCase(
     VMMicroExecutionOptions options{};
     options.registerCount = 24;
     options.maxSteps = 100;
-    options.addressWidth = 8;
+    options.addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
     VMMicroMemoryView noMemory{};
     std::string oracleError;
     Require(!VMMicroSemanticExecutor::Execute(
@@ -942,7 +1208,8 @@ void ExecuteDivideFaultCase(
     InvokeSynthEntry(entry, &context, &exceptionCode);
     Require(exceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO,
         std::string(divideOpcode == VM_UOP_UDIV_WIDE ? "UDIV" : "IDIV") +
-            " 无效 128 位除法未传播真实 #DE，exception=" +
+            " width=" + std::to_string(width) + " strategy=" +
+            std::to_string(strategy) + " 未传播真实 #DE，exception=" +
             std::to_string(exceptionCode));
 }
 
@@ -1028,6 +1295,782 @@ void ExecuteLazyPreservationCase(
             std::to_string(context.lastAlu.valid));
 }
 
+void ExecuteDataAndStackVariantMatrix(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
+    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+        if (width > addressWidth) continue;
+        for (uint8_t strategy : {0u, 1u}) {
+            const auto variant = [&](VM_MICRO_OPCODE semantic) {
+                return CoreVariantForStrategy(config, semantic, strategy);
+            };
+            std::vector<uint8_t> memory(64u);
+            for (size_t index = 0; index < memory.size(); ++index)
+                memory[index] = static_cast<uint8_t>(0xC3u ^ index);
+            const uint64_t memoryAddress = reinterpret_cast<uintptr_t>(
+                memory.data() + 16u);
+            const uint64_t mask = width == 8u
+                ? (std::numeric_limits<uint64_t>::max)()
+                : ((uint64_t{1} << (width * 8u)) - 1u);
+            const uint8_t bitOffset = width == addressWidth ? 0u : 8u;
+            const std::vector<MicroInstruction> program = {
+                Uop(VM_UOP_PUSH_VREG, {0, width, bitOffset}, variant(VM_UOP_PUSH_VREG)),
+                Uop(VM_UOP_STORE_TEMP, {0}, variant(VM_UOP_STORE_TEMP)),
+                Uop(VM_UOP_LOAD_TEMP, {0}, variant(VM_UOP_LOAD_TEMP)),
+                Uop(VM_UOP_DUP, {}, variant(VM_UOP_DUP)),
+                Uop(VM_UOP_POP_VREG, {1, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {2, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x12u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0x34u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SWAP, {}, variant(VM_UOP_SWAP)),
+                Uop(VM_UOP_POP_VREG, {3, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {4, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x11u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0x22u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0x33u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ROT, {}, variant(VM_UOP_ROT)),
+                Uop(VM_UOP_POP_VREG, {5, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {6, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {7, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x55u & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),
+                Uop(VM_UOP_PUSH_IMM, {memoryAddress, addressWidth}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0xA55Au & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_STORE, {width}, variant(VM_UOP_STORE)),
+                Uop(VM_UOP_PUSH_IMM, {memoryAddress, addressWidth}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_LOAD, {width}, variant(VM_UOP_LOAD)),
+                Uop(VM_UOP_POP_VREG, {8, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x5Au & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_POP_VREG, {9, width, bitOffset, 0}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IP, {}, variant(VM_UOP_PUSH_IP)),
+                Uop(VM_UOP_POP_VREG, {10, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMAGE_BASE, {}, variant(VM_UOP_PUSH_IMAGE_BASE)),
+                Uop(VM_UOP_POP_VREG, {11, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
+            };
+            std::array<uint64_t, 32> initialGprs{};
+            initialGprs[0] = 0x8877665544332211ULL;
+            initialGprs[9] = addressWidth == 8u
+                ? 0xFFEEDDCCBBAA9988ULL : 0xBBAA9988ULL;
+            ExecuteOracleEquivalentProgram(
+                "data/stack width=" + std::to_string(width) +
+                    " strategy=" + std::to_string(strategy),
+                program, config, result, loaded, encoding, testImage,
+                initialGprs, 0x202ULL, &memory);
+        }
+    }
+}
+
+void ExecuteArithmeticVariantMatrix(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
+    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+        if (width > addressWidth) continue;
+        const unsigned bits = width * 8u;
+        const uint64_t mask = width == 8u
+            ? (std::numeric_limits<uint64_t>::max)()
+            : ((uint64_t{1} << bits) - 1u);
+        const uint64_t sign = uint64_t{1} << (bits - 1u);
+        for (uint8_t strategy : {0u, 1u}) {
+            const auto variant = [&](VM_MICRO_OPCODE semantic) {
+                return CoreVariantForStrategy(config, semantic, strategy);
+            };
+            std::vector<MicroInstruction> program = {
+                Uop(VM_UOP_PUSH_IMM, {mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ADD_CARRY, {width}, variant(VM_UOP_ADD_CARRY)),
+                Uop(VM_UOP_POP_VREG, {0, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SUB_BORROW, {width}, variant(VM_UOP_SUB_BORROW)),
+                Uop(VM_UOP_POP_VREG, {1, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x0123456789ABCDEFULL & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_BSWAP, {width}, variant(VM_UOP_BSWAP)),
+                Uop(VM_UOP_POP_VREG, {2, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {sign | 0x21u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {bits + 1u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SAR, {width}, variant(VM_UOP_SAR)),
+                Uop(VM_UOP_POP_VREG, {3, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {sign | 0x13u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {bits + 1u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ROL, {width}, variant(VM_UOP_ROL)),
+                Uop(VM_UOP_POP_VREG, {4, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {sign | 0x27u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {bits - 1u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ROR, {width}, variant(VM_UOP_ROR)),
+                Uop(VM_UOP_POP_VREG, {5, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+            };
+            if (width < addressWidth) {
+                const uint8_t toWidth = static_cast<uint8_t>(width * 2u);
+                program.insert(program.end(), {
+                    Uop(VM_UOP_PUSH_IMM, {sign | 3u, width}, variant(VM_UOP_PUSH_IMM)),
+                    Uop(VM_UOP_ZERO_EXTEND, {width, toWidth}, variant(VM_UOP_ZERO_EXTEND)),
+                    Uop(VM_UOP_POP_VREG, {6, toWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                    Uop(VM_UOP_PUSH_IMM, {sign | 3u, width}, variant(VM_UOP_PUSH_IMM)),
+                    Uop(VM_UOP_SIGN_EXTEND, {width, toWidth}, variant(VM_UOP_SIGN_EXTEND)),
+                    Uop(VM_UOP_POP_VREG, {7, toWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                });
+            }
+            program.insert(program.end(), {
+                Uop(VM_UOP_PUSH_IMM, {mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {2, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_UMUL_WIDE, {width}, variant(VM_UOP_UMUL_WIDE)),
+                Uop(VM_UOP_POP_VREG, {9, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {8, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {sign, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {2, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SMUL_WIDE, {width}, variant(VM_UOP_SMUL_WIDE)),
+                Uop(VM_UOP_POP_VREG, {11, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {10, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {2, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_UDIV_WIDE, {width}, variant(VM_UOP_UDIV_WIDE)),
+                Uop(VM_UOP_POP_VREG, {13, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {12, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {(mask - 99u) & mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {7, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_IDIV_WIDE, {width}, variant(VM_UOP_IDIV_WIDE)),
+                Uop(VM_UOP_POP_VREG, {15, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {14, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                // signed double-width -2^(bits) / INT_MIN == 2；专门覆盖
+                // “INT_MIN 取绝对值仍为负”这条最宽 IDIV 历史漏洞。
+                Uop(VM_UOP_PUSH_IMM, {mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {sign, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_IDIV_WIDE, {width}, variant(VM_UOP_IDIV_WIDE)),
+                Uop(VM_UOP_POP_VREG, {17, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_POP_VREG, {16, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
+            });
+            const std::array<uint64_t, 32> initialGprs{};
+            ExecuteOracleEquivalentProgram(
+                "arithmetic width=" + std::to_string(width) +
+                    " strategy=" + std::to_string(strategy),
+                program, config, result, loaded, encoding, testImage,
+                initialGprs, 0x202ULL);
+        }
+    }
+}
+
+void ExecuteFlagsVariantMatrix(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
+    constexpr uint32_t preservedFlags =
+        VM_FLAG_ARCHITECTURAL_MASK & ~VM_FLAG_STATUS_MASK;
+    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+        if (width > addressWidth) continue;
+        const unsigned bits = width * 8u;
+        const uint64_t mask = width == 8u
+            ? (std::numeric_limits<uint64_t>::max)()
+            : ((uint64_t{1} << bits) - 1u);
+        const uint64_t sign = uint64_t{1} << (bits - 1u);
+        for (uint8_t strategy : {0u, 1u}) {
+            const auto variant = [&](VM_MICRO_OPCODE semantic) {
+                return CoreVariantForStrategy(config, semantic, strategy);
+            };
+            const std::vector<MicroInstruction> program = {
+                Uop(VM_UOP_PUSH_IMM, {sign - 1u, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ADD, {width}, variant(VM_UOP_ADD)),
+                Uop(VM_UOP_FLAGS_LAZY,
+                    {VM_LAZY_ADD, width, VM_FLAG_STATUS_MASK, preservedFlags},
+                    variant(VM_UOP_FLAGS_LAZY)),
+                Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),
+                Uop(VM_UOP_PUSH_CONDITION, {VM_CONDITION_O}, variant(VM_UOP_PUSH_CONDITION)),
+                Uop(VM_UOP_POP_VREG, {0, 1, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_CONDITION, {VM_CONDITION_S}, variant(VM_UOP_PUSH_CONDITION)),
+                Uop(VM_UOP_POP_VREG, {1, 1, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x11, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0x22, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SELECT, {VM_CONDITION_O}, variant(VM_UOP_SELECT)),
+                Uop(VM_UOP_POP_VREG, {2, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0x33, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0x44, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SELECT, {VM_CONDITION_E}, variant(VM_UOP_SELECT)),
+                Uop(VM_UOP_POP_VREG, {3, width, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {4, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_FLAGS_PACK_AH, {}, variant(VM_UOP_FLAGS_PACK_AH)),
+                Uop(VM_UOP_POP_VREG, {5, 1, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_FLAGS_UPDATE, {VM_FLAG_UPDATE_CLEAR, VM_FLAG_CF}, variant(VM_UOP_FLAGS_UPDATE)),
+                Uop(VM_UOP_FLAGS_UPDATE, {VM_FLAG_UPDATE_SET, VM_FLAG_CF}, variant(VM_UOP_FLAGS_UPDATE)),
+                Uop(VM_UOP_FLAGS_UPDATE, {VM_FLAG_UPDATE_TOGGLE, VM_FLAG_PF}, variant(VM_UOP_FLAGS_UPDATE)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {6, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {VM_FLAG_CF | VM_FLAG_PF | VM_FLAG_AF | VM_FLAG_ZF, addressWidth}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_FLAGS_WRITE, {VM_FLAG_STATUS_MASK}, variant(VM_UOP_FLAGS_WRITE)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {7, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0xD5, 1}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_FLAGS_UNPACK_AH, {}, variant(VM_UOP_FLAGS_UNPACK_AH)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {8, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_SUB_BORROW, {width}, variant(VM_UOP_SUB_BORROW)),
+                Uop(VM_UOP_FLAGS_LAZY,
+                    {VM_LAZY_SBB, width, VM_FLAG_STATUS_MASK, preservedFlags},
+                    variant(VM_UOP_FLAGS_LAZY)),
+                Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),
+                Uop(VM_UOP_FLAGS_MATERIALIZE, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_FLAGS_MATERIALIZE)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {9, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_PUSH_IMM, {mask, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {0, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_PUSH_IMM, {1, width}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_ADD_CARRY, {width}, variant(VM_UOP_ADD_CARRY)),
+                Uop(VM_UOP_FLAGS_LAZY,
+                    {VM_LAZY_ADC, width, VM_FLAG_STATUS_MASK, preservedFlags},
+                    variant(VM_UOP_FLAGS_LAZY)),
+                Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),
+                Uop(VM_UOP_FLAGS_MATERIALIZE, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_FLAGS_MATERIALIZE)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {10, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
+            };
+            const std::array<uint64_t, 32> initialGprs{};
+            ExecuteOracleEquivalentProgram(
+                "flags width=" + std::to_string(width) +
+                    " strategy=" + std::to_string(strategy),
+                program, config, result, loaded, encoding, testImage,
+                initialGprs, 0x202ULL);
+        }
+    }
+}
+
+void ExecuteControlFlowBoundaryMatrix(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
+        ? 8u : 4u;
+    constexpr uint32_t preservedFlags =
+        VM_FLAG_ARCHITECTURAL_MASK & ~VM_FLAG_STATUS_MASK;
+    for (uint8_t strategy : {0u, 1u}) {
+        const auto variant = [&](VM_MICRO_OPCODE semantic) {
+            return CoreVariantForStrategy(config, semantic, strategy);
+        };
+        std::vector<MicroInstruction> program = {
+            Uop(VM_UOP_LOAD_TEMP, {0}, variant(VM_UOP_LOAD_TEMP)),             // 0
+            Uop(VM_UOP_PUSH_IMM, {0, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 1
+            Uop(VM_UOP_SUB, {addressWidth}, variant(VM_UOP_SUB)),              // 2
+            Uop(VM_UOP_FLAGS_LAZY,
+                {VM_LAZY_SUB, addressWidth, VM_FLAG_STATUS_MASK, preservedFlags},
+                variant(VM_UOP_FLAGS_LAZY)),                                   // 3
+            Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),                        // 4
+            Uop(VM_UOP_BRANCH_IF, {VM_CONDITION_NE, 0}, variant(VM_UOP_BRANCH_IF)), // 5
+            Uop(VM_UOP_PUSH_IMM, {1, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 6
+            Uop(VM_UOP_STORE_TEMP, {0}, variant(VM_UOP_STORE_TEMP)),           // 7
+            Uop(VM_UOP_CALL_VM, {0}, variant(VM_UOP_CALL_VM)),                 // 8
+            Uop(VM_UOP_PUSH_IMM, {1, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 9
+            Uop(VM_UOP_PUSH_IMM, {2, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 10
+            Uop(VM_UOP_SUB, {addressWidth}, variant(VM_UOP_SUB)),              // 11
+            Uop(VM_UOP_FLAGS_LAZY,
+                {VM_LAZY_SUB, addressWidth, VM_FLAG_STATUS_MASK, preservedFlags},
+                variant(VM_UOP_FLAGS_LAZY)),                                   // 12
+            Uop(VM_UOP_DROP, {}, variant(VM_UOP_DROP)),                        // 13
+            Uop(VM_UOP_BRANCH_IF, {VM_CONDITION_E, 0}, variant(VM_UOP_BRANCH_IF)), // 14
+            Uop(VM_UOP_PUSH_IMM, {0x55, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 15
+            Uop(VM_UOP_POP_VREG, {0, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)), // 16
+            Uop(VM_UOP_BRANCH, {0}, variant(VM_UOP_BRANCH)),                   // 17
+            Uop(VM_UOP_PUSH_IMM, {0x77, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 18
+            Uop(VM_UOP_POP_VREG, {1, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)), // 19
+            Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),                         // 20
+            Uop(VM_UOP_PUSH_IMM, {0x99, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 21
+            Uop(VM_UOP_POP_VREG, {2, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)), // 22
+            Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),                         // 23
+        };
+        const std::vector<uint32_t> offsets =
+            RuntimeInstructionOffsets(program, encoding);
+        program[5].operands[1] = offsets[18]; // 恒假(首次)与恒真(递归)均命中。
+        program[8].operands[0] = offsets[0];  // CALL 目标恰为函数首字节。
+        program[14].operands[1] = offsets[0]; // 恒假分支目标也在函数首边界。
+        program[17].operands[0] = offsets[23]; // 无条件分支目标恰为末条 RET。
+        const std::array<uint64_t, 32> initialGprs{};
+        ExecuteOracleEquivalentProgram(
+            "control boundary strategy=" + std::to_string(strategy),
+            program, config, result, loaded, encoding, testImage,
+            initialGprs, 0x202ULL);
+    }
+}
+
+#if defined(_M_X64)
+extern "C" void __fastcall GateInstructionBridgeTarget(
+    VM_INSTRUCTION_BRIDGE_STATE* state)
+{
+    state->gpr[0] ^= 0x1122334455667788ULL;
+    state->gpr[15] += 0x1020304050607080ULL;
+}
+#endif
+
+#if defined(_M_X64)
+constexpr uint64_t kCallHostWin64Result = 0xA11CE5EED1234567ULL;
+constexpr uint64_t kCallHostWin64StackMutation = 0x55AA33CC0FF00FF0ULL;
+volatile uint64_t gCallHostWin64Observed[5] = {};
+
+extern "C" __declspec(noinline) uint64_t __fastcall GateCallHostWin64Target(
+    uint64_t a,
+    uint64_t b,
+    uint64_t c,
+    uint64_t d,
+    uint64_t e)
+{
+    gCallHostWin64Observed[0] = a;
+    gCallHostWin64Observed[1] = b;
+    gCallHostWin64Observed[2] = c;
+    gCallHostWin64Observed[3] = d;
+    gCallHostWin64Observed[4] = e;
+    auto* const callerStack =
+        reinterpret_cast<volatile uint64_t*>(_AddressOfReturnAddress());
+    callerStack[5] = e ^ kCallHostWin64StackMutation;
+    return kCallHostWin64Result;
+}
+#elif defined(_M_IX86)
+constexpr uint32_t kCallHostX86StackMutation = 0x55AA33CCu;
+volatile uint32_t gCallHostX86Observed[3] = {};
+
+extern "C" __declspec(noinline) uint32_t __cdecl GateCallHostCdeclTarget(
+    uint32_t a,
+    uint32_t b)
+{
+    gCallHostX86Observed[0] = a;
+    gCallHostX86Observed[1] = b;
+    auto* const callerStack =
+        reinterpret_cast<volatile uint32_t*>(_AddressOfReturnAddress());
+    callerStack[1] = a ^ kCallHostX86StackMutation;
+    callerStack[2] = b + 0x1020304u;
+    return 0xCDEC1A11u;
+}
+
+extern "C" __declspec(noinline) uint32_t __stdcall GateCallHostStdcallTarget(
+    uint32_t a,
+    uint32_t b)
+{
+    gCallHostX86Observed[0] = a;
+    gCallHostX86Observed[1] = b;
+    auto* const callerStack =
+        reinterpret_cast<volatile uint32_t*>(_AddressOfReturnAddress());
+    callerStack[1] = a + 0x11111111u;
+    callerStack[2] = b ^ kCallHostX86StackMutation;
+    return 0x57DC0112u;
+}
+
+extern "C" __declspec(noinline) uint32_t __fastcall GateCallHostFastcallTarget(
+    uint32_t a,
+    uint32_t b,
+    uint32_t stackValue)
+{
+    gCallHostX86Observed[0] = a;
+    gCallHostX86Observed[1] = b;
+    gCallHostX86Observed[2] = stackValue;
+    auto* const callerStack =
+        reinterpret_cast<volatile uint32_t*>(_AddressOfReturnAddress());
+    callerStack[1] = stackValue ^ kCallHostX86StackMutation;
+    return 0xFA57CA11u;
+}
+
+extern "C" __declspec(naked) uint32_t __cdecl GateCallHostThiscallTarget() {
+    __asm {
+        mov eax, dword ptr [ecx]
+        mov dword ptr [gCallHostX86Observed], eax
+        mov eax, dword ptr [esp + 4]
+        mov dword ptr [gCallHostX86Observed + 4], eax
+        xor dword ptr [esp + 4], 055AA33CCh
+        mov eax, 07115CA11h
+        ret 4
+    }
+}
+
+extern "C" __declspec(noinline) uint32_t __stdcall GateCallHostAutoTarget(
+    uint32_t a)
+{
+    gCallHostX86Observed[0] = a;
+    auto* const callerStack =
+        reinterpret_cast<volatile uint32_t*>(_AddressOfReturnAddress());
+    callerStack[1] = a ^ kCallHostX86StackMutation;
+    return 0xA070CA11u;
+}
+#endif
+
+#if defined(_M_X64) || defined(_M_IX86)
+VM_MICRO_EXECUTION_CONTEXT ExecuteCallHostOnce(
+    const std::string& label,
+    VM_MICRO_CALL_KIND callKind,
+    uint64_t targetToken,
+    VM_CALL_ABI callAbi,
+    uint16_t stackArgumentBytes,
+    uint8_t strategy,
+    const std::array<uint64_t, 32>& initialGprs,
+    uint8_t* imageBase,
+    VM_METADATA_HEADER* metadata,
+    uint32_t expectedError,
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& bootstrapImage)
+{
+    const uint8_t addressWidth =
+        config.architecture == VMHandlerArchitecture::X64 ? 8u : 4u;
+    const auto variant = [&](VM_MICRO_OPCODE semantic) {
+        return CoreVariantForStrategy(config, semantic, strategy);
+    };
+    const std::vector<MicroInstruction> program = {
+        Uop(VM_UOP_PUSH_IMM,
+            {targetToken, addressWidth}, variant(VM_UOP_PUSH_IMM)),
+        Uop(VM_UOP_CALL_HOST,
+            {callKind, callAbi, stackArgumentBytes},
+            variant(VM_UOP_CALL_HOST)),
+        Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
+    };
+    const std::vector<uint8_t> bytecode =
+        EncodeStraightLineRuntimeProgram(program, encoding);
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+    for (uint8_t index = 0; index < registerMap.size(); ++index)
+        registerMap[index] = index;
+    alignas(64) VM_EXTENDED_STATE extendedState{};
+    CaptureCallHostExtendedState(extendedState);
+    VM_MICRO_EXECUTION_CONTEXT context = MakeRuntimeContext(
+        bytecode, encoding, config, registerMap, bootstrapImage,
+        initialGprs, VM_FLAG_FIXED_1 | VM_FLAG_IF | VM_FLAG_CF);
+    context.imageBase = reinterpret_cast<uintptr_t>(imageBase);
+    context.metadata = reinterpret_cast<uintptr_t>(metadata);
+    context.extendedState = reinterpret_cast<uintptr_t>(&extendedState);
+
+    const auto entry = reinterpret_cast<SynthEntry>(
+        loaded.Base() + result.contextEntryOffset);
+    DWORD exceptionCode = 0;
+    const uint32_t runtimeError =
+        InvokeSynthEntry(entry, &context, &exceptionCode);
+    Require(exceptionCode == 0 && runtimeError == expectedError &&
+            context.error == expectedError,
+        label + " CALL_HOST 执行边界错误: exception=" +
+            std::to_string(exceptionCode) + " runtime=" +
+            std::to_string(runtimeError) + " context=" +
+            std::to_string(context.error) + " semantic=" +
+            std::to_string(context.currentSemantic) + " variant=" +
+            std::to_string(context.currentVariant) + " address=" +
+            std::to_string(gLastExceptionAddress) + " bytes=" +
+            RuntimeByteWindow(loaded, result, gLastExceptionAddress));
+    if (expectedError == VM_MICRO_ERR_NONE) {
+        Require(context.halted == 1u && context.valueDepth == 0u &&
+                context.vip == context.bytecodeEnd,
+            label + " CALL_HOST 成功后未在顶层 RET 精确停机");
+    }
+    return context;
+}
+#endif
+
+void ExecuteCallHostVariantCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& bootstrapImage)
+{
+#if defined(_M_X64)
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+    CallHostTestImage callImage(
+        reinterpret_cast<uintptr_t>(&GateCallHostWin64Target));
+    for (uint8_t strategy : {0u, 1u}) {
+        alignas(16) std::array<uint8_t, 64> nativeStack{};
+        std::array<uint64_t, 32> nativeGprs{};
+        nativeGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        const auto nativeContext = ExecuteCallHostOnce(
+            "x64 native RVA strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_NATIVE_RVA, kCallHostNativeTargetRVA,
+            VM_ABI_WIN64, 0, strategy, nativeGprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result,
+            loaded, encoding, bootstrapImage);
+        Require(nativeContext.vregs[0] == CallHostTestImage::NativeResult() &&
+                nativeContext.vregs[4] == nativeGprs[4] &&
+                (nativeContext.virtualFlags & VM_FLAG_CF) == 0,
+            "x64 native-RVA CALL_HOST 未正确导入初始 CF、导出清零 CF，"
+            "或返回值/RSP 回写错误");
+        ExecuteCallHostOnce(
+            "x64 rejects x86 ABI strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostWin64Target),
+            VM_ABI_X86_CDECL, 0, strategy, nativeGprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_HANDLER_BUG, config, result,
+            loaded, encoding, bootstrapImage);
+
+        const auto runCallee = [&](VM_MICRO_CALL_KIND kind,
+                                   uint64_t token,
+                                   const char* kindName,
+                                   uint64_t salt) {
+            alignas(16) std::array<uint8_t, 64> guestStack{};
+            const uint64_t stackValue = 0x5152535455565758ULL ^ salt;
+            std::memcpy(guestStack.data() + 0x20,
+                &stackValue, sizeof(stackValue));
+            std::array<uint64_t, 32> gprs{};
+            gprs[1] = 0x1111222233334444ULL ^ salt;
+            gprs[2] = 0x5555666677778888ULL ^ salt;
+            gprs[8] = 0x9999AAAABBBBCCCCULL ^ salt;
+            gprs[9] = 0xDDDDEEEEFFFF0001ULL ^ salt;
+            gprs[4] = reinterpret_cast<uintptr_t>(guestStack.data());
+            for (auto& observed : gCallHostWin64Observed) observed = 0;
+            const auto context = ExecuteCallHostOnce(
+                std::string("x64 ") + kindName + " strategy=" +
+                    std::to_string(strategy),
+                kind, token, VM_ABI_WIN64, 8, strategy, gprs,
+                callImage.Base(), callImage.Metadata(), VM_MICRO_ERR_NONE,
+                config, result, loaded, encoding, bootstrapImage);
+            uint64_t mutatedStackValue = 0;
+            std::memcpy(&mutatedStackValue, guestStack.data() + 0x20,
+                sizeof(mutatedStackValue));
+            Require(context.vregs[0] == kCallHostWin64Result &&
+                    context.vregs[4] == gprs[4] &&
+                    gCallHostWin64Observed[0] == gprs[1] &&
+                    gCallHostWin64Observed[1] == gprs[2] &&
+                    gCallHostWin64Observed[2] == gprs[8] &&
+                    gCallHostWin64Observed[3] == gprs[9] &&
+                    gCallHostWin64Observed[4] == stackValue &&
+                    mutatedStackValue ==
+                        (stackValue ^ kCallHostWin64StackMutation),
+                std::string("x64 ") + kindName +
+                    " CALL_HOST 参数、返回值或栈参数回写错误");
+        };
+        runCallee(VM_MICRO_CALL_IMPORT_SLOT, kCallHostImportSlotRVA,
+            "import slot", 0x100u + strategy);
+        runCallee(VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostWin64Target),
+            "indirect", 0x200u + strategy);
+    }
+#elif defined(_M_IX86)
+    if (config.architecture != VMHandlerArchitecture::X86) return;
+    CallHostTestImage callImage(
+        reinterpret_cast<uintptr_t>(&GateCallHostCdeclTarget));
+    struct ThiscallObject { uint32_t marker; };
+    ThiscallObject thisObject{0x7150B1ECu};
+
+    for (uint8_t strategy : {0u, 1u}) {
+        const auto run = [&](const std::string& name,
+                             VM_MICRO_CALL_KIND kind,
+                             uint64_t token,
+                             VM_CALL_ABI abi,
+                             uint16_t stackBytes,
+                             uint32_t firstStack,
+                             uint32_t secondStack,
+                             uint32_t ecxInput,
+                             uint32_t edxInput,
+                             uint32_t expectedCleanup,
+                             uint32_t expectedReturn,
+                             uint32_t expectedFirstStack,
+                             uint32_t expectedSecondStack,
+                             uint32_t expectedObserved0,
+                             uint32_t expectedObserved1,
+                             uint32_t expectedObserved2,
+                             uint32_t expectedError = VM_MICRO_ERR_NONE) {
+            alignas(16) std::array<uint32_t, 8> guestStack{};
+            guestStack[0] = firstStack;
+            guestStack[1] = secondStack;
+            std::array<uint64_t, 32> gprs{};
+            gprs[1] = ecxInput;
+            gprs[2] = edxInput;
+            gprs[4] = reinterpret_cast<uintptr_t>(guestStack.data());
+            for (auto& observed : gCallHostX86Observed) observed = 0;
+            const auto context = ExecuteCallHostOnce(
+                name + " strategy=" + std::to_string(strategy),
+                kind, token, abi, stackBytes, strategy, gprs,
+                callImage.Base(), callImage.Metadata(), expectedError,
+                config, result, loaded, encoding, bootstrapImage);
+            Require(gCallHostX86Observed[0] == expectedObserved0 &&
+                    gCallHostX86Observed[1] == expectedObserved1 &&
+                    gCallHostX86Observed[2] == expectedObserved2 &&
+                    guestStack[0] == expectedFirstStack &&
+                    guestStack[1] == expectedSecondStack,
+                name + " CALL_HOST 参数或栈参数回写错误");
+            if (expectedError == VM_MICRO_ERR_NONE) {
+                Require(context.vregs[0] == expectedReturn &&
+                        context.vregs[4] == gprs[4] + expectedCleanup,
+                    name + " CALL_HOST 返回值或虚拟 ESP 清栈错误");
+            }
+        };
+
+        alignas(16) std::array<uint32_t, 4> nativeStack{};
+        std::array<uint64_t, 32> nativeGprs{};
+        nativeGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        const auto nativeContext = ExecuteCallHostOnce(
+            "x86 native RVA strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_NATIVE_RVA, kCallHostNativeTargetRVA,
+            VM_ABI_X86_CDECL, 0, strategy, nativeGprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result,
+            loaded, encoding, bootstrapImage);
+        Require(nativeContext.vregs[0] == CallHostTestImage::NativeResult() &&
+                nativeContext.vregs[4] == nativeGprs[4] &&
+                (nativeContext.virtualFlags & VM_FLAG_CF) == 0,
+            "x86 native-RVA CALL_HOST 未正确导入初始 CF、导出清零 CF，"
+            "或返回值/ESP 回写错误");
+        ExecuteCallHostOnce(
+            "x86 rejects null target strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT, 0, VM_ABI_X86_CDECL, 0, strategy,
+            nativeGprs, callImage.Base(), callImage.Metadata(),
+            VM_MICRO_ERR_HANDLER_BUG, config, result, loaded, encoding,
+            bootstrapImage);
+
+        constexpr uint32_t cdeclA = 0x10203040u;
+        constexpr uint32_t cdeclB = 0x50607080u;
+        run("x86 import cdecl", VM_MICRO_CALL_IMPORT_SLOT,
+            kCallHostImportSlotRVA, VM_ABI_X86_CDECL, 8,
+            cdeclA, cdeclB, 0, 0, 0, 0xCDEC1A11u,
+            cdeclA ^ kCallHostX86StackMutation,
+            cdeclB + 0x1020304u, cdeclA, cdeclB, 0);
+        run("x86 indirect cdecl", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostCdeclTarget),
+            VM_ABI_X86_CDECL, 8, cdeclA + strategy, cdeclB + strategy,
+            0, 0, 0, 0xCDEC1A11u,
+            (cdeclA + strategy) ^ kCallHostX86StackMutation,
+            cdeclB + strategy + 0x1020304u,
+            cdeclA + strategy, cdeclB + strategy, 0);
+
+        constexpr uint32_t stdcallA = 0x11224488u;
+        constexpr uint32_t stdcallB = 0x99AACCEEu;
+        run("x86 stdcall", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostStdcallTarget),
+            VM_ABI_X86_STDCALL, 8, stdcallA, stdcallB, 0, 0, 8,
+            0x57DC0112u, stdcallA + 0x11111111u,
+            stdcallB ^ kCallHostX86StackMutation,
+            stdcallA, stdcallB, 0);
+
+        constexpr uint32_t fastcallA = 0x13572468u;
+        constexpr uint32_t fastcallB = 0x24681357u;
+        constexpr uint32_t fastcallStack = 0xCAFEBABEu;
+        run("x86 fastcall", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostFastcallTarget),
+            VM_ABI_X86_FASTCALL, 4, fastcallStack, 0,
+            fastcallA, fastcallB, 4, 0xFA57CA11u,
+            fastcallStack ^ kCallHostX86StackMutation, 0,
+            fastcallA, fastcallB, fastcallStack);
+
+        constexpr uint32_t thiscallStack = 0x0BADF00Du;
+        run("x86 thiscall", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostThiscallTarget),
+            VM_ABI_X86_THISCALL, 4, thiscallStack, 0,
+            reinterpret_cast<uintptr_t>(&thisObject), 0, 4, 0x7115CA11u,
+            thiscallStack ^ kCallHostX86StackMutation, 0,
+            thisObject.marker, thiscallStack, 0);
+
+        constexpr uint32_t autoA = 0x31415926u;
+        run("x86 auto partial cleanup", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostAutoTarget),
+            VM_ABI_X86_AUTO, 8, autoA, 0xDEADBEEFu, 0, 0, 4,
+            0xA070CA11u, autoA ^ kCallHostX86StackMutation,
+            0xDEADBEEFu, autoA, 0, 0);
+
+        // The same RET 4 target is illegal under a declared cdecl contract.
+        // It must fail closed after the native effect instead of silently
+        // drifting the direct-threaded handler stack.
+        run("x86 cdecl cleanup mismatch", VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostAutoTarget),
+            VM_ABI_X86_CDECL, 8, autoA, 0xDEADBEEFu, 0, 0, 0, 0,
+            autoA ^ kCallHostX86StackMutation, 0xDEADBEEFu,
+            autoA, 0, 0, VM_MICRO_ERR_NATIVE_BRIDGE);
+    }
+#else
+    (void)config;
+    (void)result;
+    (void)loaded;
+    (void)encoding;
+    (void)bootstrapImage;
+#endif
+}
+
+void ExecuteExternalSemanticVariantCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    for (uint8_t strategy : {0u, 1u}) {
+        const uint8_t int3Variant = CoreVariantForStrategy(
+            config, VM_UOP_INT3, strategy);
+        const std::vector<MicroInstruction> int3Program = {
+            Uop(VM_UOP_INT3, {}, int3Variant),
+            Uop(VM_UOP_RET, {0}, 0),
+        };
+        const std::vector<uint8_t> int3Bytecode =
+            EncodeStraightLineRuntimeProgram(int3Program, encoding);
+        std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+        for (uint8_t index = 0; index < registerMap.size(); ++index)
+            registerMap[index] = index;
+        const std::array<uint64_t, 32> initialGprs{};
+        VM_MICRO_EXECUTION_CONTEXT int3Context = MakeRuntimeContext(
+            int3Bytecode, encoding, config, registerMap, testImage,
+            initialGprs, 0x202ULL);
+        const auto entry = reinterpret_cast<SynthEntry>(
+            loaded.Base() + result.contextEntryOffset);
+        DWORD exceptionCode = 0;
+        InvokeSynthEntry(entry, &int3Context, &exceptionCode);
+        Require(exceptionCode == EXCEPTION_BREAKPOINT,
+            "INT3 strategy=" + std::to_string(strategy) +
+            " 未产生等价 breakpoint 异常: " + std::to_string(exceptionCode));
+
+#if defined(_M_X64)
+        if (config.architecture == VMHandlerArchitecture::X64) {
+            constexpr uint32_t targetRva = 0x1000u;
+            const uint8_t bridgeVariant = CoreVariantForStrategy(
+                config, VM_UOP_BRIDGE_EXTENDED, strategy);
+            const std::vector<MicroInstruction> bridgeProgram = {
+                Uop(VM_UOP_BRIDGE_EXTENDED, {targetRva, 0, 0}, bridgeVariant),
+                Uop(VM_UOP_RET, {0}, 0),
+            };
+            const std::vector<uint8_t> bridgeBytecode =
+                EncodeStraightLineRuntimeProgram(bridgeProgram, encoding);
+            std::array<uint64_t, 32> bridgeGprs{};
+            bridgeGprs[0] = 0xFFEEDDCCBBAA9988ULL;
+            bridgeGprs[15] = 0x0102030405060708ULL;
+            VM_MICRO_EXECUTION_CONTEXT bridgeContext = MakeRuntimeContext(
+                bridgeBytecode, encoding, config, registerMap, testImage,
+                bridgeGprs, 0x202ULL);
+            bridgeContext.imageBase = reinterpret_cast<uintptr_t>(
+                &GateInstructionBridgeTarget) - targetRva;
+            exceptionCode = 0;
+            const uint32_t runtimeError = InvokeSynthEntry(
+                entry, &bridgeContext, &exceptionCode);
+            Require(exceptionCode == 0 && runtimeError == VM_MICRO_ERR_NONE &&
+                bridgeContext.error == VM_MICRO_ERR_NONE &&
+                bridgeContext.vregs[0] ==
+                    (bridgeGprs[0] ^ 0x1122334455667788ULL) &&
+                bridgeContext.vregs[15] ==
+                    bridgeGprs[15] + 0x1020304050607080ULL,
+                "BRIDGE_EXTENDED strategy=" + std::to_string(strategy) +
+                " 执行副作用不一致: exception=" +
+                std::to_string(exceptionCode) + " runtime=" +
+                std::to_string(runtimeError) + " context=" +
+                std::to_string(bridgeContext.error));
+        }
+#endif
+    }
+}
+
 void TestHostContextEntryExecution() {
 #if defined(_M_X64)
     constexpr VMHandlerArchitecture architecture = VMHandlerArchitecture::X64;
@@ -1066,15 +2109,43 @@ void TestHostContextEntryExecution() {
     ExecuteCriticalHandlerCase(false, config, result, loaded, encoding, testImage);
     std::cout << "[阶段] 惰性 flags 跨记录保留\n";
     ExecuteLazyPreservationCase(config, result, loaded, encoding, testImage);
-    const uint8_t wideWidth = architecture == VMHandlerArchitecture::X64 ? 8u : 4u;
-    std::cout << "[阶段] UDIV 真实 #DE\n";
-    ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 0, 1, 0, wideWidth,
+    std::cout << "[阶段] 数据/栈/内存全宽度双策略差分\n";
+    ExecuteDataAndStackVariantMatrix(
         config, result, loaded, encoding, testImage);
-    std::cout << "[阶段] IDIV 真实 #DE\n";
-    ExecuteDivideFaultCase(VM_UOP_IDIV_WIDE,
-        wideWidth == 8u ? 0x8000000000000000ULL : 0x80000000ULL,
-        0, wideWidth == 8u ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFULL,
-        wideWidth, config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] 算术/扩展/宽乘除全宽度双策略差分\n";
+    ExecuteArithmeticVariantMatrix(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] FLAGS 家族全宽度/下游组合双策略差分\n";
+    ExecuteFlagsVariantMatrix(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] 控制流函数首尾/恒真恒假双策略差分\n";
+    ExecuteControlFlowBoundaryMatrix(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] CALL_HOST 目标解析/ABI/栈回写双策略差分\n";
+    ExecuteCallHostVariantCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] BRIDGE_EXTENDED/INT3 外部效果双策略差分\n";
+    ExecuteExternalSemanticVariantCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] 宽除法全宽度/双策略真实 #DE\n";
+    const uint8_t addressWidth =
+        architecture == VMHandlerArchitecture::X64 ? 8u : 4u;
+    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+        if (width > addressWidth) continue;
+        const unsigned bits = width * 8u;
+        const uint64_t sign = uint64_t{1} << (bits - 1u);
+        for (uint8_t strategy : {0u, 1u}) {
+            // Divisor zero and quotient overflow are distinct inputs but the
+            // same architectural #DE boundary.  The signed overflow corpus is
+            // the smallest positive quotient that no longer fits width bits.
+            ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 0, 1, 0, width,
+                strategy, config, result, loaded, encoding, testImage);
+            ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 1, 0, 1, width,
+                strategy, config, result, loaded, encoding, testImage);
+            ExecuteDivideFaultCase(VM_UOP_IDIV_WIDE, 0, sign, 1, width,
+                strategy, config, result, loaded, encoding, testImage);
+        }
+    }
 }
 #endif
 

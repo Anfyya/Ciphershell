@@ -157,7 +157,7 @@ const std::vector<VMOpcodeDescriptor> kOpcodes = {
     D(VM_UOP_CALL_HOST, "CALL_HOST", VMOpcodeClass::Call, 1, 0,
       VM_MICRO_FLAGS_NONE, K3(VM_MICRO_OPERAND_CALL_KIND, VM_MICRO_OPERAND_U8,
                               VM_MICRO_OPERAND_U16), 3,
-      false, false, false, -1, false, false),
+      false, false, false, -1, true, true),
     D(VM_UOP_RET, "RET", VMOpcodeClass::ControlFlow, 0, 0,
       VM_MICRO_FLAGS_NONE, K1(VM_MICRO_OPERAND_U16), 1, false, false, true),
     D(VM_UOP_EXIT, "EXIT", VMOpcodeClass::ControlFlow, 0, 0,

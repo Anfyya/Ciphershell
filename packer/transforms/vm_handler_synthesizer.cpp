@@ -62,6 +62,19 @@ constexpr std::array<uint8_t, 8> kX64BridgeUnwindInfo = {
     static_cast<uint8_t>(kX64BridgeStackSize / 8u),
     static_cast<uint8_t>(kX64BridgeStackSize / 8u >> 8u)
 };
+constexpr uint32_t kX64NativeCallStackSize = 0x608u;
+static_assert((kX64NativeCallStackSize & 0xFu) == 8u &&
+        kX64NativeCallStackSize / 8u <= 0xFFFFu,
+    "native-call Win64 frame contract changed");
+constexpr std::array<uint8_t, 8> kX64NativeCallUnwindInfo = {
+    0x01,
+    0x07,
+    0x02,
+    0x00,
+    0x07, 0x01,
+    static_cast<uint8_t>(kX64NativeCallStackSize / 8u),
+    static_cast<uint8_t>(kX64NativeCallStackSize / 8u >> 8u)
+};
 constexpr std::array<uint8_t, 8> kX64CpuidUnwindInfo = {
     0x01,                               // version 1, no flags
     0x01,                               // PUSH RBX length
@@ -106,6 +119,11 @@ bool ExpectedSemanticStackFunclet(
         case VM_UOP_BRIDGE_EXTENDED:
             expected.kind = VMSynthesizedUnwindKind::StackAllocation;
             expected.stackBytes = kX64BridgeStackSize;
+            expected.prologSize = 7u;
+            return true;
+        case VM_UOP_CALL_HOST:
+            expected.kind = VMSynthesizedUnwindKind::StackAllocation;
+            expected.stackBytes = kX64NativeCallStackSize;
             expected.prologSize = 7u;
             return true;
         case VM_UOP_CPUID:
@@ -957,10 +975,13 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
         };
         uint32_t smallAllocUnwindOffset = 0;
         uint32_t bridgeUnwindOffset = 0;
+        uint32_t nativeCallUnwindOffset = 0;
         uint32_t cpuidUnwindOffset = 0;
         if (!appendUnwindInfo(kX64DirectTailUnwindInfo,
                 smallAllocUnwindOffset) ||
             !appendUnwindInfo(kX64BridgeUnwindInfo, bridgeUnwindOffset) ||
+            !appendUnwindInfo(kX64NativeCallUnwindInfo,
+                nativeCallUnwindOffset) ||
             !appendUnwindInfo(kX64CpuidUnwindInfo, cpuidUnwindOffset)) {
             result.error = "handler canonical xdata layout overflows";
             return result;
@@ -985,6 +1006,12 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
                        funclet.prologSize == 7u &&
                        funclet.nonvolatileRegister == 0) {
                 unwindOffset = bridgeUnwindOffset;
+            } else if (funclet.kind ==
+                           VMSynthesizedUnwindKind::StackAllocation &&
+                       funclet.stackBytes == kX64NativeCallStackSize &&
+                       funclet.prologSize == 7u &&
+                       funclet.nonvolatileRegister == 0) {
+                unwindOffset = nativeCallUnwindOffset;
             } else if (funclet.kind ==
                            VMSynthesizedUnwindKind::PushNonvolatile &&
                        funclet.stackBytes == 0 && funclet.prologSize == 1u &&
@@ -1159,7 +1186,12 @@ bool VMHandlerSynthesizer::Validate(
     std::set<std::pair<uint32_t, uint32_t>> handlerKeys;
     std::set<std::pair<uint32_t, uint32_t>> dispatchKeys;
     std::set<std::pair<uint32_t, uint32_t>> expectedTailUnwindRanges;
-    enum class HandlerUnwindEncoding : uint8_t { SmallAlloc, BridgeAlloc, PushRbx };
+    enum class HandlerUnwindEncoding : uint8_t {
+        SmallAlloc,
+        BridgeAlloc,
+        NativeCallAlloc,
+        PushRbx
+    };
     std::map<std::pair<uint32_t, uint32_t>, HandlerUnwindEncoding>
         expectedHandlerUnwindRanges;
     std::unordered_set<uint32_t> targets;
@@ -1251,6 +1283,24 @@ bool VMHandlerSynthesizer::Validate(
                 return false;
             }
             encoding = HandlerUnwindEncoding::BridgeAlloc;
+        } else if (funclet.kind ==
+                       VMSynthesizedUnwindKind::StackAllocation &&
+                   funclet.stackBytes == kX64NativeCallStackSize) {
+            constexpr std::array<uint8_t, 7> prolog = {
+                0x48,0x81,0xEC,0x08,0x06,0x00,0x00
+            };
+            constexpr std::array<uint8_t, 7> epilog = {
+                0x48,0x81,0xC4,0x08,0x06,0x00,0x00
+            };
+            constexpr std::array<uint8_t, 2> call = {0xFF,0xD0};
+            if (funclet.size < prolog.size() + epilog.size() + call.size() ||
+                !std::equal(prolog.begin(), prolog.end(), begin) ||
+                !std::equal(epilog.begin(), epilog.end(),
+                    end - static_cast<ptrdiff_t>(epilog.size())) ||
+                std::search(begin, end, call.begin(), call.end()) == end) {
+                return false;
+            }
+            encoding = HandlerUnwindEncoding::NativeCallAlloc;
         } else if (funclet.kind ==
                        VMSynthesizedUnwindKind::PushNonvolatile &&
                    funclet.nonvolatileRegister == 3u) {
@@ -1600,6 +1650,9 @@ bool VMHandlerSynthesizer::Validate(
             const auto* expectedInfo = &kX64DirectTailUnwindInfo;
             if (expectedEncoding->second == HandlerUnwindEncoding::BridgeAlloc)
                 expectedInfo = &kX64BridgeUnwindInfo;
+            else if (expectedEncoding->second ==
+                        HandlerUnwindEncoding::NativeCallAlloc)
+                expectedInfo = &kX64NativeCallUnwindInfo;
             else if (expectedEncoding->second == HandlerUnwindEncoding::PushRbx)
                 expectedInfo = &kX64CpuidUnwindInfo;
             if (expectedInfo->size() >

@@ -84,6 +84,42 @@ constexpr uint32_t kX64BridgeStateBase = 0x20u;
 constexpr uint32_t kX64BridgeStackBytes =
     kX64BridgeStateBase + sizeof(VM_INSTRUCTION_BRIDGE_STATE);
 constexpr uint8_t kX64BridgePrologSize = 7u;
+// CALL_HOST uses one unwind-covered frame for the flag-materializer call,
+// copied guest stack arguments, volatile-register spills, and an aligned host
+// XSAVE/FXSAVE image.  Handler entry is RSP==8 (mod 16), so the allocation is
+// also 8 (mod 16) and every nested Win64 call is aligned.
+constexpr uint32_t kX64NativeCallStackBytes = 0x608u;
+constexpr uint8_t kX64NativeCallPrologSize = 7u;
+constexpr uint32_t kNativeCallArgumentBase = 0x20u;
+constexpr uint32_t kNativeCallTargetSpill = 0x220u;
+constexpr uint32_t kNativeCallGuestStackSpill = 0x228u;
+constexpr uint32_t kNativeCallHostExtendedSpill = 0x230u;
+constexpr uint32_t kNativeCallFlagsSpill = 0x238u;
+constexpr uint32_t kNativeCallRaxSpill = 0x240u;
+constexpr uint32_t kNativeCallRcxSpill = 0x248u;
+constexpr uint32_t kNativeCallRdxSpill = 0x250u;
+constexpr uint32_t kNativeCallR8Spill = 0x258u;
+constexpr uint32_t kNativeCallR9Spill = 0x260u;
+constexpr uint32_t kNativeCallR10Spill = 0x268u;
+constexpr uint32_t kNativeCallR11Spill = 0x270u;
+constexpr uint32_t kNativeCallGuardSpill = 0x278u;
+constexpr uint32_t kNativeCallHostExtendedBase = 0x280u;
+constexpr uint32_t kX86NativeCallStackBytes = 0x5C0u;
+constexpr uint32_t kX86NativeCallTargetSpill = 0x200u;
+constexpr uint32_t kX86NativeCallGuestStackSpill = 0x204u;
+constexpr uint32_t kX86NativeCallHostExtendedSpill = 0x208u;
+constexpr uint32_t kX86NativeCallFlagsSpill = 0x20Cu;
+constexpr uint32_t kX86NativeCallEaxSpill = 0x210u;
+constexpr uint32_t kX86NativeCallEcxSpill = 0x214u;
+constexpr uint32_t kX86NativeCallEdxSpill = 0x218u;
+constexpr uint32_t kX86NativeCallCleanupSpill = 0x21Cu;
+constexpr uint32_t kX86NativeCallGuardSpill = 0x220u;
+constexpr uint32_t kX86NativeCallOriginalEbpSpill = 0x224u;
+constexpr uint32_t kX86NativeCallOriginalEbxSpill = 0x228u;
+constexpr uint32_t kX86NativeCallOriginalEsiSpill = 0x22Cu;
+constexpr uint32_t kX86NativeCallOriginalEdiSpill = 0x230u;
+constexpr uint32_t kX86NativeCallStatusSpill = 0x234u;
+constexpr uint32_t kX86NativeCallHostExtendedBase = 0x240u;
 constexpr uint8_t kX64CpuidPrologSize = 1u;
 constexpr uint8_t kX64RbxUnwindRegister = 3u;
 
@@ -92,6 +128,13 @@ static_assert((kX64BridgeStackBytes & 0xFu) == 8u,
 static_assert((kX64BridgeStackBytes % 8u) == 0u &&
         kX64BridgeStackBytes / 8u <= 0xFFFFu,
     "x64 bridge stack allocation no longer fits UWOP_ALLOC_LARGE");
+static_assert((kX64NativeCallStackBytes & 0xFu) == 8u &&
+        kNativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
+            kX64NativeCallStackBytes,
+    "x64 native-call frame layout or alignment changed");
+static_assert(kX86NativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
+        kX86NativeCallStackBytes,
+    "x86 native-call frame layout changed");
 
 void RecordX64StackFunclet(
     CodeBuffer& code,
@@ -164,6 +207,7 @@ constexpr uint32_t CtxCallDepth = CTX_OFFSET(callDepth);
 constexpr uint32_t CtxVip = CTX_OFFSET(vip);
 constexpr uint32_t CtxBytecodeBegin = CTX_OFFSET(bytecodeBegin);
 constexpr uint32_t CtxImageBase = CTX_OFFSET(imageBase);
+constexpr uint32_t CtxMetadata = CTX_OFFSET(metadata);
 constexpr uint32_t CtxRegisterMap = CTX_OFFSET(registerMap);
 constexpr uint32_t CtxFlagMaterializer = CTX_OFFSET(flagMaterializer);
 constexpr uint32_t CtxNativeFrame = CTX_OFFSET(nativeFrame);
@@ -390,8 +434,24 @@ SemanticMutationPlan DeriveSemanticMutationPlan(
 
 bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
     switch (semantic) {
+        case VM_UOP_PUSH_VREG:
+        case VM_UOP_PUSH_IMM:
+        case VM_UOP_PUSH_FLAGS:
+        case VM_UOP_PUSH_IP:
+        case VM_UOP_PUSH_IMAGE_BASE:
+        case VM_UOP_POP_VREG:
+        case VM_UOP_LOAD_TEMP:
+        case VM_UOP_STORE_TEMP:
+        case VM_UOP_DUP:
+        case VM_UOP_SWAP:
+        case VM_UOP_ROT:
+        case VM_UOP_DROP:
+        case VM_UOP_LOAD:
+        case VM_UOP_STORE:
         case VM_UOP_ADD:
+        case VM_UOP_ADD_CARRY:
         case VM_UOP_SUB:
+        case VM_UOP_SUB_BORROW:
         case VM_UOP_AND:
         case VM_UOP_OR:
         case VM_UOP_XOR:
@@ -403,6 +463,31 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
         case VM_UOP_BIT_RESET:
         case VM_UOP_SHL:
         case VM_UOP_SHR:
+        case VM_UOP_SAR:
+        case VM_UOP_ROL:
+        case VM_UOP_ROR:
+        case VM_UOP_BSWAP:
+        case VM_UOP_ZERO_EXTEND:
+        case VM_UOP_SIGN_EXTEND:
+        case VM_UOP_UMUL_WIDE:
+        case VM_UOP_SMUL_WIDE:
+        case VM_UOP_UDIV_WIDE:
+        case VM_UOP_IDIV_WIDE:
+        case VM_UOP_FLAGS_LAZY:
+        case VM_UOP_FLAGS_MATERIALIZE:
+        case VM_UOP_FLAGS_WRITE:
+        case VM_UOP_FLAGS_UPDATE:
+        case VM_UOP_FLAGS_PACK_AH:
+        case VM_UOP_FLAGS_UNPACK_AH:
+        case VM_UOP_PUSH_CONDITION:
+        case VM_UOP_SELECT:
+        case VM_UOP_BRANCH:
+        case VM_UOP_BRANCH_IF:
+        case VM_UOP_CALL_VM:
+        case VM_UOP_CALL_HOST:
+        case VM_UOP_RET:
+        case VM_UOP_BRIDGE_EXTENDED:
+        case VM_UOP_INT3:
             return true;
         default:
             return false;
@@ -412,8 +497,15 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
 uint8_t DeriveBusinessCoreStrategy(
     const VMHandlerSemanticCodegenConfig& config)
 {
-    return static_cast<uint8_t>(DeriveSemanticMutationPlan(
-        config, 0x434F524556415249ULL).strategy & 1u);
+    // Seed chooses which strategy variant 0 starts with; adjacent K variants
+    // then alternate.  The previous `%3` draw could map all four production
+    // variants of one semantic to the same core strategy, making the second
+    // implementation present in source but absent from an actual build.
+    VMHandlerSemanticCodegenConfig base = config;
+    base.variant = 0;
+    const uint8_t seedStart = static_cast<uint8_t>(DeriveSemanticMutationPlan(
+        base, 0x434F524556415249ULL).strategy & 1u);
+    return static_cast<uint8_t>(seedStart ^ (config.variant & 1u));
 }
 
 SemanticPathSpec SemanticInputPath(
@@ -772,6 +864,404 @@ void X86DispatchWidth(
     c.Jmp(labels.invalid);
 }
 
+// Defined with the remaining sized-register helpers below.  The K-variant
+// cores live before EmitBusinessCoreVariant so it can be re-emitted in
+// isolation by the validator.
+void X64ShiftImmediate(CodeBuffer& c, uint8_t group, uint8_t reg, uint8_t count);
+void X64ShiftCl(CodeBuffer& c, uint8_t group, uint8_t reg);
+
+void EmitX64ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X64DispatchWidth(c, 0, width);
+    c.Bind(width.width1);
+    if (strategy == 0u) c.Raw({0x90});
+    else c.Raw({0x25,0xFF,0x00,0x00,0x00});
+    c.Jmp(done);
+    c.Bind(width.width2);
+    if (strategy == 0u) {
+        c.Raw({0x66,0xC1,0xC0,0x08});
+    } else {
+        c.Raw({0x48,0x89,0xC2,0x48,0xC1,0xE0,0x08,
+               0x48,0xC1,0xEA,0x08,0x48,0x09,0xD0});
+    }
+    c.Jmp(done);
+    c.Bind(width.width4);
+    if (strategy == 0u) {
+        c.Raw({0x0F,0xC8});
+    } else {
+        c.Raw({0x48,0x89,0xC2,0x25,0xFF,0x00,0xFF,0x00,
+               0x48,0xC1,0xE0,0x08,0x48,0xC1,0xEA,0x08,
+               0x81,0xE2,0xFF,0x00,0xFF,0x00,0x48,0x09,0xD0,
+               0xC1,0xC0,0x10});
+    }
+    c.Jmp(done);
+    c.Bind(width.width8);
+    if (strategy == 0u) {
+        c.Raw({0x48,0x0F,0xC8});
+    } else {
+        X64MovRegister(c, 10, 0);
+        X64MovImmediate(c, 11, 0x00FF00FF00FF00FFULL);
+        X64BinaryRegister(c, 0x21, 0, 11); X64ShiftImmediate(c, 4, 0, 8);
+        X64ShiftImmediate(c, 5, 10, 8); X64BinaryRegister(c, 0x21, 10, 11);
+        X64BinaryRegister(c, 0x09, 0, 10);
+        X64MovRegister(c, 10, 0);
+        X64MovImmediate(c, 11, 0x0000FFFF0000FFFFULL);
+        X64BinaryRegister(c, 0x21, 0, 11); X64ShiftImmediate(c, 4, 0, 16);
+        X64ShiftImmediate(c, 5, 10, 16); X64BinaryRegister(c, 0x21, 10, 11);
+        X64BinaryRegister(c, 0x09, 0, 10);
+        c.Raw({0x48,0xC1,0xC0,0x20});
+    }
+    c.Jmp(done);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X86DispatchWidth(c, 0, width);
+    c.Bind(width.width1);
+    if (strategy == 0u) c.Raw({0x90});
+    else c.Raw({0x25,0xFF,0x00,0x00,0x00});
+    c.Jmp(done);
+    c.Bind(width.width2);
+    if (strategy == 0u) {
+        c.Raw({0x66,0xC1,0xC0,0x08});
+    } else {
+        c.Raw({0x89,0xC2,0xC1,0xE0,0x08,0xC1,0xEA,0x08,0x09,0xD0});
+    }
+    c.Jmp(done);
+    c.Bind(width.width4);
+    if (strategy == 0u) {
+        c.Raw({0x0F,0xC8});
+    } else {
+        c.Raw({0x89,0xC2,0x25,0xFF,0x00,0xFF,0x00,0xC1,0xE0,0x08,
+               0xC1,0xEA,0x08,0x81,0xE2,0xFF,0x00,0xFF,0x00,
+               0x09,0xD0,0xC1,0xC0,0x10});
+    }
+    c.Jmp(done);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX64ShiftRotateVariant(
+    CodeBuffer& c,
+    VM_MICRO_OPCODE semantic,
+    uint8_t strategy)
+{
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X64DispatchWidth(c, 0, width);
+    const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
+        c.Bind(label);
+        c.Raw({0x48,0x89,0xD1});
+        if (strategy == 0u) {
+            uint8_t modrm = semantic == VM_UOP_SAR ? 0xF8 :
+                (semantic == VM_UOP_ROL ? 0xC0 : 0xC8);
+            if (bytes == 1u) c.Raw({0xD2,modrm});
+            else {
+                if (bytes == 2u) c.U8(0x66);
+                if (bytes == 8u) c.U8(0x48);
+                c.Raw({0xD3,modrm});
+            }
+            if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
+            else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
+            else if (bytes == 4u) c.Raw({0x89,0xC0});
+        } else if (semantic == VM_UOP_SAR) {
+            const uint8_t left = static_cast<uint8_t>((8u - bytes) * 8u);
+            if (left != 0u) {
+                X64ShiftImmediate(c, 4, 0, left);
+                X64ShiftImmediate(c, 7, 0, left);
+            }
+            c.Raw({0x80,0xE1,static_cast<uint8_t>(bytes == 8u ? 0x3Fu : 0x1Fu)});
+            X64ShiftCl(c, 7, 0);
+        } else {
+            const uint8_t countMask = static_cast<uint8_t>(bytes * 8u - 1u);
+            c.Raw({0x80,0xE1,countMask,0x89,0xCA,0xF7,0xDA,
+                   0x83,0xE2,countMask});
+            X64MovRegister(c, 10, 0);
+            if (semantic == VM_UOP_ROL) {
+                if ((strategy & 1u) != 0u) {
+                    X64ShiftCl(c, 4, 0); c.Raw({0x89,0xD1});
+                    X64ShiftCl(c, 5, 10);
+                }
+            } else {
+                if ((strategy & 1u) != 0u) {
+                    X64ShiftCl(c, 5, 0); c.Raw({0x89,0xD1});
+                    X64ShiftCl(c, 4, 10);
+                }
+            }
+            X64BinaryRegister(c, 0x09, 0, 10);
+        }
+        c.Jmp(done);
+    };
+    emit(width.width1, 1u); emit(width.width2, 2u);
+    emit(width.width4, 4u); emit(width.width8, 8u);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX86ShiftRotateVariant(
+    CodeBuffer& c,
+    VM_MICRO_OPCODE semantic,
+    uint8_t strategy)
+{
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X86DispatchWidth(c, 0, width);
+    const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
+        c.Bind(label);
+        c.Raw({0x89,0xD1});
+        if (strategy == 0u) {
+            uint8_t modrm = semantic == VM_UOP_SAR ? 0xF8 :
+                (semantic == VM_UOP_ROL ? 0xC0 : 0xC8);
+            if (bytes == 1u) c.Raw({0xD2,modrm});
+            else {
+                if (bytes == 2u) c.U8(0x66);
+                c.Raw({0xD3,modrm});
+            }
+            if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
+            else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
+        } else if (semantic == VM_UOP_SAR) {
+            const uint8_t left = static_cast<uint8_t>((4u - bytes) * 8u);
+            if (left != 0u) c.Raw({0xC1,0xE0,left,0xC1,0xF8,left});
+            c.Raw({0x80,0xE1,0x1F,0xD3,0xF8});
+        } else {
+            const uint8_t countMask = static_cast<uint8_t>(bytes * 8u - 1u);
+            c.Raw({0x80,0xE1,countMask,0x89,0xCA,0xF7,0xDA,
+                   0x83,0xE2,countMask,0x89,0xC3});
+            if (semantic == VM_UOP_ROL) {
+                c.Raw({0xD3,0xE0,0x89,0xD1,0xD3,0xEB});
+            } else {
+                c.Raw({0xD3,0xE8,0x89,0xD1,0xD3,0xE3});
+            }
+            c.Raw({0x09,0xD8});
+        }
+        c.Jmp(done);
+    };
+    emit(width.width1, 1u); emit(width.width2, 2u); emit(width.width4, 4u);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX64ExtendVariant(CodeBuffer& c, bool signExtend, uint8_t strategy) {
+    X64LoadByte(c, 1, CtxDecodedOperands);
+    c.Raw({0xBA,0x08,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,
+           0x89,0xD1});
+    if (strategy == 0u) {
+        X64ShiftCl(c, 4, 0);
+        X64MovRegister(c, 1, 2);
+        X64ShiftCl(c, signExtend ? 7u : 5u, 0);
+    } else if (!signExtend) {
+        c.Raw({0x49,0xC7,0xC2,0xFF,0xFF,0xFF,0xFF});
+        X64ShiftCl(c, 5, 10); X64BinaryRegister(c, 0x21, 0, 10);
+    } else {
+        c.Raw({0x49,0xC7,0xC2,0xFF,0xFF,0xFF,0xFF});
+        X64ShiftCl(c, 5, 10); X64BinaryRegister(c, 0x21, 0, 10);
+        c.Raw({0x49,0xBB,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80});
+        X64ShiftCl(c, 5, 11); X64BinaryRegister(c, 0x31, 0, 11);
+        X64BinaryRegister(c, 0x29, 0, 11);
+    }
+}
+
+void EmitX86ExtendVariant(CodeBuffer& c, bool signExtend, uint8_t strategy) {
+    X86LoadByte(c, 1, CtxDecodedOperands);
+    c.Raw({0xBA,0x04,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,
+           0x89,0xD1});
+    if (strategy == 0u) {
+        c.Raw({0xD3,0xE0,0x89,0xD1,static_cast<uint8_t>(0xD3),
+               static_cast<uint8_t>(signExtend ? 0xF8 : 0xE8)});
+    } else if (!signExtend) {
+        c.Raw({0xBB,0xFF,0xFF,0xFF,0xFF,0xD3,0xEB,0x21,0xD8});
+    } else {
+        c.Raw({0xBB,0xFF,0xFF,0xFF,0xFF,0xD3,0xEB,0x21,0xD8,
+               0xBB,0x00,0x00,0x00,0x80,0xD3,0xEB,0x31,0xD8,0x29,0xD8});
+    }
+}
+
+void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    if (strategy == 0u) {
+        const auto merge = c.NewLabel();
+        const auto done = c.NewLabel();
+        X64LoadD(c, 8, CtxDecodedOperands + 24u);
+        c.Raw({0x45,0x85,0xC0}); c.Jcc(JccE, merge);
+        c.Jmp(done);
+        c.Bind(merge);
+        X64LoadD(c, 1, CtxDecodedOperands + 16u);
+        X64ShiftCl(c, 4, 0);
+        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
+        c.Raw({0x49,0xF7,0xD3});
+        X64LoadIndexedQ(c, 2, 10, CtxVregs);
+        X64BinaryRegister(c, 0x21, 2, 11);
+        X64BinaryRegister(c, 0x09, 0, 2);
+        c.Bind(done);
+    } else {
+        X64LoadD(c, 1, CtxDecodedOperands + 16u);
+        X64MovRegister(c, 2, 0); X64ShiftCl(c, 4, 2);
+        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
+        c.Raw({0x49,0xF7,0xD3});
+        X64LoadIndexedQ(c, 9, 10, CtxVregs);
+        X64BinaryRegister(c, 0x21, 9, 11);
+        X64BinaryRegister(c, 0x09, 2, 9);
+        X64LoadD(c, 8, CtxDecodedOperands + 24u);
+        c.Raw({0x45,0x85,0xC0,0x48,0x0F,0x44,0xC2});
+    }
+}
+
+void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    if (strategy == 0u) {
+        const auto merge = c.NewLabel();
+        const auto done = c.NewLabel();
+        X86LoadD(c, 3, CtxDecodedOperands + 24u);
+        c.Raw({0x85,0xDB}); c.Jcc(JccE, merge); c.Jmp(done);
+        c.Bind(merge);
+        X86LoadD(c, 1, CtxDecodedOperands + 16u);
+        c.Raw({0xD3,0xE0});
+        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
+        X86LoadIndexedDVariant(c, 6, 2, CtxVregs);
+        c.Raw({0x21,0xDE,0x09,0xF0});
+        c.Bind(done);
+    } else {
+        X86LoadD(c, 1, CtxDecodedOperands + 16u);
+        c.Raw({0x89,0xC6,0xD3,0xE6});
+        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
+        X86LoadIndexedDVariant(c, 0, 2, CtxVregs);
+        c.Raw({0x21,0xD8,0x09,0xC6});
+        X86LoadD(c, 0, CtxMutationScratch + 4u);
+        c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
+        X86LoadD(c, 3, CtxDecodedOperands + 24u);
+        c.Raw({0x85,0xDB,0x0F,0x44,0xC6});
+    }
+}
+
+void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X64DispatchWidth(c, 0, width);
+    const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
+        c.Bind(label);
+        if (strategy == 0u) {
+            if (!store) {
+                if (bytes == 1u) c.Raw({0x48,0x0F,0xB6,0x00});
+                else if (bytes == 2u) c.Raw({0x48,0x0F,0xB7,0x00});
+                else if (bytes == 4u) c.Raw({0x8B,0x00});
+                else c.Raw({0x48,0x8B,0x00});
+            } else {
+                if (bytes == 1u) c.Raw({0x88,0x10});
+                else if (bytes == 2u) c.Raw({0x66,0x89,0x10});
+                else if (bytes == 4u) c.Raw({0x89,0x10});
+                else c.Raw({0x48,0x89,0x10});
+            }
+        } else if (!store) {
+            if (bytes == 1u) c.Raw({0x45,0x31,0xD2,0x44,0x8A,0x10});
+            else if (bytes == 2u) c.Raw({0x45,0x31,0xD2,0x66,0x44,0x8B,0x10});
+            else if (bytes == 4u) c.Raw({0x44,0x8B,0x10});
+            else c.Raw({0x4C,0x8B,0x10});
+            X64MovRegister(c, 0, 10);
+        } else {
+            X64MovRegister(c, 10, 2);
+            if (bytes == 1u) c.Raw({0x44,0x88,0x10});
+            else if (bytes == 2u) c.Raw({0x66,0x44,0x89,0x10});
+            else if (bytes == 4u) c.Raw({0x44,0x89,0x10});
+            else c.Raw({0x4C,0x89,0x10});
+        }
+        c.Jmp(done);
+    };
+    emit(width.width1, 1u); emit(width.width2, 2u);
+    emit(width.width4, 4u); emit(width.width8, 8u);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX86MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
+    const WidthLabels width = MakeWidthLabels(c);
+    const auto done = c.NewLabel();
+    X86DispatchWidth(c, 0, width);
+    const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
+        c.Bind(label);
+        if (strategy == 0u) {
+            if (!store) {
+                if (bytes == 1u) c.Raw({0x0F,0xB6,0x00});
+                else if (bytes == 2u) c.Raw({0x0F,0xB7,0x00});
+                else c.Raw({0x8B,0x00});
+            } else {
+                if (bytes == 1u) c.Raw({0x88,0x10});
+                else if (bytes == 2u) c.Raw({0x66,0x89,0x10});
+                else c.Raw({0x89,0x10});
+            }
+        } else if (!store) {
+            if (bytes == 1u) c.Raw({0x31,0xD2,0x8A,0x10});
+            else if (bytes == 2u) c.Raw({0x31,0xD2,0x66,0x8B,0x10});
+            else c.Raw({0x8B,0x10});
+            c.Raw({0x89,0xD0});
+        } else {
+            c.Raw({0x89,0xD3});
+            if (bytes == 1u) c.Raw({0x88,0x18});
+            else if (bytes == 2u) c.Raw({0x66,0x89,0x18});
+            else c.Raw({0x89,0x18});
+        }
+        c.Jmp(done);
+    };
+    emit(width.width1, 1u); emit(width.width2, 2u); emit(width.width4, 4u);
+    c.Bind(width.invalid); c.Raw({0x0F,0x0B});
+    c.Bind(done);
+}
+
+void EmitX64CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
+    const auto nativeRva = c.NewLabel();
+    const auto importSlot = c.NewLabel();
+    const auto indirect = c.NewLabel();
+    const auto done = c.NewLabel();
+    X64LoadD(c, 1, CtxDecodedOperands);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
+    c.Raw({0x0F,0x0B});
+    c.Bind(nativeRva);
+    X64LoadQ(c, 2, CtxImageBase);
+    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+    else c.Raw({0x48,0x8D,0x04,0x10});
+    c.Jmp(done);
+    c.Bind(importSlot);
+    X64LoadQ(c, 2, CtxImageBase);
+    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+    else c.Raw({0x48,0x8D,0x04,0x10});
+    c.Raw({0x48,0x8B,0x00});
+    c.Jmp(done);
+    c.Bind(indirect);
+    if (strategy == 0u) X64MovRegister(c, 0, 0);
+    else c.Raw({0x48,0x8D,0x40,0x00});
+    c.Bind(done);
+}
+
+void EmitX86CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
+    const auto nativeRva = c.NewLabel();
+    const auto importSlot = c.NewLabel();
+    const auto indirect = c.NewLabel();
+    const auto done = c.NewLabel();
+    X86LoadD(c, 1, CtxDecodedOperands);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
+    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
+    c.Raw({0x0F,0x0B});
+    c.Bind(nativeRva);
+    X86LoadD(c, 2, CtxImageBase);
+    if (strategy == 0u) c.Raw({0x01,0xD0});
+    else c.Raw({0x8D,0x04,0x10});
+    c.Jmp(done);
+    c.Bind(importSlot);
+    X86LoadD(c, 2, CtxImageBase);
+    if (strategy == 0u) c.Raw({0x01,0xD0});
+    else c.Raw({0x8D,0x04,0x10});
+    c.Raw({0x8B,0x00});
+    c.Jmp(done);
+    c.Bind(indirect);
+    if (strategy == 0u) X86MovRegister(c, 0, 0);
+    else c.Raw({0x8D,0x40,0x00});
+    c.Bind(done);
+}
+
 bool EmitBusinessCoreVariant(
     CodeBuffer& c,
     bool x64,
@@ -781,15 +1271,113 @@ bool EmitBusinessCoreVariant(
     strategy &= 1u;
     if (x64) {
         switch (semantic) {
+            case VM_UOP_PUSH_FLAGS:
+                if (strategy == 0u) X64LoadQ(c, 0, CtxVirtualFlags);
+                else {
+                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags);
+                    c.Raw({0x49,0x8B,0x02});
+                }
+                return true;
+            case VM_UOP_PUSH_IP:
+                if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
+                else {
+                    c.Raw({0x48,0xF7,0xDA});
+                    X64BinaryRegister(c, 0x01, 0, 2);
+                }
+                return true;
+            case VM_UOP_PUSH_IMAGE_BASE:
+                if (strategy == 0u) X64LoadQ(c, 0, CtxImageBase);
+                else {
+                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxImageBase);
+                    c.Raw({0x49,0x8B,0x02});
+                }
+                return true;
+            case VM_UOP_PUSH_VREG:
+                if (strategy == 0u) X64ShiftCl(c, 5, 0);
+                else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAC,0xD0});
+                return true;
+            case VM_UOP_PUSH_IMM:
+                if (strategy == 0u) X64BinaryRegister(c, 0x21, 0, 9);
+                else {
+                    X64MovRegister(c, 10, 9); c.Raw({0x49,0xF7,0xD2,0x48,0xF7,0xD0});
+                    X64BinaryRegister(c, 0x09, 0, 10); c.Raw({0x48,0xF7,0xD0});
+                }
+                return true;
+            case VM_UOP_POP_VREG:
+                if (strategy == 0u) EmitX64PopVregVariant(c, 0u);
+                else EmitX64PopVregVariant(c, 1u);
+                return true;
+            case VM_UOP_LOAD_TEMP:
+                if (strategy == 0u) X64LoadIndexedQ(c, 0, 10, CtxTemps);
+                else {
+                    c.Raw({0x4F,0x8D,
+                        static_cast<uint8_t>(0x80u | (3u << 3u) | 4u),0xD7});
+                    c.U32(CtxTemps);
+                    c.Raw({0x49,0x8B,0x03});
+                }
+                return true;
+            case VM_UOP_STORE_TEMP:
+                if (strategy == 0u) X64StoreIndexedQ(c, CtxTemps, 10, 0);
+                else {
+                    c.Raw({0x4F,0x8D,
+                        static_cast<uint8_t>(0x80u | (3u << 3u) | 4u),0xD7});
+                    c.U32(CtxTemps);
+                    c.Raw({0x49,0x89,0x03});
+                }
+                return true;
+            case VM_UOP_DUP:
+                if (strategy == 0u) X64MovRegister(c, 2, 0);
+                else c.Raw({0x48,0x8D,0x10});
+                return true;
+            case VM_UOP_SWAP:
+                if (strategy == 0u) c.Raw({0x48,0x92});
+                else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
+                return true;
+            case VM_UOP_ROT:
+                if (strategy == 0u) {
+                    X64MovRegister(c, 10, 0); X64MovRegister(c, 0, 2);
+                    X64MovRegister(c, 2, 8); X64MovRegister(c, 8, 10);
+                } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
+                return true;
+            case VM_UOP_DROP:
+                if (strategy == 0u) c.Raw({0x31,0xC0});
+                else c.Raw({0x29,0xC0});
+                return true;
+            case VM_UOP_LOAD:
+                if (strategy == 0u) EmitX64MemoryVariant(c, false, 0u);
+                else EmitX64MemoryVariant(c, false, 1u);
+                return true;
+            case VM_UOP_STORE:
+                if (strategy == 0u) EmitX64MemoryVariant(c, true, 0u);
+                else EmitX64MemoryVariant(c, true, 1u);
+                return true;
             case VM_UOP_ADD:
                 if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
                 else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_ADD_CARRY:
+                if (strategy == 0u) {
+                    X64BinaryRegister(c, 0x01, 0, 2);
+                    X64BinaryRegister(c, 0x01, 0, 8);
+                } else {
+                    X64BinaryRegister(c, 0x01, 0, 8);
+                    X64BinaryRegister(c, 0x01, 0, 2);
+                }
                 return true;
             case VM_UOP_SUB:
                 if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
                 else {
                     c.Raw({0x48,0xF7,0xDA});
                     X64BinaryRegister(c, 0x01, 0, 2);
+                }
+                return true;
+            case VM_UOP_SUB_BORROW:
+                if (strategy == 0u) {
+                    X64BinaryRegister(c, 0x29, 0, 2);
+                    X64BinaryRegister(c, 0x29, 0, 8);
+                } else {
+                    X64BinaryRegister(c, 0x01, 2, 8);
+                    X64BinaryRegister(c, 0x29, 0, 2);
                 }
                 return true;
             case VM_UOP_AND:
@@ -939,19 +1527,274 @@ bool EmitBusinessCoreVariant(
                 else                c.Raw({0x4C,0x0F,0xAC,0xD0}); // shrd rax, r10, cl
                 return true;
             }
+            case VM_UOP_SAR:
+                if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
+                else EmitX64ShiftRotateVariant(c, semantic, 1u);
+                return true;
+            case VM_UOP_ROL:
+                if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
+                else EmitX64ShiftRotateVariant(c, semantic, 1u);
+                return true;
+            case VM_UOP_ROR:
+                if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
+                else EmitX64ShiftRotateVariant(c, semantic, 1u);
+                return true;
+            case VM_UOP_BSWAP:
+                if (strategy == 0u) EmitX64ByteSwapVariant(c, 0u);
+                else EmitX64ByteSwapVariant(c, 1u);
+                return true;
+            case VM_UOP_ZERO_EXTEND:
+                if (strategy == 0u) EmitX64ExtendVariant(c, false, 0u);
+                else EmitX64ExtendVariant(c, false, 1u);
+                return true;
+            case VM_UOP_SIGN_EXTEND:
+                if (strategy == 0u) EmitX64ExtendVariant(c, true, 0u);
+                else EmitX64ExtendVariant(c, true, 1u);
+                return true;
+            case VM_UOP_UMUL_WIDE:
+                if (strategy == 0u) c.Raw({0x49,0xF7,0xE1});
+                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xE2});
+                return true;
+            case VM_UOP_SMUL_WIDE:
+                if (strategy == 0u) c.Raw({0x49,0xF7,0xE9});
+                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xEA});
+                return true;
+            case VM_UOP_UDIV_WIDE:
+                if (strategy == 0u) c.Raw({0x49,0xF7,0xF1});
+                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xF2});
+                return true;
+            case VM_UOP_IDIV_WIDE:
+                if (strategy == 0u) c.Raw({0x49,0xF7,0xF9});
+                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xFA});
+                return true;
+            case VM_UOP_FLAGS_LAZY:
+                if (strategy == 0u) {
+                    for (uint32_t offset = 0; offset < 40u; offset += 8u) {
+                        X64LoadQ(c, 0, CtxLastAlu + offset);
+                        X64StoreQ(c, CtxPendingFlags + offset, 0);
+                    }
+                    X64LoadD(c, 0, CtxLastAlu + 40u);
+                    X64StoreD(c, CtxPendingFlags + 40u, 0);
+                } else {
+                    X64LoadD(c, 0, CtxLastAlu + 40u);
+                    X64StoreD(c, CtxPendingFlags + 40u, 0);
+                    for (uint32_t offset = 40u; offset != 0u; offset -= 8u) {
+                        X64LoadQ(c, 0, CtxLastAlu + offset - 8u);
+                        X64StoreQ(c, CtxPendingFlags + offset - 8u, 0);
+                    }
+                }
+                return true;
+            case VM_UOP_FLAGS_MATERIALIZE:
+                if (strategy == 0u) X64LoadD(c, 2, CtxDecodedOperands);
+                else X64LoadQ(c, 2, CtxDecodedOperands);
+                return true;
+            case VM_UOP_FLAGS_WRITE:
+                if (strategy == 0u) {
+                    X64MovRegister(c, 10, 1); c.Raw({0x49,0xF7,0xD2});
+                    X64BinaryRegister(c, 0x21, 0, 10);
+                    X64BinaryRegister(c, 0x21, 2, 1);
+                    X64BinaryRegister(c, 0x09, 0, 2);
+                } else {
+                    X64BinaryRegister(c, 0x31, 2, 0);
+                    X64BinaryRegister(c, 0x21, 2, 1);
+                    X64BinaryRegister(c, 0x31, 0, 2);
+                }
+                return true;
+            case VM_UOP_FLAGS_UPDATE: {
+                const auto clear = c.NewLabel();
+                const auto set = c.NewLabel();
+                const auto done = c.NewLabel();
+                c.Raw({0x85,0xC9}); c.Jcc(JccE, clear);
+                c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE, set);
+                if (strategy == 0u) {
+                    X64BinaryRegister(c, 0x31, 0, 2);
+                } else {
+                    X64MovRegister(c, 10, 0);
+                    X64BinaryRegister(c, 0x21, 10, 2);
+                    X64BinaryRegister(c, 0x09, 0, 2);
+                    X64BinaryRegister(c, 0x29, 0, 10);
+                }
+                c.Jmp(done);
+                c.Bind(clear);
+                if (strategy == 0u) {
+                    X64MovRegister(c, 10, 2); c.Raw({0x49,0xF7,0xD2});
+                    X64BinaryRegister(c, 0x21, 0, 10);
+                } else {
+                    X64MovRegister(c, 10, 0);
+                    X64BinaryRegister(c, 0x21, 10, 2);
+                    X64BinaryRegister(c, 0x29, 0, 10);
+                }
+                c.Jmp(done);
+                c.Bind(set);
+                if (strategy == 0u) {
+                    X64BinaryRegister(c, 0x09, 0, 2);
+                } else {
+                    X64MovRegister(c, 10, 0); c.Raw({0x49,0xF7,0xD2});
+                    X64BinaryRegister(c, 0x21, 10, 2);
+                    X64BinaryRegister(c, 0x01, 0, 10);
+                }
+                c.Bind(done);
+                return true;
+            }
+            case VM_UOP_FLAGS_PACK_AH:
+                if (strategy == 0u) {
+                    c.Raw({0xB8,0x02,0x00,0x00,0x00});
+                    constexpr uint8_t bits[] = {7u, 6u, 4u, 2u, 0u};
+                    for (uint8_t bit : bits) {
+                        X64MovRegister(c, 1, 2); X64ShiftImmediate(c, 5, 1, bit);
+                        c.Raw({0x83,0xE1,0x01});
+                        if (bit != 0u) c.Raw({0xC1,0xE1,bit});
+                        c.Raw({0x09,0xC8});
+                    }
+                } else {
+                    c.Raw({0x89,0xD0,0x25,0xD5,0x00,0x00,0x00,
+                           0x83,0xC8,0x02});
+                }
+                return true;
+            case VM_UOP_FLAGS_UNPACK_AH:
+                if (strategy == 0u) {
+                    c.Raw({0x48,0x81,0xE2});
+                    c.U32(~static_cast<uint32_t>(
+                        VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
+                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
+                    X64BinaryRegister(c, 0x09, 2, 0);
+                } else {
+                    X64BinaryRegister(c, 0x31, 0, 2);
+                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
+                    X64BinaryRegister(c, 0x31, 2, 0);
+                }
+                return true;
+            case VM_UOP_PUSH_CONDITION:
+                if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
+                else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
+                return true;
+            case VM_UOP_SELECT:
+                if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
+                else {
+                    X64MovRegister(c, 11, 10); c.Raw({0x49,0xF7,0xDB});
+                    X64BinaryRegister(c, 0x31, 2, 0);
+                    X64BinaryRegister(c, 0x21, 2, 11);
+                    X64BinaryRegister(c, 0x31, 0, 2);
+                }
+                return true;
+            case VM_UOP_BRANCH:
+                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+                else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_BRANCH_IF:
+                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+                else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_CALL_VM:
+                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+                else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_CALL_HOST:
+                if (strategy == 0u) EmitX64CallTargetVariant(c, 0u);
+                else EmitX64CallTargetVariant(c, 1u);
+                return true;
+            case VM_UOP_RET:
+                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+                else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_BRIDGE_EXTENDED:
+                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+                else c.Raw({0x48,0x8D,0x04,0x10});
+                return true;
+            case VM_UOP_INT3:
+                if (strategy == 0u) c.U8(0xCC);
+                else c.Raw({0xCD,0x03});
+                return true;
             default:
                 return false;
         }
     }
 
     switch (semantic) {
+        case VM_UOP_PUSH_FLAGS:
+            if (strategy == 0u) X86LoadD(c, 0, CtxVirtualFlags);
+            else {
+                c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags);
+                c.Raw({0x8B,0x02});
+            }
+            return true;
+        case VM_UOP_PUSH_IP:
+            if (strategy == 0u) c.Raw({0x29,0xD0});
+            else c.Raw({0xF7,0xDA,0x01,0xD0});
+            return true;
+        case VM_UOP_PUSH_IMAGE_BASE:
+            if (strategy == 0u) X86LoadD(c, 0, CtxImageBase);
+            else {
+                c.Raw({0x8D,0x97}); c.U32(CtxImageBase);
+                c.Raw({0x8B,0x02});
+            }
+            return true;
+        case VM_UOP_PUSH_VREG:
+            if (strategy == 0u) c.Raw({0xD3,0xE8});
+            else c.Raw({0x31,0xDB,0x0F,0xAC,0xD8});
+            return true;
+        case VM_UOP_PUSH_IMM:
+            if (strategy == 0u) { c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); }
+            else {
+                X86LoadD(c, 2, CtxMutationScratch); c.Raw({0xF7,0xD2,0xF7,0xD0,
+                    0x09,0xD0,0xF7,0xD0});
+            }
+            return true;
+        case VM_UOP_POP_VREG:
+            if (strategy == 0u) EmitX86PopVregVariant(c, 0u);
+            else EmitX86PopVregVariant(c, 1u);
+            return true;
+        case VM_UOP_LOAD_TEMP:
+            if (strategy == 0u) X86LoadIndexedD(c, 0, CtxTemps);
+            else {
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps); c.Raw({0x8B,0x02});
+            }
+            return true;
+        case VM_UOP_STORE_TEMP:
+            if (strategy == 0u) X86StoreIndexedD(c, CtxTemps, 0);
+            else {
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps); c.Raw({0x89,0x02});
+            }
+            return true;
+        case VM_UOP_DUP:
+            if (strategy == 0u) c.Raw({0x89,0xC2});
+            else c.Raw({0x8D,0x10});
+            return true;
+        case VM_UOP_SWAP:
+            if (strategy == 0u) c.Raw({0x92});
+            else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
+            return true;
+        case VM_UOP_ROT:
+            if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
+            else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
+            return true;
+        case VM_UOP_DROP:
+            if (strategy == 0u) c.Raw({0x31,0xC0});
+            else c.Raw({0x29,0xC0});
+            return true;
+        case VM_UOP_LOAD:
+            if (strategy == 0u) EmitX86MemoryVariant(c, false, 0u);
+            else EmitX86MemoryVariant(c, false, 1u);
+            return true;
+        case VM_UOP_STORE:
+            if (strategy == 0u) EmitX86MemoryVariant(c, true, 0u);
+            else EmitX86MemoryVariant(c, true, 1u);
+            return true;
         case VM_UOP_ADD:
             if (strategy == 0u) c.Raw({0x01,0xD0});
             else c.Raw({0x8D,0x04,0x10});
             return true;
+        case VM_UOP_ADD_CARRY:
+            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
+            else c.Raw({0x01,0xC8,0x01,0xD0});
+            return true;
         case VM_UOP_SUB:
             if (strategy == 0u) c.Raw({0x29,0xD0});
             else c.Raw({0xF7,0xDA,0x01,0xD0});
+            return true;
+        case VM_UOP_SUB_BORROW:
+            if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
+            else c.Raw({0x01,0xCA,0x29,0xD0});
             return true;
         case VM_UOP_AND:
             if (strategy == 0u) c.Raw({0x21,0xD0});
@@ -1064,9 +1907,166 @@ bool EmitBusinessCoreVariant(
             }
             return true;
         }
+        case VM_UOP_SAR:
+            if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
+            else EmitX86ShiftRotateVariant(c, semantic, 1u);
+            return true;
+        case VM_UOP_ROL:
+            if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
+            else EmitX86ShiftRotateVariant(c, semantic, 1u);
+            return true;
+        case VM_UOP_ROR:
+            if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
+            else EmitX86ShiftRotateVariant(c, semantic, 1u);
+            return true;
+        case VM_UOP_BSWAP:
+            if (strategy == 0u) EmitX86ByteSwapVariant(c, 0u);
+            else EmitX86ByteSwapVariant(c, 1u);
+            return true;
+        case VM_UOP_ZERO_EXTEND:
+            if (strategy == 0u) EmitX86ExtendVariant(c, false, 0u);
+            else EmitX86ExtendVariant(c, false, 1u);
+            return true;
+        case VM_UOP_SIGN_EXTEND:
+            if (strategy == 0u) EmitX86ExtendVariant(c, true, 0u);
+            else EmitX86ExtendVariant(c, true, 1u);
+            return true;
+        case VM_UOP_UMUL_WIDE:
+            if (strategy == 0u) c.Raw({0xF7,0xE1});
+            else c.Raw({0x89,0xCB,0xF7,0xE3});
+            return true;
+        case VM_UOP_SMUL_WIDE:
+            if (strategy == 0u) c.Raw({0xF7,0xE9});
+            else c.Raw({0x89,0xCB,0xF7,0xEB});
+            return true;
+        case VM_UOP_UDIV_WIDE:
+            if (strategy == 0u) c.Raw({0xF7,0xF1});
+            else c.Raw({0x89,0xCB,0xF7,0xF3});
+            return true;
+        case VM_UOP_IDIV_WIDE:
+            if (strategy == 0u) c.Raw({0xF7,0xF9});
+            else c.Raw({0x89,0xCB,0xF7,0xFB});
+            return true;
+        case VM_UOP_FLAGS_LAZY:
+            if (strategy == 0u) {
+                for (uint32_t offset = 0; offset < sizeof(VM_LAZY_FLAGS_RECORD);
+                     offset += 4u) {
+                    X86LoadD(c, 0, CtxLastAlu + offset);
+                    X86StoreD(c, CtxPendingFlags + offset, 0);
+                }
+            } else {
+                for (uint32_t offset = sizeof(VM_LAZY_FLAGS_RECORD);
+                     offset != 0u; offset -= 4u) {
+                    X86LoadD(c, 0, CtxLastAlu + offset - 4u);
+                    X86StoreD(c, CtxPendingFlags + offset - 4u, 0);
+                }
+            }
+            return true;
+        case VM_UOP_FLAGS_MATERIALIZE:
+            if (strategy == 0u) X86LoadD(c, 2, CtxDecodedOperands);
+            else { X86LoadD(c, 1, CtxDecodedOperands); c.Raw({0x89,0xCA}); }
+            return true;
+        case VM_UOP_FLAGS_WRITE:
+            if (strategy == 0u) {
+                c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
+                       0x21,0xCA,0x09,0xD0});
+            } else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
+            return true;
+        case VM_UOP_FLAGS_UPDATE: {
+            const auto clear = c.NewLabel();
+            const auto set = c.NewLabel();
+            const auto done = c.NewLabel();
+            c.Raw({0x85,0xC9}); c.Jcc(JccE, clear);
+            c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE, set);
+            if (strategy == 0u) c.Raw({0x31,0xD0});
+            else c.Raw({0x89,0xC3,0x21,0xD3,0x09,0xD0,0x29,0xD8});
+            c.Jmp(done);
+            c.Bind(clear);
+            if (strategy == 0u) c.Raw({0x89,0xD3,0xF7,0xD3,0x21,0xD8});
+            else c.Raw({0x89,0xC3,0x21,0xD3,0x29,0xD8});
+            c.Jmp(done);
+            c.Bind(set);
+            if (strategy == 0u) c.Raw({0x09,0xD0});
+            else c.Raw({0x89,0xC3,0xF7,0xD3,0x21,0xD3,0x01,0xD8});
+            c.Bind(done);
+            return true;
+        }
+        case VM_UOP_FLAGS_PACK_AH:
+            if (strategy == 0u) {
+                c.Raw({0xB8,0x02,0x00,0x00,0x00});
+                constexpr uint8_t bits[] = {7u, 6u, 4u, 2u, 0u};
+                for (uint8_t bit : bits) {
+                    c.Raw({0x89,0xD1,0xC1,0xE9,bit,0x83,0xE1,0x01});
+                    if (bit != 0u) c.Raw({0xC1,0xE1,bit});
+                    c.Raw({0x09,0xC8});
+                }
+            } else c.Raw({0x89,0xD0,0x25,0xD5,0x00,0x00,0x00,
+                          0x83,0xC8,0x02});
+            return true;
+        case VM_UOP_FLAGS_UNPACK_AH:
+            if (strategy == 0u) {
+                c.Raw({0x81,0xE2});
+                c.U32(~static_cast<uint32_t>(
+                    VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
+                c.Raw({0x25,0xD5,0x00,0x00,0x00,0x09,0xC2});
+            } else c.Raw({0x31,0xD0,0x25,0xD5,0x00,0x00,0x00,0x31,0xC2});
+            return true;
+        case VM_UOP_PUSH_CONDITION:
+            if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
+            else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
+            return true;
+        case VM_UOP_SELECT:
+            if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
+            else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
+            return true;
+        case VM_UOP_BRANCH:
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+            return true;
+        case VM_UOP_BRANCH_IF:
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+            return true;
+        case VM_UOP_CALL_VM:
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+            return true;
+        case VM_UOP_CALL_HOST:
+            if (strategy == 0u) EmitX86CallTargetVariant(c, 0u);
+            else EmitX86CallTargetVariant(c, 1u);
+            return true;
+        case VM_UOP_RET:
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+            return true;
+        case VM_UOP_BRIDGE_EXTENDED:
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+            return true;
+        case VM_UOP_INT3:
+            if (strategy == 0u) c.U8(0xCC);
+            else c.Raw({0xCD,0x03});
+            return true;
         default:
             return false;
     }
+}
+
+bool EmitTrackedBusinessCoreVariant(
+    CodeBuffer& c,
+    bool x64,
+    VM_MICRO_OPCODE semantic,
+    uint8_t strategy,
+    uint32_t& offset,
+    uint32_t& size)
+{
+    const uint32_t begin = static_cast<uint32_t>(c.bytes.size());
+    if (!EmitBusinessCoreVariant(c, x64, semantic, strategy)) return false;
+    if (size == 0u) {
+        offset = begin;
+        size = static_cast<uint32_t>(c.bytes.size()) - begin;
+    }
+    return true;
 }
 
 void EmitExecutableSeedJunk(
@@ -1426,6 +2426,32 @@ void X86CallFlagMaterializer(
     c.Raw({0xFF,0xD0,0x83,0xC4,0x08});
 }
 
+// The selected K core has already placed the requested mask in EDX.  Keeping
+// the canonical stack-adjust/call funclet here preserves x64 unwind coverage
+// while allowing the live mask data path itself to vary per build.
+void X64CallPreparedFlagMaterializer(
+    CodeBuffer& c,
+    CodeBuffer::Label failure)
+{
+    X64LoadQ(c, 0, CtxFlagMaterializer);
+    c.Raw({0x48,0x85,0xC0}); c.Jcc(JccE, failure);
+    c.Raw({0x4C,0x89,0xF9});
+    const size_t funcletBegin = c.bytes.size();
+    c.Raw({0x48,0x83,0xEC,0x28,0xFF,0xD0,0x48,0x83,0xC4,0x28});
+    RecordX64StackFunclet(c, funcletBegin,
+        VMHandlerSemanticUnwindKind::StackAllocation,
+        kX64FlagCallStackBytes, kX64FlagCallPrologSize);
+}
+
+void X86CallPreparedFlagMaterializer(
+    CodeBuffer& c,
+    CodeBuffer::Label failure)
+{
+    X86LoadD(c, 0, CtxFlagMaterializer);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, failure);
+    c.Raw({0x52,0x57,0xFF,0xD0,0x83,0xC4,0x08});
+}
+
 void X64CallFlagMaterializerForPreviousRecord(
     CodeBuffer& c,
     CodeBuffer::Label failure)
@@ -1687,6 +2713,7 @@ bool HasConcreteEmitter(VM_MICRO_OPCODE semantic) {
         case VM_UOP_BRANCH:
         case VM_UOP_BRANCH_IF:
         case VM_UOP_CALL_VM:
+        case VM_UOP_CALL_HOST:
         case VM_UOP_RET:
         case VM_UOP_EXIT:
         case VM_UOP_BRIDGE_EXTENDED:
@@ -1695,7 +2722,6 @@ bool HasConcreteEmitter(VM_MICRO_OPCODE semantic) {
         case VM_UOP_INT3:
             return true;
         case VM_UOP_TRAP:
-        case VM_UOP_CALL_HOST:
         case VM_UOP_COUNT:
         default:
             return false;
@@ -1721,6 +2747,11 @@ bool ExpectedX64StackFunclet(
             expected.kind = VMHandlerSemanticUnwindKind::StackAllocation;
             expected.stackBytes = kX64FlagCallStackBytes;
             expected.prologSize = kX64FlagCallPrologSize;
+            return true;
+        case VM_UOP_CALL_HOST:
+            expected.kind = VMHandlerSemanticUnwindKind::StackAllocation;
+            expected.stackBytes = kX64NativeCallStackBytes;
+            expected.prologSize = kX64NativeCallPrologSize;
             return true;
         case VM_UOP_BRIDGE_EXTENDED:
             expected.kind = VMHandlerSemanticUnwindKind::StackAllocation;
@@ -1862,7 +2893,10 @@ void EmitX64DataSemantic(
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     switch (semantic) {
         case VM_UOP_PUSH_VREG: {
@@ -1876,7 +2910,8 @@ void EmitX64DataSemantic(
                    0x83,0xFA,0x40});
             c.Jcc(JccA, rangeFailure);
             X64LoadIndexedQ(c, 0, 10, CtxVregs);
-            X64ShiftCl(c, 5, 0);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64MaskForWidthInR11(c);
             X64Binary(c, 0x21, 0, 9);
             X64PushOne(c, 0, stackFailure);
@@ -1885,19 +2920,27 @@ void EmitX64DataSemantic(
         case VM_UOP_PUSH_IMM:
             X64LoadQ(c, 0, CtxDecodedOperands);
             X64ValidateWidth(c, 1, widthFailure);
-            X64MaskForWidthInR11(c); X64Binary(c, 0x21, 0, 9);
+            X64MaskForWidthInR11(c);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_PUSH_FLAGS:
             X64CallFlagMaterializer(c, 0, false, 0, flagsFailure);
-            X64LoadQ(c, 0, CtxVirtualFlags); X64PushOne(c, 0, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_PUSH_IP:
             X64LoadQ(c, 0, CtxVip); X64LoadQ(c, 2, CtxBytecodeBegin);
-            X64Binary(c, 0x29, 0, 2); X64PushOne(c, 0, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_PUSH_IMAGE_BASE:
-            X64LoadQ(c, 0, CtxImageBase); X64PushOne(c, 0, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_POP_VREG: {
             X64RequireAndPop(c, 1, stackFailure);
@@ -1912,45 +2955,54 @@ void EmitX64DataSemantic(
             X64LoadQ(c, 0, CtxMutationScratch); X64Binary(c, 0x21, 0, 9);
             X64LoadD(c, 8, CtxDecodedOperands + 24u);
             c.Raw({0x41,0x83,0xF8,0x01}); c.Jcc(JccA, rangeFailure);
-            const auto merge = c.NewLabel(); const auto store = c.NewLabel();
-            c.Raw({0x45,0x85,0xC0}); c.Jcc(JccE, merge);
-            X64StoreIndexedQ(c, CtxVregs, 10, 0); c.Jmp(store);
-            c.Bind(merge);
-            X64LoadD(c, 1, CtxDecodedOperands + 16u);
-            X64ShiftCl(c, 4, 0);
-            X64Move(c, 8, 9); X64ShiftCl(c, 4, 8); X64Not(c, 8);
-            X64LoadIndexedQ(c, 2, 10, CtxVregs); X64Binary(c, 0x21, 2, 8);
-            X64Binary(c, 0x09, 0, 2); X64StoreIndexedQ(c, CtxVregs, 10, 0);
-            c.Bind(store);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64StoreIndexedQ(c, CtxVregs, 10, 0);
             return;
         }
         case VM_UOP_LOAD_TEMP:
             X64LoadD(c, 10, CtxDecodedOperands);
             c.Raw({0x41,0x83,0xFA,VM_RUNTIME_TEMP_COUNT}); c.Jcc(JccAE, rangeFailure);
-            X64LoadIndexedQ(c, 0, 10, CtxTemps); X64PushOne(c, 0, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_STORE_TEMP:
             X64RequireAndPop(c, 1, stackFailure); X64LoadD(c, 10, CtxDecodedOperands);
             c.Raw({0x41,0x83,0xFA,VM_RUNTIME_TEMP_COUNT}); c.Jcc(JccAE, rangeFailure);
-            X64StoreIndexedQ(c, CtxTemps, 10, 0); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize); return;
         case VM_UOP_DUP:
-            X64RequireAndPop(c, 1, stackFailure); X64PushTwo(c, 0, 0, stackFailure); return;
+            X64RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushTwo(c, 0, 2, stackFailure); return;
         case VM_UOP_SWAP:
-            X64RequireAndPop(c, 2, stackFailure); X64PushTwo(c, 2, 0, stackFailure); return;
+            X64RequireAndPop(c, 2, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushTwo(c, 0, 2, stackFailure); return;
         case VM_UOP_ROT:
             X64RequireAndPop(c, 3, stackFailure);
-            X64PushOne(c, 2, stackFailure); X64PushOne(c, 8, stackFailure);
-            X64PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure); X64PushOne(c, 2, stackFailure);
+            X64PushOne(c, 8, stackFailure); return;
         case VM_UOP_DROP:
-            X64RequireAndPop(c, 1, stackFailure); return;
+            X64RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize); return;
         case VM_UOP_LOAD:
             X64RequireAndPop(c, 1, stackFailure); X64ValidateWidth(c, 0, widthFailure);
             c.Raw({0x48,0x85,0xC0}); c.Jcc(JccE, rangeFailure);
-            X64LoadMemoryByWidth(c, widthFailure); X64PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure); return;
         case VM_UOP_STORE:
             X64RequireAndPop(c, 2, stackFailure); X64ValidateWidth(c, 0, widthFailure);
             c.Raw({0x48,0x85,0xC0}); c.Jcc(JccE, rangeFailure);
-            X64StoreMemoryByWidth(c, widthFailure); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize); return;
         default:
             return;
     }
@@ -1962,7 +3014,10 @@ void EmitX86DataSemantic(
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     switch (semantic) {
         case VM_UOP_PUSH_VREG:
@@ -1973,22 +3028,32 @@ void EmitX86DataSemantic(
             c.Raw({0x0F,0xB6,0x87}); c.U32(CtxDecodedOperands + 8u);
             c.Raw({0xC1,0xE0,0x03,0x01,0xC8,0x83,0xF8,0x20}); c.Jcc(JccA, rangeFailure);
             c.Raw({0x89,0xD1}); X86LoadIndexedD(c, 0, CtxVregs);
-            X86LoadD(c, 1, CtxDecodedOperands + 16u); c.Raw({0xD3,0xE8});
+            X86LoadD(c, 1, CtxDecodedOperands + 16u);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X86LoadByte(c, 1, CtxDecodedOperands + 8u); X86BuildMaskInScratch(c);
             c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
             X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_PUSH_IMM:
             X86LoadD(c, 0, CtxDecodedOperands); X86ValidateWidth(c, 1, widthFailure);
             X86LoadByte(c, 1, CtxDecodedOperands + 8u); X86BuildMaskInScratch(c);
-            c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_PUSH_FLAGS:
             X86CallFlagMaterializer(c, 0, false, 0, flagsFailure);
-            X86LoadD(c, 0, CtxVirtualFlags); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_PUSH_IP:
             X86LoadD(c, 0, CtxVip); X86LoadD(c, 2, CtxBytecodeBegin);
-            c.Raw({0x29,0xD0}); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_PUSH_IMAGE_BASE:
-            X86LoadD(c, 0, CtxImageBase); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_POP_VREG: {
             X86RequireAndPop(c, 1, stackFailure);
             X86StoreD(c, CtxMutationScratch + 4u, 0);
@@ -2003,47 +3068,55 @@ void EmitX86DataSemantic(
             c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
             X86LoadD(c, 1, CtxDecodedOperands + 24u);
             c.Raw({0x83,0xF9,0x01}); c.Jcc(JccA, rangeFailure);
-            const auto merge = c.NewLabel(); const auto done = c.NewLabel();
-            c.Raw({0x85,0xC9}); c.Jcc(JccE, merge);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             c.Raw({0x89,0xD1}); X86StoreIndexedD(c, CtxVregs, 0);
-            c.Raw({0xC7,0x84,0xCF}); c.U32(CtxVregs + 4u); c.U32(0); c.Jmp(done);
-            c.Bind(merge);
-            X86LoadD(c, 1, CtxDecodedOperands + 16u); c.Raw({0xD3,0xE0});
-            X86LoadD(c, 1, CtxMutationScratch); c.Raw({0xD3,0xE1,0xF7,0xD1});
-            c.Raw({0x89,0xD3,0x89,0xD1}); X86LoadIndexedD(c, 2, CtxVregs);
-            c.Raw({0x21,0xCA,0x09,0xD0,0x89,0xD9}); X86StoreIndexedD(c, CtxVregs, 0);
             c.Raw({0xC7,0x84,0xCF}); c.U32(CtxVregs + 4u); c.U32(0);
-            c.Bind(done); return;
+            return;
         }
         case VM_UOP_LOAD_TEMP:
             X86LoadD(c, 1, CtxDecodedOperands);
             c.Raw({0x83,0xF9,VM_RUNTIME_TEMP_COUNT}); c.Jcc(JccAE, rangeFailure);
-            X86LoadIndexedD(c, 0, CtxTemps); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_STORE_TEMP:
             X86RequireAndPop(c, 1, stackFailure); X86LoadD(c, 1, CtxDecodedOperands);
             c.Raw({0x83,0xF9,VM_RUNTIME_TEMP_COUNT}); c.Jcc(JccAE, rangeFailure);
-            X86StoreIndexedD(c, CtxTemps, 0);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             c.Raw({0xC7,0x84,0xCF}); c.U32(CtxTemps + 4u); c.U32(0); return;
         case VM_UOP_DUP:
-            X86RequireAndPop(c, 1, stackFailure); X86PushTwo(c, 0, 0, stackFailure); return;
+            X86RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushTwo(c, 0, 2, stackFailure); return;
         case VM_UOP_SWAP:
-            X86RequireAndPop(c, 2, stackFailure); X86PushTwo(c, 2, 0, stackFailure); return;
+            X86RequireAndPop(c, 2, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushTwo(c, 0, 2, stackFailure); return;
         case VM_UOP_ROT:
             X86RequireAndPop(c, 3, stackFailure);
-            X86StoreD(c, CtxMutationScratch, 1);       // c
-            X86StoreD(c, CtxMutationScratch + 4u, 0);  // a
-            X86PushOne(c, 2, stackFailure);
-            X86LoadD(c, 0, CtxMutationScratch); X86PushOne(c, 0, stackFailure);
-            X86LoadD(c, 0, CtxMutationScratch + 4u); X86PushOne(c, 0, stackFailure); return;
-        case VM_UOP_DROP: X86RequireAndPop(c, 1, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); X86PushOne(c, 2, stackFailure);
+            c.Raw({0x89,0xD8}); X86PushOne(c, 0, stackFailure); return;
+        case VM_UOP_DROP:
+            X86RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize); return;
         case VM_UOP_LOAD:
             X86RequireAndPop(c, 1, stackFailure); X86ValidateWidth(c, 0, widthFailure);
             c.Raw({0x85,0xC0}); c.Jcc(JccE, rangeFailure);
-            X86LoadMemoryByWidth(c, widthFailure); X86PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_STORE:
             X86RequireAndPop(c, 2, stackFailure); X86ValidateWidth(c, 0, widthFailure);
             c.Raw({0x85,0xC0}); c.Jcc(JccE, rangeFailure);
-            X86StoreMemoryByWidth(c, widthFailure); return;
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize); return;
         default: return;
     }
 }
@@ -2085,9 +3158,8 @@ void EmitX64BinaryAlu(
     X64StoreQ(c, RECORD_OFFSET(CtxLastAlu, b), 11);
     c.Raw({0x45,0x31,0xD2});                  // auxiliary = 0
     coreVariantOffset = static_cast<uint32_t>(c.bytes.size());
-    if (EmitBusinessCoreVariant(c, true, semantic, coreStrategy)) {
-        coreVariantSize = static_cast<uint32_t>(c.bytes.size()) -
-            coreVariantOffset;
+    if (EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize)) {
     } else {
         coreVariantOffset = 0;
         switch (semantic) {
@@ -2111,18 +3183,18 @@ void EmitX64CarryAlu(
     CodeBuffer& c,
     VM_MICRO_OPCODE semantic,
     CodeBuffer::Label stackFailure,
-    CodeBuffer::Label widthFailure)
+    CodeBuffer::Label widthFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X64RequireAndPop(c, 3, stackFailure);
     X64ValidateWidth(c, 0, widthFailure); X64MaskForWidthInR11(c);
     X64Binary(c, 0x21, 0, 9); X64Binary(c, 0x21, 2, 9);
     c.Raw({0x49,0x83,0xE0,0x01});
     X64Move(c, 10, 0); X64Move(c, 11, 2);
-    if (semantic == VM_UOP_ADD_CARRY) {
-        X64Binary(c, 0x01, 0, 2); X64Binary(c, 0x01, 0, 8);
-    } else {
-        X64Binary(c, 0x29, 0, 2); X64Binary(c, 0x29, 0, 8);
-    }
+    EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+        coreVariantOffset, coreVariantSize);
     X64Binary(c, 0x21, 0, 9);
     X64LoadByte(c, 1, CtxDecodedOperands);
     X64Latch(c, 10, 11, 0, 8, 1); X64PushOne(c, 0, stackFailure);
@@ -2140,9 +3212,8 @@ void EmitX64UnaryAlu(
     X64RequireAndPop(c, 1, stackFailure); X64ValidateWidth(c, 0, widthFailure);
     X64MaskForWidthInR11(c); X64Binary(c, 0x21, 0, 9); X64Move(c, 8, 0);
     coreVariantOffset = static_cast<uint32_t>(c.bytes.size());
-    if (EmitBusinessCoreVariant(c, true, semantic, coreStrategy)) {
-        coreVariantSize = static_cast<uint32_t>(c.bytes.size()) -
-            coreVariantOffset;
+    if (EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize)) {
     } else {
         coreVariantOffset = 0;
         const WidthLabels width = MakeWidthLabels(c); const auto done = c.NewLabel();
@@ -2163,7 +3234,10 @@ void EmitX64Extend(
     bool signExtend,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
-    CodeBuffer::Label rangeFailure)
+    CodeBuffer::Label rangeFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X64RequireAndPop(c, 1, stackFailure);
     X64ValidateWidth(c, 0, widthFailure); X64LoadByte(c, 10, CtxDecodedOperands);
@@ -2171,15 +3245,9 @@ void EmitX64Extend(
     c.Raw({0x45,0x39,0xDA}); c.Jcc(JccAE, rangeFailure);
     X64MaskForWidthInR11(c);                   // destination mask r9
     X64Move(c, 8, 0);
-    X64LoadByte(c, 1, CtxDecodedOperands);     // from width
-    c.Raw({0xBA,0x08,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,
-           0x89,0xD1});
-    if (signExtend) {
-        X64ShiftCl(c, 4, 0); X64Move(c, 1, 2); X64ShiftCl(c, 7, 0);
-    } else {
-        c.Raw({0x49,0xC7,0xC1,0xFF,0xFF,0xFF,0xFF}); X64ShiftCl(c, 5, 9);
-        X64Binary(c, 0x21, 0, 9);
-    }
+    EmitTrackedBusinessCoreVariant(c, true,
+        signExtend ? VM_UOP_SIGN_EXTEND : VM_UOP_ZERO_EXTEND,
+        coreStrategy, coreVariantOffset, coreVariantSize);
     X64LoadByte(c, 11, CtxDecodedOperands + 8u); X64MaskForWidthInR11(c);
     X64Binary(c, 0x21, 0, 9); c.Raw({0x31,0xD2,0x45,0x31,0xD2});
     X64LoadByte(c, 1, CtxDecodedOperands + 8u);
@@ -2190,7 +3258,10 @@ void EmitX64WideMultiply(
     CodeBuffer& c,
     bool signedMultiply,
     CodeBuffer::Label stackFailure,
-    CodeBuffer::Label widthFailure)
+    CodeBuffer::Label widthFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X64RequireAndPop(c, 2, stackFailure); X64ValidateWidth(c, 0, widthFailure);
     X64MaskForWidthInR11(c); X64Binary(c, 0x21, 0, 9); X64Binary(c, 0x21, 2, 9);
@@ -2204,8 +3275,10 @@ void EmitX64WideMultiply(
             if (bytes == 1u) c.Raw({0x48,0x0F,0xBE,0xC0,0x4D,0x0F,0xBE,0xC9});
             else if (bytes == 2u) c.Raw({0x48,0x0F,0xBF,0xC0,0x4D,0x0F,0xBF,0xC9});
             else c.Raw({0x48,0x63,0xC0,0x4D,0x63,0xC9});
-            c.Raw({0x49,0xF7,0xE9});
-        } else c.Raw({0x49,0xF7,0xE1});
+            EmitTrackedBusinessCoreVariant(c, true, VM_UOP_SMUL_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
+        } else EmitTrackedBusinessCoreVariant(c, true, VM_UOP_UMUL_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
         c.Raw({0x48,0x89,0xC2});
         c.Raw({0xB9}); c.U32(bytes * 8u); c.Raw({0x48,0xD3,0xEA});
         X64LoadByte(c, 11, CtxDecodedOperands); X64MaskForWidthInR11(c);
@@ -2213,7 +3286,9 @@ void EmitX64WideMultiply(
     };
     emitNarrow(width.width1,1); emitNarrow(width.width2,2); emitNarrow(width.width4,4);
     c.Bind(width.width8);
-    if (signedMultiply) c.Raw({0x49,0xF7,0xE9}); else c.Raw({0x49,0xF7,0xE1});
+    EmitTrackedBusinessCoreVariant(c, true,
+        signedMultiply ? VM_UOP_SMUL_WIDE : VM_UOP_UMUL_WIDE,
+        coreStrategy, coreVariantOffset, coreVariantSize);
     c.Jmp(finish);
     c.Bind(width.invalid); c.Jmp(widthFailure);
     c.Bind(product); c.Bind(split);
@@ -2227,7 +3302,10 @@ void EmitX64WideDivide(
     bool signedDivide,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
-    CodeBuffer::Label divideFailure)
+    CodeBuffer::Label divideFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X64RequireAndPop(c, 3, stackFailure);       // rax=high, rdx=low, r8=divisor
     X64ValidateWidth(c, 0, widthFailure); X64MaskForWidthInR11(c);
@@ -2251,10 +3329,14 @@ void EmitX64WideDivide(
             c.Raw({0x48,0xBA,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,
                    0x48,0x39,0xD0}); c.Jcc(JccNE, safe);
             c.Raw({0x49,0x83,0xF9,0xFF}); c.Jcc(JccE, divideFailure); c.Bind(safe);
-            c.Raw({0x48,0x99,0x49,0xF7,0xF9});
+            c.Raw({0x48,0x99});
+            EmitTrackedBusinessCoreVariant(c, true, VM_UOP_IDIV_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
         } else {
             c.Raw({0x4D,0x85,0xC9}); c.Jcc(JccE, divideFailure);
-            c.Raw({0x31,0xD2,0x49,0xF7,0xF1});
+            c.Raw({0x31,0xD2});
+            EmitTrackedBusinessCoreVariant(c, true, VM_UOP_UDIV_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
         }
         X64LoadByte(c, 11, CtxDecodedOperands); X64MaskForWidthInR11(c);
         if (signedDivide) {
@@ -2275,28 +3357,19 @@ void EmitX64WideDivide(
         c.Raw({0x4D,0x85,0xC9}); c.Jcc(JccE, divideFailure);
         c.Raw({0x4C,0x39,0xC8}); c.Jcc(JccAE, divideFailure);
         X64Move(c, 10, 0); X64Move(c, 0, 2); X64Move(c, 2, 10);
-        c.Raw({0x49,0xF7,0xF1});
+        EmitTrackedBusinessCoreVariant(c, true, VM_UOP_UDIV_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
     } else {
-        /* Signed 128/64 uses magnitudes, avoiding a host #DE. */
-        X64Move(c, 10, 0); X64Move(c, 11, 2); c.Raw({0x31,0xC9});
-        const auto dividendPositive = c.NewLabel(); const auto divisorPositive = c.NewLabel();
-        c.Raw({0x4D,0x85,0xD2}); c.Jcc(JccNS, dividendPositive);
-        c.Raw({0x83,0xC9,0x01}); X64Not(c, 10); X64Not(c, 11);
-        c.Raw({0x49,0x83,0xC3,0x01,0x49,0x83,0xD2,0x00}); c.Bind(dividendPositive);
-        c.Raw({0x4D,0x85,0xC9}); c.Jcc(JccNS, divisorPositive);
-        c.Raw({0x83,0xC9,0x02}); X64Neg(c, 9); c.Bind(divisorPositive);
         c.Raw({0x4D,0x85,0xC9}); c.Jcc(JccE, divideFailure);
-        c.Raw({0x4D,0x39,0xCA}); c.Jcc(JccAE, divideFailure);
-        X64Move(c, 0, 11); X64Move(c, 2, 10); c.Raw({0x49,0xF7,0xF1});
-        c.Raw({0x89,0xCE,0xC1,0xEE,0x01,0x31,0xCE,0x83,0xE6,0x01});
-        const auto qPositive = c.NewLabel(); const auto qRangeDone = c.NewLabel();
-        c.Raw({0x85,0xF6}); c.Jcc(JccE, qPositive);
-        c.Raw({0x49,0xB8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,
-               0x4C,0x39,0xC0}); c.Jcc(JccA, divideFailure); X64Neg(c, 0); c.Jmp(qRangeDone);
-        c.Bind(qPositive); c.Raw({0x48,0x85,0xC0}); c.Jcc(JccS, divideFailure);
-        c.Bind(qRangeDone);
-        c.Raw({0xF6,0xC1,0x01}); const auto remPositive = c.NewLabel();
-        c.Jcc(JccE, remPositive); X64Neg(c, 2); c.Bind(remPositive);
+        // The VM stack is unpacked as RAX=high,RDX=low; IDIV requires the
+        // opposite register placement RDX:RAX=high:low.  Keep the original
+        // signed bit pattern and only swap the halves here.  This is correct
+        // for the INT64_MIN divisor, whose magnitude cannot be represented as
+        // a positive int64.  Hardware #DE remains the required VM behavior for
+        // divisor zero and quotient overflow.
+        X64Move(c, 10, 0); X64Move(c, 0, 2); X64Move(c, 2, 10);
+        EmitTrackedBusinessCoreVariant(c, true, VM_UOP_IDIV_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
     }
     c.Jmp(finish);
     c.Bind(width.invalid); c.Jmp(widthFailure);
@@ -2320,9 +3393,8 @@ void EmitX86BinaryAlu(
     c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
     X86BeginLatch(c, 0, 2);
     coreVariantOffset = static_cast<uint32_t>(c.bytes.size());
-    if (EmitBusinessCoreVariant(c, false, semantic, coreStrategy)) {
-        coreVariantSize = static_cast<uint32_t>(c.bytes.size()) -
-            coreVariantOffset;
+    if (EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize)) {
     } else {
         coreVariantOffset = 0;
         switch (semantic) {
@@ -2348,7 +3420,10 @@ void EmitX86CarryAlu(
     CodeBuffer& c,
     VM_MICRO_OPCODE semantic,
     CodeBuffer::Label stackFailure,
-    CodeBuffer::Label widthFailure)
+    CodeBuffer::Label widthFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X86RequireAndPop(c, 3, stackFailure);       // eax=a, edx=b, ecx=carry
     X86StoreD(c, CtxMutationScratch + 4u, 1);
@@ -2359,8 +3434,8 @@ void EmitX86CarryAlu(
     c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
     X86BeginLatch(c, 0, 2);
     X86LoadD(c, 1, CtxMutationScratch + 4u); c.Raw({0x83,0xE1,0x01});
-    if (semantic == VM_UOP_ADD_CARRY) c.Raw({0x01,0xD0,0x01,0xC8});
-    else c.Raw({0x29,0xD0,0x29,0xC8});
+    EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+        coreVariantOffset, coreVariantSize);
     c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
     c.Raw({0x89,0xCA}); X86LoadByte(c, 1, CtxDecodedOperands);
     X86LatchFromStoredOperands(c, 0, 2, 1); X86PushOne(c, 0, stackFailure);
@@ -2380,9 +3455,8 @@ void EmitX86UnaryAlu(
     c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); c.Raw({0x31,0xD2});
     X86BeginLatch(c, 0, 2);
     coreVariantOffset = static_cast<uint32_t>(c.bytes.size());
-    if (EmitBusinessCoreVariant(c, false, semantic, coreStrategy)) {
-        coreVariantSize = static_cast<uint32_t>(c.bytes.size()) -
-            coreVariantOffset;
+    if (EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize)) {
     } else {
         coreVariantOffset = 0;
         const WidthLabels width = MakeWidthLabels(c); const auto done = c.NewLabel();
@@ -2402,19 +3476,19 @@ void EmitX86Extend(
     bool signExtend,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
-    CodeBuffer::Label rangeFailure)
+    CodeBuffer::Label rangeFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X86RequireAndPop(c, 1, stackFailure); X86StoreD(c, CtxMutationScratch + 4u, 0);
     X86ValidateWidth(c, 0, widthFailure); X86LoadByte(c, 2, CtxDecodedOperands);
     X86ValidateWidth(c, 1, widthFailure); X86LoadByte(c, 1, CtxDecodedOperands + 8u);
     c.Raw({0x39,0xCA}); c.Jcc(JccAE, rangeFailure);
     X86LoadD(c, 0, CtxMutationScratch + 4u); c.Raw({0x31,0xD2}); X86BeginLatch(c, 0, 2);
-    X86LoadByte(c, 1, CtxDecodedOperands);
-    c.Raw({0xBA,0x04,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,0x89,0xD1});
-    if (signExtend) c.Raw({0xD3,0xE0,0x89,0xD1,0xD3,0xF8});
-    else {
-        c.Raw({0xBA,0xFF,0xFF,0xFF,0xFF,0xD3,0xEA,0x21,0xD0});
-    }
+    EmitTrackedBusinessCoreVariant(c, false,
+        signExtend ? VM_UOP_SIGN_EXTEND : VM_UOP_ZERO_EXTEND,
+        coreStrategy, coreVariantOffset, coreVariantSize);
     X86LoadByte(c, 1, CtxDecodedOperands + 8u); X86BuildMaskInScratch(c);
     c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); c.Raw({0x31,0xD2});
     X86LoadByte(c, 1, CtxDecodedOperands + 8u);
@@ -2425,7 +3499,10 @@ void EmitX86WideMultiply(
     CodeBuffer& c,
     bool signedMultiply,
     CodeBuffer::Label stackFailure,
-    CodeBuffer::Label widthFailure)
+    CodeBuffer::Label widthFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X86RequireAndPop(c, 2, stackFailure); X86ValidateWidth(c, 0, widthFailure);
     X86LoadByte(c, 1, CtxDecodedOperands); X86BuildMaskInScratch(c);
@@ -2439,16 +3516,20 @@ void EmitX86WideMultiply(
         if (signedMultiply) {
             if (bytes == 1u) c.Raw({0x0F,0xBE,0xC0,0x0F,0xBE,0xC9});
             else c.Raw({0x0F,0xBF,0xC0,0x0F,0xBF,0xC9});
-            c.Raw({0xF7,0xE9});
-        } else c.Raw({0xF7,0xE1});
+            EmitTrackedBusinessCoreVariant(c, false, VM_UOP_SMUL_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
+        } else EmitTrackedBusinessCoreVariant(c, false, VM_UOP_UMUL_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
         c.Raw({0x89,0xC2,0xB9}); c.U32(bytes * 8u); c.Raw({0xD3,0xEA});
         X86LoadByte(c, 1, CtxDecodedOperands); X86BuildMaskInScratch(c);
         c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
         c.Jmp(finish);
     };
     narrow(width.width1,1); narrow(width.width2,2);
-    c.Bind(width.width4); X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b)); c.Raw(signedMultiply ?
-        std::initializer_list<uint8_t>{0xF7,0xE9} : std::initializer_list<uint8_t>{0xF7,0xE1});
+    c.Bind(width.width4); X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
+    EmitTrackedBusinessCoreVariant(c, false,
+        signedMultiply ? VM_UOP_SMUL_WIDE : VM_UOP_UMUL_WIDE,
+        coreStrategy, coreVariantOffset, coreVariantSize);
     c.Jmp(finish);
     c.Bind(width.invalid); c.Jmp(widthFailure); c.Bind(finish);
     X86LoadByte(c, 1, CtxDecodedOperands);
@@ -2460,7 +3541,10 @@ void EmitX86WideDivide(
     bool signedDivide,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
-    CodeBuffer::Label divideFailure)
+    CodeBuffer::Label divideFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     X86RequireAndPop(c, 3, stackFailure);       // eax=high, edx=low, ecx=divisor
     X86BeginLatch(c, 0, 1);                    // preserve high and divisor
@@ -2478,11 +3562,30 @@ void EmitX86WideDivide(
             if (bytes == 1u) c.Raw({0x0F,0xBF,0xC0,0x0F,0xBE,0xCB});
             else c.Raw({0x0F,0xBF,0xCB});
             c.Raw({0x85,0xC9}); c.Jcc(JccE, divideFailure);
-            c.Raw({0x99,0xF7,0xF9});
+            c.Raw({0x99});
+            EmitTrackedBusinessCoreVariant(c, false, VM_UOP_IDIV_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
         } else {
             c.Raw({0x85,0xC9}); c.Jcc(JccE, divideFailure);
-            c.Raw({0x31,0xD2,0xF7,0xF1});
+            c.Raw({0x31,0xD2});
+            EmitTrackedBusinessCoreVariant(c, false, VM_UOP_UDIV_WIDE,
+                coreStrategy, coreVariantOffset, coreVariantSize);
         }
+        // Native 32-bit DIV/IDIV only checks whether the quotient fits EAX;
+        // the VM operation additionally requires it to fit the requested
+        // 8/16-bit destination.  Compare the full quotient with its explicit
+        // zero/sign extension before truncating, so narrow overflow keeps the
+        // architectural #DE contract on x86 as it already does on x64.
+        if (bytes == 1u) {
+            c.Raw(signedDivide
+                ? std::initializer_list<uint8_t>{0x0F,0xBE,0xF0}
+                : std::initializer_list<uint8_t>{0x0F,0xB6,0xF0});
+        } else {
+            c.Raw(signedDivide
+                ? std::initializer_list<uint8_t>{0x0F,0xBF,0xF0}
+                : std::initializer_list<uint8_t>{0x0F,0xB7,0xF0});
+        }
+        c.Raw({0x39,0xC6}); c.Jcc(JccNE, divideFailure);
         X86LoadByte(c, 1, CtxDecodedOperands); X86BuildMaskInScratch(c);
         c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
         c.Jmp(finish);
@@ -2493,34 +3596,17 @@ void EmitX86WideDivide(
     c.Raw({0x85,0xC9}); c.Jcc(JccE, divideFailure);
     if (!signedDivide) {
         c.Raw({0x39,0xC8}); c.Jcc(JccAE, divideFailure);
-        c.Raw({0x89,0xC6,0x89,0xD0,0x89,0xF2,0xF7,0xF1});
+        c.Raw({0x89,0xC6,0x89,0xD0,0x89,0xF2});
+        EmitTrackedBusinessCoreVariant(c, false, VM_UOP_UDIV_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
     } else {
-        /* Magnitude precheck prevents native IDIV overflow. */
-        // EBP belongs to the x86 validation-entry frame and must survive the
-        // direct-threaded handler chain.  Save it around the signed-magnitude
-        // scratch use, including every branch to the intentional #DE path.
-        const auto signedFailure = c.NewLabel();
-        const auto signedDone = c.NewLabel();
-        c.Raw({0x55,0x89,0xC6,0x89,0xD3,0x31,0xED,0x85,0xF6});
-        const auto dp = c.NewLabel(); const auto sp = c.NewLabel();
-        c.Jcc(JccNS, dp); c.Raw({0x83,0xCD,0x01,0xF7,0xD6,0xF7,0xD3,
-                                 0x83,0xC3,0x01,0x83,0xD6,0x00}); c.Bind(dp);
-        c.Raw({0x85,0xC9}); c.Jcc(JccNS, sp); c.Raw({0x83,0xCD,0x02,0xF7,0xD9}); c.Bind(sp);
-        c.Raw({0x85,0xC9}); c.Jcc(JccE, signedFailure);
-        c.Raw({0x39,0xCE}); c.Jcc(JccAE, signedFailure);
-        c.Raw({0x89,0xD8,0x89,0xF2,0xF7,0xF1});
-        c.Raw({0x89,0xEE,0xD1,0xEE,0x31,0xEE,0x83,0xE6,0x01});
-        const auto qp = c.NewLabel(); const auto qdone = c.NewLabel();
-        c.Raw({0x85,0xF6}); c.Jcc(JccE, qp); c.Raw({0x3D,0x00,0x00,0x00,0x80});
-        c.Jcc(JccA, signedFailure); c.Raw({0xF7,0xD8}); c.Jmp(qdone);
-        c.Bind(qp); c.Raw({0x85,0xC0}); c.Jcc(JccS, signedFailure); c.Bind(qdone);
-        // F6 /0 cannot address BPL in 32-bit mode (r/m=5 is CH).  Test the
-        // saved dividend-sign bit as a full EBP value before signing remainder.
-        c.Raw({0xF7,0xC5,0x01,0x00,0x00,0x00});
-        const auto rp = c.NewLabel(); c.Jcc(JccE, rp);
-        c.Raw({0xF7,0xDA}); c.Bind(rp); c.Raw({0x5D}); c.Jmp(signedDone);
-        c.Bind(signedFailure); c.Raw({0x5D}); c.Jmp(divideFailure);
-        c.Bind(signedDone);
+        // The VM stack is unpacked as EAX=high,EDX=low; put the original
+        // signed halves in IDIV's required EDX:EAX=high:low order.  Direct
+        // IDIV preserves the INT32_MIN-divisor meaning and raises the
+        // architecturally required #DE for zero or quotient overflow.
+        c.Raw({0x89,0xC6,0x89,0xD0,0x89,0xF2});
+        EmitTrackedBusinessCoreVariant(c, false, VM_UOP_IDIV_WIDE,
+            coreStrategy, coreVariantOffset, coreVariantSize);
     }
     c.Jmp(finish);
     c.Bind(width.invalid); c.Jmp(widthFailure); c.Bind(finish);
@@ -2534,12 +3620,16 @@ void EmitX64FlagsSemantic(
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     switch (semantic) {
         case VM_UOP_PUSH_FLAGS:
             X64CallFlagMaterializer(c, 0, false, 0, flagsFailure);
-            X64LoadQ(c, 0, CtxVirtualFlags);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_FLAGS_LAZY: {
@@ -2555,7 +3645,8 @@ void EmitX64FlagsSemantic(
             c.Raw({0x89,0xC8,0x09,0xD0,0xA9});
             c.U32(~static_cast<uint32_t>(VM_FLAG_ARCHITECTURAL_MASK));
             c.Jcc(JccNE, flagsFailure); c.Raw({0x85,0xD1}); c.Jcc(JccNE, flagsFailure);
-            X64CopyRecord(c, CtxPendingFlags, CtxLastAlu);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64LoadByte(c, 0, CtxDecodedOperands); X64StoreByteRegister(c,
                 RECORD_OFFSET(CtxPendingFlags, operation), 0);
             X64LoadByte(c, 0, CtxDecodedOperands + 8u); X64StoreByteRegister(c,
@@ -2568,14 +3659,17 @@ void EmitX64FlagsSemantic(
             return;
         }
         case VM_UOP_FLAGS_MATERIALIZE:
-            X64CallFlagMaterializer(c, 0, false, 0, flagsFailure); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64CallPreparedFlagMaterializer(c, flagsFailure); return;
         case VM_UOP_FLAGS_WRITE: {
             X64RequireAndPop(c, 1, stackFailure); X64StoreQ(c, CtxMutationScratch, 0);
             X64CallFlagMaterializer(c, 0, true, VM_FLAG_ARCHITECTURAL_MASK, flagsFailure);
             X64LoadQ(c, 1, CtxDecodedOperands); X64LoadQ(c, 0, CtxVirtualFlags);
-            X64Move(c, 2, 1); X64Not(c, 2); X64Binary(c, 0x21, 0, 2);
-            X64LoadQ(c, 2, CtxMutationScratch); X64Binary(c, 0x21, 2, 1);
-            X64Binary(c, 0x09, 0, 2); X64StoreQ(c, CtxVirtualFlags, 0);
+            X64LoadQ(c, 2, CtxMutationScratch);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64StoreQ(c, CtxVirtualFlags, 0);
             X64StoreByteImmediate(c, RECORD_OFFSET(CtxPendingFlags, valid), 0); return;
         }
         case VM_UOP_FLAGS_UPDATE: {
@@ -2584,25 +3678,17 @@ void EmitX64FlagsSemantic(
             X64LoadD(c, 1, CtxDecodedOperands); c.Raw({0x83,0xF9,VM_FLAG_UPDATE_TOGGLE});
             c.Jcc(JccA, rangeFailure);
             X64LoadQ(c, 2, CtxDecodedOperands + 8u); X64LoadQ(c, 0, CtxVirtualFlags);
-            const auto clear = c.NewLabel(); const auto set = c.NewLabel(); const auto done = c.NewLabel();
-            c.Raw({0x85,0xC9}); c.Jcc(JccE, clear);
-            c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE, set);
-            X64Binary(c, 0x31, 0, 2); c.Jmp(done);
-            c.Bind(clear); X64Not(c, 2); X64Binary(c, 0x21, 0, 2); c.Jmp(done);
-            c.Bind(set); X64Binary(c, 0x09, 0, 2); c.Bind(done);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64StoreQ(c, CtxVirtualFlags, 0);
             X64StoreByteImmediate(c, RECORD_OFFSET(CtxPendingFlags, valid), 0); return;
         }
         case VM_UOP_FLAGS_PACK_AH: {
             X64CallFlagMaterializer(c, 0, true,
                 VM_FLAG_SF | VM_FLAG_ZF | VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF, flagsFailure);
-            X64LoadQ(c, 2, CtxVirtualFlags); c.Raw({0xB8,0x02,0x00,0x00,0x00});
-            const auto bit = [&](uint32_t source, uint8_t destination) {
-                X64Move(c, 1, 2); X64ShiftImmediate(c, 5, 1, static_cast<uint8_t>(source));
-                c.Raw({0x83,0xE1,0x01}); if (destination) c.Raw({0xC1,0xE1,destination});
-                c.Raw({0x09,0xC8});
-            };
-            bit(7,7); bit(6,6); bit(4,4); bit(2,2); bit(0,0);
+            X64LoadQ(c, 2, CtxVirtualFlags);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X64PushOne(c, 0, stackFailure); return;
         }
         case VM_UOP_FLAGS_UNPACK_AH: {
@@ -2610,23 +3696,24 @@ void EmitX64FlagsSemantic(
             X64CallFlagMaterializer(c, 0, true,
                 VM_FLAG_ARCHITECTURAL_MASK, flagsFailure);
             X64LoadQ(c, 0, CtxMutationScratch); X64LoadQ(c, 2, CtxVirtualFlags);
-            c.Raw({0x48,0x81,0xE2});
-            c.U32(~static_cast<uint32_t>(
-                VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-            X64Move(c, 1, 0); c.Raw({0x48,0x81,0xE1,0xD5,0x00,0x00,0x00});
-            X64Binary(c, 0x09, 2, 1); X64StoreQ(c, CtxVirtualFlags, 2);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64StoreQ(c, CtxVirtualFlags, 2);
             X64StoreByteImmediate(c, RECORD_OFFSET(CtxPendingFlags, valid), 0); return;
         }
         case VM_UOP_PUSH_CONDITION:
             X64CallFlagMaterializer(c, 0, true, VM_FLAG_STATUS_MASK, flagsFailure);
-            X64EvaluateCondition(c, 0, rangeFailure); X64PushOne(c, 0, stackFailure); return;
+            X64EvaluateCondition(c, 0, rangeFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure); return;
         case VM_UOP_SELECT: {
             X64CallFlagMaterializer(c, 0, true, VM_FLAG_STATUS_MASK, flagsFailure);
             X64EvaluateCondition(c, 0, rangeFailure); X64Move(c, 10, 0);
             X64RequireAndPop(c, 2, stackFailure);
-            c.Raw({0x45,0x85,0xD2}); const auto chooseA = c.NewLabel(); const auto chosen = c.NewLabel();
-            c.Jcc(JccE, chooseA); X64Move(c, 0, 2); c.Jmp(chosen);
-            c.Bind(chooseA); c.Bind(chosen); X64PushOne(c, 0, stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
+            X64PushOne(c, 0, stackFailure); return;
         }
         default: return;
     }
@@ -2638,12 +3725,16 @@ void EmitX86FlagsSemantic(
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label widthFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     switch (semantic) {
         case VM_UOP_PUSH_FLAGS:
             X86CallFlagMaterializer(c, 0, false, 0, flagsFailure);
-            X86LoadD(c, 0, CtxVirtualFlags);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X86PushOne(c, 0, stackFailure);
             return;
         case VM_UOP_FLAGS_LAZY:
@@ -2656,57 +3747,64 @@ void EmitX86FlagsSemantic(
             c.Raw({0x89,0xC8,0x09,0xD0,0xA9});
             c.U32(~static_cast<uint32_t>(VM_FLAG_ARCHITECTURAL_MASK));
             c.Jcc(JccNE, flagsFailure);
-            c.Raw({0x85,0xD1}); c.Jcc(JccNE, flagsFailure); X86CopyRecord(c, CtxPendingFlags, CtxLastAlu);
+            c.Raw({0x85,0xD1}); c.Jcc(JccNE, flagsFailure);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             X86LoadByte(c, 0, CtxDecodedOperands); X86StoreByteRegister(c, RECORD_OFFSET(CtxPendingFlags, operation), 0);
             X86LoadByte(c, 0, CtxDecodedOperands + 8u); X86StoreByteRegister(c, RECORD_OFFSET(CtxPendingFlags, width), 0);
             X86LoadD(c, 0, CtxDecodedOperands + 16u); X86StoreD(c, RECORD_OFFSET(CtxPendingFlags, definedMask), 0);
             X86LoadD(c, 0, CtxDecodedOperands + 24u); X86StoreD(c, RECORD_OFFSET(CtxPendingFlags, preserveMask), 0);
             X86StoreByteImmediate(c, RECORD_OFFSET(CtxPendingFlags, valid), 1); return;
-        case VM_UOP_FLAGS_MATERIALIZE: X86CallFlagMaterializer(c,0,false,0,flagsFailure); return;
+        case VM_UOP_FLAGS_MATERIALIZE:
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86CallPreparedFlagMaterializer(c,flagsFailure); return;
         case VM_UOP_FLAGS_WRITE:
             X86RequireAndPop(c,1,stackFailure); X86StoreD(c,CtxMutationScratch,0);
             X86CallFlagMaterializer(c,0,true,VM_FLAG_ARCHITECTURAL_MASK,flagsFailure);
             X86LoadD(c,1,CtxDecodedOperands); X86LoadD(c,0,CtxVirtualFlags);
-            c.Raw({0x89,0xCA,0xF7,0xD2,0x21,0xD0}); X86LoadD(c,2,CtxMutationScratch);
-            c.Raw({0x21,0xCA,0x09,0xD0}); X86StoreD(c,CtxVirtualFlags,0);
+            X86LoadD(c,2,CtxMutationScratch);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86StoreD(c,CtxVirtualFlags,0);
             X86StoreByteImmediate(c,RECORD_OFFSET(CtxPendingFlags,valid),0); return;
         case VM_UOP_FLAGS_UPDATE: {
             X86CallFlagMaterializer(c,0,true,VM_FLAG_ARCHITECTURAL_MASK,flagsFailure);
             X86LoadD(c,1,CtxDecodedOperands);
             c.Raw({0x83,0xF9,VM_FLAG_UPDATE_TOGGLE}); c.Jcc(JccA,rangeFailure);
             X86LoadD(c,2,CtxDecodedOperands+8u); X86LoadD(c,0,CtxVirtualFlags);
-            const auto clear=c.NewLabel(), set=c.NewLabel(), done=c.NewLabel();
-            c.Raw({0x85,0xC9}); c.Jcc(JccE,clear); c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE,set);
-            c.Raw({0x31,0xD0}); c.Jmp(done); c.Bind(clear); c.Raw({0xF7,0xD2,0x21,0xD0}); c.Jmp(done);
-            c.Bind(set); c.Raw({0x09,0xD0}); c.Bind(done); X86StoreD(c,CtxVirtualFlags,0);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86StoreD(c,CtxVirtualFlags,0);
             X86StoreByteImmediate(c,RECORD_OFFSET(CtxPendingFlags,valid),0); return;
         }
         case VM_UOP_FLAGS_PACK_AH:
             X86CallFlagMaterializer(c,0,true,VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF,flagsFailure);
-            X86LoadD(c,2,CtxVirtualFlags); c.Raw({0xB8,0x02,0x00,0x00,0x00});
-            c.Raw({0x89,0xD1,0xC1,0xE9,0x07,0x83,0xE1,0x01,0xC1,0xE1,0x07,0x09,0xC8,
-                   0x89,0xD1,0xC1,0xE9,0x06,0x83,0xE1,0x01,0xC1,0xE1,0x06,0x09,0xC8,
-                   0x89,0xD1,0xC1,0xE9,0x04,0x83,0xE1,0x01,0xC1,0xE1,0x04,0x09,0xC8,
-                   0x89,0xD1,0xC1,0xE9,0x02,0x83,0xE1,0x01,0xC1,0xE1,0x02,0x09,0xC8,
-                   0x83,0xE2,0x01,0x09,0xD0}); X86PushOne(c,0,stackFailure); return;
+            X86LoadD(c,2,CtxVirtualFlags);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86PushOne(c,0,stackFailure); return;
         case VM_UOP_FLAGS_UNPACK_AH:
             X86RequireAndPop(c,1,stackFailure); X86StoreD(c,CtxMutationScratch,0);
             X86CallFlagMaterializer(c,0,true,VM_FLAG_ARCHITECTURAL_MASK,flagsFailure);
             X86LoadD(c,0,CtxMutationScratch); X86LoadD(c,2,CtxVirtualFlags);
-            c.Raw({0x81,0xE2});
-            c.U32(~static_cast<uint32_t>(
-                VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-            c.Raw({0x25,0xD5,0x00,0x00,0x00,0x09,0xC2}); X86StoreD(c,CtxVirtualFlags,2);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86StoreD(c,CtxVirtualFlags,2);
             X86StoreByteImmediate(c,RECORD_OFFSET(CtxPendingFlags,valid),0); return;
         case VM_UOP_PUSH_CONDITION:
             X86CallFlagMaterializer(c,0,true,VM_FLAG_STATUS_MASK,flagsFailure);
-            X86EvaluateCondition(c,0,rangeFailure); X86PushOne(c,0,stackFailure); return;
+            X86EvaluateCondition(c,0,rangeFailure);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86PushOne(c,0,stackFailure); return;
         case VM_UOP_SELECT: {
             X86CallFlagMaterializer(c,0,true,VM_FLAG_STATUS_MASK,flagsFailure);
             X86EvaluateCondition(c,0,rangeFailure); X86StoreD(c,CtxMutationScratch,0);
             X86RequireAndPop(c,2,stackFailure); X86LoadD(c,1,CtxMutationScratch);
-            c.Raw({0x85,0xC9}); const auto chooseA=c.NewLabel(),chosen=c.NewLabel(); c.Jcc(JccE,chooseA);
-            c.Raw({0x89,0xD0}); c.Jmp(chosen); c.Bind(chooseA); c.Bind(chosen); X86PushOne(c,0,stackFailure); return;
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize);
+            X86PushOne(c,0,stackFailure); return;
         }
         default:return;
     }
@@ -2717,29 +3815,38 @@ void EmitX64ControlSemantic(
     VM_MICRO_OPCODE semantic,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     (void)stackFailure;
     switch (semantic) {
         case VM_UOP_BRANCH:
             X64LoadQ(c,0,CtxBytecodeBegin); X64LoadD(c,2,CtxDecodedOperands);
-            X64Binary(c,0x01,0,2); X64StoreQ(c,CtxVip,0); return;
+            EmitTrackedBusinessCoreVariant(c,true,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize); X64StoreQ(c,CtxVip,0); return;
         case VM_UOP_BRANCH_IF: {
             X64CallFlagMaterializer(c,0,true,VM_FLAG_STATUS_MASK,flagsFailure);
             X64EvaluateCondition(c,0,rangeFailure); c.Raw({0x85,0xC0}); const auto done=c.NewLabel(); c.Jcc(JccE,done);
             X64LoadQ(c,0,CtxBytecodeBegin); X64LoadD(c,2,CtxDecodedOperands+8u);
-            X64Binary(c,0x01,0,2); X64StoreQ(c,CtxVip,0); c.Bind(done); return;
+            EmitTrackedBusinessCoreVariant(c,true,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize); X64StoreQ(c,CtxVip,0); c.Bind(done); return;
         }
         case VM_UOP_CALL_VM: {
             X64LoadD(c,1,CtxCallDepth); c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_CALL_DEPTH); c.Jcc(JccAE,rangeFailure);
             X64LoadQ(c,0,CtxVip); X64LoadQ(c,2,CtxBytecodeBegin); X64Binary(c,0x29,0,2);
             c.Raw({0x41,0x89,0x84,0x8F}); c.U32(CtxCallStack); c.Raw({0xFF,0xC1}); X64StoreD(c,CtxCallDepth,1);
-            X64LoadQ(c,0,CtxBytecodeBegin); X64LoadD(c,2,CtxDecodedOperands); X64Binary(c,0x01,0,2); X64StoreQ(c,CtxVip,0); return;
+            X64LoadQ(c,0,CtxBytecodeBegin); X64LoadD(c,2,CtxDecodedOperands);
+            EmitTrackedBusinessCoreVariant(c,true,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize); X64StoreQ(c,CtxVip,0); return;
         }
         case VM_UOP_RET: {
             X64LoadD(c,1,CtxCallDepth); c.Raw({0x85,0xC9}); const auto top=c.NewLabel(),done=c.NewLabel(); c.Jcc(JccE,top);
             c.Raw({0xFF,0xC9}); X64StoreD(c,CtxCallDepth,1); c.Raw({0x41,0x8B,0x84,0x8F}); c.U32(CtxCallStack);
-            X64LoadQ(c,2,CtxBytecodeBegin); X64Binary(c,0x01,0,2); X64StoreQ(c,CtxVip,0); c.Jmp(done);
+            X64LoadQ(c,2,CtxBytecodeBegin);
+            EmitTrackedBusinessCoreVariant(c,true,semantic,coreStrategy,
+                coreVariantOffset,coreVariantSize); X64StoreQ(c,CtxVip,0); c.Jmp(done);
             c.Bind(top); X64LoadD(c,0,CtxDecodedOperands); X64StoreD(c,CtxReturnStackCleanup,0); X64StoreDImmediate(c,CtxHalted,1);
             c.Bind(done); return;
         }
@@ -2754,19 +3861,25 @@ void EmitX86ControlSemantic(
     VM_MICRO_OPCODE semantic,
     CodeBuffer::Label stackFailure,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     (void)stackFailure;
     switch(semantic){
-        case VM_UOP_BRANCH:X86LoadD(c,0,CtxBytecodeBegin);X86LoadD(c,2,CtxDecodedOperands);c.Raw({0x01,0xD0});X86StoreD(c,CtxVip,0);return;
+        case VM_UOP_BRANCH:X86LoadD(c,0,CtxBytecodeBegin);X86LoadD(c,2,CtxDecodedOperands);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,coreVariantOffset,coreVariantSize);X86StoreD(c,CtxVip,0);return;
         case VM_UOP_BRANCH_IF:{X86CallFlagMaterializer(c,0,true,VM_FLAG_STATUS_MASK,flagsFailure);X86EvaluateCondition(c,0,rangeFailure);
             c.Raw({0x85,0xC0});const auto done=c.NewLabel();c.Jcc(JccE,done);X86LoadD(c,0,CtxBytecodeBegin);X86LoadD(c,2,CtxDecodedOperands+8u);
-            c.Raw({0x01,0xD0});X86StoreD(c,CtxVip,0);c.Bind(done);return;}
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,coreVariantOffset,coreVariantSize);X86StoreD(c,CtxVip,0);c.Bind(done);return;}
         case VM_UOP_CALL_VM:{X86LoadD(c,1,CtxCallDepth);c.Raw({0x81,0xF9});c.U32(VM_RUNTIME_CALL_DEPTH);c.Jcc(JccAE,rangeFailure);
             X86LoadD(c,0,CtxVip);X86LoadD(c,2,CtxBytecodeBegin);c.Raw({0x29,0xD0,0x89,0x84,0x8F});c.U32(CtxCallStack);
-            c.Raw({0x41});X86StoreD(c,CtxCallDepth,1);X86LoadD(c,0,CtxBytecodeBegin);X86LoadD(c,2,CtxDecodedOperands);c.Raw({0x01,0xD0});X86StoreD(c,CtxVip,0);return;}
+            c.Raw({0x41});X86StoreD(c,CtxCallDepth,1);X86LoadD(c,0,CtxBytecodeBegin);X86LoadD(c,2,CtxDecodedOperands);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,coreVariantOffset,coreVariantSize);X86StoreD(c,CtxVip,0);return;}
         case VM_UOP_RET:{X86LoadD(c,1,CtxCallDepth);c.Raw({0x85,0xC9});const auto top=c.NewLabel(),done=c.NewLabel();c.Jcc(JccE,top);
-            c.Raw({0x49});X86StoreD(c,CtxCallDepth,1);c.Raw({0x8B,0x84,0x8F});c.U32(CtxCallStack);X86LoadD(c,2,CtxBytecodeBegin);c.Raw({0x01,0xD0});
+            c.Raw({0x49});X86StoreD(c,CtxCallDepth,1);c.Raw({0x8B,0x84,0x8F});c.U32(CtxCallStack);X86LoadD(c,2,CtxBytecodeBegin);
+            EmitTrackedBusinessCoreVariant(c,false,semantic,coreStrategy,coreVariantOffset,coreVariantSize);
             X86StoreD(c,CtxVip,0);c.Jmp(done);c.Bind(top);X86LoadD(c,0,CtxDecodedOperands);X86StoreD(c,CtxReturnStackCleanup,0);X86StoreDImmediate(c,CtxHalted,1);c.Bind(done);return;}
         case VM_UOP_EXIT:X86LoadD(c,0,CtxDecodedOperands);X86StoreD(c,CtxReturnStackCleanup,0);X86StoreDImmediate(c,CtxHalted,1);return;
         default:return;
@@ -2791,17 +3904,543 @@ void X86LoadStackD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
     c.Raw({0x8B,static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)),0x24}); c.U32(displacement);
 }
 
+void X64LoadMappedVreg(
+    CodeBuffer& c,
+    uint8_t destination,
+    uint8_t family)
+{
+    X64LoadQ(c, 11, CtxRegisterMap);
+    X64LoadByteIndirect(c, 1, 11, family);
+    X64LoadIndexedQ(c, destination, 1, CtxVregs);
+}
+
+void X64StoreMappedVregFromStack(
+    CodeBuffer& c,
+    uint8_t family,
+    uint32_t stackDisplacement)
+{
+    X64LoadQ(c, 11, CtxRegisterMap);
+    X64LoadByteIndirect(c, 1, 11, family);
+    X64LoadStackQ(c, 0, stackDisplacement);
+    X64StoreIndexedQ(c, CtxVregs, 1, 0);
+}
+
+void EmitX64ByteCopyLoop(
+    CodeBuffer& c,
+    uint8_t source,
+    uint8_t destination,
+    uint8_t count)
+{
+    const auto done = c.NewLabel();
+    const auto loop = c.NewLabel();
+    const uint8_t loadRex = static_cast<uint8_t>(0x40u |
+        ((source & 8u) ? 0x01u : 0u));
+    const uint8_t storeRex = static_cast<uint8_t>(0x40u |
+        ((destination & 8u) ? 0x01u : 0u));
+    const uint8_t countRex = static_cast<uint8_t>(0x40u |
+        ((count & 8u) ? 0x01u : 0u));
+    if (count & 8u) c.U8(0x45);
+    c.Raw({0x85,static_cast<uint8_t>(0xC0u | ((count & 7u) << 3u) |
+        (count & 7u))});
+    c.Jcc(JccE, done);
+    c.Bind(loop);
+    c.Raw({loadRex,0x8A,static_cast<uint8_t>(source & 7u)});
+    c.Raw({storeRex,0x88,static_cast<uint8_t>(destination & 7u)});
+    const uint8_t sourceRex = static_cast<uint8_t>(0x48u |
+        ((source & 8u) ? 0x01u : 0u));
+    const uint8_t destinationRex = static_cast<uint8_t>(0x48u |
+        ((destination & 8u) ? 0x01u : 0u));
+    c.Raw({sourceRex,0xFF,static_cast<uint8_t>(0xC0u | (source & 7u))});
+    c.Raw({destinationRex,0xFF,
+        static_cast<uint8_t>(0xC0u | (destination & 7u))});
+    c.Raw({countRex,0xFF,static_cast<uint8_t>(0xC8u | (count & 7u))});
+    c.Jcc(JccNE, loop);
+    c.Bind(done);
+}
+
+void EmitX64CallHost(
+    CodeBuffer& c,
+    CodeBuffer::Label stackFailure,
+    CodeBuffer::Label rangeFailure,
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
+{
+    constexpr uint32_t metaFlags =
+        static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, flags));
+    constexpr uint32_t metaGuardDispatch = static_cast<uint32_t>(
+        offsetof(VM_METADATA_HEADER, guardCFDispatchPointerRVA));
+    constexpr uint32_t extendedFlags =
+        static_cast<uint32_t>(offsetof(VM_EXTENDED_STATE, flags));
+
+    X64RequireAndPop(c, 1, stackFailure);             // rax = target token
+    X64LoadD(c, 1, CtxDecodedOperands + 8u);
+    c.Raw({0x83,0xF9,VM_ABI_WIN64}); c.Jcc(JccNE, rangeFailure);
+    X64LoadD(c, 1, CtxDecodedOperands + 16u);
+    c.Raw({0x81,0xF9}); c.U32(VM_NATIVE_MAX_STACK_ARGUMENT_BYTES);
+    c.Jcc(JccA, rangeFailure);
+    c.Raw({0xF7,0xC1,0x07,0x00,0x00,0x00}); c.Jcc(JccNE, rangeFailure);
+    X64LoadQ(c, 11, CtxRegisterMap);
+    c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE, rangeFailure);
+    X64LoadQ(c, 10, CtxExtendedState);
+    c.Raw({0x4D,0x85,0xD2}); c.Jcc(JccE, rangeFailure);
+    X64LoadQ(c, 10, CtxMetadata);
+    c.Raw({0x4D,0x85,0xD2}); c.Jcc(JccE, rangeFailure);
+    X64LoadQ(c, 10, CtxFlagMaterializer);
+    c.Raw({0x4D,0x85,0xD2}); c.Jcc(JccE, flagsFailure);
+
+    EmitTrackedBusinessCoreVariant(c, true, VM_UOP_CALL_HOST,
+        coreStrategy, coreVariantOffset, coreVariantSize);
+    c.Raw({0x48,0x85,0xC0}); c.Jcc(JccE, rangeFailure);
+    X64LoadMappedVreg(c, 10, 4u);                    // guest RSP
+    c.Raw({0x4D,0x85,0xD2}); c.Jcc(JccE, rangeFailure);
+    c.Raw({0x41,0xF6,0xC2,0x0F}); c.Jcc(JccNE, rangeFailure);
+
+    const auto cfgReady = c.NewLabel();
+    const auto cfgFailure = c.NewLabel();
+    const auto saveHostFx = c.NewLabel();
+    const auto hostSaved = c.NewLabel();
+    const auto restoreGuestFx = c.NewLabel();
+    const auto guestRestored = c.NewLabel();
+    const auto directCall = c.NewLabel();
+    const auto callComplete = c.NewLabel();
+    const auto saveGuestFx = c.NewLabel();
+    const auto guestSaved = c.NewLabel();
+    const auto restoreHostFx = c.NewLabel();
+    const auto hostRestored = c.NewLabel();
+    const auto materializerFailure = c.NewLabel();
+    const auto leave = c.NewLabel();
+    const auto leaveFlags = c.NewLabel();
+    const auto leaveNative = c.NewLabel();
+    const auto finished = c.NewLabel();
+
+    const size_t funcletBegin = c.bytes.size();
+    c.Raw({0x48,0x81,0xEC}); c.U32(kX64NativeCallStackBytes);
+    X64StoreStackQ(c, kNativeCallTargetSpill, 0);
+    X64StoreStackQ(c, kNativeCallGuestStackSpill, 10);
+    c.Raw({0x31,0xC0}); X64StoreStackQ(c, kNativeCallGuardSpill, 0);
+
+    // Materialize every architectural flag while the one declared native-call
+    // frame is active, avoiding a second overlapping unwind funclet.
+    X64LoadQ(c, 0, CtxFlagMaterializer);
+    c.Raw({0x4C,0x89,0xF9,0xBA}); c.U32(VM_FLAG_ARCHITECTURAL_MASK);
+    c.Raw({0xFF,0xD0});
+    X64LoadD(c, 0, CtxError); c.Raw({0x85,0xC0});
+    c.Jcc(JccNE, materializerFailure);
+
+    // CFG mirrors the historical bridge contract: native RVAs are known
+    // direct targets; import-slot and indirect calls use the image's Guard
+    // dispatch pointer whenever CFG is enabled.
+    X64LoadD(c, 0, CtxDecodedOperands);
+    c.Raw({0x83,0xF8,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, cfgReady);
+    X64LoadQ(c, 10, CtxMetadata);
+    c.Raw({0x45,0x8B,0x9A}); c.U32(metaFlags);
+    c.Raw({0x41,0xF7,0xC3}); c.U32(VM_METADATA_FLAG_CFG_ENABLED);
+    c.Jcc(JccE, cfgReady);
+    c.Raw({0x45,0x8B,0x9A}); c.U32(metaGuardDispatch);
+    c.Raw({0x45,0x85,0xDB}); c.Jcc(JccE, cfgFailure);
+    X64LoadQ(c, 2, CtxImageBase);
+    X64BinaryRegister(c, 0x01, 11, 2);
+    c.Raw({0x4D,0x8B,0x1B,0x4D,0x85,0xDB}); c.Jcc(JccE, cfgFailure);
+    X64StoreStackQ(c, kNativeCallGuardSpill, 11);
+    c.Bind(cfgReady);
+
+    // Save the handler's host extended state into an aligned local image.
+    c.Raw({0x4C,0x8D,0x94,0x24});
+    c.U32(kNativeCallHostExtendedBase + 63u);
+    c.Raw({0x49,0x83,0xE2,0xC0});
+    X64StoreStackQ(c, kNativeCallHostExtendedSpill, 10);
+    X64LoadQ(c, 11, CtxExtendedState);
+    c.Raw({0x41,0x8B,0x93}); c.U32(extendedFlags);
+    c.Raw({0x85,0xD2}); c.Jcc(JccE, saveHostFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x49,0x0F,0xAE,0x22});
+    c.Jmp(hostSaved);
+    c.Bind(saveHostFx); c.Raw({0x49,0x0F,0xAE,0x02});
+    c.Bind(hostSaved);
+
+    // Copy only the statically declared stack-argument window.  Byte loops
+    // avoid clobbering RSI/RDI, which remain nonvolatile at every unwind point.
+    X64LoadStackQ(c, 10, kNativeCallGuestStackSpill);
+    c.Raw({0x49,0x83,0xC2,0x20});
+    c.Raw({0x4C,0x8D,0x9C,0x24}); c.U32(kNativeCallArgumentBase);
+    X64LoadD(c, 1, CtxDecodedOperands + 16u);
+    EmitX64ByteCopyLoop(c, 10, 11, 1);
+
+    // Restore guest SIMD/x87 state immediately before the external call.
+    X64LoadQ(c, 10, CtxExtendedState);
+    c.Raw({0x41,0x8B,0x92}); c.U32(extendedFlags);
+    c.Raw({0x85,0xD2}); c.Jcc(JccE, restoreGuestFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x49,0x0F,0xAE,0x2A});
+    c.Jmp(guestRestored);
+    c.Bind(restoreGuestFx); c.Raw({0x49,0x0F,0xAE,0x0A});
+    c.Bind(guestRestored);
+
+    X64LoadStackQ(c, 11, kNativeCallGuardSpill);
+    c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE, directCall);
+    // Guard-dispatch path: Windows requires the validated target in RAX.
+    X64LoadQ(c, 0, CtxVirtualFlags); c.U8(0x50); c.U8(0x9D);
+    X64LoadMappedVreg(c, 1, 1u); X64LoadMappedVreg(c, 2, 2u);
+    X64LoadMappedVreg(c, 8, 8u); X64LoadMappedVreg(c, 9, 9u);
+    X64LoadMappedVreg(c, 10, 10u); X64LoadMappedVreg(c, 11, 11u);
+    X64LoadStackQ(c, 0, kNativeCallTargetSpill);
+    c.Raw({0xFF,0x94,0x24}); c.U32(kNativeCallGuardSpill);
+    c.Jmp(callComplete);
+    c.Bind(directCall);
+    X64LoadQ(c, 0, CtxVirtualFlags); c.U8(0x50); c.U8(0x9D);
+    X64LoadMappedVreg(c, 1, 1u); X64LoadMappedVreg(c, 2, 2u);
+    X64LoadMappedVreg(c, 8, 8u); X64LoadMappedVreg(c, 9, 9u);
+    X64LoadMappedVreg(c, 10, 10u); X64LoadMappedVreg(c, 11, 11u);
+    X64LoadMappedVreg(c, 0, 0u);
+    c.Raw({0xFF,0x94,0x24}); c.U32(kNativeCallTargetSpill);
+    c.Bind(callComplete);
+
+    X64StoreStackQ(c, kNativeCallRaxSpill, 0);
+    X64StoreStackQ(c, kNativeCallRcxSpill, 1);
+    X64StoreStackQ(c, kNativeCallRdxSpill, 2);
+    X64StoreStackQ(c, kNativeCallR8Spill, 8);
+    X64StoreStackQ(c, kNativeCallR9Spill, 9);
+    X64StoreStackQ(c, kNativeCallR10Spill, 10);
+    X64StoreStackQ(c, kNativeCallR11Spill, 11);
+    c.U8(0x9C); c.U8(0x58);
+    X64StoreStackQ(c, kNativeCallFlagsSpill, 0);
+
+    // Save the guest's post-call extended state, then restore the handler's
+    // host state before using any SIMD/x87 instruction in the VM again.
+    X64LoadQ(c, 10, CtxExtendedState);
+    c.Raw({0x41,0x8B,0x92}); c.U32(extendedFlags);
+    c.Raw({0x85,0xD2}); c.Jcc(JccE, saveGuestFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x49,0x0F,0xAE,0x22});
+    c.Jmp(guestSaved);
+    c.Bind(saveGuestFx); c.Raw({0x49,0x0F,0xAE,0x02});
+    c.Bind(guestSaved);
+    X64LoadStackQ(c, 10, kNativeCallHostExtendedSpill);
+    X64LoadQ(c, 11, CtxExtendedState);
+    c.Raw({0x41,0x8B,0x93}); c.U32(extendedFlags);
+    c.Raw({0x85,0xD2}); c.Jcc(JccE, restoreHostFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x49,0x0F,0xAE,0x2A});
+    c.Jmp(hostRestored);
+    c.Bind(restoreHostFx); c.Raw({0x49,0x0F,0xAE,0x0A});
+    c.Bind(hostRestored);
+
+    c.Raw({0x4C,0x8D,0x94,0x24}); c.U32(kNativeCallArgumentBase);
+    X64LoadStackQ(c, 11, kNativeCallGuestStackSpill);
+    c.Raw({0x49,0x83,0xC3,0x20});
+    X64LoadD(c, 1, CtxDecodedOperands + 16u);
+    EmitX64ByteCopyLoop(c, 10, 11, 1);
+
+    X64StoreMappedVregFromStack(c, 0u, kNativeCallRaxSpill);
+    X64StoreMappedVregFromStack(c, 1u, kNativeCallRcxSpill);
+    X64StoreMappedVregFromStack(c, 2u, kNativeCallRdxSpill);
+    X64StoreMappedVregFromStack(c, 8u, kNativeCallR8Spill);
+    X64StoreMappedVregFromStack(c, 9u, kNativeCallR9Spill);
+    X64StoreMappedVregFromStack(c, 10u, kNativeCallR10Spill);
+    X64StoreMappedVregFromStack(c, 11u, kNativeCallR11Spill);
+    X64LoadStackQ(c, 0, kNativeCallFlagsSpill);
+    X64StoreQ(c, CtxVirtualFlags, 0);
+    c.Raw({0x45,0x31,0xDB}); c.Jmp(leave);       // status 0
+
+    c.Bind(materializerFailure);
+    c.Raw({0x41,0xBB,0x01,0x00,0x00,0x00}); c.Jmp(leave);
+    c.Bind(cfgFailure);
+    c.Raw({0x41,0xBB,0x02,0x00,0x00,0x00});
+    c.Bind(leave);
+    c.Raw({0x48,0x81,0xC4}); c.U32(kX64NativeCallStackBytes);
+    RecordX64StackFunclet(c, funcletBegin,
+        VMHandlerSemanticUnwindKind::StackAllocation,
+        kX64NativeCallStackBytes, kX64NativeCallPrologSize);
+    c.Raw({0x45,0x85,0xDB}); c.Jcc(JccE, finished);
+    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, leaveFlags);
+    c.Jmp(leaveNative);
+    c.Bind(leaveFlags); c.Jmp(flagsFailure);
+    c.Bind(leaveNative);
+    EmitX64Failure(c, VM_MICRO_ERR_NATIVE_BRIDGE);
+    c.Bind(finished);
+}
+
+void X86StoreFrameD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
+    c.Raw({0x89,static_cast<uint8_t>(0x85u | ((reg & 7u) << 3u))});
+    c.U32(displacement);
+}
+
+void X86LoadFrameD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
+    c.Raw({0x8B,static_cast<uint8_t>(0x85u | ((reg & 7u) << 3u))});
+    c.U32(displacement);
+}
+
+void X86LoadMappedVregToFrame(
+    CodeBuffer& c,
+    uint8_t family,
+    uint32_t frameDisplacement)
+{
+    X86LoadD(c, 2, CtxRegisterMap);
+    X86LoadByteIndirect(c, 1, 2, family);
+    X86LoadIndexedDVariant(c, 0, 1, CtxVregs);
+    X86StoreFrameD(c, frameDisplacement, 0);
+}
+
+void X86StoreMappedVregFromFrame(
+    CodeBuffer& c,
+    uint8_t family,
+    uint32_t frameDisplacement)
+{
+    X86LoadD(c, 2, CtxRegisterMap);
+    X86LoadByteIndirect(c, 1, 2, family);
+    X86LoadFrameD(c, 0, frameDisplacement);
+    X86StoreIndexedDVariant(c, CtxVregs, 1, 0);
+    c.Raw({0xC7,0x84,0xCF}); c.U32(CtxVregs + 4u); c.U32(0);
+}
+
+void EmitX86CallHost(
+    CodeBuffer& c,
+    CodeBuffer::Label stackFailure,
+    CodeBuffer::Label rangeFailure,
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
+{
+    constexpr uint32_t metaFlags =
+        static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, flags));
+    constexpr uint32_t metaGuardCheck = static_cast<uint32_t>(
+        offsetof(VM_METADATA_HEADER, guardCFCheckPointerRVA));
+    constexpr uint32_t extendedFlags =
+        static_cast<uint32_t>(offsetof(VM_EXTENDED_STATE, flags));
+
+    X86RequireAndPop(c, 1, stackFailure);             // eax = target token
+    X86LoadD(c, 1, CtxDecodedOperands + 8u);
+    c.Raw({0x83,0xF9,VM_ABI_X86_CDECL}); c.Jcc(JccB, rangeFailure);
+    c.Raw({0x83,0xF9,VM_ABI_X86_AUTO}); c.Jcc(JccA, rangeFailure);
+    X86LoadD(c, 1, CtxDecodedOperands + 16u);
+    c.Raw({0x81,0xF9}); c.U32(VM_NATIVE_MAX_STACK_ARGUMENT_BYTES);
+    c.Jcc(JccA, rangeFailure);
+    c.Raw({0xF7,0xC1,0x01,0x00,0x00,0x00}); c.Jcc(JccNE, rangeFailure);
+    X86LoadD(c, 2, CtxRegisterMap); c.Raw({0x85,0xD2});
+    c.Jcc(JccE, rangeFailure);
+    X86LoadD(c, 2, CtxExtendedState); c.Raw({0x85,0xD2});
+    c.Jcc(JccE, rangeFailure);
+    X86LoadD(c, 2, CtxMetadata); c.Raw({0x85,0xD2});
+    c.Jcc(JccE, rangeFailure);
+    X86LoadD(c, 2, CtxFlagMaterializer); c.Raw({0x85,0xD2});
+    c.Jcc(JccE, flagsFailure);
+
+    EmitTrackedBusinessCoreVariant(c, false, VM_UOP_CALL_HOST,
+        coreStrategy, coreVariantOffset, coreVariantSize);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, rangeFailure);
+    X86StoreD(c, CtxMutationScratch, 0);
+    X86LoadD(c, 2, CtxRegisterMap);
+    X86LoadByteIndirect(c, 1, 2, 4u);
+    X86LoadIndexedDVariant(c, 0, 1, CtxVregs);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, rangeFailure);
+    X86StoreD(c, CtxMutationScratch + 4u, 0);
+    X86LoadD(c, 0, CtxMutationScratch);
+
+    const auto cfgReady = c.NewLabel();
+    const auto cfgFailure = c.NewLabel();
+    const auto saveHostFx = c.NewLabel();
+    const auto hostSaved = c.NewLabel();
+    const auto restoreGuestFx = c.NewLabel();
+    const auto guestRestored = c.NewLabel();
+    const auto guardComplete = c.NewLabel();
+    const auto cleanupRangeFailure = c.NewLabel();
+    const auto cleanupAbiReady = c.NewLabel();
+    const auto cleanupValid = c.NewLabel();
+    const auto saveGuestFx = c.NewLabel();
+    const auto guestSaved = c.NewLabel();
+    const auto restoreHostFx = c.NewLabel();
+    const auto hostRestored = c.NewLabel();
+    const auto skipWriteback = c.NewLabel();
+    const auto materializerFailure = c.NewLabel();
+    const auto leave = c.NewLabel();
+    const auto leaveFlags = c.NewLabel();
+    const auto leaveNative = c.NewLabel();
+    const auto finished = c.NewLabel();
+
+    c.Raw({0x81,0xEC}); c.U32(kX86NativeCallStackBytes);
+    // Save the direct-threaded ABI and establish a frame base that every x86
+    // calling convention in the explicit CALL_HOST contract must preserve.
+    c.Raw({0x89,0xAC,0x24}); c.U32(kX86NativeCallOriginalEbpSpill);
+    c.Raw({0x89,0xE5});
+    X86StoreFrameD(c, kX86NativeCallOriginalEbxSpill, 3);
+    X86StoreFrameD(c, kX86NativeCallOriginalEsiSpill, 6);
+    X86StoreFrameD(c, kX86NativeCallOriginalEdiSpill, 7);
+    X86StoreFrameD(c, kX86NativeCallTargetSpill, 0);
+    X86LoadD(c, 0, CtxMutationScratch + 4u);
+    X86StoreFrameD(c, kX86NativeCallGuestStackSpill, 0);
+    c.Raw({0x31,0xC0});
+    X86StoreFrameD(c, kX86NativeCallGuardSpill, 0);
+    X86StoreFrameD(c, kX86NativeCallStatusSpill, 0);
+
+    X86LoadD(c, 0, CtxFlagMaterializer);
+    c.Raw({0x68}); c.U32(VM_FLAG_ARCHITECTURAL_MASK);
+    c.Raw({0x57,0xFF,0xD0,0x83,0xC4,0x08});
+    X86LoadD(c, 0, CtxError); c.Raw({0x85,0xC0});
+    c.Jcc(JccNE, materializerFailure);
+
+    X86LoadD(c, 0, CtxDecodedOperands);
+    c.Raw({0x83,0xF8,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, cfgReady);
+    X86LoadD(c, 2, CtxMetadata);
+    c.Raw({0x8B,0x82}); c.U32(metaFlags);
+    c.Raw({0xA9}); c.U32(VM_METADATA_FLAG_CFG_ENABLED); c.Jcc(JccE, cfgReady);
+    c.Raw({0x8B,0x82}); c.U32(metaGuardCheck);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, cfgFailure);
+    X86LoadD(c, 2, CtxImageBase); c.Raw({0x01,0xD0,0x8B,0x00,0x85,0xC0});
+    c.Jcc(JccE, cfgFailure);
+    X86StoreFrameD(c, kX86NativeCallGuardSpill, 0);
+    c.Bind(cfgReady);
+
+    c.Raw({0x8D,0x85}); c.U32(kX86NativeCallHostExtendedBase + 63u);
+    c.Raw({0x83,0xE0,0xC0});
+    X86StoreFrameD(c, kX86NativeCallHostExtendedSpill, 0);
+    X86LoadD(c, 2, CtxExtendedState);
+    c.Raw({0x8B,0x8A}); c.U32(extendedFlags);
+    c.Raw({0x85,0xC9}); c.Jcc(JccE, saveHostFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2});
+    X86LoadFrameD(c, 1, kX86NativeCallHostExtendedSpill);
+    c.Raw({0x0F,0xAE,0x21});
+    c.Jmp(hostSaved);
+    c.Bind(saveHostFx);
+    X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
+    c.Raw({0x0F,0xAE,0x00});
+    c.Bind(hostSaved);
+
+    // ESI/EDI are temporarily used only for the copy and are restored before
+    // any external call, preserving the direct-threaded EBX/ESI/EDI contract.
+    X86LoadD(c, 1, CtxDecodedOperands + 16u);
+    X86LoadFrameD(c, 6, kX86NativeCallGuestStackSpill);
+    c.Raw({0x89,0xEF});
+    c.Raw({0xFC,0xF3,0xA4});
+    X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
+    X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
+
+    X86LoadD(c, 0, CtxExtendedState);
+    c.Raw({0x8B,0x88}); c.U32(extendedFlags);
+    c.Raw({0x85,0xC9}); c.Jcc(JccE, restoreGuestFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2});
+    X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x28});
+    c.Jmp(guestRestored);
+    c.Bind(restoreGuestFx);
+    X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x08});
+    c.Bind(guestRestored);
+
+    X86LoadFrameD(c, 0, kX86NativeCallGuardSpill);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, guardComplete);
+    X86LoadFrameD(c, 1, kX86NativeCallTargetSpill);
+    c.Raw({0xFF,0xD0});
+    c.Bind(guardComplete);
+
+    // Stage guest volatile inputs in locals so register-map lookups cannot
+    // overwrite another input immediately before the native call.
+    X86LoadMappedVregToFrame(c, 0u, kX86NativeCallEaxSpill);
+    X86LoadMappedVregToFrame(c, 1u, kX86NativeCallEcxSpill);
+    X86LoadMappedVregToFrame(c, 2u, kX86NativeCallEdxSpill);
+    X86LoadD(c, 0, CtxVirtualFlags); c.U8(0x50); c.U8(0x9D);
+    X86LoadFrameD(c, 0, kX86NativeCallEaxSpill);
+    X86LoadFrameD(c, 1, kX86NativeCallEcxSpill);
+    X86LoadFrameD(c, 2, kX86NativeCallEdxSpill);
+    c.Raw({0xFF,0x95}); c.U32(kX86NativeCallTargetSpill);
+
+    X86StoreFrameD(c, kX86NativeCallEaxSpill, 0);
+    X86StoreFrameD(c, kX86NativeCallEcxSpill, 1);
+    X86StoreFrameD(c, kX86NativeCallEdxSpill, 2);
+    c.U8(0x9C); c.U8(0x58);
+    X86StoreFrameD(c, kX86NativeCallFlagsSpill, 0);
+    c.Raw({0x89,0xE1,0x29,0xE9});             // cleanup = esp - ebp
+    X86StoreFrameD(c, kX86NativeCallCleanupSpill, 1);
+    X86LoadD(c, 0, CtxDecodedOperands + 16u);
+    c.Raw({0x39,0xC1}); c.Jcc(JccA, cleanupRangeFailure);
+    c.Raw({0x89,0xEC});
+    X86LoadD(c, 0, CtxDecodedOperands + 8u);
+    c.Raw({0x83,0xF8,VM_ABI_X86_AUTO}); c.Jcc(JccE, cleanupValid);
+    c.Raw({0x83,0xF8,VM_ABI_X86_CDECL}); c.Jcc(JccNE, cleanupAbiReady);
+    c.Raw({0x85,0xC9}); c.Jcc(JccE, cleanupValid);
+    c.Jmp(cleanupRangeFailure);
+    c.Bind(cleanupAbiReady);
+    X86LoadD(c, 0, CtxDecodedOperands + 16u);
+    c.Raw({0x39,0xC1}); c.Jcc(JccE, cleanupValid);
+    c.Jmp(cleanupRangeFailure);
+    c.Bind(cleanupRangeFailure);
+    c.Raw({0x89,0xEC,0xC7,0x85}); c.U32(kX86NativeCallStatusSpill); c.U32(2u);
+    c.Bind(cleanupValid);
+
+    X86LoadD(c, 0, CtxExtendedState);
+    c.Raw({0x8B,0x88}); c.U32(extendedFlags);
+    c.Raw({0x85,0xC9}); c.Jcc(JccE, saveGuestFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2});
+    X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x20});
+    c.Jmp(guestSaved);
+    c.Bind(saveGuestFx);
+    X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x00});
+    c.Bind(guestSaved);
+    X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
+    X86LoadD(c, 2, CtxExtendedState);
+    c.Raw({0x8B,0x8A}); c.U32(extendedFlags);
+    c.Raw({0x85,0xC9}); c.Jcc(JccE, restoreHostFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2});
+    X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
+    c.Raw({0x0F,0xAE,0x28}); c.Jmp(hostRestored);
+    c.Bind(restoreHostFx);
+    X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
+    c.Raw({0x0F,0xAE,0x08});
+    c.Bind(hostRestored);
+
+    X86LoadD(c, 1, CtxDecodedOperands + 16u);
+    c.Raw({0x89,0xEE});
+    X86LoadFrameD(c, 7, kX86NativeCallGuestStackSpill);
+    c.Raw({0xFC,0xF3,0xA4});
+    X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
+    X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
+
+    X86LoadFrameD(c, 0, kX86NativeCallStatusSpill);
+    c.Raw({0x85,0xC0}); c.Jcc(JccNE, skipWriteback);
+    X86StoreMappedVregFromFrame(c, 0u, kX86NativeCallEaxSpill);
+    X86StoreMappedVregFromFrame(c, 1u, kX86NativeCallEcxSpill);
+    X86StoreMappedVregFromFrame(c, 2u, kX86NativeCallEdxSpill);
+    X86LoadFrameD(c, 0, kX86NativeCallGuestStackSpill);
+    X86LoadFrameD(c, 1, kX86NativeCallCleanupSpill);
+    c.Raw({0x01,0xC8}); X86StoreFrameD(c, kX86NativeCallCleanupSpill, 0);
+    X86StoreMappedVregFromFrame(c, 4u, kX86NativeCallCleanupSpill);
+    X86LoadFrameD(c, 0, kX86NativeCallFlagsSpill);
+    X86StoreD(c, CtxVirtualFlags, 0);
+    c.Bind(skipWriteback);
+    c.Jmp(leave);
+
+    c.Bind(materializerFailure);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallStatusSpill); c.U32(1u);
+    c.Jmp(leave);
+    c.Bind(cfgFailure);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallStatusSpill); c.U32(2u);
+    c.Bind(leave);
+    X86LoadFrameD(c, 0, kX86NativeCallStatusSpill);
+    X86LoadFrameD(c, 3, kX86NativeCallOriginalEbxSpill);
+    X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
+    X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
+    X86LoadFrameD(c, 2, kX86NativeCallOriginalEbpSpill);
+    c.Raw({0x89,0xEC,0x89,0xD5,0x81,0xC4}); c.U32(kX86NativeCallStackBytes);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, finished);
+    c.Raw({0x83,0xF8,0x01}); c.Jcc(JccE, leaveFlags);
+    c.Jmp(leaveNative);
+    c.Bind(leaveFlags); c.Jmp(flagsFailure);
+    c.Bind(leaveNative); EmitX86Failure(c, VM_MICRO_ERR_NATIVE_BRIDGE);
+    c.Bind(finished);
+}
+
 void EmitX64BridgeExtended(
     CodeBuffer& c,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     constexpr uint32_t stateBase = kX64BridgeStateBase;
     constexpr uint32_t allocation = kX64BridgeStackBytes;
     (void)flagsFailure;
     X64LoadD(c,0,CtxDecodedOperands+8u); c.Raw({0xA9}); c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);
     c.Jcc(JccNE,rangeFailure);
-    X64LoadQ(c,0,CtxImageBase); X64LoadD(c,2,CtxDecodedOperands); X64Binary(c,0x01,0,2);
+    X64LoadQ(c,0,CtxImageBase); X64LoadD(c,2,CtxDecodedOperands);
+    EmitTrackedBusinessCoreVariant(c, true, VM_UOP_BRIDGE_EXTENDED,
+        coreStrategy, coreVariantOffset, coreVariantSize);
     X64StoreQ(c,CtxMutationScratch,0);
     X64LoadQ(c,11,CtxRegisterMap); c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE,rangeFailure);
     const size_t funcletBegin = c.bytes.size();
@@ -2835,12 +4474,18 @@ void EmitX64BridgeExtended(
 void EmitX86BridgeExtended(
     CodeBuffer& c,
     CodeBuffer::Label rangeFailure,
-    CodeBuffer::Label flagsFailure)
+    CodeBuffer::Label flagsFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
 {
     constexpr uint32_t allocation=sizeof(VM_INSTRUCTION_BRIDGE_STATE);
     (void)flagsFailure;
     X86LoadD(c,0,CtxDecodedOperands+8u);c.Raw({0xA9});c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);c.Jcc(JccNE,rangeFailure);
-    X86LoadD(c,0,CtxImageBase);X86LoadD(c,2,CtxDecodedOperands);c.Raw({0x01,0xD0});X86StoreD(c,CtxMutationScratch,0);
+    X86LoadD(c,0,CtxImageBase);X86LoadD(c,2,CtxDecodedOperands);
+    EmitTrackedBusinessCoreVariant(c, false, VM_UOP_BRIDGE_EXTENDED,
+        coreStrategy, coreVariantOffset, coreVariantSize);
+    X86StoreD(c,CtxMutationScratch,0);
     X86LoadD(c,2,CtxRegisterMap);c.Raw({0x85,0xD2});c.Jcc(JccE,rangeFailure);
     c.Raw({0x81,0xEC});c.U32(allocation);
     for(uint8_t family=0;family<8;++family){
@@ -2865,8 +4510,19 @@ void EmitX86BridgeExtended(
     c.Raw({0x81,0xC4});c.U32(allocation);
 }
 
-void EmitX64SpecialSemantic(CodeBuffer& c,VM_MICRO_OPCODE semantic,CodeBuffer::Label rangeFailure){
-    if(semantic==VM_UOP_INT3){c.U8(0xCC);return;}
+void EmitX64SpecialSemantic(
+    CodeBuffer& c,
+    VM_MICRO_OPCODE semantic,
+    CodeBuffer::Label rangeFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
+{
+    if(semantic==VM_UOP_INT3){
+        EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize);
+        return;
+    }
     X64LoadQ(c,11,CtxRegisterMap);c.Raw({0x4D,0x85,0xDB});c.Jcc(JccE,rangeFailure);
     if(semantic==VM_UOP_RDTSC){
         c.Raw({0x0F,0x31,0x41,0x89,0xC0,0x41,0x89,0xD1});
@@ -2886,8 +4542,19 @@ void EmitX64SpecialSemantic(CodeBuffer& c,VM_MICRO_OPCODE semantic,CodeBuffer::L
     c.Raw({0x0F,0xB6,0x48,0x02});X64StoreIndexedQ(c,CtxVregs,1,11);
 }
 
-void EmitX86SpecialSemantic(CodeBuffer& c,VM_MICRO_OPCODE semantic,CodeBuffer::Label rangeFailure){
-    if(semantic==VM_UOP_INT3){c.U8(0xCC);return;}
+void EmitX86SpecialSemantic(
+    CodeBuffer& c,
+    VM_MICRO_OPCODE semantic,
+    CodeBuffer::Label rangeFailure,
+    uint8_t coreStrategy,
+    uint32_t& coreVariantOffset,
+    uint32_t& coreVariantSize)
+{
+    if(semantic==VM_UOP_INT3){
+        EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+            coreVariantOffset, coreVariantSize);
+        return;
+    }
     X86LoadD(c,2,CtxRegisterMap);c.Raw({0x85,0xD2});c.Jcc(JccE,rangeFailure);
     if(semantic==VM_UOP_RDTSC){c.Raw({0x0F,0x31,0x52,0x50});X86LoadD(c,2,CtxRegisterMap);
         c.Raw({0x0F,0xB6,0x0A,0x58});X86StoreIndexedD(c,CtxVregs,0);c.Raw({0xC7,0x84,0xCF});c.U32(CtxVregs+4u);c.U32(0);
@@ -2923,10 +4590,6 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     if ((x64 && !descriptor->runtimeSupportedX64) ||
         (!x64 && !descriptor->runtimeSupportedX86)) {
         result.error = "semantic is intentionally fail-closed for this architecture";
-        return result;
-    }
-    if (config.semantic == VM_UOP_CALL_HOST) {
-        result.error = "CALL_HOST has no production native-call bridge contract";
         return result;
     }
     if (!HasConcreteEmitter(config.semantic)) {
@@ -2997,7 +4660,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
             case VMOpcodeClass::Stack:
             case VMOpcodeClass::Memory:
                 EmitX64DataSemantic(code, config.semantic, stackFailure,
-                    widthFailure, rangeFailure, flagsFailure);
+                    widthFailure, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::Arithmetic:
                 if (IsBinaryAlu(config.semantic))
@@ -3007,7 +4673,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                         result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_ADD_CARRY ||
                          config.semantic == VM_UOP_SUB_BORROW)
-                    EmitX64CarryAlu(code, config.semantic, stackFailure, widthFailure);
+                    EmitX64CarryAlu(code, config.semantic, stackFailure, widthFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (IsUnaryAlu(config.semantic))
                     EmitX64UnaryAlu(code, config.semantic, stackFailure,
                         widthFailure, result.semanticCoreStrategy,
@@ -3016,15 +4685,23 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                 else if (config.semantic == VM_UOP_ZERO_EXTEND ||
                          config.semantic == VM_UOP_SIGN_EXTEND)
                     EmitX64Extend(code, config.semantic == VM_UOP_SIGN_EXTEND,
-                        stackFailure, widthFailure, rangeFailure);
+                        stackFailure, widthFailure, rangeFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_UMUL_WIDE ||
                          config.semantic == VM_UOP_SMUL_WIDE)
                     EmitX64WideMultiply(code, config.semantic == VM_UOP_SMUL_WIDE,
-                        stackFailure, widthFailure);
+                        stackFailure, widthFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_UDIV_WIDE ||
                          config.semantic == VM_UOP_IDIV_WIDE)
                     EmitX64WideDivide(code, config.semantic == VM_UOP_IDIV_WIDE,
-                        stackFailure, widthFailure, divideFailure);
+                        stackFailure, widthFailure, divideFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else {
                     result.error = "arithmetic semantic has no x64 emitter";
                     return result;
@@ -3032,18 +4709,41 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                 break;
             case VMOpcodeClass::Flags:
                 EmitX64FlagsSemantic(code, config.semantic, stackFailure,
-                    widthFailure, rangeFailure, flagsFailure);
+                    widthFailure, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::ControlFlow:
-            case VMOpcodeClass::Call:
                 EmitX64ControlSemantic(code, config.semantic, stackFailure,
-                    rangeFailure, flagsFailure);
+                    rangeFailure, flagsFailure, result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
+                break;
+            case VMOpcodeClass::Call:
+                if (config.semantic == VM_UOP_CALL_HOST) {
+                    EmitX64CallHost(code, stackFailure, rangeFailure,
+                        flagsFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
+                } else {
+                    EmitX64ControlSemantic(code, config.semantic, stackFailure,
+                        rangeFailure, flagsFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
+                }
                 break;
             case VMOpcodeClass::Bridge:
-                EmitX64BridgeExtended(code, rangeFailure, flagsFailure);
+                EmitX64BridgeExtended(code, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::Special:
-                EmitX64SpecialSemantic(code, config.semantic, rangeFailure);
+                EmitX64SpecialSemantic(code, config.semantic, rangeFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             default:
                 result.error = "semantic opcode class is not executable";
@@ -3055,7 +4755,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
             case VMOpcodeClass::Stack:
             case VMOpcodeClass::Memory:
                 EmitX86DataSemantic(code, config.semantic, stackFailure,
-                    widthFailure, rangeFailure, flagsFailure);
+                    widthFailure, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::Arithmetic:
                 if (IsBinaryAlu(config.semantic))
@@ -3065,7 +4768,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                         result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_ADD_CARRY ||
                          config.semantic == VM_UOP_SUB_BORROW)
-                    EmitX86CarryAlu(code, config.semantic, stackFailure, widthFailure);
+                    EmitX86CarryAlu(code, config.semantic, stackFailure, widthFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (IsUnaryAlu(config.semantic))
                     EmitX86UnaryAlu(code, config.semantic, stackFailure,
                         widthFailure, result.semanticCoreStrategy,
@@ -3074,15 +4780,23 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                 else if (config.semantic == VM_UOP_ZERO_EXTEND ||
                          config.semantic == VM_UOP_SIGN_EXTEND)
                     EmitX86Extend(code, config.semantic == VM_UOP_SIGN_EXTEND,
-                        stackFailure, widthFailure, rangeFailure);
+                        stackFailure, widthFailure, rangeFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_UMUL_WIDE ||
                          config.semantic == VM_UOP_SMUL_WIDE)
                     EmitX86WideMultiply(code, config.semantic == VM_UOP_SMUL_WIDE,
-                        stackFailure, widthFailure);
+                        stackFailure, widthFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else if (config.semantic == VM_UOP_UDIV_WIDE ||
                          config.semantic == VM_UOP_IDIV_WIDE)
                     EmitX86WideDivide(code, config.semantic == VM_UOP_IDIV_WIDE,
-                        stackFailure, widthFailure, divideFailure);
+                        stackFailure, widthFailure, divideFailure,
+                        result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
                 else {
                     result.error = "arithmetic semantic has no x86 emitter";
                     return result;
@@ -3090,18 +4804,41 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
                 break;
             case VMOpcodeClass::Flags:
                 EmitX86FlagsSemantic(code, config.semantic, stackFailure,
-                    widthFailure, rangeFailure, flagsFailure);
+                    widthFailure, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::ControlFlow:
-            case VMOpcodeClass::Call:
                 EmitX86ControlSemantic(code, config.semantic, stackFailure,
-                    rangeFailure, flagsFailure);
+                    rangeFailure, flagsFailure, result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
+                break;
+            case VMOpcodeClass::Call:
+                if (config.semantic == VM_UOP_CALL_HOST) {
+                    EmitX86CallHost(code, stackFailure, rangeFailure,
+                        flagsFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
+                } else {
+                    EmitX86ControlSemantic(code, config.semantic, stackFailure,
+                        rangeFailure, flagsFailure, result.semanticCoreStrategy,
+                        result.semanticCoreVariantOffset,
+                        result.semanticCoreVariantSize);
+                }
                 break;
             case VMOpcodeClass::Bridge:
-                EmitX86BridgeExtended(code, rangeFailure, flagsFailure);
+                EmitX86BridgeExtended(code, rangeFailure, flagsFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             case VMOpcodeClass::Special:
-                EmitX86SpecialSemantic(code, config.semantic, rangeFailure);
+                EmitX86SpecialSemantic(code, config.semantic, rangeFailure,
+                    result.semanticCoreStrategy,
+                    result.semanticCoreVariantOffset,
+                    result.semanticCoreVariantSize);
                 break;
             default:
                 result.error = "semantic opcode class is not executable";
@@ -3311,6 +5048,24 @@ bool ValidateVMHandlerSemanticVariantKernel(
                 return false;
             }
         } else if (funclet.kind ==
+                       VMHandlerSemanticUnwindKind::StackAllocation &&
+                   funclet.stackBytes == kX64NativeCallStackBytes) {
+            constexpr std::array<uint8_t, 7> prolog = {
+                0x48,0x81,0xEC,0x08,0x06,0x00,0x00
+            };
+            constexpr std::array<uint8_t, 7> epilog = {
+                0x48,0x81,0xC4,0x08,0x06,0x00,0x00
+            };
+            constexpr std::array<uint8_t, 2> call = {0xFF,0xD0};
+            if (funclet.size < prolog.size() + epilog.size() + call.size() ||
+                !std::equal(prolog.begin(), prolog.end(), begin) ||
+                !std::equal(epilog.begin(), epilog.end(),
+                    end - static_cast<ptrdiff_t>(epilog.size())) ||
+                std::search(begin, end, call.begin(), call.end()) == end) {
+                error = "native-call funclet bytes are not canonical";
+                return false;
+            }
+        } else if (funclet.kind ==
                        VMHandlerSemanticUnwindKind::PushNonvolatile &&
                    funclet.nonvolatileRegister == kX64RbxUnwindRegister) {
             constexpr std::array<uint8_t, 2> cpuid = {0x0F,0xA2};
@@ -3372,7 +5127,12 @@ bool ValidateVMHandlerSemanticVariantKernel(
         }
         CodeBuffer expectedCoreVariant;
         if (!EmitBusinessCoreVariant(expectedCoreVariant, x64,
-                config.semantic, expectedCoreStrategy) ||
+                config.semantic, expectedCoreStrategy)) {
+            error = "business core variant could not be re-emitted";
+            return false;
+        }
+        std::string coreResolveError;
+        if (!expectedCoreVariant.Resolve(coreResolveError) ||
             !rangeEquals(result.semanticCoreVariantOffset,
                 result.semanticCoreVariantSize,
                 expectedCoreVariant.bytes)) {

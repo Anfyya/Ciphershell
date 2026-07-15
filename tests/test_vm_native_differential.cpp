@@ -398,6 +398,67 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
         "native=SHL vs VM-bytecode=SHR 必须被判定语义分歧");
 }
 
+void TestRemainingArithmeticFamiliesNativeDifferential() {
+    // 将新增的进位/借位、字节翻转、算术移位/旋转、扩展以及宽乘法放进
+    // 三段真实可调用机器码。每段都先过同一个 IR preflight，再交给隔离
+    // native worker 与合成 handler 链逐寄存器/逐 flags 比较；这不是只看
+    // EmitBusinessCoreVariant 的字节存在性。
+    const auto seed = MakeSeed(0xA7);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // adc eax,ecx; sbb eax,edx; bswap eax; sar eax,5;
+    // rol eax,1; ror eax,1; add eax,0; ret.
+    // 最后的 ADD 只关闭 SAR count>1 留下的 OF 未定义窗口，不改变值。
+    const std::vector<uint8_t> carryShiftBytes = {
+        0x11,0xC8, 0x19,0xD0, 0x0F,0xC8, 0xC1,0xF8,0x05,
+        0xD1,0xC0, 0xD1,0xC8,
+        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+    // movzx eax,cl; movsx edx,cl; ret. MOVZX/MOVSX 必须保持输入 flags。
+    const std::vector<uint8_t> extendBytes = {
+        0x0F,0xB6,0xC1, 0x0F,0xBE,0xD1, 0xC3};
+    // mul ecx; imul ecx; add eax,0; ret. 两条 implicit multiply 分别落到
+    // UMUL_WIDE/SMUL_WIDE；末尾 ADD 关闭 MUL/IMUL 未定义状态位。
+    const std::vector<uint8_t> wideMultiplyBytes = {
+        0xF7,0xE1, 0xF7,0xE9,
+        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+
+    const struct {
+        const std::vector<uint8_t>* bytes;
+        uint64_t preflightSeed;
+        const char* label;
+    } cases[] = {
+        {&carryShiftBytes, 0xA701ULL,
+            "ADC/SBB/BSWAP/SAR/ROL/ROR"},
+        {&extendBytes, 0xA702ULL,
+            "ZERO_EXTEND/SIGN_EXTEND"},
+        {&wideMultiplyBytes, 0xA703ULL,
+            "UMUL_WIDE/SMUL_WIDE"},
+    };
+
+    for (const auto& testCase : cases) {
+        const Function function = DecodeStandaloneFunction(
+            disassembler, *testCase.bytes, kEntry);
+        Translator translator;
+        const TranslationResult translation =
+            TranslateStandaloneFunction(function, build, translator);
+        VMIRModelPreflightConfig preflightConfig{};
+        preflightConfig.corpusSeed = testCase.preflightSeed;
+        preflightConfig.corpusCount = 16;
+        const auto preflight = VMIRModelPreflightVerifier::Verify(
+            function, translation, build.isa.opcodeMap,
+            build.isa.registerMap, preflightConfig);
+        Require(preflight.success,
+            std::string(testCase.label) + " software IR 预检失败: " +
+                preflight.error);
+        RunDifferentialCase(function, translation, build, 32, true,
+            (std::string("native-vs-VM ") + testCase.label +
+                " 语义一致").c_str());
+    }
+}
+
 void TestWideDivideNativeDifferentialAndDivideFault() {
     // 生产级 DIV/IDIV(UDIV_WIDE/IDIV_WIDE)差分证据：直接复用 packer/differential/
     // 的隔离原生 worker，而不是另起一套验证机制。dividend 是完整的
@@ -482,6 +543,8 @@ int main() {
         &TestBitOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("SHL/SHR 真 K 变体: 真实 CPU 移位与合成 handler 链一致性/分歧检测",
         &TestShiftOperationsNativeDifferentialMatchesRealCpu, failures);
+    Run("剩余算术家族真 K 变体: 真实 CPU 与合成 handler 链一致性检测",
+        &TestRemainingArithmeticFamiliesNativeDifferential, failures);
     Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
         &TestWideDivideNativeDifferentialAndDivideFault, failures);
 #else
