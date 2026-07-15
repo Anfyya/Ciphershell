@@ -22,6 +22,8 @@ using CipherShell::MutationConfig;
 using CipherShell::MutationEngine;
 using CipherShell::PEEmitter;
 using CipherShell::PEParser;
+using CipherShell::EncodeVMDispatchTableTarget;
+using CipherShell::VMDispatchTableEncoding;
 using CipherShell::VMFunctionRecord;
 using CipherShell::VMHandlerArchitecture;
 using CipherShell::VMHandlerFunctionDecodePlans;
