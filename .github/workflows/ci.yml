@@ -1,10 +1,10 @@
 name: CI
 
-# 每次往 main 推代码、或开 PR 自动触发,不需要人手动点。
+# 所有分支 push、开 PR，或手动触发时运行。
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
