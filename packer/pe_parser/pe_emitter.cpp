@@ -109,8 +109,9 @@ bool PEEmitter::PredictNextSectionRVA(uint32_t& rva, std::string* error) const {
             if (error) *error = "existing section virtual end overflows";
             return false;
         }
-        lastVirtualEnd = (std::max)(lastVirtualEnd,
-            section.VirtualAddress + alignedSpan);
+        const uint32_t sectionEnd =
+            static_cast<uint32_t>(section.VirtualAddress) + alignedSpan;
+        lastVirtualEnd = (std::max)(lastVirtualEnd, sectionEnd);
     }
     if (lastVirtualEnd > (std::numeric_limits<uint32_t>::max)() -
             (sectionAlignment - 1u)) {
@@ -720,4 +721,3 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
 }
 
 } // namespace CipherShell
-

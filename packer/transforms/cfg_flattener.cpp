@@ -81,7 +81,7 @@ bool IsX64StackMutatingInstruction(const InstructionIR& instruction) {
     }
     for (const OperandIR& operand : instruction.operands) {
         if (operand.type == OperandType::Register &&
-            operand.regInfo.registerClass == RegisterClass::GeneralPurpose &&
+            operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
             operand.regInfo.family == 4u && OperandWrites(operand.action)) {
             return true;
         }

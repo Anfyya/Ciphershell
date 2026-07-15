@@ -35,7 +35,7 @@ bool WritesStackPointer(const InstructionIR& instruction) {
             operand.action == OperandAction::ConditionalWrite ||
             operand.action == OperandAction::ConditionalReadWrite;
         if (writes && operand.type == OperandType::Register &&
-            operand.regInfo.registerClass == RegisterClass::GeneralPurpose &&
+            operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
             operand.regInfo.family == 4u) return true;
     }
     return false;

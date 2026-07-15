@@ -21,7 +21,7 @@ RegisterInfo Gpr(RegisterId id, uint8_t family, uint16_t width, uint8_t bitOffse
                  bool zeroExtend = false, bool highByte = false) {
     RegisterInfo info{};
     info.id = id;
-    info.registerClass = RegisterClass::GeneralPurpose;
+    info.registerClass = RegisterCategory::GeneralPurpose;
     info.family = family;
     info.index = family;
     info.width = width;
@@ -63,34 +63,34 @@ RegisterInfo DescribeRegister(RegisterId id) {
     RegisterInfo info{};
     info.id = id;
     switch (id) {
-        case RegisterId::IP: info.registerClass = RegisterClass::InstructionPointer; info.width = 16; break;
-        case RegisterId::EIP: info.registerClass = RegisterClass::InstructionPointer; info.width = 32; break;
-        case RegisterId::RIP: info.registerClass = RegisterClass::InstructionPointer; info.width = 64; break;
-        case RegisterId::FLAGS: info.registerClass = RegisterClass::Flags; info.width = 16; break;
-        case RegisterId::EFLAGS: info.registerClass = RegisterClass::Flags; info.width = 32; break;
-        case RegisterId::RFLAGS: info.registerClass = RegisterClass::Flags; info.width = 64; break;
+        case RegisterId::IP: info.registerClass = RegisterCategory::InstructionPointer; info.width = 16; break;
+        case RegisterId::EIP: info.registerClass = RegisterCategory::InstructionPointer; info.width = 32; break;
+        case RegisterId::RIP: info.registerClass = RegisterCategory::InstructionPointer; info.width = 64; break;
+        case RegisterId::FLAGS: info.registerClass = RegisterCategory::Flags; info.width = 16; break;
+        case RegisterId::EFLAGS: info.registerClass = RegisterCategory::Flags; info.width = 32; break;
+        case RegisterId::RFLAGS: info.registerClass = RegisterCategory::Flags; info.width = 64; break;
         case RegisterId::ES: case RegisterId::CS: case RegisterId::SS:
         case RegisterId::DS: case RegisterId::FS: case RegisterId::GS:
-            info.registerClass = RegisterClass::Segment; info.width = 16; break;
+            info.registerClass = RegisterCategory::Segment; info.width = 16; break;
         case RegisterId::ST0: case RegisterId::ST1: case RegisterId::ST2: case RegisterId::ST3:
         case RegisterId::ST4: case RegisterId::ST5: case RegisterId::ST6: case RegisterId::ST7:
-            info.registerClass = RegisterClass::X87;
+            info.registerClass = RegisterCategory::X87;
             info.index = static_cast<uint8_t>(v - static_cast<uint16_t>(RegisterId::ST0));
             info.width = 80;
             break;
         case RegisterId::MM0: case RegisterId::MM1: case RegisterId::MM2: case RegisterId::MM3:
         case RegisterId::MM4: case RegisterId::MM5: case RegisterId::MM6: case RegisterId::MM7:
-            info.registerClass = RegisterClass::Mmx;
+            info.registerClass = RegisterCategory::Mmx;
             info.index = static_cast<uint8_t>(v - static_cast<uint16_t>(RegisterId::MM0));
             info.width = 64;
             break;
-        case RegisterId::XMM0: info.registerClass = RegisterClass::Vector; info.width = 128; break;
-        case RegisterId::YMM0: info.registerClass = RegisterClass::Vector; info.width = 256; break;
-        case RegisterId::ZMM0: info.registerClass = RegisterClass::Vector; info.width = 512; break;
-        case RegisterId::K0: info.registerClass = RegisterClass::Mask; info.width = 64; break;
-        case RegisterId::CR0: info.registerClass = RegisterClass::Control; break;
-        case RegisterId::DR0: info.registerClass = RegisterClass::Debug; break;
-        case RegisterId::Other: info.registerClass = RegisterClass::Other; break;
+        case RegisterId::XMM0: info.registerClass = RegisterCategory::Vector; info.width = 128; break;
+        case RegisterId::YMM0: info.registerClass = RegisterCategory::Vector; info.width = 256; break;
+        case RegisterId::ZMM0: info.registerClass = RegisterCategory::Vector; info.width = 512; break;
+        case RegisterId::K0: info.registerClass = RegisterCategory::Mask; info.width = 64; break;
+        case RegisterId::CR0: info.registerClass = RegisterCategory::Control; break;
+        case RegisterId::DR0: info.registerClass = RegisterCategory::Debug; break;
+        case RegisterId::Other: info.registerClass = RegisterCategory::Other; break;
         default: break;
     }
     return info;

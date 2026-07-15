@@ -56,7 +56,10 @@ enum class OperandVisibility : uint8_t {
     Hidden
 };
 
-enum class RegisterClass : uint8_t {
+// Avoid the Win32 RegisterClassA/RegisterClassW macro family.  This type is
+// consumed after <windows.h> in several transforms, so the generic API macro
+// would otherwise rewrite qualified enum uses in 32-bit MSVC builds.
+enum class RegisterCategory : uint8_t {
     None,
     GeneralPurpose,
     InstructionPointer,
@@ -97,7 +100,7 @@ enum class RegisterId : uint16_t {
 
 struct RegisterInfo {
     RegisterId id = RegisterId::None;
-    RegisterClass registerClass = RegisterClass::None;
+    RegisterCategory registerClass = RegisterCategory::None;
     uint8_t family = 0xFF;
     uint8_t index = 0xFF;
     uint16_t width = 0;
