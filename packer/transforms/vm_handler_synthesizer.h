@@ -2,6 +2,7 @@
 #define CS_VM_HANDLER_SYNTHESIZER_H
 
 #include "../../runtime/common/vm_micro_runtime_abi.h"
+#include "vm_dispatch_table_codec.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -137,6 +138,7 @@ struct VMHandlerSynthesisResult {
     uint32_t flagMaterializerSize = 0;
     uint32_t dispatchTableOffset = 0;
     uint32_t dispatchTableSize = 0;
+    VMDispatchTableCodec dispatchTableCodec{};
     uint32_t decodePlanTableOffset = 0;
     uint32_t decodePlanTableSize = 0;
     uint32_t encryptedHandlerOffset = 0;
@@ -168,6 +170,17 @@ public:
     static std::vector<uint8_t> ExtractPlaintextBodies(
         const VMHandlerSynthesisResult& result);
 };
+
+VMDispatchTableCodec DeriveVMDispatchTableCodec(
+    const std::array<uint8_t, 32>& buildSeed);
+uint64_t EncodeVMDispatchTableTarget(
+    uint64_t targetOffset,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec);
+uint64_t DecodeVMDispatchTableTarget(
+    uint64_t encodedTarget,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec);
 
 } // namespace CipherShell
 

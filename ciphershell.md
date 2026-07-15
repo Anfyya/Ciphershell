@@ -722,6 +722,7 @@ Native bridge 是正式 VM 子系统，不是 fallback。
 - metadata cookie 与派生密钥。
 - bytecode operand encoding。
 - handler 排列。
+- handler 分发表编码方案、密钥与旋转参数；表内只存编码后的 runtime 相对偏移，不存明文函数指针。
 - section 名称。
 - runtime layout。
 

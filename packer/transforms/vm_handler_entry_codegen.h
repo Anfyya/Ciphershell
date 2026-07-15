@@ -2,6 +2,7 @@
 #define CS_VM_HANDLER_ENTRY_CODEGEN_H
 
 #include "../../runtime/common/vm_micro_runtime_abi.h"
+#include "vm_dispatch_table_codec.h"
 
 #include <array>
 #include <cstdint>
@@ -64,6 +65,7 @@ struct VMHandlerEntryCodegenConfig {
     uint32_t variantCount = VM_HANDLER_VARIANT_COUNT;
     VMHandlerEntryLayout layout{};
     VMHandlerEntryCipher cipher{};
+    VMDispatchTableCodec dispatchTableCodec{};
     uint32_t virtualProtectIatRVA = 0;
     uint32_t flushInstructionCacheIatRVA = 0;
     uint32_t functionPlanCount = 0;
@@ -98,6 +100,8 @@ struct VMHandlerEntryCodegenResult {
     uint32_t decryptorLoopOffset = 0;
     uint32_t decryptorLoopSize = 0;
     std::vector<uint8_t> operandDecoderCode;
+    uint32_t dispatchDecoderOffset = 0;
+    uint32_t dispatchDecoderSize = 0;
     std::vector<uint8_t> flagMaterializerCode;
     std::vector<VMHandlerEntryRelocation> relocations;
     std::vector<VMHandlerEntryUnwindRecord> unwindRecords;

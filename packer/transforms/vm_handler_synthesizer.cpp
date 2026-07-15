@@ -558,6 +558,61 @@ void WritePointer(
         image[offset + byte] = static_cast<uint8_t>(value >> (byte * 8u));
 }
 
+uint64_t DispatchPointerMask(uint32_t pointerSize) {
+    return pointerSize == 8u ? (std::numeric_limits<uint64_t>::max)()
+                             : 0xFFFFFFFFULL;
+}
+
+uint64_t RotateDispatchLeft(
+    uint64_t value,
+    uint8_t rotate,
+    uint32_t pointerSize)
+{
+    const uint32_t bits = pointerSize * 8u;
+    const uint32_t count = static_cast<uint32_t>(rotate) & (bits - 1u);
+    const uint64_t mask = DispatchPointerMask(pointerSize);
+    value &= mask;
+    return count == 0u ? value :
+        ((value << count) | (value >> (bits - count))) & mask;
+}
+
+uint64_t RotateDispatchRight(
+    uint64_t value,
+    uint8_t rotate,
+    uint32_t pointerSize)
+{
+    const uint32_t bits = pointerSize * 8u;
+    const uint32_t count = static_cast<uint32_t>(rotate) & (bits - 1u);
+    const uint64_t mask = DispatchPointerMask(pointerSize);
+    value &= mask;
+    return count == 0u ? value :
+        ((value >> count) | (value << (bits - count))) & mask;
+}
+
+uint64_t EncodeDispatchTableTarget(
+    uint64_t targetOffset,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec)
+{
+    const uint64_t mask = DispatchPointerMask(pointerSize);
+    if (codec.encoding == VMDispatchTableEncoding::XorKeyedTable)
+        return (targetOffset ^ codec.key) & mask;
+    return RotateDispatchLeft(
+        (targetOffset + codec.key) & mask, codec.rotate, pointerSize);
+}
+
+uint64_t DecodeDispatchTableTarget(
+    uint64_t encodedTarget,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec)
+{
+    const uint64_t mask = DispatchPointerMask(pointerSize);
+    if (codec.encoding == VMDispatchTableEncoding::XorKeyedTable)
+        return (encodedTarget ^ codec.key) & mask;
+    return (RotateDispatchRight(
+        encodedTarget, codec.rotate, pointerSize) - codec.key) & mask;
+}
+
 bool CopyRoutine(
     std::vector<uint8_t>& image,
     uint32_t offset,
@@ -689,6 +744,39 @@ bool ConfigValid(const VMHandlerSynthesisConfig& config, std::string& error) {
 
 } // namespace
 
+VMDispatchTableCodec DeriveVMDispatchTableCodec(
+    const std::array<uint8_t, 32>& buildSeed)
+{
+    constexpr uint64_t kDispatchCodecDomain = 0x44535054424C454EULL;
+    const uint64_t material = HashBytes(
+        buildSeed.data(), buildSeed.size(), kDispatchCodecDomain);
+    VMDispatchTableCodec codec{};
+    codec.encoding = (material & 1u) == 0u
+        ? VMDispatchTableEncoding::XorKeyedTable
+        : VMDispatchTableEncoding::AddRotateKeyedTable;
+    codec.key = static_cast<uint32_t>(
+        (material >> 1u) & 0x7FFFFFFFULL) | 1u;
+    codec.rotate = static_cast<uint8_t>(
+        ((material >> 33u) % 31u) + 1u);
+    return codec;
+}
+
+uint64_t EncodeVMDispatchTableTarget(
+    uint64_t targetOffset,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec)
+{
+    return EncodeDispatchTableTarget(targetOffset, pointerSize, codec);
+}
+
+uint64_t DecodeVMDispatchTableTarget(
+    uint64_t encodedTarget,
+    uint32_t pointerSize,
+    const VMDispatchTableCodec& codec)
+{
+    return DecodeDispatchTableTarget(encodedTarget, pointerSize, codec);
+}
+
 VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     const VMHandlerSynthesisConfig& config) const
 {
@@ -699,6 +787,7 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     result.directThreaded = true;
     result.handlerBodiesEncrypted = true;
     result.fixedRuntimeBlobUsed = false;
+    result.dispatchTableCodec = DeriveVMDispatchTableCodec(config.buildSeed);
     result.entryOffset = 0;
     result.contextEntryOffset = kPublicEntryReserve;
     result.validationEntryOffset = result.contextEntryOffset;
@@ -840,13 +929,13 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
         for (uint32_t variant = 0; variant < config.variantCount; ++variant) {
             const size_t index = static_cast<size_t>(slot) * config.variantCount + variant;
             const auto* handler = bySlotVariant[index];
-            if (!handler) continue;
             const uint32_t entryOffset = result.dispatchTableOffset +
                 static_cast<uint32_t>(index) * pointerSize;
-            WritePointer(result.image, entryOffset, pointerSize, handler->storageOffset);
-            result.relocations.push_back({entryOffset,
-                static_cast<uint16_t>(pointerSize == 8
-                    ? kRelocationDir64 : kRelocationHighLow), 0});
+            const uint64_t targetOffset = handler ? handler->storageOffset : 0u;
+            WritePointer(result.image, entryOffset, pointerSize,
+                EncodeVMDispatchTableTarget(
+                    targetOffset, pointerSize, result.dispatchTableCodec));
+            if (!handler) continue;
             VMHandlerDispatchEntry entry{handler->slot, handler->semantic,
                 handler->variant, 0, handler->storageOffset};
             if (handler->semantic == VM_HANDLER_JUNK)
@@ -882,6 +971,7 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     entryConfig.cipher.shiftRightB = cipher.shiftRightB;
     entryConfig.cipher.shiftLeftC = cipher.shiftLeftC;
     entryConfig.cipher.instructionVariant = cipher.instructionVariant;
+    entryConfig.dispatchTableCodec = result.dispatchTableCodec;
     entryConfig.virtualProtectIatRVA = config.virtualProtectIatRVA;
     entryConfig.flushInstructionCacheIatRVA = config.flushInstructionCacheIatRVA;
     entryConfig.functionPlanCount = static_cast<uint32_t>(functionPlans.size());
@@ -1178,6 +1268,18 @@ bool VMHandlerSynthesizer::Validate(
         config.variantCount * pointerSize;
     if (result.dispatchTableSize != expectedDispatchSize) {
         error = "dispatch table is not the exact slot-by-K layout";
+        return false;
+    }
+    const VMDispatchTableCodec expectedDispatchCodec =
+        DeriveVMDispatchTableCodec(config.buildSeed);
+    if (result.dispatchTableCodec.encoding != expectedDispatchCodec.encoding ||
+        result.dispatchTableCodec.key != expectedDispatchCodec.key ||
+        result.dispatchTableCodec.rotate != expectedDispatchCodec.rotate ||
+        result.dispatchTableCodec.key == 0u ||
+        result.dispatchTableCodec.key > 0x7FFFFFFFu ||
+        result.dispatchTableCodec.rotate == 0u ||
+        result.dispatchTableCodec.rotate > 31u) {
+        error = "dispatch table codec is not the per-build derived scheme";
         return false;
     }
 
@@ -1536,8 +1638,8 @@ bool VMHandlerSynthesizer::Validate(
     }
 
     // Verify the physical [slot][K] table, not only its descriptive vectors.
-    // Before runtime relocation every non-zero cell stores a section-relative
-    // handler offset; the loader later adds the mapped runtime base.
+    // Every cell, including an unused zero target, is encoded.  The table must
+    // contain neither raw relative offsets nor loader-relocatable pointers.
     const size_t dispatchCellCount = static_cast<size_t>(VM_HANDLER_TABLE_SIZE) *
         config.variantCount;
     std::vector<uint64_t> expectedPhysicalTargets(dispatchCellCount, 0);
@@ -1561,7 +1663,6 @@ bool VMHandlerSynthesizer::Validate(
             return false;
         }
     }
-    std::set<uint32_t> requiredDispatchRelocations;
     for (size_t cell = 0; cell < expectedPhysicalTargets.size(); ++cell) {
         const uint64_t byteOffset64 = static_cast<uint64_t>(
             result.dispatchTableOffset) + static_cast<uint64_t>(cell) * pointerSize;
@@ -1571,14 +1672,27 @@ bool VMHandlerSynthesizer::Validate(
             return false;
         }
         const uint32_t byteOffset = static_cast<uint32_t>(byteOffset64);
-        uint64_t storedTarget = 0;
-        std::memcpy(&storedTarget, result.image.data() + byteOffset, pointerSize);
-        if (pointerSize == 4u) storedTarget &= 0xFFFFFFFFULL;
-        if (storedTarget != expectedPhysicalTargets[cell]) {
-            error = "physical dispatch table target disagrees with handler layout";
+        uint64_t storedEncodedTarget = 0;
+        std::memcpy(&storedEncodedTarget,
+            result.image.data() + byteOffset, pointerSize);
+        if (pointerSize == 4u) storedEncodedTarget &= 0xFFFFFFFFULL;
+        const uint64_t expectedEncodedTarget = EncodeVMDispatchTableTarget(
+            expectedPhysicalTargets[cell], pointerSize,
+            result.dispatchTableCodec);
+        if (storedEncodedTarget != expectedEncodedTarget) {
+            error = "physical dispatch table ciphertext disagrees with handler layout";
             return false;
         }
-        if (storedTarget != 0) requiredDispatchRelocations.insert(byteOffset);
+        const uint64_t decodedTarget = DecodeVMDispatchTableTarget(
+            storedEncodedTarget, pointerSize, result.dispatchTableCodec);
+        if (decodedTarget != expectedPhysicalTargets[cell]) {
+            error = "physical dispatch table codec does not round-trip its target";
+            return false;
+        }
+        if (storedEncodedTarget == expectedPhysicalTargets[cell]) {
+            error = "physical dispatch table leaks a plaintext target offset";
+            return false;
+        }
     }
 
     const uint16_t relocationType = pointerSize == 8
@@ -1592,10 +1706,11 @@ bool VMHandlerSynthesizer::Validate(
             error = "synthesized runtime relocation is invalid or duplicated";
             return false;
         }
-    }
-    for (uint32_t requiredOffset : requiredDispatchRelocations) {
-        if (relocationOffsets.count(requiredOffset) == 0) {
-            error = "physical dispatch pointer is missing its target relocation";
+        const uint64_t dispatchEnd = static_cast<uint64_t>(
+            result.dispatchTableOffset) + result.dispatchTableSize;
+        if (relocation.offset >= result.dispatchTableOffset &&
+            static_cast<uint64_t>(relocation.offset) < dispatchEnd) {
+            error = "encoded dispatch table unexpectedly contains a base relocation";
             return false;
         }
     }

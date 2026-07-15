@@ -1007,6 +1007,16 @@ bool VMRuntimeBuilder::VerifyRuntimeContents(
         expectation.sectionContentSize > expectation.expectedSectionBytes.size()) {
         return fail("runtime integrity expectation is missing or malformed");
     }
+    if ((expectation.dispatchTableCodec.encoding !=
+                VMDispatchTableEncoding::XorKeyedTable &&
+            expectation.dispatchTableCodec.encoding !=
+                VMDispatchTableEncoding::AddRotateKeyedTable) ||
+        expectation.dispatchTableCodec.key == 0u ||
+        expectation.dispatchTableCodec.key > 0x7FFFFFFFu ||
+        expectation.dispatchTableCodec.rotate == 0u ||
+        expectation.dispatchTableCodec.rotate > 31u) {
+        return fail("runtime integrity dispatch-table codec is invalid");
+    }
     if (expectation.synthesizedImage.offset != 0 ||
         expectation.synthesizedImage.size != result.runtimeImageSize ||
         !RuntimeRangeValid(expectation.synthesizedImage,
@@ -1120,22 +1130,15 @@ bool VMRuntimeBuilder::VerifyRuntimeContents(
     if (expectation.dispatchTable.size % pointerSize != 0) {
         return fail("runtime dispatch-table width is invalid");
     }
-    const uint64_t mappedBase = GetImageBase(image) + result.sectionRVA;
-    if ((!expected64 && mappedBase > (std::numeric_limits<uint32_t>::max)()) ||
-        mappedBase < GetImageBase(image)) {
-        return fail("runtime mapped base overflows the target architecture");
-    }
-    std::vector<uint8_t> normalizedDispatch(expectation.dispatchTable.size, 0);
     for (uint32_t offset = 0; offset < expectation.dispatchTable.size;
          offset += pointerSize) {
-        uint64_t target = 0;
-        std::memcpy(&target,
+        uint64_t encodedTarget = 0;
+        std::memcpy(&encodedTarget,
             current + expectation.dispatchTable.offset + offset, pointerSize);
-        if (target == 0) continue;
-        if (target < mappedBase) {
-            return fail("runtime dispatch target precedes the runtime image");
-        }
-        const uint64_t relative = target - mappedBase;
+        if (pointerSize == 4u) encodedTarget &= 0xFFFFFFFFULL;
+        const uint64_t relative = DecodeVMDispatchTableTarget(
+            encodedTarget, pointerSize, expectation.dispatchTableCodec);
+        if (relative == 0u) continue;
         const uint64_t handlerEnd = static_cast<uint64_t>(
             expectation.encryptedHandlers.offset) +
             expectation.encryptedHandlers.size;
@@ -1144,11 +1147,12 @@ bool VMRuntimeBuilder::VerifyRuntimeContents(
             relative > (std::numeric_limits<uint32_t>::max)()) {
             return fail("runtime dispatch target is outside encrypted handlers");
         }
-        std::memcpy(normalizedDispatch.data() + offset, &relative, pointerSize);
     }
-    if (HashRuntimeBytes(normalizedDispatch.data(), normalizedDispatch.size(),
+    if (HashRuntimeBytes(
+            current + expectation.dispatchTable.offset,
+            expectation.dispatchTable.size,
             expectation.dispatchDigestDomain) != result.dispatchKeyDigest) {
-        return fail("runtime dispatch-key digest does not match physical targets");
+        return fail("runtime dispatch-key digest does not match encoded targets");
     }
     if (!VerifyNoReferenceRuntimeBlob(image->rawData, image->rawSize, error)) {
         return false;
@@ -1433,6 +1437,7 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     expectation.handlerBodyDigest = result.handlerBodyDigest;
     expectation.dispatchKeyDigest = result.dispatchKeyDigest;
     expectation.variantSelectorDigest = result.variantSelectorDigest;
+    expectation.dispatchTableCodec = synthesized.dispatchTableCodec;
     expectation.expectedSectionBytes.assign(result.sectionSize, 0);
     std::copy(blob.begin(), blob.end(), expectation.expectedSectionBytes.begin());
     expectation.synthesizedImage.offset = 0;

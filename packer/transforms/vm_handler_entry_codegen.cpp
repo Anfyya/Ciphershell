@@ -584,6 +584,65 @@ std::vector<uint8_t> DecryptorInstructionEvidence(
     return evidence;
 }
 
+void AppendU32LE(std::vector<uint8_t>& bytes, uint32_t value) {
+    bytes.push_back(static_cast<uint8_t>(value));
+    bytes.push_back(static_cast<uint8_t>(value >> 8u));
+    bytes.push_back(static_cast<uint8_t>(value >> 16u));
+    bytes.push_back(static_cast<uint8_t>(value >> 24u));
+}
+
+bool ValidateDispatchDecoderEncoding(
+    const VMHandlerEntryCodegenConfig& config,
+    const VMHandlerEntryCodegenResult& result,
+    std::string& error)
+{
+    if (result.dispatchDecoderSize == 0u ||
+        result.dispatchDecoderOffset > result.operandDecoderCode.size() ||
+        result.dispatchDecoderSize >
+            result.operandDecoderCode.size() - result.dispatchDecoderOffset) {
+        error = "entry dispatch decoder evidence range is invalid";
+        return false;
+    }
+    const bool x64 = config.architecture == VM_ARCH_X64;
+    std::vector<uint8_t> expected;
+    if (x64) expected.insert(expected.end(), {0x49,0x8B,0x04,0xCE});
+    else expected.insert(expected.end(), {0x8B,0x04,0x8B});
+    if (config.dispatchTableCodec.encoding ==
+            VMDispatchTableEncoding::XorKeyedTable) {
+        if (x64) expected.insert(expected.end(), {0x48,0x35});
+        else expected.push_back(0x35);
+        AppendU32LE(expected, config.dispatchTableCodec.key);
+    } else {
+        if (x64) expected.insert(expected.end(),
+            {0x48,0xC1,0xC8,config.dispatchTableCodec.rotate,0x48,0x2D});
+        else expected.insert(expected.end(),
+            {0xC1,0xC8,config.dispatchTableCodec.rotate,0x2D});
+        AppendU32LE(expected, config.dispatchTableCodec.key);
+    }
+    if (x64) expected.insert(expected.end(), {0x48,0x85,0xC0,0x0F,0x84});
+    else expected.insert(expected.end(), {0x85,0xC0,0x0F,0x84});
+    const size_t branchDisplacement = expected.size();
+    AppendU32LE(expected, 0u);
+    if (x64) expected.insert(expected.end(), {0x4C,0x01,0xF0,0x48,0x2D});
+    else expected.insert(expected.end(), {0x01,0xD8,0x2D});
+    AppendU32LE(expected, config.layout.dispatchTableOffset);
+
+    if (expected.size() != result.dispatchDecoderSize) {
+        error = "entry dispatch decoder size does not match its selected codec";
+        return false;
+    }
+    for (size_t index = 0; index < expected.size(); ++index) {
+        if (index >= branchDisplacement && index < branchDisplacement + 4u)
+            continue;
+        if (result.operandDecoderCode[
+                result.dispatchDecoderOffset + index] != expected[index]) {
+            error = "entry dispatch decoder bytes disagree with codec constants";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) {
     if (config.architecture != VM_ARCH_X86 && config.architecture != VM_ARCH_X64) {
         error = "entry codegen architecture is invalid";
@@ -607,6 +666,17 @@ bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) 
         config.cipher.instructionVariant >=
             VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT) {
         error = "entry codegen handler cipher contract is invalid";
+        return false;
+    }
+    if ((config.dispatchTableCodec.encoding !=
+                VMDispatchTableEncoding::XorKeyedTable &&
+            config.dispatchTableCodec.encoding !=
+                VMDispatchTableEncoding::AddRotateKeyedTable) ||
+        config.dispatchTableCodec.key == 0u ||
+        config.dispatchTableCodec.key > 0x7FFFFFFFu ||
+        config.dispatchTableCodec.rotate == 0u ||
+        config.dispatchTableCodec.rotate > 31u) {
+        error = "entry codegen dispatch table codec contract is invalid";
         return false;
     }
     if (config.virtualProtectIatRVA == 0 ||
@@ -805,6 +875,7 @@ bool VMHandlerEntryCodegen::Validate(
             return false;
         }
     }
+    if (!ValidateDispatchDecoderEncoding(config, result, error)) return false;
     return ValidateDecryptorMutationEncoding(config, result, error);
 }
 
@@ -1977,8 +2048,23 @@ bool BuildOperandDecoder(
         code.Jcc32(0x84, unsupported);
         code.Raw({0x6B,0xC9,static_cast<uint8_t>(config.variantCount)});
         code.Raw({0x41,0x0F,0xB6,0x97}); code.U32(CtxCurrentVariant);
-        code.Raw({0x01,0xD1,0x49,0x8B,0x04,0xCE,0x48,0x85,0xC0});
+        code.Raw({0x01,0xD1});
+        result.dispatchDecoderOffset = static_cast<uint32_t>(code.Offset());
+        code.Raw({0x49,0x8B,0x04,0xCE});
+        if (config.dispatchTableCodec.encoding ==
+                VMDispatchTableEncoding::XorKeyedTable) {
+            code.Raw({0x48,0x35}); code.U32(config.dispatchTableCodec.key);
+        } else {
+            code.Raw({0x48,0xC1,0xC8,config.dispatchTableCodec.rotate,
+                      0x48,0x2D});
+            code.U32(config.dispatchTableCodec.key);
+        }
+        code.Raw({0x48,0x85,0xC0});
         code.Jcc32(0x84, unsupported);
+        code.Raw({0x4C,0x01,0xF0,0x48,0x2D});
+        code.U32(config.layout.dispatchTableOffset);
+        result.dispatchDecoderSize = static_cast<uint32_t>(code.Offset()) -
+            result.dispatchDecoderOffset;
         code.Jmp32(epilog);
 
         code.Bind(unsupported);
@@ -2221,7 +2307,19 @@ bool BuildOperandDecoder(
         code.Raw({0x6B,0xC9,static_cast<uint8_t>(config.variantCount)});
         code.Raw({0x0F,0xB6,0x97}); code.U32(CtxCurrentVariant);
         code.Raw({0x01,0xD1,0x8B,0x9F}); code.U32(CtxDispatchTable);
-        code.Raw({0x8B,0x04,0x8B,0x85,0xC0}); code.Jcc32(0x84, unsupported);
+        result.dispatchDecoderOffset = static_cast<uint32_t>(code.Offset());
+        code.Raw({0x8B,0x04,0x8B});
+        if (config.dispatchTableCodec.encoding ==
+                VMDispatchTableEncoding::XorKeyedTable) {
+            code.U8(0x35); code.U32(config.dispatchTableCodec.key);
+        } else {
+            code.Raw({0xC1,0xC8,config.dispatchTableCodec.rotate,0x2D});
+            code.U32(config.dispatchTableCodec.key);
+        }
+        code.Raw({0x85,0xC0}); code.Jcc32(0x84, unsupported);
+        code.Raw({0x01,0xD8,0x2D}); code.U32(config.layout.dispatchTableOffset);
+        result.dispatchDecoderSize = static_cast<uint32_t>(code.Offset()) -
+            result.dispatchDecoderOffset;
         code.Jmp32(epilog);
         code.Bind(unsupported);
         code.Raw({0xC7,0x87}); code.U32(CtxError); code.U32(VM_MICRO_ERR_OPCODE_UNSUPPORTED);

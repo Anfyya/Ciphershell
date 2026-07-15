@@ -148,6 +148,12 @@ VMRuntimeBuildResult MakeExpectedRuntime(bool is64Bit) {
     expectation.opcodeMapDigest = result.opcodeMapDigest;
     expectation.handlerBodyDigest = result.handlerBodyDigest;
     expectation.variantSelectorDigest = result.variantSelectorDigest;
+    expectation.dispatchTableCodec.encoding = is64Bit
+        ? VMDispatchTableEncoding::AddRotateKeyedTable
+        : VMDispatchTableEncoding::XorKeyedTable;
+    expectation.dispatchTableCodec.key = is64Bit
+        ? 0x13579BDFu : 0x2468ACE1u;
+    expectation.dispatchTableCodec.rotate = is64Bit ? 19u : 11u;
     expectation.synthesizedImage = {0, kRuntimeImageSize, 0};
     expectation.encryptedHandlers = {kHandlerOffset, kHandlerSize, 0};
     expectation.dispatchTable = {kDispatchOffset, kDispatchSize, 0};
@@ -159,28 +165,19 @@ VMRuntimeBuildResult MakeExpectedRuntime(bool is64Bit) {
     }
 
     const uint32_t pointerSize = is64Bit ? 8u : 4u;
-    // 内容区在上面已经被非零测试花纹填满；x86 指针宽度(4 字节)只占用
-    // kDispatchSize(16 字节) 里的前两槽，若不先清零整张表，剩余槽位会残留
-    // 花纹字节，被当成"非空"派发目标而非合法的未使用槽位。
-    std::fill(expectation.expectedSectionBytes.begin() + kDispatchOffset,
-        expectation.expectedSectionBytes.begin() + kDispatchOffset + kDispatchSize,
-        static_cast<uint8_t>(0));
-    const uint64_t imageBase = is64Bit ? kImageBase64 : kImageBase32;
-    const uint64_t mappedBase = imageBase + kRuntimeSectionRVA;
-    const uint64_t firstTarget = mappedBase + kHandlerOffset;
-    const uint64_t secondTarget = mappedBase + kHandlerOffset + 0x20u;
-    WritePointer(expectation.expectedSectionBytes, kDispatchOffset,
-        pointerSize, firstTarget);
-    WritePointer(expectation.expectedSectionBytes,
-        kDispatchOffset + pointerSize, pointerSize, secondTarget);
-
-    std::vector<uint8_t> normalizedDispatch(kDispatchSize, 0);
-    const uint64_t firstRelative = kHandlerOffset;
-    const uint64_t secondRelative = kHandlerOffset + 0x20u;
-    WritePointer(normalizedDispatch, 0, pointerSize, firstRelative);
-    WritePointer(normalizedDispatch, pointerSize, pointerSize, secondRelative);
-    result.dispatchKeyDigest = HashBytes(normalizedDispatch.data(),
-        normalizedDispatch.size(), expectation.dispatchDigestDomain);
+    const uint32_t cellCount = kDispatchSize / pointerSize;
+    for (uint32_t cell = 0; cell < cellCount; ++cell) {
+        uint64_t relative = 0;
+        if (cell == 0u) relative = kHandlerOffset;
+        else if (cell == 1u) relative = kHandlerOffset + 0x20u;
+        const uint64_t encoded = EncodeVMDispatchTableTarget(
+            relative, pointerSize, expectation.dispatchTableCodec);
+        WritePointer(expectation.expectedSectionBytes,
+            kDispatchOffset + cell * pointerSize, pointerSize, encoded);
+    }
+    result.dispatchKeyDigest = HashBytes(
+        expectation.expectedSectionBytes.data() + kDispatchOffset,
+        kDispatchSize, expectation.dispatchDigestDomain);
     expectation.dispatchKeyDigest = result.dispatchKeyDigest;
     RefreshPhysicalDigests(result);
     return result;
@@ -262,13 +259,13 @@ void TestDigestAndDispatchTargetRejection() {
         digestTamper.variantSelectorDigest ^= 1u;
         RequireRejected(image, digestTamper, "diversity digest");
 
-        // 即使攻击者同步伪造整段期望字节与物理摘要，dispatch 目标反归一化后
+        // 即使攻击者同步伪造整段期望字节与物理摘要，编码后的 dispatch 表
         // 仍必须与 pack-time dispatch-key digest 一致。
         VMRuntimeBuildResult forgedDispatch = result;
         const uint32_t pointerSize = is64Bit ? 8u : 4u;
-        const uint64_t imageBase = is64Bit ? kImageBase64 : kImageBase32;
-        const uint64_t forgedTarget = imageBase + kRuntimeSectionRVA +
-            kHandlerOffset + 0x10u;
+        const uint64_t forgedTarget = EncodeVMDispatchTableTarget(
+            kHandlerOffset + 0x10u, pointerSize,
+            forgedDispatch.integrityExpectation.dispatchTableCodec);
         WritePointer(forgedDispatch.integrityExpectation.expectedSectionBytes,
             kDispatchOffset, pointerSize, forgedTarget);
         RefreshPhysicalDigests(forgedDispatch);

@@ -2297,6 +2297,28 @@ void ValidateOneBuild(
         static_cast<uint64_t>(VM_HANDLER_TABLE_SIZE) * config.variantCount * pointerSize;
     Require(result.dispatchTableSize >= minimumDispatchBytes,
         "dispatch table 不是 slot*K 的可索引布局");
+    for (const auto& entry : result.dispatchEntries) {
+        const uint32_t cell = static_cast<uint32_t>(entry.slot) *
+            config.variantCount + entry.variant;
+        const uint32_t tableOffset = result.dispatchTableOffset +
+            cell * pointerSize;
+        uint64_t stored = 0;
+        std::memcpy(&stored, result.image.data() + tableOffset, pointerSize);
+        if (pointerSize == 4u) stored &= 0xFFFFFFFFULL;
+        Require(stored != entry.targetOffset,
+            "dispatch table 泄露明文 handler 相对偏移");
+        Require(DecodeVMDispatchTableTarget(
+                stored, pointerSize, result.dispatchTableCodec) ==
+                    entry.targetOffset,
+            "dispatch table 密文不能按本次 build codec 还原");
+    }
+    const uint64_t dispatchEnd = static_cast<uint64_t>(
+        result.dispatchTableOffset) + result.dispatchTableSize;
+    for (const auto& relocation : result.relocations) {
+        Require(relocation.offset < result.dispatchTableOffset ||
+                static_cast<uint64_t>(relocation.offset) >= dispatchEnd,
+            "编码后的 dispatch table 仍携带 PE base relocation");
+    }
 
     std::map<std::tuple<uint8_t, uint8_t, uint8_t>, uint32_t> dispatchTargets;
     for (const auto& entry : result.dispatchEntries) {
@@ -2405,6 +2427,28 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     const VMHandlerSynthesisResult buildB = synthesizer.Synthesize(configB);
     ValidateOneBuild(configA, buildA);
     ValidateOneBuild(configB, buildB);
+
+    VMHandlerSynthesisResult tableTamper = buildA;
+    tableTamper.image[tableTamper.dispatchTableOffset] ^= 0x01u;
+    std::string tableTamperError;
+    Require(!VMHandlerSynthesizer::Validate(
+            configA, tableTamper, tableTamperError),
+        "dispatch table 密文篡改逃过合成器自校验");
+    VMHandlerSynthesisResult codecTamper = buildA;
+    codecTamper.dispatchTableCodec.key ^= 0x02u;
+    std::string codecTamperError;
+    Require(!VMHandlerSynthesizer::Validate(
+            configA, codecTamper, codecTamperError),
+        "dispatch table codec 常量篡改逃过 seed 重放校验");
+    VMHandlerSynthesisResult relocationTamper = buildA;
+    relocationTamper.relocations.push_back({
+        relocationTamper.dispatchTableOffset,
+        static_cast<uint16_t>(architecture == VMHandlerArchitecture::X64
+            ? IMAGE_REL_BASED_DIR64 : IMAGE_REL_BASED_HIGHLOW), 0});
+    std::string relocationTamperError;
+    Require(!VMHandlerSynthesizer::Validate(
+            configA, relocationTamper, relocationTamperError),
+        "dispatch table relocation 篡改逃过无明文指针校验");
 
     if (architecture == VMHandlerArchitecture::X64) {
         const uint64_t handlerEnd =

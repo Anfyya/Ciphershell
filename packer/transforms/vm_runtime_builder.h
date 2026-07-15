@@ -17,7 +17,7 @@ struct VMRuntimeFunctionEntry {
     uint32_t unwindRVA = 0;
 };
 
-constexpr uint32_t VM_RUNTIME_INTEGRITY_EXPECTATION_VERSION = 1;
+constexpr uint32_t VM_RUNTIME_INTEGRITY_EXPECTATION_VERSION = 2;
 
 struct VMRuntimeContentRange {
     // Relative to VMRuntimeBuildResult::sectionRVA.
@@ -35,6 +35,7 @@ struct VMRuntimeIntegrityExpectation {
     uint64_t handlerBodyDigest = 0;
     uint64_t dispatchKeyDigest = 0;
     uint64_t variantSelectorDigest = 0;
+    VMDispatchTableCodec dispatchTableCodec{};
     VMRuntimeContentRange synthesizedImage;
     VMRuntimeContentRange encryptedHandlers;
     VMRuntimeContentRange dispatchTable;

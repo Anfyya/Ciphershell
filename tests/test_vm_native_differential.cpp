@@ -117,10 +117,11 @@ void RunDifferentialCase(
     uint32_t corpusCount,
     bool expectSuccess,
     const char* label,
-    bool expectDivideFault = false)
+    bool expectDivideFault = false,
+    uint8_t providerSeedDomain = 0xC7u)
 {
     VMWindowsNativeDifferentialEvidenceProvider provider;
-    const auto providerSeed = MakeSeed(0xC7);
+    const auto providerSeed = MakeSeed(providerSeedDomain);
     VMHandlerOperandCodecConfig operandCodec{};
     operandCodec.opcodeXor = static_cast<uint8_t>(providerSeed[3] | 1u);
     operandCodec.opcodeAdd = static_cast<uint8_t>(providerSeed[7] | 1u);
@@ -161,6 +162,48 @@ void RunDifferentialCase(
     }
     std::cout << "[" << label << "] cases=" << result.casesVerified
               << " success=" << result.success << " error=" << result.error << '\n';
+}
+
+void TestDispatchTableEncodingSchemesExecuteNatively() {
+    const auto seed = MakeSeed(0x6Du);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+    const std::vector<uint8_t> addBytes = {0x01,0xC8,0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+    const Function function =
+        DecodeStandaloneFunction(disassembler, addBytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    uint8_t xorDomain = 0u;
+    uint8_t addRotateDomain = 0u;
+    bool haveXor = false;
+    bool haveAddRotate = false;
+    for (uint16_t domain = 1u; domain <= 0xFFu &&
+            (!haveXor || !haveAddRotate); ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        const VMDispatchTableCodec codec =
+            DeriveVMDispatchTableCodec(candidateSeed);
+        if (codec.encoding == VMDispatchTableEncoding::XorKeyedTable &&
+            !haveXor) {
+            xorDomain = static_cast<uint8_t>(domain);
+            haveXor = true;
+        } else if (codec.encoding ==
+                VMDispatchTableEncoding::AddRotateKeyedTable &&
+            !haveAddRotate) {
+            addRotateDomain = static_cast<uint8_t>(domain);
+            haveAddRotate = true;
+        }
+    }
+    Require(haveXor && haveAddRotate,
+        "测试 seed 未覆盖两种 dispatch table 编码方案");
+    RunDifferentialCase(function, translation, build, 16, true,
+        "XorKeyedTable 加密查表跳转原生执行", false, xorDomain);
+    RunDifferentialCase(function, translation, build, 16, true,
+        "AddRotateKeyedTable 加密查表跳转原生执行", false,
+        addRotateDomain);
 }
 
 void TestRealDifferentialPassAndCatchesRealMismatch() {
@@ -538,6 +581,8 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
+    Run("分发表编码分化: 两套加密查表路径均由隔离原生 CPU 执行",
+        &TestDispatchTableEncodingSchemesExecuteNatively, failures);
     Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",
         &TestMulNativeDifferentialMatchesRealCpu, failures);
     Run("BIT_TEST/BIT_SET/BIT_RESET 真 K 变体: 真实 CPU BT/BTS/BTR 与合成 handler 链一致性/分歧检测",

@@ -749,6 +749,189 @@ def vm_group_seed_divergence_gate(root: Path) -> list[Violation]:
     return violations
 
 
+def dispatch_table_encoding_gate(root: Path) -> list[Violation]:
+    """Numerically replay both production dispatch-table codecs.
+
+    This gate extracts the real seed-domain/hash/key/rotate constants from the
+    synthesizer, independently implements both forward and inverse transforms,
+    and exercises them at 32- and 64-bit pointer widths.  It also pins the
+    generated decoder to the inverse immediates and requires the Windows
+    isolated native-differential test to execute both selected schemes.
+    """
+    synth_path = root / "packer" / "transforms" / "vm_handler_synthesizer.cpp"
+    entry_path = root / "packer" / "transforms" / "vm_handler_entry_codegen.cpp"
+    native_test_path = root / "tests" / "test_vm_native_differential.cpp"
+    violations: list[Violation] = []
+    for path in (synth_path, entry_path, native_test_path):
+        if not path.is_file():
+            violations.append(Violation(
+                path, 1, "dispatch-table-codec-numeric-gate",
+                "required source file is missing"))
+    if violations:
+        return violations
+
+    synth = strip_comments_and_literals(
+        synth_path.read_text(encoding="utf-8", errors="strict"))
+    entry = strip_comments_and_literals(
+        entry_path.read_text(encoding="utf-8", errors="strict"))
+    native_test = strip_comments_and_literals(
+        native_test_path.read_text(encoding="utf-8", errors="strict"))
+    hash_body = extract_function_body(synth, "HashBytes")
+    derive_body = extract_function_body(synth, "DeriveVMDispatchTableCodec")
+    encode_body = extract_function_body(synth, "EncodeDispatchTableTarget")
+    decode_body = extract_function_body(synth, "DecodeDispatchTableTarget")
+    decoder_body = extract_function_body(entry, "bool BuildOperandDecoder")
+    if None in (hash_body, derive_body, encode_body, decode_body, decoder_body):
+        return [Violation(
+            synth_path, 1, "dispatch-table-codec-numeric-gate",
+            "one or more dispatch codec functions were not found")]
+
+    hash_norm = re.sub(r"\s+", "", hash_body or "")
+    derive_norm = re.sub(r"\s+", "", derive_body or "")
+    encode_norm = re.sub(r"\s+", "", encode_body or "")
+    decode_norm = re.sub(r"\s+", "", decode_body or "")
+    decoder_norm = re.sub(r"\s+", "", decoder_body or "")
+    native_test_norm = re.sub(r"\s+", "", native_test)
+
+    initial_match = re.search(r"uint64_thash=([0-9]+)ULL\^domain", hash_norm)
+    multiply_match = re.search(r"hash\*=([0-9]+)ULL", hash_norm)
+    hash_shift_match = re.search(r"hash\^=hash>>([0-9]+)u", hash_norm)
+    domain_match = re.search(
+        r"kDispatchCodecDomain=0x([0-9A-Fa-f]+)ULL", derive_norm)
+    key_match = re.search(
+        r"\(material>>([0-9]+)u\)&0x([0-9A-Fa-f]+)ULL\)\|([0-9]+)u",
+        derive_norm)
+    rotate_match = re.search(
+        r"\(\(material>>([0-9]+)u\)%([0-9]+)u\)\+([0-9]+)u",
+        derive_norm)
+    if None in (initial_match, multiply_match, hash_shift_match,
+                domain_match, key_match, rotate_match):
+        return [Violation(
+            synth_path, 1, "dispatch-table-codec-numeric-gate",
+            "could not extract the production codec derivation constants")]
+
+    structural = (
+        (derive_norm, "VMDispatchTableEncoding::XorKeyedTable",
+         "dispatch-table-xor-keyed-numeric-gate"),
+        (derive_norm, "VMDispatchTableEncoding::AddRotateKeyedTable",
+         "dispatch-table-add-rotate-numeric-gate"),
+        (encode_norm, "(targetOffset^codec.key)&mask",
+         "dispatch-table-xor-keyed-numeric-gate"),
+        (decode_norm, "(encodedTarget^codec.key)&mask",
+         "dispatch-table-xor-keyed-numeric-gate"),
+        (encode_norm, "(targetOffset+codec.key)&mask",
+         "dispatch-table-add-rotate-numeric-gate"),
+        (decode_norm, "encodedTarget,codec.rotate,pointerSize)-codec.key)&mask",
+         "dispatch-table-add-rotate-numeric-gate"),
+        (decoder_norm,
+         "code.Raw({0x48,0x35});code.U32(config.dispatchTableCodec.key)",
+         "dispatch-table-xor-keyed-numeric-gate"),
+        (decoder_norm,
+         "{0x48,0xC1,0xC8,config.dispatchTableCodec.rotate,0x48,0x2D}",
+         "dispatch-table-add-rotate-numeric-gate"),
+        (decoder_norm,
+         "code.Raw({0x4C,0x01,0xF0,0x48,0x2D});code.U32(config.layout.dispatchTableOffset)",
+         "dispatch-table-codec-runtime-base-gate"),
+        (decoder_norm,
+         "code.Raw({0x01,0xD8,0x2D});code.U32(config.layout.dispatchTableOffset)",
+         "dispatch-table-codec-runtime-base-gate"),
+    )
+    for haystack, needle, rule in structural:
+        if needle not in haystack:
+            violations.append(Violation(
+                entry_path if haystack == decoder_norm else synth_path,
+                1, rule, f"production writer/decoder evidence missing: {needle}"))
+    for evidence, rule in (
+        ("TestDispatchTableEncodingSchemesExecuteNatively",
+         "dispatch-table-codec-native-differential-gate"),
+        ("XorKeyedTable",
+         "dispatch-table-xor-keyed-numeric-gate"),
+        ("AddRotateKeyedTable",
+         "dispatch-table-add-rotate-numeric-gate"),
+        ("RunDifferentialCase(function,translation,build,16,true",
+         "dispatch-table-codec-native-differential-gate"),
+    ):
+        if evidence not in native_test_norm:
+            violations.append(Violation(
+                native_test_path, 1, rule,
+                f"isolated native execution evidence missing: {evidence}"))
+    if violations:
+        return violations
+
+    mask64 = (1 << 64) - 1
+    initial = int(initial_match.group(1))
+    multiplier = int(multiply_match.group(1))
+    hash_shift = int(hash_shift_match.group(1))
+    domain = int(domain_match.group(1), 16)
+    key_shift = int(key_match.group(1))
+    key_mask = int(key_match.group(2), 16)
+    key_or = int(key_match.group(3))
+    rotate_shift = int(rotate_match.group(1))
+    rotate_modulus = int(rotate_match.group(2))
+    rotate_add = int(rotate_match.group(3))
+
+    def production_hash(seed: bytes) -> int:
+        value = (initial ^ domain) & mask64
+        for byte in seed:
+            value ^= byte
+            value = (value * multiplier) & mask64
+            value ^= value >> hash_shift
+        return value & mask64
+
+    def rotl(value: int, count: int, bits: int) -> int:
+        width_mask = (1 << bits) - 1
+        count &= bits - 1
+        value &= width_mask
+        return value if count == 0 else (
+            ((value << count) | (value >> (bits - count))) & width_mask)
+
+    def rotr(value: int, count: int, bits: int) -> int:
+        width_mask = (1 << bits) - 1
+        count &= bits - 1
+        value &= width_mask
+        return value if count == 0 else (
+            ((value >> count) | (value << (bits - count))) & width_mask)
+
+    selected: set[int] = set()
+    for seed_domain in range(1, 257):
+        seed = bytes(
+            ((seed_domain * 0x5D + index * 0x9B + (index * index)) & 0xFF)
+            for index in range(32))
+        material = production_hash(seed)
+        scheme = material & 1
+        selected.add(scheme)
+        key = ((material >> key_shift) & key_mask) | key_or
+        rotate = ((material >> rotate_shift) % rotate_modulus) + rotate_add
+        if key == 0 or key > 0x7FFFFFFF or not (1 <= rotate <= 31):
+            violations.append(Violation(
+                synth_path, 1, "dispatch-table-codec-numeric-gate",
+                f"derived invalid key/rotate for seed sample {seed_domain}"))
+            break
+        for bits in (32, 64):
+            width_mask = (1 << bits) - 1
+            for target in (0, 0x1000, 0x12345, 0x7FFFFF00):
+                if scheme == 0:
+                    encoded = (target ^ key) & width_mask
+                    decoded = (encoded ^ key) & width_mask
+                else:
+                    encoded = rotl((target + key) & width_mask, rotate, bits)
+                    decoded = (rotr(encoded, rotate, bits) - key) & width_mask
+                if decoded != target or encoded == target:
+                    rule = ("dispatch-table-xor-keyed-numeric-gate"
+                            if scheme == 0 else
+                            "dispatch-table-add-rotate-numeric-gate")
+                    violations.append(Violation(
+                        synth_path, 1, rule,
+                        f"numeric replay failed: bits={bits} target={target:#x} "
+                        f"encoded={encoded:#x} decoded={decoded:#x}"))
+                    return violations
+    if selected != {0, 1}:
+        violations.append(Violation(
+            synth_path, 1, "dispatch-table-codec-seed-selection-gate",
+            "sampled build seeds did not select both production codecs"))
+    return violations
+
+
 def decryptor_coverage_gate(root: Path) -> list[Violation]:
     """Verify production choice cardinality, exact-byte self-validation and
     exhaustive native execution coverage.  Digest/result field names alone do
@@ -1056,6 +1239,7 @@ def main() -> int:
     violations.extend(reference_runtime_fingerprint_gate(root))
     violations.extend(decryptor_coverage_gate(root))
     violations.extend(vm_group_seed_divergence_gate(root))
+    violations.extend(dispatch_table_encoding_gate(root))
 
     # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
     # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，

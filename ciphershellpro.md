@@ -159,6 +159,8 @@ struct VMPendingFlags {
 
 - **直接线程化分发（direct-threaded）**：每个 handler 末尾自行解码下一 opcode 并跳转到目标 handler，**没有集中循环**。
 - **分发键 per-build 混淆**：opcode → handler 地址的映射经构建期变换，且分散在各 handler 尾部。
+- **分发表项不得存放明文地址**：物理 `[slot][K]` 表存放按 build seed 选择的编码后 runtime 相对偏移，当前正式方案为 `XorKeyedTable` 与 `AddRotateKeyedTable`。空槽同样编码；查表路径先现场还原相对偏移，再从 dispatch 表地址反推出 runtime 基址并形成最终跳转地址。编码表项不得生成 PE base relocation，避免 loader 把密文当指针修正。
+- **编码/解码一致性是硬门禁**：合成器必须逐表项独立回解并拒绝明文偏移，入口 codegen 必须验证实际发出的 x86/x64 逆变换机器码及 key/rotate/dispatch offset 立即数；隔离原生 CPU 差分测试必须分别执行两种 seed 选型，源码门禁从生产常量独立重放 32/64 位数值算法。
 
 ### 4.2 多分发器共存（可选强化）
 
