@@ -55,6 +55,7 @@ constexpr uint32_t kTestFlushInstructionCacheIatRVA = 0x110u;
 constexpr size_t kTestImageSize = 0x200u;
 constexpr uint32_t kCallHostImportSlotRVA = 0x140u;
 constexpr uint32_t kCallHostNativeTargetRVA = 0x180u;
+constexpr uint32_t kInstructionBridgeTargetRVA = 0x300u;
 constexpr size_t kCallHostImageSize = 0x1000u;
 constexpr std::array<uint8_t, 4> kSemanticWidths = {1u, 2u, 4u, 8u};
 constexpr std::array<uint8_t, 2> kCoreStrategies = {0u, 1u};
@@ -661,7 +662,10 @@ struct TestRuntimeIatImage {
 
 class CallHostTestImage final {
 public:
-    explicit CallHostTestImage(uintptr_t importTarget) {
+    explicit CallHostTestImage(
+        uintptr_t importTarget,
+        uintptr_t instructionBridgeTarget = 0)
+    {
         m_base = static_cast<uint8_t*>(VirtualAlloc(
             nullptr, kCallHostImageSize, MEM_RESERVE | MEM_COMMIT,
             PAGE_READWRITE));
@@ -728,6 +732,33 @@ public:
 #endif
         std::memcpy(m_base + kCallHostNativeTargetRVA,
             nativeTarget.data(), nativeTarget.size());
+        if (instructionBridgeTarget != 0) {
+#if defined(_M_X64)
+            const std::array<uint8_t, 12> bridgeTrampoline = {
+                0x48,0xB8,                       // mov rax, imm64
+                static_cast<uint8_t>(instructionBridgeTarget),
+                static_cast<uint8_t>(instructionBridgeTarget >> 8u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 16u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 24u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 32u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 40u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 48u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 56u),
+                0xFF,0xE0                        // jmp rax
+            };
+#else
+            const std::array<uint8_t, 7> bridgeTrampoline = {
+                0xB8,                            // mov eax, imm32
+                static_cast<uint8_t>(instructionBridgeTarget),
+                static_cast<uint8_t>(instructionBridgeTarget >> 8u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 16u),
+                static_cast<uint8_t>(instructionBridgeTarget >> 24u),
+                0xFF,0xE0                        // jmp eax
+            };
+#endif
+            std::memcpy(m_base + kInstructionBridgeTargetRVA,
+                bridgeTrampoline.data(), bridgeTrampoline.size());
+        }
         m_metadata.imageSize = static_cast<uint32_t>(kCallHostImageSize);
 
         DWORD oldProtection = 0;
@@ -2019,6 +2050,10 @@ void ExecuteExternalSemanticVariantCases(
     const RuntimeEncoding& encoding,
     TestRuntimeIatImage& testImage)
 {
+#if defined(_M_X64)
+    CallHostTestImage bridgeImage(
+        0, reinterpret_cast<uintptr_t>(&GateInstructionBridgeTarget));
+#endif
     for (uint8_t strategy : kCoreStrategies) {
         const uint8_t int3Variant = CoreVariantForStrategy(
             config, VM_UOP_INT3, strategy);
@@ -2053,11 +2088,11 @@ void ExecuteExternalSemanticVariantCases(
 
 #if defined(_M_X64)
         if (config.architecture == VMHandlerArchitecture::X64) {
-            constexpr uint32_t targetRva = 0x1000u;
             const uint8_t bridgeVariant = CoreVariantForStrategy(
                 config, VM_UOP_BRIDGE_EXTENDED, strategy);
             const std::vector<MicroInstruction> bridgeProgram = {
-                Uop(VM_UOP_BRIDGE_EXTENDED, {targetRva, 0, 0}, bridgeVariant),
+                Uop(VM_UOP_BRIDGE_EXTENDED,
+                    {kInstructionBridgeTargetRVA, 0, 0}, bridgeVariant),
                 Uop(VM_UOP_RET, {0}, 0),
             };
             const std::vector<uint8_t> bridgeBytecode =
@@ -2069,7 +2104,9 @@ void ExecuteExternalSemanticVariantCases(
                 bridgeBytecode, encoding, config, registerMap, testImage,
                 bridgeGprs, 0x202ULL);
             bridgeContext.imageBase = reinterpret_cast<uintptr_t>(
-                &GateInstructionBridgeTarget) - targetRva;
+                bridgeImage.Base());
+            bridgeContext.metadata = reinterpret_cast<uintptr_t>(
+                bridgeImage.Metadata());
             exceptionCode = 0;
             const auto entry = reinterpret_cast<SynthEntry>(
                 loaded.Base() + result.contextEntryOffset);

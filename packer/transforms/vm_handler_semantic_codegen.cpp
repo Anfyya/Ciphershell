@@ -3891,6 +3891,12 @@ void X64StoreStackQ(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
     c.Raw({rex,0x89,static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)),0x24}); c.U32(displacement);
 }
 
+void X64StoreStackD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
+    const uint8_t rex = static_cast<uint8_t>(0x40u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex,0x89,static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)),0x24});
+    c.U32(displacement);
+}
+
 void X64LoadStackQ(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
     const uint8_t rex = static_cast<uint8_t>(0x48u | ((reg & 8u) ? 0x04u : 0u));
     c.Raw({rex,0x8B,static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)),0x24}); c.U32(displacement);
@@ -4486,8 +4492,8 @@ void EmitX64BridgeExtended(
     X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,guardTarget),0);
     X64LoadQ(c,0,CtxExtendedState); X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,extendedState),0);
     X64LoadD(c,0,CtxDecodedOperands+8u); c.Raw({0x89,0xC2,0x81,0xE2}); c.U32(VM_MICRO_BRIDGE_AVX);
-    c.Raw({0xC1,0xEA,0x08}); X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,extendedStateFlags),2);
-    c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK}); X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
+    c.Raw({0xC1,0xEA,0x08}); X64StoreStackD(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,extendedStateFlags),2);
+    c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK}); X64StoreStackD(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
     X64LoadStackQ(c,0,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,target));
     c.Raw({0x48,0x8D,0x8C,0x24}); c.U32(stateBase); c.Raw({0xFF,0xD0});
     X64LoadQ(c,11,CtxRegisterMap);
