@@ -1294,7 +1294,7 @@ bool EmitBusinessCoreVariant(
                 return true;
             case VM_UOP_PUSH_VREG:
                 if (strategy == 0u) X64ShiftCl(c, 5, 0);
-                else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAC,0xD0});
+                else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAD,0xD0});
                 return true;
             case VM_UOP_PUSH_IMM:
                 if (strategy == 0u) X64BinaryRegister(c, 0x21, 0, 9);
@@ -1524,7 +1524,7 @@ bool EmitBusinessCoreVariant(
                 c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
                 c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
                 if (strategy == 0u) c.Raw({0x48,0xD3,0xE8});      // shr rax, cl
-                else                c.Raw({0x4C,0x0F,0xAC,0xD0}); // shrd rax, r10, cl
+                else                c.Raw({0x4C,0x0F,0xAD,0xD0}); // shrd rax, r10, cl
                 return true;
             }
             case VM_UOP_SAR:
@@ -1731,7 +1731,7 @@ bool EmitBusinessCoreVariant(
             return true;
         case VM_UOP_PUSH_VREG:
             if (strategy == 0u) c.Raw({0xD3,0xE8});
-            else c.Raw({0x31,0xDB,0x0F,0xAC,0xD8});
+            else c.Raw({0x31,0xDB,0x0F,0xAD,0xD8});
             return true;
         case VM_UOP_PUSH_IMM:
             if (strategy == 0u) { c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); }
@@ -1903,7 +1903,7 @@ bool EmitBusinessCoreVariant(
                 c.Raw({0xD3,0xE8});        // shr eax, cl
             } else {
                 c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
-                c.Raw({0x0F,0xAC,0xD8});   // shrd eax, ebx, cl
+                c.Raw({0x0F,0xAD,0xD8});   // shrd eax, ebx, cl
             }
             return true;
         }

@@ -410,11 +410,12 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
     constexpr uint64_t kEntry = 0x1000;
 
     // adc eax,ecx; sbb eax,edx; bswap eax; sar eax,5;
-    // rol eax,1; ror eax,1; add eax,0; ret.
+    // rol eax,1; ror eax,1; add eax,0; ret.  Use the explicit C1 imm8
+    // encodings so the translator receives a visible count operand.
     // 最后的 ADD 只关闭 SAR count>1 留下的 OF 未定义窗口，不改变值。
     const std::vector<uint8_t> carryShiftBytes = {
         0x11,0xC8, 0x19,0xD0, 0x0F,0xC8, 0xC1,0xF8,0x05,
-        0xD1,0xC0, 0xD1,0xC8,
+        0xC1,0xC0,0x01, 0xC1,0xC8,0x01,
         0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
     // movzx eax,cl; movsx edx,cl; ret. MOVZX/MOVSX 必须保持输入 flags。
     const std::vector<uint8_t> extendBytes = {
