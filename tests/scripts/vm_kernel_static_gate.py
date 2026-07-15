@@ -505,6 +505,250 @@ def reference_runtime_fingerprint_gate(root: Path) -> list[Violation]:
     return violations
 
 
+def _sipround(v0: int, v1: int, v2: int, v3: int, mask64: int) -> tuple[int, int, int, int]:
+    def rotl64(x: int, b: int) -> int:
+        x &= mask64
+        return ((x << b) | (x >> (64 - b))) & mask64
+    v0 = (v0 + v1) & mask64
+    v1 = rotl64(v1, 13)
+    v1 ^= v0
+    v0 = rotl64(v0, 32)
+    v2 = (v2 + v3) & mask64
+    v3 = rotl64(v3, 16)
+    v3 ^= v2
+    v0 = (v0 + v3) & mask64
+    v3 = rotl64(v3, 21)
+    v3 ^= v0
+    v2 = (v2 + v1) & mask64
+    v1 = rotl64(v1, 17)
+    v1 ^= v2
+    v2 = rotl64(v2, 32)
+    return v0, v1, v2, v3
+
+
+def _siphash24(data: bytes, key: bytes, iv: tuple[int, int, int, int]) -> int:
+    """Reference SipHash-2-4 (2 compression rounds, 4 finalization rounds),
+    parameterized by the IV constants extracted from vm_crypto.c so this is
+    provably the same primitive vm_siphash24() implements, not a lookalike."""
+    mask64 = (1 << 64) - 1
+    k0 = int.from_bytes(key[0:8], "little")
+    k1 = int.from_bytes(key[8:16], "little")
+    v0, v1, v2, v3 = (iv[0] ^ k0, iv[1] ^ k1, iv[2] ^ k0, iv[3] ^ k1)
+    length = len(data)
+    pos = 0
+    while pos + 8 <= length:
+        m = int.from_bytes(data[pos:pos + 8], "little")
+        v3 ^= m
+        v0, v1, v2, v3 = _sipround(v0, v1, v2, v3, mask64)
+        v0, v1, v2, v3 = _sipround(v0, v1, v2, v3, mask64)
+        v0 ^= m
+        pos += 8
+    tail = 0
+    for i, b in enumerate(data[pos:]):
+        tail |= b << (i * 8)
+    final_block = tail | ((length & 0xFF) << 56)
+    v3 ^= final_block
+    v0, v1, v2, v3 = _sipround(v0, v1, v2, v3, mask64)
+    v0, v1, v2, v3 = _sipround(v0, v1, v2, v3, mask64)
+    v0 ^= final_block
+    v2 ^= 0xFF
+    for _ in range(4):
+        v0, v1, v2, v3 = _sipround(v0, v1, v2, v3, mask64)
+    return (v0 ^ v1 ^ v2 ^ v3) & mask64
+
+
+def vm_group_seed_divergence_gate(root: Path) -> list[Violation]:
+    """Re-derive the VM Variant Group seed arithmetic in Python from the
+    literal constants/expressions parsed out of the source, then actually
+    execute it for a battery of sample build seeds and function addresses.
+
+    A gate that only greps for "vm_group" / "VMGroupRuntime" would pass even
+    if every group silently reused group 0's seed (groups exist "in name"
+    but produce identical opcode-map/dispatch-key entropy).  This instead
+    proves the numeric divergence property: DeriveVMGroupSeed(seed, 0) must
+    equal seed unchanged (single-group backward compatibility), every other
+    group must produce a pairwise-distinct 32-byte seed AND a pairwise-
+    distinct GetSeedFingerprint()-equivalent SipHash-2-4 value (the actual
+    uint64 that becomes Translator/VMHandlerSynthesisConfig buildSeed), and
+    AssignVMGroupId must actually spread candidate functions across more
+    than one group rather than collapsing to a constant."""
+    main_path = root / "packer" / "main.cpp"
+    mutation_path = root / "packer" / "mutation" / "mutation_engine.cpp"
+    crypto_path = root / "runtime" / "common" / "vm_crypto.c"
+    violations: list[Violation] = []
+    for path in (main_path, mutation_path, crypto_path):
+        if not path.is_file():
+            violations.append(Violation(path, 1, "vm-group-seed-divergence-gate",
+                                        "required source file is missing"))
+    if violations:
+        return violations
+
+    main_code = strip_comments_and_literals(
+        main_path.read_text(encoding="utf-8", errors="strict"))
+    mutation_code = strip_comments_and_literals(
+        mutation_path.read_text(encoding="utf-8", errors="strict"))
+    crypto_code = strip_comments_and_literals(
+        crypto_path.read_text(encoding="utf-8", errors="strict"))
+
+    mix_body = extract_function_body(main_code, "MixVMGroupSeed")
+    derive_body = extract_function_body(main_code, "DeriveVMGroupSeed")
+    assign_body = extract_function_body(main_code, "AssignVMGroupId")
+    fingerprint_body = extract_function_body(
+        mutation_code, "MutationEngine::GetSeedFingerprint")
+    siphash_init_body = extract_function_body(crypto_code, "vm_siphash24_init")
+    if None in (mix_body, derive_body, assign_body, fingerprint_body, siphash_init_body):
+        return [Violation(main_path, 1, "vm-group-seed-divergence-gate",
+                          "one or more seed-derivation functions were not found")]
+
+    mix_norm = re.sub(r"\s+", "", mix_body or "")
+    derive_norm = re.sub(r"\s+", "", derive_body or "")
+    assign_norm = re.sub(r"\s+", "", assign_body or "")
+    fingerprint_norm = re.sub(r"\s+", "", fingerprint_body or "")
+    siphash_init_norm = re.sub(r"\s+", "", siphash_init_body or "")
+
+    # 结构性证据：确认 groupId / functionEntryAddress 真的被混进了种子，
+    # 不是带了参数却没用上；GetSeedFingerprint 真的把种子喂给 SipHash。
+    structural_requirements = (
+        (derive_norm, "if(groupId==0)returnbuildSeed", derive_body),
+        (derive_norm, "static_cast<uint64_t>(groupId)<<32", derive_body),
+        (assign_norm, "if(groupCount<=1)return0", assign_body),
+        (assign_norm, "^functionEntryAddress^", assign_body),
+        (assign_norm, "static_cast<uint32_t>(mixed%groupCount)", assign_body),
+        (fingerprint_norm,
+         "vm_siphash24(m_config.seed.data()+16,16,m_config.seed.data())",
+         fingerprint_body),
+    )
+    for haystack, needle, _source in structural_requirements:
+        if needle not in haystack:
+            violations.append(Violation(
+                main_path, 1, "vm-group-seed-divergence-gate",
+                f"expected mixing expression missing: {needle}"))
+    if violations:
+        return violations
+
+    # 只查子串"存在"挡不住"在真正逻辑前插一条提前 return 把它架空"这种
+    # 破坏——substring 检查不关心控制流，插入的死代码同样会通过。用
+    # return 语句计数钉死控制流形状：两个函数都必须恰好是"一个提前退出
+    # 分支 + 一个真正计算后的 return"，多一个 return 就必然是分支被架空
+    # 或逻辑被重写，必须先失败再排查。
+    expected_return_count = 2
+    if derive_norm.count("return") != expected_return_count:
+        violations.append(Violation(
+            main_path, 1, "vm-group-seed-divergence-gate",
+            f"DeriveVMGroupSeed has {derive_norm.count('return')} return "
+            f"statements, expected exactly {expected_return_count} "
+            "(groupId==0 early-out + the real derivation) -- control flow "
+            "may have been shadowed by an extra early return"))
+    if assign_norm.count("return") != expected_return_count:
+        violations.append(Violation(
+            main_path, 1, "vm-group-seed-divergence-gate",
+            f"AssignVMGroupId has {assign_norm.count('return')} return "
+            f"statements, expected exactly {expected_return_count} "
+            "(groupCount<=1 early-out + the real assignment) -- control flow "
+            "may have been shadowed by an extra early return"))
+    if violations:
+        return violations
+
+    # SipHash-2-4 IV 常量必须与标准实现一致，这样下面 Python 侧的重放
+    # 才是同一个原语，而不是看起来像的另一套算法。
+    expected_iv = (0x736F6D6570736575, 0x646F72616E646F6D,
+                   0x6C7967656E657261, 0x7465646279746573)
+    iv_matches = re.findall(r"0x([0-9A-Fa-f]{16})ULL", siphash_init_norm)
+    if [int(value, 16) for value in iv_matches[:4]] != list(expected_iv):
+        violations.append(Violation(
+            crypto_path, 1, "vm-group-seed-divergence-gate",
+            "vm_siphash24_init IV constants do not match the standard SipHash-2-4 IV"))
+        return violations
+
+    mask64 = (1 << 64) - 1
+    multiplier_matches = re.findall(r"value\*=0x([0-9A-Fa-f]+)ULL", mix_norm)
+    lane_tag_match = re.search(
+        r"\^\(0x([0-9A-Fa-f]+)ULL\*\(lane\+1\)\)\^0x([0-9A-Fa-f]+)ULL", derive_norm)
+    assign_tag_match = re.search(
+        r"functionEntryAddress\^0x([0-9A-Fa-f]+)ULL", assign_norm)
+    if len(multiplier_matches) != 2 or lane_tag_match is None or assign_tag_match is None:
+        violations.append(Violation(
+            main_path, 1, "vm-group-seed-divergence-gate",
+            "could not extract avalanche/tag constants for numeric replay"))
+        return violations
+    mul_a, mul_b = (int(value, 16) for value in multiplier_matches)
+    lane_multiplier = int(lane_tag_match.group(1), 16)
+    derive_tag = int(lane_tag_match.group(2), 16)
+    assign_tag = int(assign_tag_match.group(1), 16)
+
+    def mix(value: int) -> int:
+        value &= mask64
+        value ^= value >> 33
+        value = (value * mul_a) & mask64
+        value ^= value >> 33
+        value = (value * mul_b) & mask64
+        value ^= value >> 33
+        return value
+
+    def derive_group_seed(seed: bytes, group_id: int) -> bytes:
+        if group_id == 0:
+            return seed
+        out = bytearray(32)
+        for lane in range(4):
+            base = int.from_bytes(seed[lane * 8:lane * 8 + 8], "little")
+            mixed = mix(base ^ ((group_id & mask64) << 32) ^
+                        ((lane_multiplier * (lane + 1)) & mask64) ^ derive_tag)
+            out[lane * 8:lane * 8 + 8] = mixed.to_bytes(8, "little")
+        return bytes(out)
+
+    def assign_group_id(seed: bytes, function_entry: int, group_count: int) -> int:
+        if group_count <= 1:
+            return 0
+        base = int.from_bytes(seed[0:8], "little")
+        mixed = mix(base ^ (function_entry & mask64) ^ assign_tag)
+        return mixed % group_count
+
+    def seed_fingerprint(seed: bytes) -> int:
+        return _siphash24(seed[16:32], seed[0:16], expected_iv)
+
+    # 固定种子的 PRNG 只是为了让每次 CI 跑出同一批样例，不代表种子本身
+    # 弱——真正的 build seed 仍然来自 BCryptGenRandom。
+    sample_rng = __import__("random").Random(0xC1DE5EED)
+    sample_seeds = [
+        bytes(sample_rng.getrandbits(8) for _ in range(32)) for _ in range(6)
+    ]
+    probe_group_count = 5
+    for seed in sample_seeds:
+        if derive_group_seed(seed, 0) != seed:
+            violations.append(Violation(
+                main_path, 1, "vm-group-seed-divergence-gate",
+                "DeriveVMGroupSeed(seed, 0) is not identical to the build seed"))
+            break
+        derived = [derive_group_seed(seed, g) for g in range(probe_group_count)]
+        if len(set(derived)) != len(derived):
+            violations.append(Violation(
+                main_path, 1, "vm-group-seed-divergence-gate",
+                "two different vm_group ids derived the same 32-byte group seed"))
+            break
+        fingerprints = [seed_fingerprint(value) for value in derived]
+        if len(set(fingerprints)) != len(fingerprints):
+            violations.append(Violation(
+                main_path, 1, "vm-group-seed-divergence-gate",
+                "two different vm_group ids produced the same operand-codec "
+                "seed fingerprint (the value that becomes Translator/"
+                "VMHandlerSynthesisConfig buildSeed)"))
+            break
+    if violations:
+        return violations
+
+    seen_group_ids: set[int] = set()
+    for address in range(0, 256 * 7, 7):
+        seen_group_ids.add(
+            assign_group_id(sample_seeds[0], address, probe_group_count))
+    if len(seen_group_ids) < 3:
+        violations.append(Violation(
+            main_path, 1, "vm-group-seed-divergence-gate",
+            f"AssignVMGroupId only produced {sorted(seen_group_ids)} across "
+            f"256 sample function addresses with {probe_group_count} groups "
+            "-- function-to-group assignment looks degenerate"))
+    return violations
+
+
 def decryptor_coverage_gate(root: Path) -> list[Violation]:
     """Verify production choice cardinality, exact-byte self-validation and
     exhaustive native execution coverage.  Digest/result field names alone do
@@ -811,6 +1055,7 @@ def main() -> int:
     violations.extend(require_markers(root, files, code_by_path))
     violations.extend(reference_runtime_fingerprint_gate(root))
     violations.extend(decryptor_coverage_gate(root))
+    violations.extend(vm_group_seed_divergence_gate(root))
 
     # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
     # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，
