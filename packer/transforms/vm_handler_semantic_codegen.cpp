@@ -4379,13 +4379,17 @@ void EmitX86CallHost(
     X86StoreFrameD(c, kX86NativeCallEaxSpill, 0);
     X86StoreFrameD(c, kX86NativeCallEcxSpill, 1);
     X86StoreFrameD(c, kX86NativeCallEdxSpill, 2);
-    c.U8(0x9C); c.U8(0x58);
-    X86StoreFrameD(c, kX86NativeCallFlagsSpill, 0);
     c.Raw({0x89,0xE1,0x29,0xE9});             // cleanup = esp - ebp
     X86StoreFrameD(c, kX86NativeCallCleanupSpill, 1);
+    // A callee-clean ABI returns with ESP above the copied argument window.
+    // Capture the cleanup before restoring ESP, then move below that window
+    // before PUSHFD; otherwise PUSHFD overwrites the last stdcall/fastcall
+    // argument and corrupts the subsequent guest-stack writeback.
+    c.Raw({0x89,0xEC});
+    c.U8(0x9C); c.U8(0x58);
+    X86StoreFrameD(c, kX86NativeCallFlagsSpill, 0);
     X86LoadD(c, 0, CtxDecodedOperands + 16u);
     c.Raw({0x39,0xC1}); c.Jcc(JccA, cleanupRangeFailure);
-    c.Raw({0x89,0xEC});
     X86LoadD(c, 0, CtxDecodedOperands + 8u);
     c.Raw({0x83,0xF8,VM_ABI_X86_AUTO}); c.Jcc(JccE, cleanupValid);
     c.Raw({0x83,0xF8,VM_ABI_X86_CDECL}); c.Jcc(JccNE, cleanupAbiReady);
