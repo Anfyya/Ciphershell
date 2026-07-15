@@ -83,12 +83,17 @@ struct VMIRModelPreflightConfig {
     uint32_t corpusCount = 256;
     uint32_t memorySize = 0x10000;
     uint32_t maxSteps = 1000000;
+    // 纯粹的调用方标注：这次校验是替哪个 VM Variant Group 跑的。Verify()
+    // 逐字节把它抄进 result，不参与任何校验逻辑本身——只是为了让日志/未来
+    // 的多 Group 交叉校验能把证据和 Group 对上号，而不需要额外的旁路映射。
+    uint32_t vmGroupId = 0;
 };
 
 struct VMIRModelPreflightResult {
     bool success = false;
     uint32_t casesExecuted = 0;
     uint32_t failingCase = 0;
+    uint32_t vmGroupId = 0;
     std::string error;
 };
 
@@ -170,6 +175,12 @@ struct VMNativeDifferentialConfig {
     // one side faulting without the other (or a different fault) still
     // fails the whole run.
     bool expectDivideFault = false;
+    // 纯粹的调用方标注：这次差分校验用的是哪个 VM Variant Group 的
+    // handler 镜像/opcode map（即 evidenceProvider 背后那个 Group）。
+    // Verify() 原样抄进 result，不参与判定——是为多 Group 场景下把每条
+    // 证据和它所属 Group 对应起来，给后续"验证多个 Group 互不干扰"的
+    // 交叉校验提供可识别的锚点。
+    uint32_t vmGroupId = 0;
 };
 
 class VMNativeDifferentialEvidenceProvider {
@@ -194,6 +205,7 @@ struct VMNativeDifferentialResult {
     uint32_t failingCase = 0;
     bool nativeCpuEvidenceVerified = false;
     bool synthesizedHandlerEvidenceVerified = false;
+    uint32_t vmGroupId = 0;
     std::string error;
 };
 

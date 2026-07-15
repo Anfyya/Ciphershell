@@ -1367,6 +1367,10 @@ int main(int argc, char* argv[]) {
                 // Must match kVmNativeDifferentialMemorySize: the native
                 // differential gate below reuses this corpus's memory size.
                 modelConfig.memorySize = kVmNativeDifferentialMemorySize;
+                // 纯标注，不影响校验逻辑：让 result.vmGroupId 能回答"这份
+                // 证据是哪个 VM Variant Group 产出的"，为后续多 Group 交叉
+                // 校验（确认互不干扰）打基础。
+                modelConfig.vmGroupId = vmGroupId;
                 const auto modelPreflight =
                     CipherShell::VMIRModelPreflightVerifier::Verify(
                     func, transResult, grp.mutatedISA.opcodeMap,
@@ -1375,6 +1379,7 @@ int main(int argc, char* argv[]) {
                     std::cerr << "VM_IR_MODEL_PREFLIGHT_FAIL module=VMIRModelPreflightVerifier"
                               << " function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
+                              << " vm_group=" << modelPreflight.vmGroupId
                               << " case=" << modelPreflight.failingCase
                               << " reason=" << modelPreflight.error << std::endl;
                     ++rejectedCount;
@@ -1382,6 +1387,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "VM_IR_MODEL_PREFLIGHT_PASS function_rva=0x" << std::hex
                           << func.entryAddress << std::dec
+                          << " vm_group=" << modelPreflight.vmGroupId
                           << " cases=" << modelPreflight.casesExecuted
                           << " evidence=software_model_only" << std::endl;
 
@@ -1414,6 +1420,9 @@ int main(int argc, char* argv[]) {
                     ? grp.nativeDifferentialProvider.SemanticIdentityDigest() : 0;
                 nativeConfig.evidenceProvider = nativeDifferentialFunctionReady
                     ? &grp.nativeDifferentialProvider : nullptr;
+                // 同上：纯标注，供后续多 Group 交叉校验把每条证据和它的
+                // Group 对应起来。
+                nativeConfig.vmGroupId = vmGroupId;
                 const auto nativeDifferential =
                     CipherShell::VMNativeDifferentialVerifier::Verify(
                         func, transResult, grp.mutatedISA.opcodeMap,
@@ -1425,6 +1434,7 @@ int main(int argc, char* argv[]) {
                               << " module=VMNativeDifferentialVerifier"
                               << " function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
+                              << " vm_group=" << nativeDifferential.vmGroupId
                               << " case=" << nativeDifferential.failingCase
                               << " reason=" << nativeDifferential.error << std::endl;
                     ++rejectedCount;
@@ -1432,6 +1442,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "VM_NATIVE_DIFFERENTIAL_PASS function_rva=0x" << std::hex
                           << func.entryAddress << std::dec
+                          << " vm_group=" << nativeDifferential.vmGroupId
                           << " cases=" << nativeDifferential.casesVerified
                           << " native_cpu=true synthesized_handlers=true" << std::endl;
 

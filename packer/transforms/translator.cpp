@@ -2133,6 +2133,7 @@ VMIRModelPreflightResult VMIRModelPreflightVerifier::Verify(
     const VMIRModelPreflightConfig& config)
 {
     VMIRModelPreflightResult result{};
+    result.vmGroupId = config.vmGroupId;
     if (!translation.success || translation.bytecode.empty() || config.corpusCount == 0 ||
         config.memorySize < 0x1000u || registerMap.size() < 16) {
         result.error = "IR model preflight received incomplete translation/configuration";
@@ -2408,6 +2409,7 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
     const VMNativeDifferentialConfig& config)
 {
     VMNativeDifferentialResult result{};
+    result.vmGroupId = config.vmGroupId;
     if (!translation.success || translation.bytecode.empty() ||
         function.blocks.empty() || config.corpusCount == 0u ||
         config.memorySize < 0x1000u || config.timeoutMilliseconds == 0u) {
