@@ -52,6 +52,13 @@ struct VMConfig {
     bool embedJunkHandlers;
     bool simdBridge;
     bool x87Bridge;
+    // VM Variant Group（分发去中心化 + 函数级 VM 异构）:
+    // variantGroupCount == 0 表示自适应（按候选函数数量决定组数）；
+    // >= 1 表示显式固定组数。variantGroupMax/variantGroupFunctionsPerGroup
+    // 只影响自适应模式下的组数计算，不影响显式组数。
+    int variantGroupCount;
+    int variantGroupMax;
+    int variantGroupFunctionsPerGroup;
 
     VMConfig() :
         enabled(false),
@@ -66,7 +73,10 @@ struct VMConfig {
         x86CallAbi("auto"),
         embedJunkHandlers(true),
         simdBridge(true),
-        x87Bridge(true) {}
+        x87Bridge(true),
+        variantGroupCount(0),
+        variantGroupMax(4),
+        variantGroupFunctionsPerGroup(4) {}
 };
 
 struct StringEncryptionConfig {

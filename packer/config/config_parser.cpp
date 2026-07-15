@@ -105,6 +105,9 @@ x86_call_abi = "auto"            # "auto" | "cdecl" | "stdcall" | "fastcall" | "
 embed_junk_handlers = true        # 生成不可由合法 opcode 到达的垃圾 handler 槽
 simd_bridge = true                # SSE2/SSE4/AVX/AVX2 严格指令桥
 x87_bridge = true                 # x87 严格指令桥
+variant_group_count = 0            # VM Variant Group 数量；0 = 按候选函数数量自适应，>=1 为显式固定组数
+variant_group_max = 4              # 自适应模式下的组数上限（仅影响 variant_group_count=0 时）
+variant_group_functions_per_group = 4  # 自适应模式下，大约每多少个候选函数增加一个 Group
 
 [string_encryption]
 # Fail-closed: 弱加密（未认证算法 + 可恢复密钥），默认关闭。
@@ -192,7 +195,9 @@ bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
             {"opcode_randomization", ValueKind::Boolean}, {"handler_mutation", ValueKind::Boolean},
             {"bytecode_encryption", ValueKind::Boolean}, {"native_body_policy", ValueKind::String},
             {"x86_call_abi", ValueKind::String}, {"embed_junk_handlers", ValueKind::Boolean},
-            {"simd_bridge", ValueKind::Boolean}, {"x87_bridge", ValueKind::Boolean}
+            {"simd_bridge", ValueKind::Boolean}, {"x87_bridge", ValueKind::Boolean},
+            {"variant_group_count", ValueKind::Integer}, {"variant_group_max", ValueKind::Integer},
+            {"variant_group_functions_per_group", ValueKind::Integer}
         }},
         {"string_encryption", {
             {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
@@ -370,6 +375,10 @@ void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) 
     std::regex regex_target_rvas(R"RE(target_rvas\s*=\s*(\[[^\]]*\]))RE");
     std::regex regex_simd_bridge(R"(simd_bridge\s*=\s*(true|false))");
     std::regex regex_x87_bridge(R"(x87_bridge\s*=\s*(true|false))");
+    std::regex regex_variant_group_count(R"(variant_group_count\s*=\s*(\d+))");
+    std::regex regex_variant_group_max(R"(variant_group_max\s*=\s*(\d+))");
+    std::regex regex_variant_group_functions_per_group(
+        R"(variant_group_functions_per_group\s*=\s*(\d+))");
 
     std::smatch match;
     if (std::regex_search(section, match, regex_reg)) config.registerCount = ParseInt(match[1]);
@@ -386,6 +395,12 @@ void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) 
     if (std::regex_search(section, match, regex_target_rvas)) config.targetRVAs = ParseUint32Array(match[1]);
     if (std::regex_search(section, match, regex_simd_bridge)) config.simdBridge = ParseBool(match[1]);
     if (std::regex_search(section, match, regex_x87_bridge)) config.x87Bridge = ParseBool(match[1]);
+    if (std::regex_search(section, match, regex_variant_group_count))
+        config.variantGroupCount = ParseInt(match[1]);
+    if (std::regex_search(section, match, regex_variant_group_max))
+        config.variantGroupMax = ParseInt(match[1]);
+    if (std::regex_search(section, match, regex_variant_group_functions_per_group))
+        config.variantGroupFunctionsPerGroup = ParseInt(match[1]);
 }
 
 void ConfigParser::ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config) {
