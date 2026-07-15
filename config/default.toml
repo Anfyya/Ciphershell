@@ -22,6 +22,9 @@ x86_call_abi = "auto"
 embed_junk_handlers = true
 simd_bridge = true
 x87_bridge = true
+variant_group_count = 0
+variant_group_max = 4
+variant_group_functions_per_group = 4
 
 [string_encryption]
 # Fail-closed: 弱加密（未认证算法 + 可恢复密钥），默认关闭。

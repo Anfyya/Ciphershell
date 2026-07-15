@@ -1013,14 +1013,180 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Phase 1 骨架：Group 数暂时写死为 2，只为打通"多个独立 VM 实例
-        // 共存于同一产物"这条主干；Phase 3 会替换成按 build seed 与候选
-        // 函数数量自适应。groupId==0 在下面每一步都刻意复用与单 Group
-        // 时完全相同的种子/派生盐值，因此 vmGroupCount==1 时行为必须与
-        // 改动前逐位一致——这里先验证 2 组能独立工作、互不覆盖。
-        const uint32_t vmGroupCount = 2u;
         const uint32_t vmRegisterCountConfig = static_cast<uint32_t>(config.vm.registerCount);
         constexpr uint32_t kVmNativeDifferentialMemorySize = 0x10000u;
+
+        CipherShell::Disassembler disasm;
+        bool is64 = image->is64Bit != 0;
+        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
+                                     : image->ntHeaders32->OptionalHeader.ImageBase);
+        uint32_t virtualizedCount = 0;
+        uint32_t rejectedCount = 0;
+        uint32_t selectedCount = 0;
+        std::vector<CipherShell::Function> allProtectedFunctions;
+        std::vector<CipherShell::TranslationResult> allPendingTranslations;
+        std::vector<uint32_t> allFunctionGroupIds;
+
+        CipherShell::FunctionDiscovery functionDiscovery;
+        auto discoveryResult = functionDiscovery.Discover(
+            image.get(), disasm, buildCtx.vm.targetRVAs);
+        if (!discoveryResult.success) {
+            std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
+                      << discoveryResult.error << std::endl;
+            PrintFeatureStatus("vm", "failed", discoveryResult.error);
+            return 1;
+        }
+        for (auto& function : discoveryResult.functions) {
+            function.assignedLevel = static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel));
+        }
+        if (config.performance.autoHotspotAnalysis) {
+            CipherShell::HotspotAnalyzer hotspotAnalyzer;
+            CipherShell::HotspotConfig hotspotConfig;
+            hotspotConfig.maxAllowedLevel = 2;
+            auto hotspots = hotspotAnalyzer.AnalyzeFunctions(
+                discoveryResult.functions, hotspotConfig);
+            hotspotAnalyzer.GenerateSuggestions(
+                hotspots,
+                static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel)),
+                hotspotConfig);
+            hotspotAnalyzer.ApplySuggestions(discoveryResult.functions, hotspots);
+            std::cout << "VM_HOTSPOT_PROFILE analyzed="
+                      << discoveryResult.functions.size()
+                      << " downgraded=" << hotspots.size() << std::endl;
+        }
+        for (const auto& issue : discoveryResult.issues) {
+            std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x" << std::hex
+                      << issue.rva << std::dec << " reason=" << issue.reason << std::endl;
+        }
+        if (verbose) {
+            for (const auto& function : discoveryResult.functions) {
+                std::cout << "VM_FUNCTION_DISCOVERY rva=0x" << std::hex
+                          << function.entryAddress << " size=0x" << function.size << std::dec
+                          << " source=" << (function.discoverySource.empty() ? "unknown" : function.discoverySource)
+                          << " boundary_trusted=" << (function.boundaryTrusted ? "true" : "false")
+                          << std::endl;
+            }
+        }
+
+        for (const auto& pattern : buildCtx.vm.targetFunctions) {
+            const bool matched = std::any_of(discoveryResult.functions.begin(),
+                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
+                    std::ostringstream rva;
+                    rva << "0x" << std::hex << function.entryAddress;
+                    return WildcardMatchInsensitive(pattern, function.name) ||
+                        WildcardMatchInsensitive(pattern, rva.str());
+                });
+            if (!matched) {
+                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_pattern_matched_none"
+                          << " pattern=" << pattern << std::endl;
+                PrintFeatureStatus("vm", "failed", "target_pattern_matched_none");
+                return 1;
+            }
+        }
+        for (uint32_t targetRVA : buildCtx.vm.targetRVAs) {
+            const bool matched = std::any_of(discoveryResult.functions.begin(),
+                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
+                    return function.entryAddress == targetRVA;
+                });
+            if (!matched) {
+                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_rva_matched_none"
+                          << " rva=0x" << std::hex << targetRVA << std::dec << std::endl;
+                PrintFeatureStatus("vm", "failed", "target_rva_matched_none");
+                return 1;
+            }
+        }
+
+        // Pass A：只做与 Group 无关的筛选（显式目标匹配 / CFG 互斥 / native_unprotected
+        // 降级 / 尺寸与地址范围校验 / CapabilityChecker），先拿到真正会进入 VM 的候选
+        // 函数列表，Group 数量的自适应策略要量的是"实际候选数"，不是"全部发现函数数"。
+        std::vector<CipherShell::Function> eligibleFunctions;
+        for (const auto& func : discoveryResult.functions) {
+                if (!FunctionSelected(func, buildCtx.vm.targetFunctions,
+                        buildCtx.vm.targetRVAs)) continue;
+                if (func.entryAddress <= 0xFFFFFFFFULL &&
+                    cfgFunctionRVAs.count(static_cast<uint32_t>(func.entryAddress)) != 0u) {
+                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " mode=cfg_flatten vm=skipped" << std::endl;
+                    continue;
+                }
+                ++selectedCount;
+                const bool explicitlySelectedForEligibility =
+                    !buildCtx.vm.targetFunctions.empty() ||
+                    !buildCtx.vm.targetRVAs.empty();
+                if (!explicitlySelectedForEligibility && func.assignedLevel <= 1) {
+                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " mode=native_unprotected vm=skipped" << std::endl;
+                    continue;
+                }
+                if (func.size < 5) {
+                    ++rejectedCount;
+                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex
+                              << func.entryAddress << std::dec
+                              << " reason=function_too_small" << std::endl;
+                    continue;
+                }
+                if (func.entryAddress > 0xFFFFFFFFULL) {
+                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
+                              << std::dec << " reason=function_range_too_large" << std::endl;
+                    rejectedCount++;
+                    continue;
+                }
+
+                std::string vmSafetyReason;
+                if (!capabilityChecker.IsFunctionVmSafe(image.get(), func, vmSafetyReason)) {
+                    std::cerr << "VM_REJECT module=CapabilityChecker rva=0x" << std::hex << func.entryAddress
+                              << std::dec << " reason=" << vmSafetyReason << std::endl;
+                    rejectedCount++;
+                    continue;
+                }
+
+                eligibleFunctions.push_back(func);
+        }
+
+        // Group 数量：variant_group_count==0 表示自适应——按候选函数数量
+        // ceil(eligible / variant_group_functions_per_group)，夹在
+        // [1, variant_group_max] 之间；否则使用显式配置的固定组数。两种
+        // 模式都不允许得到 0：vmGroupCount==1 时 DeriveVMGroupSeed/
+        // AssignVMGroupId/DeriveGroupSectionName 均退化为改动前的单 Group
+        // 行为，逐位一致。
+        if (config.vm.variantGroupCount < 0 || config.vm.variantGroupCount > 64) {
+            std::cerr << "VM_INIT_FAIL module=VMGroupPolicy reason=variant_group_count_out_of_range"
+                      << " value=" << config.vm.variantGroupCount << std::endl;
+            PrintFeatureStatus("vm", "failed", "variant_group_count_out_of_range");
+            return 1;
+        }
+        if (config.vm.variantGroupMax < 1 || config.vm.variantGroupMax > 64) {
+            std::cerr << "VM_INIT_FAIL module=VMGroupPolicy reason=variant_group_max_out_of_range"
+                      << " value=" << config.vm.variantGroupMax << std::endl;
+            PrintFeatureStatus("vm", "failed", "variant_group_max_out_of_range");
+            return 1;
+        }
+        if (config.vm.variantGroupFunctionsPerGroup < 1) {
+            std::cerr << "VM_INIT_FAIL module=VMGroupPolicy"
+                      << " reason=variant_group_functions_per_group_must_be_positive"
+                      << " value=" << config.vm.variantGroupFunctionsPerGroup << std::endl;
+            PrintFeatureStatus("vm", "failed", "variant_group_functions_per_group_must_be_positive");
+            return 1;
+        }
+        uint32_t vmGroupCount;
+        if (config.vm.variantGroupCount > 0) {
+            vmGroupCount = static_cast<uint32_t>(config.vm.variantGroupCount);
+        } else {
+            const uint32_t functionsPerGroup =
+                static_cast<uint32_t>(config.vm.variantGroupFunctionsPerGroup);
+            const uint32_t eligibleCount = static_cast<uint32_t>(eligibleFunctions.size());
+            const uint32_t autoCount = eligibleCount == 0
+                ? 1u
+                : (eligibleCount + functionsPerGroup - 1u) / functionsPerGroup;
+            vmGroupCount = (std::max)(1u, (std::min)(
+                autoCount, static_cast<uint32_t>(config.vm.variantGroupMax)));
+        }
+        std::cout << "VM_GROUP_POLICY mode="
+                  << (config.vm.variantGroupCount > 0 ? "explicit" : "auto")
+                  << " eligible_functions=" << eligibleFunctions.size()
+                  << " vm_group_count=" << vmGroupCount << std::endl;
 
         std::vector<VMGroupRuntime> vmGroups(vmGroupCount);
         for (uint32_t g = 0; g < vmGroupCount; ++g) {
@@ -1140,130 +1306,14 @@ int main(int argc, char* argv[]) {
             if (g == 0) PrintVMRegisterMapReport(grp.mutatedISA.registerMap);
         }
         vmRegisterCount = vmRegisterCountConfig;
-
-        CipherShell::Disassembler disasm;
-        bool is64 = image->is64Bit != 0;
-        disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
-                                     : image->ntHeaders32->OptionalHeader.ImageBase);
-        uint32_t virtualizedCount = 0;
-        uint32_t rejectedCount = 0;
-        uint32_t selectedCount = 0;
-        std::vector<CipherShell::Function> allProtectedFunctions;
-        std::vector<CipherShell::TranslationResult> allPendingTranslations;
-        std::vector<uint32_t> allFunctionGroupIds;
         vmGroupOutcomes.resize(vmGroupCount);
         for (uint32_t g = 0; g < vmGroupCount; ++g) vmGroupOutcomes[g].groupId = g;
 
-        CipherShell::FunctionDiscovery functionDiscovery;
-        auto discoveryResult = functionDiscovery.Discover(
-            image.get(), disasm, buildCtx.vm.targetRVAs);
-        if (!discoveryResult.success) {
-            std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
-                      << discoveryResult.error << std::endl;
-            PrintFeatureStatus("vm", "failed", discoveryResult.error);
-            return 1;
-        }
-        for (auto& function : discoveryResult.functions) {
-            function.assignedLevel = static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel));
-        }
-        if (config.performance.autoHotspotAnalysis) {
-            CipherShell::HotspotAnalyzer hotspotAnalyzer;
-            CipherShell::HotspotConfig hotspotConfig;
-            hotspotConfig.maxAllowedLevel = 2;
-            auto hotspots = hotspotAnalyzer.AnalyzeFunctions(
-                discoveryResult.functions, hotspotConfig);
-            hotspotAnalyzer.GenerateSuggestions(
-                hotspots,
-                static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel)),
-                hotspotConfig);
-            hotspotAnalyzer.ApplySuggestions(discoveryResult.functions, hotspots);
-            std::cout << "VM_HOTSPOT_PROFILE analyzed="
-                      << discoveryResult.functions.size()
-                      << " downgraded=" << hotspots.size() << std::endl;
-        }
-        for (const auto& issue : discoveryResult.issues) {
-            std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x" << std::hex
-                      << issue.rva << std::dec << " reason=" << issue.reason << std::endl;
-        }
-        if (verbose) {
-            for (const auto& function : discoveryResult.functions) {
-                std::cout << "VM_FUNCTION_DISCOVERY rva=0x" << std::hex
-                          << function.entryAddress << " size=0x" << function.size << std::dec
-                          << " source=" << (function.discoverySource.empty() ? "unknown" : function.discoverySource)
-                          << " boundary_trusted=" << (function.boundaryTrusted ? "true" : "false")
-                          << std::endl;
-            }
-        }
-
-        for (const auto& pattern : buildCtx.vm.targetFunctions) {
-            const bool matched = std::any_of(discoveryResult.functions.begin(),
-                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
-                    std::ostringstream rva;
-                    rva << "0x" << std::hex << function.entryAddress;
-                    return WildcardMatchInsensitive(pattern, function.name) ||
-                        WildcardMatchInsensitive(pattern, rva.str());
-                });
-            if (!matched) {
-                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_pattern_matched_none"
-                          << " pattern=" << pattern << std::endl;
-                PrintFeatureStatus("vm", "failed", "target_pattern_matched_none");
-                return 1;
-            }
-        }
-        for (uint32_t targetRVA : buildCtx.vm.targetRVAs) {
-            const bool matched = std::any_of(discoveryResult.functions.begin(),
-                discoveryResult.functions.end(), [&](const CipherShell::Function& function) {
-                    return function.entryAddress == targetRVA;
-                });
-            if (!matched) {
-                std::cerr << "VM_BUILD_FAIL module=FunctionSelect reason=target_rva_matched_none"
-                          << " rva=0x" << std::hex << targetRVA << std::dec << std::endl;
-                PrintFeatureStatus("vm", "failed", "target_rva_matched_none");
-                return 1;
-            }
-        }
-
-        for (const auto& func : discoveryResult.functions) {
-                if (!FunctionSelected(func, buildCtx.vm.targetFunctions,
-                        buildCtx.vm.targetRVAs)) continue;
-                if (func.entryAddress <= 0xFFFFFFFFULL &&
-                    cfgFunctionRVAs.count(static_cast<uint32_t>(func.entryAddress)) != 0u) {
-                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
-                              << func.entryAddress << std::dec
-                              << " mode=cfg_flatten vm=skipped" << std::endl;
-                    continue;
-                }
-                ++selectedCount;
+        // Pass B：对 Pass A 筛出的候选函数分组、翻译、软件模型/原生差分校验。
+        for (const auto& func : eligibleFunctions) {
                 const bool explicitlySelected =
                     !buildCtx.vm.targetFunctions.empty() ||
                     !buildCtx.vm.targetRVAs.empty();
-                if (!explicitlySelected && func.assignedLevel <= 1) {
-                    std::cout << "VM_PROFILE function_rva=0x" << std::hex
-                              << func.entryAddress << std::dec
-                              << " mode=native_unprotected vm=skipped" << std::endl;
-                    continue;
-                }
-                if (func.size < 5) {
-                    ++rejectedCount;
-                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex
-                              << func.entryAddress << std::dec
-                              << " reason=function_too_small" << std::endl;
-                    continue;
-                }
-                if (func.entryAddress > 0xFFFFFFFFULL) {
-                    std::cerr << "VM_REJECT module=FunctionSelect rva=0x" << std::hex << func.entryAddress
-                              << std::dec << " reason=function_range_too_large" << std::endl;
-                    rejectedCount++;
-                    continue;
-                }
-
-                std::string vmSafetyReason;
-                if (!capabilityChecker.IsFunctionVmSafe(image.get(), func, vmSafetyReason)) {
-                    std::cerr << "VM_REJECT module=CapabilityChecker rva=0x" << std::hex << func.entryAddress
-                              << std::dec << " reason=" << vmSafetyReason << std::endl;
-                    rejectedCount++;
-                    continue;
-                }
 
                 // 函数级 VM 异构：分组只依赖 build seed 与函数自身入口地址，
                 // 与遍历顺序、CFG/native_unprotected 之类的其它分支无关。
@@ -1317,6 +1367,10 @@ int main(int argc, char* argv[]) {
                 // Must match kVmNativeDifferentialMemorySize: the native
                 // differential gate below reuses this corpus's memory size.
                 modelConfig.memorySize = kVmNativeDifferentialMemorySize;
+                // 纯标注，不影响校验逻辑：让 result.vmGroupId 能回答"这份
+                // 证据是哪个 VM Variant Group 产出的"，为后续多 Group 交叉
+                // 校验（确认互不干扰）打基础。
+                modelConfig.vmGroupId = vmGroupId;
                 const auto modelPreflight =
                     CipherShell::VMIRModelPreflightVerifier::Verify(
                     func, transResult, grp.mutatedISA.opcodeMap,
@@ -1325,6 +1379,7 @@ int main(int argc, char* argv[]) {
                     std::cerr << "VM_IR_MODEL_PREFLIGHT_FAIL module=VMIRModelPreflightVerifier"
                               << " function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
+                              << " vm_group=" << modelPreflight.vmGroupId
                               << " case=" << modelPreflight.failingCase
                               << " reason=" << modelPreflight.error << std::endl;
                     ++rejectedCount;
@@ -1332,6 +1387,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "VM_IR_MODEL_PREFLIGHT_PASS function_rva=0x" << std::hex
                           << func.entryAddress << std::dec
+                          << " vm_group=" << modelPreflight.vmGroupId
                           << " cases=" << modelPreflight.casesExecuted
                           << " evidence=software_model_only" << std::endl;
 
@@ -1364,6 +1420,9 @@ int main(int argc, char* argv[]) {
                     ? grp.nativeDifferentialProvider.SemanticIdentityDigest() : 0;
                 nativeConfig.evidenceProvider = nativeDifferentialFunctionReady
                     ? &grp.nativeDifferentialProvider : nullptr;
+                // 同上：纯标注，供后续多 Group 交叉校验把每条证据和它的
+                // Group 对应起来。
+                nativeConfig.vmGroupId = vmGroupId;
                 const auto nativeDifferential =
                     CipherShell::VMNativeDifferentialVerifier::Verify(
                         func, transResult, grp.mutatedISA.opcodeMap,
@@ -1375,6 +1434,7 @@ int main(int argc, char* argv[]) {
                               << " module=VMNativeDifferentialVerifier"
                               << " function_rva=0x" << std::hex
                               << func.entryAddress << std::dec
+                              << " vm_group=" << nativeDifferential.vmGroupId
                               << " case=" << nativeDifferential.failingCase
                               << " reason=" << nativeDifferential.error << std::endl;
                     ++rejectedCount;
@@ -1382,6 +1442,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "VM_NATIVE_DIFFERENTIAL_PASS function_rva=0x" << std::hex
                           << func.entryAddress << std::dec
+                          << " vm_group=" << nativeDifferential.vmGroupId
                           << " cases=" << nativeDifferential.casesVerified
                           << " native_cpu=true synthesized_handlers=true" << std::endl;
 

@@ -23,6 +23,11 @@ x86_call_abi = "auto"
 embed_junk_handlers = true
 simd_bridge = true
 x87_bridge = true
+# VM Variant Group：0 = 按候选函数数量自适应决定组数，>=1 为显式固定组数。
+# groupId=0（或单 Group 场景）与不启用这套机制时逐位一致。
+variant_group_count = 0
+variant_group_max = 4
+variant_group_functions_per_group = 4
 
 [string_encryption]
 # Fail-closed: 弱加密（未认证算法 + 可恢复密钥）。显式开启会被 CapabilityChecker fatal 拒绝。
