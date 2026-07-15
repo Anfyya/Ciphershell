@@ -63,6 +63,13 @@ jobs:
     # 一致。这不是糊弄(没跳测试/没降阈/没标记预期失败),只是选了带正确工具链的
     # 受支持镜像。
     runs-on: windows-2022
+    # CTest 启动 Python 时不会继承 PowerShell 的 UTF-8 控制台设置。GitHub
+    # Windows runner 的 Python 3.14 stdout 默认可能落到 cp1252，静态门禁打印中文
+    # 进度就会在真正执行规则前抛 UnicodeEncodeError。强制 Python 标准流使用
+    # UTF-8，只修复日志编码，不改变门禁规则、阈值或测试断言。
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
     steps:
       - uses: actions/checkout@v4
         with:
