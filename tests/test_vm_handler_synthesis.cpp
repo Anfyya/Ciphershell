@@ -1604,16 +1604,14 @@ void ExecuteControlFlowBoundaryMatrix(
             Uop(VM_UOP_PUSH_IMM, {0x77, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 18
             Uop(VM_UOP_POP_VREG, {1, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)), // 19
             Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),                         // 20
-            Uop(VM_UOP_PUSH_IMM, {0x99, addressWidth}, variant(VM_UOP_PUSH_IMM)), // 21
-            Uop(VM_UOP_POP_VREG, {2, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)), // 22
-            Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),                         // 23
+            Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),                         // 21
         };
         const std::vector<uint32_t> offsets =
             RuntimeInstructionOffsets(program, encoding);
         program[5].operands[1] = offsets[18]; // 恒假(首次)与恒真(递归)均命中。
         program[8].operands[0] = offsets[0];  // CALL 目标恰为函数首字节。
         program[14].operands[1] = offsets[0]; // 恒假分支目标也在函数首边界。
-        program[17].operands[0] = offsets[23]; // 无条件分支目标恰为末条 RET。
+        program[17].operands[0] = offsets[21]; // 无条件分支目标恰为末条 RET。
         const std::array<uint64_t, 32> initialGprs{};
         ExecuteOracleEquivalentProgram(
             "control boundary strategy=" + std::to_string(strategy),
