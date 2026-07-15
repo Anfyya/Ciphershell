@@ -1193,10 +1193,9 @@ void ExecuteDivideFaultCase(
     uint64_t divisor,
     uint8_t width,
     uint8_t strategy,
-    DWORD expectedExceptionCode,
+    bool quotientOverflow,
     const VMHandlerSynthesisConfig& config,
     const VMHandlerSynthesisResult& result,
-    LoadedSynthImage& loaded,
     const RuntimeEncoding& encoding,
     TestRuntimeIatImage& testImage)
 {
@@ -1237,16 +1236,31 @@ void ExecuteDivideFaultCase(
     VM_MICRO_EXECUTION_CONTEXT context = MakeRuntimeContext(
         bytecode, encoding, config, registerMap, testImage,
         initialGprs, 0x202ULL);
+    // A real #DE interrupts the handler before its mutation suffix completes.
+    // Isolate every fault corpus item so one deliberately interrupted handler
+    // cannot affect the next width/strategy.
+    LoadedSynthImage faultLoaded;
+    std::string faultLoadError;
+    Require(faultLoaded.Load(result, faultLoadError),
+        "wide divide 隔离 handler 映像装载失败: " + faultLoadError);
     const auto entry = reinterpret_cast<SynthEntry>(
-        loaded.Base() + result.contextEntryOffset);
+        faultLoaded.Base() + result.contextEntryOffset);
     DWORD exceptionCode = 0;
     InvokeSynthEntry(entry, &context, &exceptionCode);
-    Require(exceptionCode == expectedExceptionCode,
+    const bool expectedDivideFault =
+        exceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+        (quotientOverflow &&
+            exceptionCode == kIntegerOverflowExceptionCode);
+    Require(expectedDivideFault,
         std::string(divideOpcode == VM_UOP_UDIV_WIDE ? "UDIV" : "IDIV") +
             " width=" + std::to_string(width) + " strategy=" +
             std::to_string(strategy) + " 未传播真实 #DE，exception=" +
             std::to_string(exceptionCode) + " expected=" +
-            std::to_string(expectedExceptionCode));
+            (quotientOverflow ? "0xC0000094/0xC0000095" :
+                "0xC0000094") + " address=" +
+            std::to_string(gLastExceptionAddress) + " bytes=" +
+            RuntimeByteWindow(
+                faultLoaded, result, gLastExceptionAddress));
 }
 
 void ExecuteLazyPreservationCase(
@@ -2202,14 +2216,11 @@ void TestHostContextEntryExecution() {
             // same architectural #DE boundary.  The signed overflow corpus is
             // the smallest positive quotient that no longer fits width bits.
             ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 0, 1, 0, width,
-                strategy, EXCEPTION_INT_DIVIDE_BY_ZERO,
-                config, result, loaded, encoding, testImage);
+                strategy, false, config, result, encoding, testImage);
             ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 1, 0, 1, width,
-                strategy, kIntegerOverflowExceptionCode,
-                config, result, loaded, encoding, testImage);
+                strategy, true, config, result, encoding, testImage);
             ExecuteDivideFaultCase(VM_UOP_IDIV_WIDE, 0, sign, 1, width,
-                strategy, kIntegerOverflowExceptionCode,
-                config, result, loaded, encoding, testImage);
+                strategy, true, config, result, encoding, testImage);
         }
     }
 }
