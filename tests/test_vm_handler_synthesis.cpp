@@ -56,6 +56,8 @@ constexpr size_t kTestImageSize = 0x200u;
 constexpr uint32_t kCallHostImportSlotRVA = 0x140u;
 constexpr uint32_t kCallHostNativeTargetRVA = 0x180u;
 constexpr size_t kCallHostImageSize = 0x1000u;
+constexpr std::array<uint8_t, 4> kSemanticWidths = {1u, 2u, 4u, 8u};
+constexpr std::array<uint8_t, 2> kCoreStrategies = {0u, 1u};
 
 void Require(bool condition, const std::string& message) {
     if (!condition) throw TestFailure(message);
@@ -1304,9 +1306,9 @@ void ExecuteDataAndStackVariantMatrix(
 {
     const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
         ? 8u : 4u;
-    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+    for (uint8_t width : kSemanticWidths) {
         if (width > addressWidth) continue;
-        for (uint8_t strategy : {0u, 1u}) {
+        for (uint8_t strategy : kCoreStrategies) {
             const auto variant = [&](VM_MICRO_OPCODE semantic) {
                 return CoreVariantForStrategy(config, semantic, strategy);
             };
@@ -1376,14 +1378,14 @@ void ExecuteArithmeticVariantMatrix(
 {
     const uint8_t addressWidth = config.architecture == VMHandlerArchitecture::X64
         ? 8u : 4u;
-    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+    for (uint8_t width : kSemanticWidths) {
         if (width > addressWidth) continue;
         const unsigned bits = width * 8u;
         const uint64_t mask = width == 8u
             ? (std::numeric_limits<uint64_t>::max)()
             : ((uint64_t{1} << bits) - 1u);
         const uint64_t sign = uint64_t{1} << (bits - 1u);
-        for (uint8_t strategy : {0u, 1u}) {
+        for (uint8_t strategy : kCoreStrategies) {
             const auto variant = [&](VM_MICRO_OPCODE semantic) {
                 return CoreVariantForStrategy(config, semantic, strategy);
             };
@@ -1479,14 +1481,14 @@ void ExecuteFlagsVariantMatrix(
         ? 8u : 4u;
     constexpr uint32_t preservedFlags =
         VM_FLAG_ARCHITECTURAL_MASK & ~VM_FLAG_STATUS_MASK;
-    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+    for (uint8_t width : kSemanticWidths) {
         if (width > addressWidth) continue;
         const unsigned bits = width * 8u;
         const uint64_t mask = width == 8u
             ? (std::numeric_limits<uint64_t>::max)()
             : ((uint64_t{1} << bits) - 1u);
         const uint64_t sign = uint64_t{1} << (bits - 1u);
-        for (uint8_t strategy : {0u, 1u}) {
+        for (uint8_t strategy : kCoreStrategies) {
             const auto variant = [&](VM_MICRO_OPCODE semantic) {
                 return CoreVariantForStrategy(config, semantic, strategy);
             };
@@ -1572,7 +1574,7 @@ void ExecuteControlFlowBoundaryMatrix(
         ? 8u : 4u;
     constexpr uint32_t preservedFlags =
         VM_FLAG_ARCHITECTURAL_MASK & ~VM_FLAG_STATUS_MASK;
-    for (uint8_t strategy : {0u, 1u}) {
+    for (uint8_t strategy : kCoreStrategies) {
         const auto variant = [&](VM_MICRO_OPCODE semantic) {
             return CoreVariantForStrategy(config, semantic, strategy);
         };
@@ -1745,7 +1747,8 @@ VM_MICRO_EXECUTION_CONTEXT ExecuteCallHostOnce(
         Uop(VM_UOP_PUSH_IMM,
             {targetToken, addressWidth}, variant(VM_UOP_PUSH_IMM)),
         Uop(VM_UOP_CALL_HOST,
-            {callKind, callAbi, stackArgumentBytes},
+            {static_cast<uint64_t>(callKind),
+             static_cast<uint64_t>(callAbi), stackArgumentBytes},
             variant(VM_UOP_CALL_HOST)),
         Uop(VM_UOP_RET, {0}, variant(VM_UOP_RET)),
     };
@@ -1798,7 +1801,7 @@ void ExecuteCallHostVariantCases(
     if (config.architecture != VMHandlerArchitecture::X64) return;
     CallHostTestImage callImage(
         reinterpret_cast<uintptr_t>(&GateCallHostWin64Target));
-    for (uint8_t strategy : {0u, 1u}) {
+    for (uint8_t strategy : kCoreStrategies) {
         alignas(16) std::array<uint8_t, 64> nativeStack{};
         std::array<uint64_t, 32> nativeGprs{};
         nativeGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
@@ -1870,7 +1873,7 @@ void ExecuteCallHostVariantCases(
     struct ThiscallObject { uint32_t marker; };
     ThiscallObject thisObject{0x7150B1ECu};
 
-    for (uint8_t strategy : {0u, 1u}) {
+    for (uint8_t strategy : kCoreStrategies) {
         const auto run = [&](const std::string& name,
                              VM_MICRO_CALL_KIND kind,
                              uint64_t token,
@@ -2009,7 +2012,7 @@ void ExecuteExternalSemanticVariantCases(
     const RuntimeEncoding& encoding,
     TestRuntimeIatImage& testImage)
 {
-    for (uint8_t strategy : {0u, 1u}) {
+    for (uint8_t strategy : kCoreStrategies) {
         const uint8_t int3Variant = CoreVariantForStrategy(
             config, VM_UOP_INT3, strategy);
         const std::vector<MicroInstruction> int3Program = {
@@ -2130,11 +2133,11 @@ void TestHostContextEntryExecution() {
     std::cout << "[阶段] 宽除法全宽度/双策略真实 #DE\n";
     const uint8_t addressWidth =
         architecture == VMHandlerArchitecture::X64 ? 8u : 4u;
-    for (uint8_t width : {1u, 2u, 4u, 8u}) {
+    for (uint8_t width : kSemanticWidths) {
         if (width > addressWidth) continue;
         const unsigned bits = width * 8u;
         const uint64_t sign = uint64_t{1} << (bits - 1u);
-        for (uint8_t strategy : {0u, 1u}) {
+        for (uint8_t strategy : kCoreStrategies) {
             // Divisor zero and quotient overflow are distinct inputs but the
             // same architectural #DE boundary.  The signed overflow corpus is
             // the smallest positive quotient that no longer fits width bits.
