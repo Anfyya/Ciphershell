@@ -2035,10 +2035,18 @@ void ExecuteExternalSemanticVariantCases(
         VM_MICRO_EXECUTION_CONTEXT int3Context = MakeRuntimeContext(
             int3Bytecode, encoding, config, registerMap, testImage,
             initialGprs, 0x202ULL);
-        const auto entry = reinterpret_cast<SynthEntry>(
-            loaded.Base() + result.contextEntryOffset);
+        // INT3 deliberately interrupts the handler before its normal suffix
+        // can complete.  Give every breakpoint case a fresh self-mutating
+        // image so its partial decrypt state cannot poison BRIDGE_EXTENDED or
+        // the other INT3 strategy.
+        LoadedSynthImage int3Loaded;
+        std::string int3LoadError;
+        Require(int3Loaded.Load(result, int3LoadError),
+            "INT3 隔离 handler 映像装载失败: " + int3LoadError);
+        const auto int3Entry = reinterpret_cast<SynthEntry>(
+            int3Loaded.Base() + result.contextEntryOffset);
         DWORD exceptionCode = 0;
-        InvokeSynthEntry(entry, &int3Context, &exceptionCode);
+        InvokeSynthEntry(int3Entry, &int3Context, &exceptionCode);
         Require(exceptionCode == EXCEPTION_BREAKPOINT,
             "INT3 strategy=" + std::to_string(strategy) +
             " 未产生等价 breakpoint 异常: " + std::to_string(exceptionCode));
@@ -2063,6 +2071,8 @@ void ExecuteExternalSemanticVariantCases(
             bridgeContext.imageBase = reinterpret_cast<uintptr_t>(
                 &GateInstructionBridgeTarget) - targetRva;
             exceptionCode = 0;
+            const auto entry = reinterpret_cast<SynthEntry>(
+                loaded.Base() + result.contextEntryOffset);
             const uint32_t runtimeError = InvokeSynthEntry(
                 entry, &bridgeContext, &exceptionCode);
             Require(exceptionCode == 0 && runtimeError == VM_MICRO_ERR_NONE &&
@@ -2075,7 +2085,10 @@ void ExecuteExternalSemanticVariantCases(
                 " 执行副作用不一致: exception=" +
                 std::to_string(exceptionCode) + " runtime=" +
                 std::to_string(runtimeError) + " context=" +
-                std::to_string(bridgeContext.error));
+                std::to_string(bridgeContext.error) + " address=" +
+                std::to_string(gLastExceptionAddress) + " bytes=" +
+                RuntimeByteWindow(
+                    loaded, result, gLastExceptionAddress));
         }
 #endif
     }
