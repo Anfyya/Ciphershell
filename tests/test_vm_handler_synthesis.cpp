@@ -57,6 +57,7 @@ constexpr uint32_t kCallHostImportSlotRVA = 0x140u;
 constexpr uint32_t kCallHostNativeTargetRVA = 0x180u;
 constexpr uint32_t kInstructionBridgeTargetRVA = 0x300u;
 constexpr size_t kCallHostImageSize = 0x1000u;
+constexpr DWORD kIntegerOverflowExceptionCode = 0xC0000095u;
 constexpr std::array<uint8_t, 4> kSemanticWidths = {1u, 2u, 4u, 8u};
 constexpr std::array<uint8_t, 2> kCoreStrategies = {0u, 1u};
 
@@ -1192,6 +1193,7 @@ void ExecuteDivideFaultCase(
     uint64_t divisor,
     uint8_t width,
     uint8_t strategy,
+    DWORD expectedExceptionCode,
     const VMHandlerSynthesisConfig& config,
     const VMHandlerSynthesisResult& result,
     LoadedSynthImage& loaded,
@@ -1239,11 +1241,12 @@ void ExecuteDivideFaultCase(
         loaded.Base() + result.contextEntryOffset);
     DWORD exceptionCode = 0;
     InvokeSynthEntry(entry, &context, &exceptionCode);
-    Require(exceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO,
+    Require(exceptionCode == expectedExceptionCode,
         std::string(divideOpcode == VM_UOP_UDIV_WIDE ? "UDIV" : "IDIV") +
             " width=" + std::to_string(width) + " strategy=" +
             std::to_string(strategy) + " 未传播真实 #DE，exception=" +
-            std::to_string(exceptionCode));
+            std::to_string(exceptionCode) + " expected=" +
+            std::to_string(expectedExceptionCode));
 }
 
 void ExecuteLazyPreservationCase(
@@ -2199,11 +2202,14 @@ void TestHostContextEntryExecution() {
             // same architectural #DE boundary.  The signed overflow corpus is
             // the smallest positive quotient that no longer fits width bits.
             ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 0, 1, 0, width,
-                strategy, config, result, loaded, encoding, testImage);
+                strategy, EXCEPTION_INT_DIVIDE_BY_ZERO,
+                config, result, loaded, encoding, testImage);
             ExecuteDivideFaultCase(VM_UOP_UDIV_WIDE, 1, 0, 1, width,
-                strategy, config, result, loaded, encoding, testImage);
+                strategy, kIntegerOverflowExceptionCode,
+                config, result, loaded, encoding, testImage);
             ExecuteDivideFaultCase(VM_UOP_IDIV_WIDE, 0, sign, 1, width,
-                strategy, config, result, loaded, encoding, testImage);
+                strategy, kIntegerOverflowExceptionCode,
+                config, result, loaded, encoding, testImage);
         }
     }
 }
