@@ -584,6 +584,103 @@ static bool ValidateLoaderStaticLink(
     return true;
 }
 
+// ============================================================================
+// VM Variant Group：分发去中心化 + 函数级 VM 异构的统一编排抽象。
+//
+// 现状（改动前）：VMHandlerSynthesizer::Synthesize() 对整个产物只调用一次，
+// 所有被虚拟化函数共用同一份 opcode map / handler K 变体选择 / dispatch
+// table。这里把它升级为 N 个相互独立的 Group：每个 Group 各自完整走一遍
+// MutationEngine -> Translator -> VMHandlerSynthesizer -> VMSectionEmitter ->
+// VMRuntimeBuilder -> FunctionTrampolinePatcher 这条既有流水线，只是种子、
+// section 名字与函数子集不同。不改动 54 个微操作语义本身的 codegen
+// （GenerateVMHandlerSemanticKernel），K 变体机制原样复用，只是"跑几遍、
+// 每遍独立"。函数按 build seed 派生的哈希分到唯一一个 Group，组间不共享
+// 可变状态，因而攻破一个 Group 的 opcode map/dispatch table 不直接复用于
+// 其它 Group（§5 函数级异构）；同一产物里同时存在 N 套独立分发子，取代
+// 原来"全二进制一张集中 dispatch table"的结构（§4 分发去中心化）。
+namespace {
+
+uint64_t MixVMGroupSeed(uint64_t value) {
+    value ^= value >> 33;
+    value *= 0xFF51AFD7ED558CCDULL;
+    value ^= value >> 33;
+    value *= 0xC4CEB9FE1A85EC53ULL;
+    value ^= value >> 33;
+    return value;
+}
+
+// groupCount==1 时必须与今天单 Group 行为逐位一致：groupId 0 的种子直接
+// 复用 buildSeed 本身（不做任何变换），只有 groupId>=1 才真正派生出新种子。
+std::array<uint8_t, 32> DeriveVMGroupSeed(
+    const std::array<uint8_t, 32>& buildSeed, uint32_t groupId)
+{
+    if (groupId == 0) return buildSeed;
+    std::array<uint8_t, 32> out{};
+    for (size_t lane = 0; lane < 4; ++lane) {
+        uint64_t base = 0;
+        std::memcpy(&base, buildSeed.data() + lane * 8, 8);
+        const uint64_t mixed = MixVMGroupSeed(base ^
+            (static_cast<uint64_t>(groupId) << 32) ^
+            (0x9E3779B97F4A7C15ULL * (lane + 1)) ^
+            0x56475250554F5450ULL /* "VGROUPTP" 标签 */);
+        std::memcpy(out.data() + lane * 8, &mixed, 8);
+    }
+    return out;
+}
+
+// 函数到 Group 的分配只依赖 build seed 与函数自身入口地址，不依赖遍历
+// 顺序或候选函数总数，因此同一函数在同一次 build 里始终落在同一个 Group。
+uint32_t AssignVMGroupId(
+    const std::array<uint8_t, 32>& buildSeed,
+    uint64_t functionEntryAddress,
+    uint32_t groupCount)
+{
+    if (groupCount <= 1) return 0;
+    uint64_t base = 0;
+    std::memcpy(&base, buildSeed.data(), 8);
+    const uint64_t mixed = MixVMGroupSeed(base ^ functionEntryAddress ^
+        0x47524F5550494421ULL /* "GROUPID!" 标签 */);
+    return static_cast<uint32_t>(mixed % groupCount);
+}
+
+// 每个 Group 的"预构建期"状态：变异引擎产生的 opcode map / handler 变体
+// 布局、两个密度档的 Translator、原生差分证据源，全部按该 Group 自己的
+// 种子生成，不与其它 Group 共享。
+struct VMGroupRuntime {
+    uint32_t groupId = 0;
+    std::array<uint8_t, 32> groupSeed{};
+    char sectionName[8] = {0};
+    char runtimeSectionName[8] = {0};
+    char unwindSectionName[8] = {0};
+    char relocSectionName[8] = {0};
+    char runtimeApiSectionName[8] = {0};
+    CipherShell::MutationEngine mutEngine;
+    CipherShell::MutatedISA mutatedISA;
+    uint64_t operandCodecSeed = 0;
+    CipherShell::Translator translator;
+    CipherShell::Translator lightTranslator;
+    CipherShell::VMWindowsNativeDifferentialEvidenceProvider nativeDifferentialProvider;
+    bool nativeDifferentialProviderReady = false;
+};
+
+// 每个 Group 构建完成后的产物，供收尾阶段的两次静态复验（重建后/写盘后）
+// 复用，且各 Group 独立校验，不合并进一张全局表。
+struct VMGroupOutcome {
+    uint32_t groupId = 0;
+    std::vector<CipherShell::Function> protectedFunctions;
+    std::vector<CipherShell::VMFunctionRecord> vmRecords;
+    std::vector<uint8_t> vmBytecodeBlob;
+    std::unordered_map<uint8_t, uint8_t> opcodeMap;
+    std::unordered_map<uint8_t, uint8_t> registerMap;
+    CipherShell::VMInstructionBridgeBuildResult bridgeResult{};
+    CipherShell::VMEmitResult emitResult{};
+    CipherShell::VMRuntimeBuildResult runtimeResult{};
+    std::vector<CipherShell::FunctionPatchResult> patchResults;
+    std::unordered_map<uint32_t, uint32_t> vmOpcodeCounts;
+};
+
+} // namespace
+
 int main(int argc, char* argv[]) {
     // 设置控制台为 UTF-8 编码
     SetConsoleOutputCP(65001);
@@ -878,14 +975,7 @@ int main(int argc, char* argv[]) {
 
     bool vmApplied = false;
     uint32_t vmRegisterCount = 0;
-    uint64_t vmOperandCodecSeed = 0;
-    std::vector<uint8_t> vmBytecodeBlob;
-    std::vector<CipherShell::VMFunctionRecord> vmRecords;
-    std::vector<CipherShell::Function> protectedFunctions;
-    CipherShell::VMInstructionBridgeBuildResult bridgeResult{};
-    CipherShell::VMEmitResult emitResult{};
-    CipherShell::VMRuntimeBuildResult runtimeResult{};
-    std::vector<CipherShell::FunctionPatchResult> patchResults;
+    std::vector<VMGroupOutcome> vmGroupOutcomes;
     CipherShell::LoaderImportBuildResult vmRuntimeImports{};
 
     // Phase E: 函数级 VM 保护。这里只允许完整落盘的数据进入下一步，失败必须明确诊断。
@@ -923,111 +1013,134 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        CipherShell::MutationEngine mutEngine;
-        CipherShell::MutationConfig mutConfig;
-        mutConfig.randomizeOpcodeMap = true;
-        mutConfig.randomizeRegisterMap = true;
-        mutConfig.registerCount = static_cast<uint32_t>(config.vm.registerCount);
-        mutConfig.seed = buildCtx.isaSeed;
-        mutConfig.mutateHandlers = true;
-        mutConfig.embedJunkHandlers = true;
-        mutConfig.requestedJunkHandlerCount = 16u;
-        for (const auto& descriptor : CipherShell::VMSchema::Opcodes()) {
-            const bool runtimeSupported = image->is64Bit
-                ? descriptor.runtimeSupportedX64
-                : descriptor.runtimeSupportedX86;
-            if (runtimeSupported) {
-                mutConfig.validOpcodes.push_back(
-                    static_cast<uint8_t>(descriptor.opcode));
-            }
-        }
-        if (!mutEngine.Initialize(mutConfig)) {
-            std::cerr << "VM_INIT_FAIL module=MutationEngine reason=register_count_must_be_16_to_32" << std::endl;
-            PrintFeatureStatus("vm", "failed", "invalid_register_count");
-            return 1;
-        }
-
-        CipherShell::MutatedISA mutatedISA = mutEngine.GenerateMutatedISA();
-        vmOperandCodecSeed = mutEngine.GetSeedFingerprint();
-        buildCtx.opcodeMap = mutatedISA.opcodeMap;
-        buildCtx.registerMap = mutatedISA.registerMap;
-        std::string registerMapReason;
-        if (!ValidateVMRegisterMap(buildCtx.registerMap, mutConfig.registerCount, registerMapReason)) {
-            std::cerr << "VM_INIT_FAIL module=MutationEngine reason=" << registerMapReason << std::endl;
-            PrintFeatureStatus("vm", "failed", registerMapReason);
-            return 1;
-        }
-        std::cout << "    ISA seed fingerprint: 0x" << std::hex
-                  << vmOperandCodecSeed << std::dec << std::endl;
-        std::cout << "VM_HANDLER_LAYOUT mutated="
-                  << (mutatedISA.handlerMutationEnabled ? "true" : "false")
-                  << " junk_handlers=" << mutatedISA.junkHandlerCount
-                  << " variant_count=" << VM_HANDLER_VARIANT_COUNT << std::endl;
-
-        // 隔离原生差分证据源：本次 build 只合成一次 handler 镜像（与最终
-        // PE 里写入的 handler 语义等价，只是 decryptor IAT 槽位不同——那两个
-        // 槽位只影响 W^X 解密流程，不影响任何一条微语义的计算结果），后续
-        // 每个候选函数的每个 corpus case 都复用它，在隔离 worker 里对逐位
-        // 比较原生 CPU 执行与该镜像的执行结果。worker 缺失、初始化失败或
-        // 架构不匹配都必须让下面每个函数的 native differential 检查 fail-
-        // closed，不能有静默降级路径。
-        CipherShell::VMWindowsNativeDifferentialEvidenceProvider nativeDifferentialProvider;
-        CipherShell::VMHandlerOperandCodecConfig nativeDifferentialOperandCodec{};
-        nativeDifferentialOperandCodec.opcodeXor = static_cast<uint8_t>(buildCtx.isaSeed[3] | 1u);
-        nativeDifferentialOperandCodec.opcodeAdd = static_cast<uint8_t>(buildCtx.isaSeed[7] | 1u);
-        nativeDifferentialOperandCodec.opcodeRotate =
-            static_cast<uint8_t>((buildCtx.isaSeed[11] % 7u) + 1u);
+        // Phase 1 骨架：Group 数暂时写死为 2，只为打通"多个独立 VM 实例
+        // 共存于同一产物"这条主干；Phase 3 会替换成按 build seed 与候选
+        // 函数数量自适应。groupId==0 在下面每一步都刻意复用与单 Group
+        // 时完全相同的种子/派生盐值，因此 vmGroupCount==1 时行为必须与
+        // 改动前逐位一致——这里先验证 2 组能独立工作、互不覆盖。
+        const uint32_t vmGroupCount = 2u;
+        const uint32_t vmRegisterCountConfig = static_cast<uint32_t>(config.vm.registerCount);
         constexpr uint32_t kVmNativeDifferentialMemorySize = 0x10000u;
-        std::string nativeDifferentialInitError;
-        const bool nativeDifferentialProviderReady = nativeDifferentialProvider.Initialize(
-            image->is64Bit
-                ? CipherShell::VMHandlerArchitecture::X64
-                : CipherShell::VMHandlerArchitecture::X86,
-            buildCtx.isaSeed,
-            mutatedISA.handlerSemanticToSlot,
-            mutatedISA.handlerSlotToSemantic,
-            mutatedISA.handlerVariants,
-            nativeDifferentialOperandCodec,
-            kVmNativeDifferentialMemorySize,
-            nativeDifferentialInitError);
-        if (!nativeDifferentialProviderReady) {
-            std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL reason="
-                      << nativeDifferentialInitError << std::endl;
-            std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL every candidate function "
-                         "will fail closed at the native differential gate below" << std::endl;
-        }
 
-        CipherShell::Translator translator;
-        CipherShell::TranslationConfig transConfig;
-        transConfig.virtualRegisterCount = mutConfig.registerCount;
-        transConfig.buildSeed = vmOperandCodecSeed;
-        transConfig.density = CipherShell::VMMicroDensity::Heavy;
-        transConfig.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
-        transConfig.x86CallAbi = configuredX86CallAbi;
-        transConfig.enableSimdBridge = config.vm.simdBridge;
-        transConfig.enableX87Bridge = config.vm.x87Bridge;
-        vmRegisterCount = transConfig.virtualRegisterCount;
-        for (const auto& dll : image->imports.dlls) {
-            for (const auto& imported : dll.functions) {
-                transConfig.importThunkRVAs.insert(imported.thunkRVA);
+        std::vector<VMGroupRuntime> vmGroups(vmGroupCount);
+        for (uint32_t g = 0; g < vmGroupCount; ++g) {
+            VMGroupRuntime& grp = vmGroups[g];
+            grp.groupId = g;
+            grp.groupSeed = DeriveVMGroupSeed(buildCtx.isaSeed, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.sectionName, buildCtx, buildCtx.vmSectionName, 0xC0DEu, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.runtimeSectionName, buildCtx, buildCtx.vmRuntimeSectionName, 0x51A7u, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.unwindSectionName, buildCtx, buildCtx.vmUnwindSectionName, 0xDA7Au, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.relocSectionName, buildCtx, buildCtx.vmRelocSectionName, 0x2E10u, g);
+
+            CipherShell::MutationConfig mutConfig;
+            mutConfig.randomizeOpcodeMap = true;
+            mutConfig.randomizeRegisterMap = true;
+            mutConfig.registerCount = vmRegisterCountConfig;
+            mutConfig.seed = grp.groupSeed;
+            mutConfig.mutateHandlers = true;
+            mutConfig.embedJunkHandlers = true;
+            mutConfig.requestedJunkHandlerCount = 16u;
+            for (const auto& descriptor : CipherShell::VMSchema::Opcodes()) {
+                const bool runtimeSupported = image->is64Bit
+                    ? descriptor.runtimeSupportedX64
+                    : descriptor.runtimeSupportedX86;
+                if (runtimeSupported) {
+                    mutConfig.validOpcodes.push_back(
+                        static_cast<uint8_t>(descriptor.opcode));
+                }
             }
+            if (!grp.mutEngine.Initialize(mutConfig)) {
+                std::cerr << "VM_INIT_FAIL module=MutationEngine reason=register_count_must_be_16_to_32"
+                          << " vm_group=" << g << std::endl;
+                PrintFeatureStatus("vm", "failed", "invalid_register_count");
+                return 1;
+            }
+
+            grp.mutatedISA = grp.mutEngine.GenerateMutatedISA();
+            grp.operandCodecSeed = grp.mutEngine.GetSeedFingerprint();
+            std::string registerMapReason;
+            if (!ValidateVMRegisterMap(grp.mutatedISA.registerMap, mutConfig.registerCount, registerMapReason)) {
+                std::cerr << "VM_INIT_FAIL module=MutationEngine reason=" << registerMapReason
+                          << " vm_group=" << g << std::endl;
+                PrintFeatureStatus("vm", "failed", registerMapReason);
+                return 1;
+            }
+            std::cout << "    ISA seed fingerprint (vm_group=" << g << "): 0x" << std::hex
+                      << grp.operandCodecSeed << std::dec << std::endl;
+            std::cout << "VM_HANDLER_LAYOUT vm_group=" << g
+                      << " mutated=" << (grp.mutatedISA.handlerMutationEnabled ? "true" : "false")
+                      << " junk_handlers=" << grp.mutatedISA.junkHandlerCount
+                      << " variant_count=" << VM_HANDLER_VARIANT_COUNT << std::endl;
+
+            // 隔离原生差分证据源：每个 Group 只合成一次 handler 镜像（与
+            // 该 Group 最终 PE 里写入的 handler 语义等价，只是 decryptor
+            // IAT 槽位不同——那两个槽位只影响 W^X 解密流程，不影响任何
+            // 一条微语义的计算结果），后续这个 Group 里每个候选函数的每
+            // 个 corpus case 都复用它。worker 缺失、初始化失败或架构不
+            // 匹配都必须让这个 Group 下每个函数的 native differential
+            // 检查 fail-closed，不能有静默降级路径。
+            CipherShell::VMHandlerOperandCodecConfig nativeDifferentialOperandCodec{};
+            nativeDifferentialOperandCodec.opcodeXor = static_cast<uint8_t>(grp.groupSeed[3] | 1u);
+            nativeDifferentialOperandCodec.opcodeAdd = static_cast<uint8_t>(grp.groupSeed[7] | 1u);
+            nativeDifferentialOperandCodec.opcodeRotate =
+                static_cast<uint8_t>((grp.groupSeed[11] % 7u) + 1u);
+            std::string nativeDifferentialInitError;
+            grp.nativeDifferentialProviderReady = grp.nativeDifferentialProvider.Initialize(
+                image->is64Bit
+                    ? CipherShell::VMHandlerArchitecture::X64
+                    : CipherShell::VMHandlerArchitecture::X86,
+                grp.groupSeed,
+                grp.mutatedISA.handlerSemanticToSlot,
+                grp.mutatedISA.handlerSlotToSemantic,
+                grp.mutatedISA.handlerVariants,
+                nativeDifferentialOperandCodec,
+                kVmNativeDifferentialMemorySize,
+                nativeDifferentialInitError);
+            if (!grp.nativeDifferentialProviderReady) {
+                std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL vm_group=" << g
+                          << " reason=" << nativeDifferentialInitError << std::endl;
+                std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL every candidate function "
+                             "in this group will fail closed at the native differential gate below"
+                          << std::endl;
+            }
+
+            CipherShell::TranslationConfig transConfig;
+            transConfig.virtualRegisterCount = mutConfig.registerCount;
+            transConfig.buildSeed = grp.operandCodecSeed;
+            transConfig.density = CipherShell::VMMicroDensity::Heavy;
+            transConfig.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+            transConfig.x86CallAbi = configuredX86CallAbi;
+            transConfig.enableSimdBridge = config.vm.simdBridge;
+            transConfig.enableX87Bridge = config.vm.x87Bridge;
+            for (const auto& dll : image->imports.dlls) {
+                for (const auto& imported : dll.functions) {
+                    transConfig.importThunkRVAs.insert(imported.thunkRVA);
+                }
+            }
+            if (!grp.translator.Initialize(transConfig)) {
+                std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed"
+                          << " vm_group=" << g << std::endl;
+                return 1;
+            }
+            grp.translator.SetOpcodeMap(grp.mutatedISA.opcodeMap);
+            grp.translator.SetRegisterMap(grp.mutatedISA.registerMap);
+            CipherShell::TranslationConfig lightConfig = transConfig;
+            lightConfig.density = CipherShell::VMMicroDensity::Light;
+            if (!grp.lightTranslator.Initialize(lightConfig)) {
+                std::cerr << "VM_INIT_FAIL module=Translator reason=light_initialize_failed"
+                          << " vm_group=" << g << std::endl;
+                return 1;
+            }
+            grp.lightTranslator.SetOpcodeMap(grp.mutatedISA.opcodeMap);
+            grp.lightTranslator.SetRegisterMap(grp.mutatedISA.registerMap);
+            if (g == 0) PrintVMRegisterMapReport(grp.mutatedISA.registerMap);
         }
-        if (!translator.Initialize(transConfig)) {
-            std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed" << std::endl;
-            return 1;
-        }
-        translator.SetOpcodeMap(buildCtx.opcodeMap);
-        translator.SetRegisterMap(buildCtx.registerMap);
-        CipherShell::Translator lightTranslator;
-        CipherShell::TranslationConfig lightConfig = transConfig;
-        lightConfig.density = CipherShell::VMMicroDensity::Light;
-        if (!lightTranslator.Initialize(lightConfig)) {
-            std::cerr << "VM_INIT_FAIL module=Translator reason=light_initialize_failed" << std::endl;
-            return 1;
-        }
-        lightTranslator.SetOpcodeMap(buildCtx.opcodeMap);
-        lightTranslator.SetRegisterMap(buildCtx.registerMap);
-        PrintVMRegisterMapReport(buildCtx.registerMap);
+        vmRegisterCount = vmRegisterCountConfig;
+
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
         disasm.Initialize(is64, is64 ? image->ntHeaders64->OptionalHeader.ImageBase
@@ -1035,7 +1148,11 @@ int main(int argc, char* argv[]) {
         uint32_t virtualizedCount = 0;
         uint32_t rejectedCount = 0;
         uint32_t selectedCount = 0;
-        std::vector<CipherShell::TranslationResult> pendingTranslations;
+        std::vector<CipherShell::Function> allProtectedFunctions;
+        std::vector<CipherShell::TranslationResult> allPendingTranslations;
+        std::vector<uint32_t> allFunctionGroupIds;
+        vmGroupOutcomes.resize(vmGroupCount);
+        for (uint32_t g = 0; g < vmGroupCount; ++g) vmGroupOutcomes[g].groupId = g;
 
         CipherShell::FunctionDiscovery functionDiscovery;
         auto discoveryResult = functionDiscovery.Discover(
@@ -1148,9 +1265,15 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
+                // 函数级 VM 异构：分组只依赖 build seed 与函数自身入口地址，
+                // 与遍历顺序、CFG/native_unprotected 之类的其它分支无关。
+                const uint32_t vmGroupId = AssignVMGroupId(
+                    buildCtx.isaSeed, func.entryAddress, vmGroupCount);
+                VMGroupRuntime& grp = vmGroups[vmGroupId];
+
                 CipherShell::Translator& selectedTranslator =
                     (!explicitlySelected && func.assignedLevel <= 2)
-                    ? lightTranslator : translator;
+                    ? grp.lightTranslator : grp.translator;
                 auto transResult = selectedTranslator.TranslateFunction(func);
                 if (!transResult.success || transResult.instructions.empty()) {
                     rejectedCount++;
@@ -1170,6 +1293,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "VM_PROFILE function_rva=0x" << std::hex
                           << func.entryAddress << std::dec
+                          << " vm_group=" << vmGroupId
                           << " mode="
                           << (transResult.density == CipherShell::VMMicroDensity::Heavy
                               ? "heavy_micro" : "light_micro")
@@ -1188,15 +1312,15 @@ int main(int argc, char* argv[]) {
 
                 CipherShell::VMIRModelPreflightConfig modelConfig{};
                 modelConfig.corpusSeed =
-                    vmOperandCodecSeed ^ func.entryAddress;
+                    grp.operandCodecSeed ^ func.entryAddress;
                 modelConfig.corpusCount = 256;
                 // Must match kVmNativeDifferentialMemorySize: the native
                 // differential gate below reuses this corpus's memory size.
                 modelConfig.memorySize = kVmNativeDifferentialMemorySize;
                 const auto modelPreflight =
                     CipherShell::VMIRModelPreflightVerifier::Verify(
-                    func, transResult, buildCtx.opcodeMap,
-                    buildCtx.registerMap, modelConfig);
+                    func, transResult, grp.mutatedISA.opcodeMap,
+                    grp.mutatedISA.registerMap, modelConfig);
                 if (!modelPreflight.success) {
                     std::cerr << "VM_IR_MODEL_PREFLIGHT_FAIL module=VMIRModelPreflightVerifier"
                               << " function_rva=0x" << std::hex
@@ -1216,9 +1340,9 @@ int main(int argc, char* argv[]) {
                 // shipped table later), so it must be (re)prepared per function
                 // before any of that function's corpus cases run.
                 bool nativeDifferentialFunctionReady = false;
-                if (nativeDifferentialProviderReady) {
+                if (grp.nativeDifferentialProviderReady) {
                     std::string prepareError;
-                    nativeDifferentialFunctionReady = nativeDifferentialProvider.PrepareForFunction(
+                    nativeDifferentialFunctionReady = grp.nativeDifferentialProvider.PrepareForFunction(
                         static_cast<uint32_t>(func.entryAddress), transResult.operandCodec,
                         prepareError);
                     if (!nativeDifferentialFunctionReady) {
@@ -1237,13 +1361,13 @@ int main(int argc, char* argv[]) {
                 // wrong architecture, synthesis failure) must fail closed here,
                 // never fall back to the software IR preflight as evidence.
                 nativeConfig.expectedHandlerImageDigest = nativeDifferentialFunctionReady
-                    ? nativeDifferentialProvider.SemanticIdentityDigest() : 0;
+                    ? grp.nativeDifferentialProvider.SemanticIdentityDigest() : 0;
                 nativeConfig.evidenceProvider = nativeDifferentialFunctionReady
-                    ? &nativeDifferentialProvider : nullptr;
+                    ? &grp.nativeDifferentialProvider : nullptr;
                 const auto nativeDifferential =
                     CipherShell::VMNativeDifferentialVerifier::Verify(
-                        func, transResult, buildCtx.opcodeMap,
-                        buildCtx.registerMap, nativeConfig);
+                        func, transResult, grp.mutatedISA.opcodeMap,
+                        grp.mutatedISA.registerMap, nativeConfig);
                 if (!nativeDifferential.success ||
                     !nativeDifferential.nativeCpuEvidenceVerified ||
                     !nativeDifferential.synthesizedHandlerEvidenceVerified) {
@@ -1261,8 +1385,9 @@ int main(int argc, char* argv[]) {
                           << " cases=" << nativeDifferential.casesVerified
                           << " native_cpu=true synthesized_handlers=true" << std::endl;
 
-                protectedFunctions.push_back(func);
-                pendingTranslations.push_back(std::move(transResult));
+                allProtectedFunctions.push_back(func);
+                allPendingTranslations.push_back(std::move(transResult));
+                allFunctionGroupIds.push_back(vmGroupId);
         }
 
         const bool explicitTargets = !buildCtx.vm.targetFunctions.empty() ||
@@ -1280,44 +1405,58 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        if (!pendingTranslations.empty()) {
+        if (!allPendingTranslations.empty()) {
+            // Native bridge/CALL 桥接是一个与 opcode map/dispatch 无关的
+            // 通用子系统，不需要按 Group 分化：所有 Group 的函数共用同一份
+            // bridge/guard section，构建一次即可，随后按各自 Group 拆分
+            // bytecode/record。
             CipherShell::VMInstructionBridgeBuilder bridgeBuilder;
-            bridgeResult = bridgeBuilder.Build(image.get(), protectedFunctions,
-                pendingTranslations, buildCtx.vmBridgeSectionName,
+            auto sharedBridgeResult = bridgeBuilder.Build(image.get(), allProtectedFunctions,
+                allPendingTranslations, buildCtx.vmBridgeSectionName,
                 buildCtx.vmBridgeUnwindSectionName, buildCtx.vmGuardSectionName);
-            if (!bridgeResult.success) {
+            if (!sharedBridgeResult.success) {
                 std::cerr << "VM_BRIDGE_FAIL module=VMInstructionBridgeBuilder reason="
-                          << bridgeResult.error << std::endl;
-                PrintFeatureStatus("vm", "failed", bridgeResult.error);
+                          << sharedBridgeResult.error << std::endl;
+                PrintFeatureStatus("vm", "failed", sharedBridgeResult.error);
                 return 1;
             }
-            for (size_t i = 0; i < pendingTranslations.size(); ++i) {
-                auto vmBytecode = translator.GenerateBytecode(pendingTranslations[i]);
+            for (auto& outcome : vmGroupOutcomes) outcome.bridgeResult = sharedBridgeResult;
+
+            for (size_t i = 0; i < allProtectedFunctions.size(); ++i) {
+                const uint32_t g = allFunctionGroupIds[i];
+                VMGroupRuntime& grp = vmGroups[g];
+                VMGroupOutcome& outcome = vmGroupOutcomes[g];
+                auto vmBytecode = grp.translator.GenerateBytecode(allPendingTranslations[i]);
                 if (vmBytecode.empty()) {
                     std::cerr << "VM_BYTECODE_FAIL module=TranslatorBytecode function_rva=0x"
-                              << std::hex << protectedFunctions[i].entryAddress << std::dec
+                              << std::hex << allProtectedFunctions[i].entryAddress << std::dec
+                              << " vm_group=" << g
                               << " reason=unlinked_or_invalid_bytecode" << std::endl;
                     PrintFeatureStatus("vm", "failed", "unlinked_or_invalid_bytecode");
                     return 1;
                 }
                 CipherShell::VMFunctionRecord record{};
-                record.functionRVA = static_cast<uint32_t>(protectedFunctions[i].entryAddress);
-                record.functionSize = protectedFunctions[i].size;
-                record.bytecodeOffset = static_cast<uint32_t>(vmBytecodeBlob.size());
+                record.functionRVA = static_cast<uint32_t>(allProtectedFunctions[i].entryAddress);
+                record.functionSize = allProtectedFunctions[i].size;
+                record.bytecodeOffset = static_cast<uint32_t>(outcome.vmBytecodeBlob.size());
                 record.bytecodeSize = static_cast<uint32_t>(vmBytecode.size());
                 record.flags = is64 ? static_cast<uint32_t>(VM_RECORD_FLAG_X64) : 0u;
-                if (pendingTranslations[i].usesSimd) record.flags |= VM_RECORD_FLAG_USES_SIMD;
-                if (pendingTranslations[i].usesAvx) record.flags |= VM_RECORD_FLAG_USES_AVX;
-                if (pendingTranslations[i].usesX87) record.flags |= VM_RECORD_FLAG_USES_X87;
-                record.returnStackCleanup = pendingTranslations[i].returnStackCleanup;
+                if (allPendingTranslations[i].usesSimd) record.flags |= VM_RECORD_FLAG_USES_SIMD;
+                if (allPendingTranslations[i].usesAvx) record.flags |= VM_RECORD_FLAG_USES_AVX;
+                if (allPendingTranslations[i].usesX87) record.flags |= VM_RECORD_FLAG_USES_X87;
+                record.returnStackCleanup = allPendingTranslations[i].returnStackCleanup;
                 record.guestStackSize = static_cast<uint32_t>(config.vm.stackSize);
-                vmRecords.push_back(record);
-                vmBytecodeBlob.insert(vmBytecodeBlob.end(), vmBytecode.begin(), vmBytecode.end());
+                outcome.vmRecords.push_back(record);
+                outcome.vmBytecodeBlob.insert(outcome.vmBytecodeBlob.end(), vmBytecode.begin(), vmBytecode.end());
+                outcome.protectedFunctions.push_back(allProtectedFunctions[i]);
                 ++virtualizedCount;
             }
         }
 
-        if (!vmRecords.empty()) {
+        uint32_t totalVmRecords = 0;
+        for (const auto& outcome : vmGroupOutcomes) totalVmRecords += static_cast<uint32_t>(outcome.vmRecords.size());
+
+        if (totalVmRecords > 0) {
             CipherShell::LoaderImportBuilder runtimeImportBuilder;
             vmRuntimeImports = runtimeImportBuilder.Build(
                 image.get(), buildCtx.vmRuntimeApiSectionName);
@@ -1331,163 +1470,179 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            CipherShell::VMSectionEmitter vmEmitter;
-            emitResult = vmEmitter.Emit(image.get(), vmBytecodeBlob, vmRecords,
-                buildCtx.opcodeMap, buildCtx.registerMap,
-                mutatedISA.handlerSemanticToSlot, mutatedISA.handlerSlotToSemantic,
-                mutatedISA.handlerVariants, mutatedISA.junkHandlerCount,
-                mutatedISA.handlerMutationEnabled, mutatedISA.junkHandlersEnabled,
-                vmOperandCodecSeed,
-                0, buildCtx.vmSectionName);
-            if (!emitResult.success) {
-                std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter reason=" << emitResult.error << std::endl;
-                                PrintFeatureStatus("vm", "failed", emitResult.error);
-                return 1;
-            }
-            vmRecords = emitResult.records;
+            for (uint32_t g = 0; g < vmGroupCount; ++g) {
+                VMGroupOutcome& outcome = vmGroupOutcomes[g];
+                if (outcome.vmRecords.empty()) continue;
+                VMGroupRuntime& grp = vmGroups[g];
 
-            CipherShell::VMRuntimeBuilder runtimeBuilder;
-            CipherShell::VMHandlerSynthesisConfig synthesisConfig{};
-            synthesisConfig.architecture = is64
-                ? CipherShell::VMHandlerArchitecture::X64
-                : CipherShell::VMHandlerArchitecture::X86;
-            synthesisConfig.buildSeed = buildCtx.isaSeed;
-            synthesisConfig.handlerSemanticToSlot =
-                emitResult.handlerSemanticToSlot;
-            synthesisConfig.handlerSlotToSemantic =
-                emitResult.handlerSlotToSemantic;
-            synthesisConfig.handlerVariants = emitResult.handlerVariants;
-            synthesisConfig.variantCount = VM_HANDLER_VARIANT_COUNT;
-            synthesisConfig.operandCodec.opcodeXor =
-                static_cast<uint8_t>(buildCtx.isaSeed[3] | 1u);
-            synthesisConfig.operandCodec.opcodeAdd =
-                static_cast<uint8_t>(buildCtx.isaSeed[7] | 1u);
-            synthesisConfig.operandCodec.opcodeRotate =
-                static_cast<uint8_t>((buildCtx.isaSeed[11] % 7u) + 1u);
-            synthesisConfig.virtualProtectIatRVA =
-                vmRuntimeImports.virtualProtectIatRVA;
-            synthesisConfig.flushInstructionCacheIatRVA =
-                vmRuntimeImports.flushInstructionCacheIatRVA;
-            runtimeResult = runtimeBuilder.Build(image.get(), vmRecords,
-                emitResult.metadataRVA, emitResult.runtimeKeyShare,
-                synthesisConfig,
-                buildCtx.vmRuntimeSectionName,
-                buildCtx.vmUnwindSectionName,
-                buildCtx.vmRelocSectionName);
-            if (!runtimeResult.success ||
-                !runtimeResult.handlerSynthesisVerified ||
-                !runtimeResult.directThreadedVerified ||
-                !runtimeResult.handlerEncryptionVerified ||
-                !runtimeResult.runtimeContentVerified) {
-                std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
-                                PrintFeatureStatus("vm", "failed", runtimeResult.error);
-                return 1;
-            }
-
-            std::string patchError;
-            const uint32_t runtimeVerifiedFlags =
-                (runtimeResult.unwindVerified
-                    ? static_cast<uint32_t>(VM_METADATA_FLAG_UNWIND_VERIFIED) : 0u) |
-                VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
-                VM_METADATA_FLAG_DIRECT_THREADED |
-                VM_METADATA_FLAG_HANDLER_ENCRYPTED;
-            const uint32_t linkageVerifiedFlags = runtimeVerifiedFlags |
-                (runtimeResult.cfgVerified
-                    ? static_cast<uint32_t>(VM_METADATA_FLAG_CFG_VERIFIED) : 0u);
-            if (!vmEmitter.PatchLinkage(image.get(), emitResult.metadataRVA,
-                    runtimeResult.sectionRVA, runtimeResult.runtimeEntryRVA,
-                    runtimeResult.runtimeImageSize,
-                    runtimeResult.trampolines, emitResult.runtimeKeyShare,
-                    linkageVerifiedFlags, &patchError)) {
-                std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
-                                PrintFeatureStatus("vm", "failed", patchError);
-                return 1;
-            }
-
-            if (!runtimeResult.executionReady) {
-                std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder reason=" << runtimeResult.error << std::endl;
-                                PrintFeatureStatus("vm", "failed", runtimeResult.error);
-                return 1;
-            }
-
-            CipherShell::FunctionTrampolinePatcher patcher;
-            patchResults = patcher.PatchFunctions(
-                image.get(), runtimeResult.trampolines, vmRecords, protectedFunctions, true);
-            for (const auto& patch : patchResults) {
-                if (!patch.success) {
-                    std::cerr << "VM_PATCH_FAIL module=FunctionTrampolinePatcher function_rva=0x"
-                              << std::hex << patch.functionRVA << std::dec
-                              << " reason=" << patch.error << std::endl;
-                                        PrintFeatureStatus("vm", "failed", patch.error);
+                CipherShell::VMSectionEmitter vmEmitter;
+                outcome.emitResult = vmEmitter.Emit(image.get(), outcome.vmBytecodeBlob, outcome.vmRecords,
+                    grp.mutatedISA.opcodeMap, grp.mutatedISA.registerMap,
+                    grp.mutatedISA.handlerSemanticToSlot, grp.mutatedISA.handlerSlotToSemantic,
+                    grp.mutatedISA.handlerVariants, grp.mutatedISA.junkHandlerCount,
+                    grp.mutatedISA.handlerMutationEnabled, grp.mutatedISA.junkHandlersEnabled,
+                    grp.operandCodecSeed,
+                    0, grp.sectionName);
+                if (!outcome.emitResult.success) {
+                    std::cerr << "VM_EMIT_FAIL module=VMSectionEmitter vm_group=" << g
+                              << " reason=" << outcome.emitResult.error << std::endl;
+                    PrintFeatureStatus("vm", "failed", outcome.emitResult.error);
                     return 1;
                 }
-            }
+                outcome.vmRecords = outcome.emitResult.records;
+                outcome.opcodeMap = grp.mutatedISA.opcodeMap;
+                outcome.registerMap = grp.mutatedISA.registerMap;
 
-            if (!vmEmitter.PatchLinkage(image.get(), emitResult.metadataRVA,
-                    runtimeResult.sectionRVA, runtimeResult.runtimeEntryRVA,
-                    runtimeResult.runtimeImageSize,
-                    runtimeResult.trampolines,
-                    emitResult.runtimeKeyShare,
-                    VM_METADATA_FLAG_NATIVE_BODY_DESTROYED | linkageVerifiedFlags, &patchError)) {
-                std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver reason=" << patchError << std::endl;
-                PrintFeatureStatus("vm", "failed", patchError);
-                return 1;
-            }
-
-            std::string staticCheckReason;
-            std::unordered_map<uint32_t, uint32_t> vmOpcodeCounts;
-            if (!ValidateVMStaticLink(image.get(), vmRecords, vmBytecodeBlob, emitResult, runtimeResult,
-                    bridgeResult,
-                    patchResults, buildCtx.opcodeMap, buildCtx.registerMap,
-                    transConfig.virtualRegisterCount, vmOpcodeCounts, staticCheckReason)) {
-                std::cerr << "VM_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
-                          << staticCheckReason << std::endl;
-                PrintFeatureStatus("vm", "failed", staticCheckReason);
-                return 1;
-            }
-            std::cout << "VM_STATIC_CHECK_PASS module=VMStaticLinkChecker records="
-                      << vmRecords.size() << std::endl;
-            vmApplied = true;
-            std::cout << "VM_RUNTIME_SECTION rva=0x" << std::hex << runtimeResult.sectionRVA
-                      << " raw=0x" << runtimeResult.sectionRawOffset
-                      << " size=0x" << runtimeResult.sectionSize
-                      << " entry=0x" << runtimeResult.runtimeEntryRVA << std::dec << std::endl;
-            std::cout << "VM_METADATA_SECTION rva=0x" << std::hex << emitResult.sectionRVA
-                      << " raw=0x" << emitResult.sectionRawOffset
-                      << " size=0x" << emitResult.sectionSize
-                      << " metadata=0x" << emitResult.metadataRVA
-                      << " bytecode=0x" << emitResult.bytecodeRVA << std::dec << std::endl;
-            std::cout << "VM_RUNTIME_CAPABILITIES schema=0x" << std::hex << VM_SCHEMA_VERSION
-                      << " metadata=0x" << VM_METADATA_VERSION
-                      << " runtime=0x" << VM_RUNTIME_VERSION << std::dec
-                      << " scalar_memory=true memory_arithmetic=true"
-                      << " native_call_bridge=false intra_vm_direct_call=true simd_x87_bridge=true"
-                      << " fail_policy=error_code_in_eax_then_int3_ud2" << std::endl;
-
-            for (const auto& record : vmRecords) {
-                const CipherShell::VMTrampolineRecord* trampoline = nullptr;
-                const CipherShell::FunctionPatchResult* patch = nullptr;
-                for (const auto& tr : runtimeResult.trampolines) {
-                    if (tr.functionRVA == record.functionRVA) { trampoline = &tr; break; }
+                CipherShell::VMRuntimeBuilder runtimeBuilder;
+                CipherShell::VMHandlerSynthesisConfig synthesisConfig{};
+                synthesisConfig.architecture = is64
+                    ? CipherShell::VMHandlerArchitecture::X64
+                    : CipherShell::VMHandlerArchitecture::X86;
+                synthesisConfig.buildSeed = grp.groupSeed;
+                synthesisConfig.handlerSemanticToSlot =
+                    outcome.emitResult.handlerSemanticToSlot;
+                synthesisConfig.handlerSlotToSemantic =
+                    outcome.emitResult.handlerSlotToSemantic;
+                synthesisConfig.handlerVariants = outcome.emitResult.handlerVariants;
+                synthesisConfig.variantCount = VM_HANDLER_VARIANT_COUNT;
+                synthesisConfig.operandCodec.opcodeXor =
+                    static_cast<uint8_t>(grp.groupSeed[3] | 1u);
+                synthesisConfig.operandCodec.opcodeAdd =
+                    static_cast<uint8_t>(grp.groupSeed[7] | 1u);
+                synthesisConfig.operandCodec.opcodeRotate =
+                    static_cast<uint8_t>((grp.groupSeed[11] % 7u) + 1u);
+                synthesisConfig.virtualProtectIatRVA =
+                    vmRuntimeImports.virtualProtectIatRVA;
+                synthesisConfig.flushInstructionCacheIatRVA =
+                    vmRuntimeImports.flushInstructionCacheIatRVA;
+                outcome.runtimeResult = runtimeBuilder.Build(image.get(), outcome.vmRecords,
+                    outcome.emitResult.metadataRVA, outcome.emitResult.runtimeKeyShare,
+                    synthesisConfig,
+                    grp.runtimeSectionName,
+                    grp.unwindSectionName,
+                    grp.relocSectionName);
+                if (!outcome.runtimeResult.success ||
+                    !outcome.runtimeResult.handlerSynthesisVerified ||
+                    !outcome.runtimeResult.directThreadedVerified ||
+                    !outcome.runtimeResult.handlerEncryptionVerified ||
+                    !outcome.runtimeResult.runtimeContentVerified) {
+                    std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder vm_group=" << g
+                              << " reason=" << outcome.runtimeResult.error << std::endl;
+                    PrintFeatureStatus("vm", "failed", outcome.runtimeResult.error);
+                    return 1;
                 }
-                for (const auto& pr : patchResults) {
-                    if (pr.functionRVA == record.functionRVA) { patch = &pr; break; }
+
+                std::string patchError;
+                const uint32_t runtimeVerifiedFlags =
+                    (outcome.runtimeResult.unwindVerified
+                        ? static_cast<uint32_t>(VM_METADATA_FLAG_UNWIND_VERIFIED) : 0u) |
+                    VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
+                    VM_METADATA_FLAG_DIRECT_THREADED |
+                    VM_METADATA_FLAG_HANDLER_ENCRYPTED;
+                const uint32_t linkageVerifiedFlags = runtimeVerifiedFlags |
+                    (outcome.runtimeResult.cfgVerified
+                        ? static_cast<uint32_t>(VM_METADATA_FLAG_CFG_VERIFIED) : 0u);
+                if (!vmEmitter.PatchLinkage(image.get(), outcome.emitResult.metadataRVA,
+                        outcome.runtimeResult.sectionRVA, outcome.runtimeResult.runtimeEntryRVA,
+                        outcome.runtimeResult.runtimeImageSize,
+                        outcome.runtimeResult.trampolines, outcome.emitResult.runtimeKeyShare,
+                        linkageVerifiedFlags, &patchError)) {
+                    std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver vm_group=" << g
+                              << " reason=" << patchError << std::endl;
+                    PrintFeatureStatus("vm", "failed", patchError);
+                    return 1;
                 }
-                uint32_t opcodeCount = 0;
-                auto countIt = vmOpcodeCounts.find(record.functionRVA);
-                if (countIt != vmOpcodeCounts.end()) opcodeCount = countIt->second;
-                std::cout << "VM_RECORD function_rva=0x" << std::hex << record.functionRVA
-                          << " original_size=0x" << record.functionSize
-                          << " trampoline_rva=0x" << (trampoline ? trampoline->trampolineRVA : 0)
-                          << " trampoline_size=0x" << (trampoline ? trampoline->trampolineSize : 0)
-                          << " patch_type=" << (patch ? PatchKindName(patch->patchKind) : "none")
-                          << " bytecode_offset=0x" << record.bytecodeOffset
-                          << " bytecode_size=0x" << record.bytecodeSize
-                          << " guest_stack_size=0x" << record.guestStackSize
-                          << " opcode_count=" << std::dec << opcodeCount
-                          << " patched_first16=" << FormatImageBytesAtRva(image.get(), record.functionRVA, 16)
-                          << " trampoline_first16=" << FormatImageBytesAtRva(image.get(), trampoline ? trampoline->trampolineRVA : 0, 16)
-                          << std::endl;
+
+                if (!outcome.runtimeResult.executionReady) {
+                    std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder vm_group=" << g
+                              << " reason=" << outcome.runtimeResult.error << std::endl;
+                    PrintFeatureStatus("vm", "failed", outcome.runtimeResult.error);
+                    return 1;
+                }
+
+                CipherShell::FunctionTrampolinePatcher patcher;
+                outcome.patchResults = patcher.PatchFunctions(
+                    image.get(), outcome.runtimeResult.trampolines, outcome.vmRecords,
+                    outcome.protectedFunctions, true);
+                for (const auto& patch : outcome.patchResults) {
+                    if (!patch.success) {
+                        std::cerr << "VM_PATCH_FAIL module=FunctionTrampolinePatcher function_rva=0x"
+                                  << std::hex << patch.functionRVA << std::dec
+                                  << " vm_group=" << g
+                                  << " reason=" << patch.error << std::endl;
+                        PrintFeatureStatus("vm", "failed", patch.error);
+                        return 1;
+                    }
+                }
+
+                if (!vmEmitter.PatchLinkage(image.get(), outcome.emitResult.metadataRVA,
+                        outcome.runtimeResult.sectionRVA, outcome.runtimeResult.runtimeEntryRVA,
+                        outcome.runtimeResult.runtimeImageSize,
+                        outcome.runtimeResult.trampolines,
+                        outcome.emitResult.runtimeKeyShare,
+                        VM_METADATA_FLAG_NATIVE_BODY_DESTROYED | linkageVerifiedFlags, &patchError)) {
+                    std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver vm_group=" << g
+                              << " reason=" << patchError << std::endl;
+                    PrintFeatureStatus("vm", "failed", patchError);
+                    return 1;
+                }
+
+                std::string staticCheckReason;
+                if (!ValidateVMStaticLink(image.get(), outcome.vmRecords, outcome.vmBytecodeBlob,
+                        outcome.emitResult, outcome.runtimeResult, outcome.bridgeResult,
+                        outcome.patchResults, outcome.opcodeMap, outcome.registerMap,
+                        vmRegisterCount, outcome.vmOpcodeCounts, staticCheckReason)) {
+                    std::cerr << "VM_STATIC_CHECK_FAIL module=VMStaticLinkChecker vm_group=" << g
+                              << " reason=" << staticCheckReason << std::endl;
+                    PrintFeatureStatus("vm", "failed", staticCheckReason);
+                    return 1;
+                }
+                std::cout << "VM_STATIC_CHECK_PASS module=VMStaticLinkChecker vm_group=" << g
+                          << " records=" << outcome.vmRecords.size() << std::endl;
+                vmApplied = true;
+                std::cout << "VM_RUNTIME_SECTION vm_group=" << g << " rva=0x" << std::hex
+                          << outcome.runtimeResult.sectionRVA
+                          << " raw=0x" << outcome.runtimeResult.sectionRawOffset
+                          << " size=0x" << outcome.runtimeResult.sectionSize
+                          << " entry=0x" << outcome.runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+                std::cout << "VM_METADATA_SECTION vm_group=" << g << " rva=0x" << std::hex
+                          << outcome.emitResult.sectionRVA
+                          << " raw=0x" << outcome.emitResult.sectionRawOffset
+                          << " size=0x" << outcome.emitResult.sectionSize
+                          << " metadata=0x" << outcome.emitResult.metadataRVA
+                          << " bytecode=0x" << outcome.emitResult.bytecodeRVA << std::dec << std::endl;
+                std::cout << "VM_RUNTIME_CAPABILITIES vm_group=" << g << " schema=0x" << std::hex << VM_SCHEMA_VERSION
+                          << " metadata=0x" << VM_METADATA_VERSION
+                          << " runtime=0x" << VM_RUNTIME_VERSION << std::dec
+                          << " scalar_memory=true memory_arithmetic=true"
+                          << " native_call_bridge=false intra_vm_direct_call=true simd_x87_bridge=true"
+                          << " fail_policy=error_code_in_eax_then_int3_ud2" << std::endl;
+
+                for (const auto& record : outcome.vmRecords) {
+                    const CipherShell::VMTrampolineRecord* trampoline = nullptr;
+                    const CipherShell::FunctionPatchResult* patch = nullptr;
+                    for (const auto& tr : outcome.runtimeResult.trampolines) {
+                        if (tr.functionRVA == record.functionRVA) { trampoline = &tr; break; }
+                    }
+                    for (const auto& pr : outcome.patchResults) {
+                        if (pr.functionRVA == record.functionRVA) { patch = &pr; break; }
+                    }
+                    uint32_t opcodeCount = 0;
+                    auto countIt = outcome.vmOpcodeCounts.find(record.functionRVA);
+                    if (countIt != outcome.vmOpcodeCounts.end()) opcodeCount = countIt->second;
+                    std::cout << "VM_RECORD vm_group=" << g << " function_rva=0x" << std::hex << record.functionRVA
+                              << " original_size=0x" << record.functionSize
+                              << " trampoline_rva=0x" << (trampoline ? trampoline->trampolineRVA : 0)
+                              << " trampoline_size=0x" << (trampoline ? trampoline->trampolineSize : 0)
+                              << " patch_type=" << (patch ? PatchKindName(patch->patchKind) : "none")
+                              << " bytecode_offset=0x" << record.bytecodeOffset
+                              << " bytecode_size=0x" << record.bytecodeSize
+                              << " guest_stack_size=0x" << record.guestStackSize
+                              << " opcode_count=" << std::dec << opcodeCount
+                              << " patched_first16=" << FormatImageBytesAtRva(image.get(), record.functionRVA, 16)
+                              << " trampoline_first16=" << FormatImageBytesAtRva(image.get(), trampoline ? trampoline->trampolineRVA : 0, 16)
+                              << std::endl;
+                }
             }
         } else {
             std::cerr << "VM_BUILD_FAIL module=VM reason=no_supported_functions" << std::endl;
@@ -1657,15 +1812,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (vmApplied) {
-        std::string finalVMReason;
-        std::unordered_map<uint32_t, uint32_t> finalOpcodeCounts;
-        if (!ValidateVMStaticLink(rebuiltImage, vmRecords, vmBytecodeBlob, emitResult,
-                runtimeResult, bridgeResult, patchResults, buildCtx.opcodeMap,
-                buildCtx.registerMap, vmRegisterCount, finalOpcodeCounts, finalVMReason)) {
-            parser.FreeImage(rebuiltImage);
-            std::cerr << "VM_FINAL_STATIC_CHECK_FAIL module=VMStaticLinkChecker reason="
-                      << finalVMReason << std::endl;
-            return 1;
+        // 每个 Group 是一份独立的 handler/dispatch 产物，逐组复验，不合并
+        // 成一次调用——这样任何一个 Group 的复验失败都能定位到具体 Group。
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            std::string finalVMReason;
+            std::unordered_map<uint32_t, uint32_t> finalOpcodeCounts;
+            if (!ValidateVMStaticLink(rebuiltImage, outcome.vmRecords, outcome.vmBytecodeBlob,
+                    outcome.emitResult, outcome.runtimeResult, outcome.bridgeResult,
+                    outcome.patchResults, outcome.opcodeMap,
+                    outcome.registerMap, vmRegisterCount, finalOpcodeCounts, finalVMReason)) {
+                parser.FreeImage(rebuiltImage);
+                std::cerr << "VM_FINAL_STATIC_CHECK_FAIL module=VMStaticLinkChecker vm_group="
+                          << outcome.groupId << " reason=" << finalVMReason << std::endl;
+                return 1;
+            }
         }
     }
     if (cfgApplied) {
@@ -1727,17 +1888,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (vmApplied) {
-        std::string writtenVMReason;
-        std::unordered_map<uint32_t, uint32_t> writtenOpcodeCounts;
-        if (!ValidateVMStaticLink(verifyImage, vmRecords, vmBytecodeBlob, emitResult,
-                runtimeResult, bridgeResult, patchResults, buildCtx.opcodeMap,
-                buildCtx.registerMap, vmRegisterCount, writtenOpcodeCounts,
-                writtenVMReason)) {
-            parser.FreeImage(verifyImage);
-            std::remove(outputFile.c_str());
-            std::cerr << "VM_WRITE_VERIFY_FAIL module=VMStaticLinkChecker reason="
-                      << writtenVMReason << std::endl;
-            return 1;
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            std::string writtenVMReason;
+            std::unordered_map<uint32_t, uint32_t> writtenOpcodeCounts;
+            if (!ValidateVMStaticLink(verifyImage, outcome.vmRecords, outcome.vmBytecodeBlob,
+                    outcome.emitResult, outcome.runtimeResult, outcome.bridgeResult,
+                    outcome.patchResults, outcome.opcodeMap,
+                    outcome.registerMap, vmRegisterCount, writtenOpcodeCounts,
+                    writtenVMReason)) {
+                parser.FreeImage(verifyImage);
+                std::remove(outputFile.c_str());
+                std::cerr << "VM_WRITE_VERIFY_FAIL module=VMStaticLinkChecker vm_group="
+                          << outcome.groupId << " reason=" << writtenVMReason << std::endl;
+                return 1;
+            }
         }
     }
     if (cfgApplied) {
@@ -1764,7 +1929,15 @@ int main(int argc, char* argv[]) {
     parser.FreeImage(verifyImage);
     std::cout << "  输出文件静态复验成功" << std::endl;
     if (vmApplied) {
-        PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmRecords.size()));
+        uint32_t vmAppliedFunctionCount = 0;
+        uint32_t vmActiveGroupCount = 0;
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            vmAppliedFunctionCount += static_cast<uint32_t>(outcome.vmRecords.size());
+            ++vmActiveGroupCount;
+        }
+        PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmAppliedFunctionCount) +
+            " vm_groups=" + std::to_string(vmActiveGroupCount));
         // Scope note (do not drop this when editing nearby logging): "applied"
         // means every emitted function passed real native-CPU-vs-synthesized-
         // handler differential evidence (VM_NATIVE_DIFFERENTIAL_PASS) for its

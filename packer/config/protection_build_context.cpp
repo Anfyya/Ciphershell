@@ -146,4 +146,22 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     return ctx;
 }
 
+void ProtectionBuildContext::DeriveGroupSectionName(char out[8],
+    const ProtectionBuildContext& ctx, const char base[8], uint32_t salt, uint32_t groupId)
+{
+    if (ctx.randomizeSectionNames && !ctx.debugNames) {
+        // groupId==0 reuses the untouched salt, so it is byte-for-byte the
+        // same name a single-group build would have produced.
+        MakeSectionName(out, ctx.isaSeed, salt ^ (groupId * 0x1000001u));
+        return;
+    }
+    CopyName(out, base);
+    if (groupId > 0) {
+        int len = 0;
+        while (len < 8 && out[len]) ++len;
+        const int index = len > 0 ? len - 1 : 0;
+        out[index] = static_cast<char>('0' + (groupId % 10));
+    }
+}
+
 } // namespace CipherShell
