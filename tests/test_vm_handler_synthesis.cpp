@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -2631,6 +2632,29 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     std::vector<std::string> identicalCoreVariants;
     const auto orderedA = SortedHandlers(buildA);
     const auto orderedB = SortedHandlers(buildB);
+    std::map<uint8_t, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
+        coreBytesBySemantic;
+    std::map<uint8_t, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
+        businessBytesBySemantic;
+    const auto businessBytes = [](const VMSynthesizedHandler& handler) {
+        std::vector<uint8_t> output;
+        uint32_t cursor = handler.semanticCoreOffset;
+        const uint32_t end = handler.semanticCoreOffset +
+            handler.semanticCoreSize;
+        for (const auto& range : handler.valueCodecRanges) {
+            Require(range.offset >= cursor && range.offset <= end &&
+                    range.size <= end - range.offset,
+                "handler diagnostic value-codec range is outside semantic core");
+            output.insert(output.end(),
+                handler.plaintextBody.begin() + cursor,
+                handler.plaintextBody.begin() + range.offset);
+            cursor = range.offset + range.size;
+        }
+        output.insert(output.end(),
+            handler.plaintextBody.begin() + cursor,
+            handler.plaintextBody.begin() + end);
+        return output;
+    };
     Require(orderedA.size() == orderedB.size(),
         "两次构建的生产 handler 集合大小不同");
     for (size_t index = 0; index < orderedA.size(); ++index) {
@@ -2649,6 +2673,22 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
         const auto rightCore = Slice(right->plaintextBody,
             right->semanticCoreVariantOffset,
             right->semanticCoreVariantSize);
+        auto& diagnostic = coreBytesBySemantic[left->semantic];
+        diagnostic.first.push_back(left->variant);
+        diagnostic.first.insert(
+            diagnostic.first.end(), leftCore.begin(), leftCore.end());
+        diagnostic.second.push_back(right->variant);
+        diagnostic.second.insert(
+            diagnostic.second.end(), rightCore.begin(), rightCore.end());
+        const auto leftBusiness = businessBytes(*left);
+        const auto rightBusiness = businessBytes(*right);
+        auto& businessDiagnostic = businessBytesBySemantic[left->semantic];
+        businessDiagnostic.first.push_back(left->variant);
+        businessDiagnostic.first.insert(businessDiagnostic.first.end(),
+            leftBusiness.begin(), leftBusiness.end());
+        businessDiagnostic.second.push_back(right->variant);
+        businessDiagnostic.second.insert(businessDiagnostic.second.end(),
+            rightBusiness.begin(), rightBusiness.end());
         // TRAP is the fail-closed synthesized sentinel and INT3 has one
         // canonical breakpoint instruction.  Their narrow instruction bytes
         // are semantically unique; both remain covered by the full live-body
@@ -2669,6 +2709,26 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
         }
         std::cout << "[identical-core-variants] arch=" <<
             static_cast<uint32_t>(architecture) << " keys=" << joined << '\n';
+    }
+    if (std::getenv("CS_VM_DIVERSITY_DEBUG") != nullptr) {
+        for (const auto& item : coreBytesBySemantic) {
+            std::cout << "[core-similarity] arch=" <<
+                static_cast<uint32_t>(architecture) <<
+                " semantic=" << static_cast<uint32_t>(item.first) <<
+                " dice=" << FourGramDiceSimilarity(
+                    item.second.first, item.second.second) <<
+                " bytes=" << item.second.first.size() << '/' <<
+                item.second.second.size() << '\n';
+        }
+        for (const auto& item : businessBytesBySemantic) {
+            std::cout << "[business-similarity] arch=" <<
+                static_cast<uint32_t>(architecture) <<
+                " semantic=" << static_cast<uint32_t>(item.first) <<
+                " dice=" << FourGramDiceSimilarity(
+                    item.second.first, item.second.second) <<
+                " bytes=" << item.second.first.size() << '/' <<
+                item.second.second.size() << '\n';
+        }
     }
     Require(identicalCoreVariants.empty(),
         "两次构建仍含逐字节相同的必经业务核心 (semantic,K)");
