@@ -449,6 +449,18 @@ bool Disassembler::DecodeInstruction(
                    out.instructionSet == InstructionSetClass::Avx ||
                    out.instructionSet == InstructionSetClass::Avx512) {
             out.mnemonic = InstructionMnemonic::Simd;
+        } else if (decoded.mnemonic == ZYDIS_MNEMONIC_INT &&
+                   operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                   operands[0].imm.value.u == 3u) {
+            // The generic two-byte "CD 03" INT n form with n=3 is
+            // architecturally equivalent to the dedicated one-byte INT3
+            // (0xCC) opcode -- both trap to STATUS_BREAKPOINT -- except for
+            // Windows' EIP/RIP fault-reporting quirk (0xCC's is rolled back
+            // to the trap's own address; CD 03's is not). Map it to the
+            // same IR mnemonic so both encodings translate to the same
+            // VM_UOP_INT3 semantic. Any other INT n value (syscall gates
+            // etc.) is unrelated and stays Unsupported.
+            out.mnemonic = InstructionMnemonic::Int3;
         }
     }
     out.category = MapCategory(decoded, out.mnemonic);

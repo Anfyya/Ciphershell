@@ -118,7 +118,9 @@ void RunDifferentialCase(
     bool expectSuccess,
     const char* label,
     bool expectDivideFault = false,
-    uint8_t providerSeedDomain = 0xC7u)
+    uint8_t providerSeedDomain = 0xC7u,
+    bool expectBreakpointFault = false,
+    uint64_t expectedNativeFaultOffset = 0)
 {
     VMWindowsNativeDifferentialEvidenceProvider provider;
     const auto providerSeed = MakeSeed(providerSeedDomain);
@@ -148,6 +150,8 @@ void RunDifferentialCase(
     config.expectedHandlerImageDigest = provider.SemanticIdentityDigest();
     config.evidenceProvider = &provider;
     config.expectDivideFault = expectDivideFault;
+    config.expectBreakpointFault = expectBreakpointFault;
+    config.expectedNativeFaultOffset = expectedNativeFaultOffset;
 
     const auto result = VMNativeDifferentialVerifier::Verify(
         function, translation, build.isa.opcodeMap, build.isa.registerMap, config);
@@ -646,7 +650,67 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
         RunDifferentialCase(divideFunction, divideTranslation, build, 64, true,
             signedDivide ? "native-vs-VM IDIV_WIDE(128-bit dividend)/#DE 一致"
                          : "native-vs-VM UDIV_WIDE(128-bit dividend)/#DE 一致",
-            /*expectDivideFault=*/true);
+            /*expectDivideFault=*/true, /*providerSeedDomain=*/0xC7u,
+            /*expectBreakpointFault=*/false, /*expectedNativeFaultOffset=*/0);
+    }
+}
+
+void TestInt3NativeDifferentialAndBreakpointFault() {
+    // INT3(0xCC)/INT 3(CD 03) 两种编码语义相同(都会触发真实的
+    // STATUS_BREAKPOINT，向量都是 3)，但 Windows 报告的故障 EIP/RIP 不同。
+    // 实测(而不是凭经验假设)得到的真实规律是：Windows 的向量 3 陷阱处理是
+    // "无条件按 1 字节指令回退"，不管真正触发的是 1 字节的 0xCC 还是 2
+    // 字节的 CD 03，报告的 Eip/Rip 都是"指令结束地址 - 1"：0xCC(1 字节)因此
+    // 落在偏移 0(指令自身起始地址)；CD 03(2 字节)落在偏移 1(两个字节中间，
+    // 不是指令末尾的偏移 2)。VM_UOP_INT3 的合成 handler
+    // (EmitBusinessCoreVariant 的两个 strategy，见
+    // vm_handler_semantic_codegen.cpp)直接内联执行真实的 0xCC 或 CD 03，而
+    // 不是软件模拟这个 trap，所以"两种编码方式的等价性"必须用真实 CPU 差分
+    // 证明：这里对每种编码分别构造一个只含该编码的 guest 函数，验证真实
+    // CPU 执行它时确实表现出上述规律(RunDifferentialCase 里的
+    // expectedNativeFaultOffset)，并且不管这次构建的 seed 让 VM_UOP_INT3 的
+    // 哪个 strategy 生效，两侧故障时的寄存器/FLAGS 现场都必须和故障前的
+    // 语料初始值完全一致，而不仅仅是异常码相同。
+    //
+    // 软件 IR 模型预检(VMIRModelPreflightVerifier)背后的 ExecuteOracle 现在
+    // 会把 INT3 分类为 OracleFault::Breakpoint(参见 ExecuteOracle 的
+    // InstructionMnemonic::Int3 分支)，但该预检自身的等价性折叠逻辑目前
+    // 只认 DivideError；这里和 TestDispatchTableEncodingSchemesExecuteNatively
+    // 一样，直接跑真实差分，不经过预检这一步。
+    const auto seed = MakeSeed(0xE5);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+
+    constexpr uint64_t kEntry = 0x1000;
+    struct Int3Case {
+        std::vector<uint8_t> bytes;
+        const char* label;
+        uint8_t seedDomain;
+        uint64_t expectedNativeFaultOffset;
+    };
+    // No trailing RET: AnalyzeFunctionRange (disassembler.cpp) treats any
+    // Interrupt-category instruction as a function boundary exactly like
+    // RET/an indirect branch and never decodes past it, so the trap byte(s)
+    // are the entire function.
+    const Int3Case cases[] = {
+        {{0xCC}, "native-vs-VM INT3(0xCC 单字节编码)/#BP 一致", 0xE6u, 0u},
+        {{0xCD, 0x03}, "native-vs-VM INT 3(CD 03 双字节编码)/#BP 一致", 0xE7u, 1u},
+    };
+
+    for (const auto& testCase : cases) {
+        const Function int3Function =
+            DecodeStandaloneFunction(disassembler, testCase.bytes, kEntry);
+        Translator translator;
+        const TranslationResult int3Translation =
+            TranslateStandaloneFunction(int3Function, build, translator);
+
+        RunDifferentialCase(int3Function, int3Translation, build, 16, true,
+            testCase.label,
+            /*expectDivideFault=*/false, testCase.seedDomain,
+            /*expectBreakpointFault=*/true,
+            /*expectedNativeFaultOffset=*/testCase.expectedNativeFaultOffset);
     }
 }
 
@@ -851,6 +915,8 @@ int main() {
         &TestRemainingArithmeticFamiliesNativeDifferential, failures);
     Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
         &TestWideDivideNativeDifferentialAndDivideFault, failures);
+    Run("INT3 两种编码与 #BP: 真实 CPU 与合成 handler 链故障 EIP/寄存器上下文一致性检测",
+        &TestInt3NativeDifferentialAndBreakpointFault, failures);
 #else
     std::cout << "[SKIP] non-x86/x64 host: native differential evidence provider is Windows x86/x64 only\n";
 #endif

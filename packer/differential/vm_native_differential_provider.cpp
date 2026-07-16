@@ -681,12 +681,20 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
     //      fault bucket rather than silently misreporting a real cause.
     constexpr uint32_t kDivideByZeroExceptionCode = 0xC0000094u;
     constexpr uint32_t kIntegerOverflowExceptionCode = 0xC0000095u;
+    // STATUS_BREAKPOINT: VM_UOP_INT3's business-core variants emit a literal
+    // 0xCC or CD 03 inline in the synthesized handler (see EmitBusinessCore
+    // Variant's VM_UOP_INT3 case in vm_handler_semantic_codegen.cpp) instead
+    // of simulating the trap, so this is a real hardware #BP caught by the
+    // same SEH wrapper as everything else, never a soft VM_MICRO_ERR_* code.
+    constexpr uint32_t kBreakpointExceptionCode = 0x80000003u;
     if (!evidence.vmFaulted) {
         evidence.vmFault = VMMicroFault::None;
     } else if (response.vmRuntimeError == VM_MICRO_ERR_DIVIDE ||
                response.vmExceptionCode == kDivideByZeroExceptionCode ||
                response.vmExceptionCode == kIntegerOverflowExceptionCode) {
         evidence.vmFault = VMMicroFault::DivideError;
+    } else if (response.vmExceptionCode == kBreakpointExceptionCode) {
+        evidence.vmFault = VMMicroFault::ExplicitTrap;
     } else {
         evidence.vmFault = VMMicroFault::UnsupportedSemantic;
     }
@@ -707,6 +715,10 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
         evidence.nativeState.memory.assign(
             responseBlob.begin() + sizeof(response),
             responseBlob.begin() + sizeof(response) + response.memorySize);
+    } else {
+        evidence.nativeFaultOffset = response.nativeFaultOffset;
+        evidence.nativeFaultGpr = response.nativeFaultGpr;
+        evidence.nativeFaultRflags = response.nativeFaultRflags;
     }
     if (!evidence.vmFaulted) {
         for (uint8_t family = 0; family < 16; ++family) {
@@ -717,6 +729,10 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
         evidence.vmState.memory.assign(
             responseBlob.begin() + sizeof(response) + response.memorySize,
             responseBlob.begin() + sizeof(response) + 2u * static_cast<size_t>(response.memorySize));
+    } else {
+        evidence.vmFaultOffset = response.vmFaultOffset;
+        evidence.vmFaultGpr = response.vmFaultGpr;
+        evidence.vmFaultRflags = response.vmFaultRflags;
     }
     return true;
 #endif

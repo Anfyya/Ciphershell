@@ -1019,6 +1019,33 @@ bool Translator::LowerInstruction(const InstructionIR& instruction, TranslationR
         case InstructionMnemonic::Simd:
         case InstructionMnemonic::FloatingPoint:
             return LowerExtendedBridge(instruction, result);
+        case InstructionMnemonic::Int3:
+            // Both encodings (0xCC and CD 03) decode to the same mnemonic;
+            // VM_UOP_INT3 has no operands and no stack effect (VMSchema:
+            // Special/0/0), and its synthesized handler executes a real
+            // trap inline (see EmitBusinessCoreVariant's VM_UOP_INT3 case in
+            // vm_handler_semantic_codegen.cpp) rather than simulating one.
+            //
+            // AnalyzeFunctionRange (disassembler.cpp) treats any Interrupt-
+            // category instruction as a function boundary exactly like RET
+            // or an indirect branch and never decodes anything past it, so
+            // this is always the function's final instruction. VM_UOP_INT3
+            // itself is schema-non-terminal (descriptor.terminal == false,
+            // to keep VMSchema::ValidateStream's fallthrough/reachability
+            // rules the same as every other opcode), so synthesize the same
+            // "materialize lazy flags, then return" terminal LowerRet emits
+            // for a real RET immediately after it -- this both gives the
+            // bytecode stream a real terminal to reach and defines what
+            // happens if the hardware trap is ever survived/resumed rather
+            // than ending the process. Matches the INT3-then-RET shape this
+            // opcode's own tests already rely on (see
+            // ExecuteExternalSemanticVariantCases in
+            // test_vm_handler_synthesis.cpp).
+            Emit(result, VM_UOP_INT3, {}, instruction.rva);
+            Emit(result, VM_UOP_FLAGS_MATERIALIZE,
+                {VM_FLAG_ARCHITECTURAL_MASK}, instruction.rva);
+            Emit(result, VM_UOP_RET, {0}, instruction.rva);
+            return true;
         default:
             return FailInstruction(instruction, "instruction has no production micro-op lowering");
     }
@@ -1231,6 +1258,33 @@ bool Translator::ValidateFlagDataflow(
                     return FailInstruction(instruction, "terminal RET paths use inconsistent cleanup");
                 }
             }
+        } else if (instruction.IsInterrupt()) {
+            // AnalyzeFunctionRange (disassembler.cpp) already treats any
+            // Interrupt-category instruction (INT3/INT n) as a function
+            // boundary exactly like RET or an indirect branch: it
+            // deliberately never decodes anything past a real trap, since it
+            // cannot know what follows one. So this is always the last
+            // decoded instruction on its path -- mirror that here as an
+            // alternate terminal, with 0 cleanup (INT3 has no cleanup
+            // operand and its VM_UOP_INT3 handler never touches the guest
+            // stack).
+            //
+            // Reaching it from inside a virtualized internal CALL is
+            // different from RET, though: the real hardware trap bypasses
+            // that internal call-stack bookkeeping entirely rather than
+            // "returning" through it, so there is no provable resumption
+            // point to enqueue. Fail closed instead of guessing.
+            if (!state.key.returns.empty()) {
+                return FailInstruction(instruction,
+                    "INT3 inside a virtualized internal CALL has no provable termination path");
+            }
+            terminalUndefined |= mayUndefined & VM_FLAG_ARCHITECTURAL_MASK;
+            if (!sawTerminalReturn) {
+                terminalReturnStackCleanup = 0;
+                sawTerminalReturn = true;
+            } else if (terminalReturnStackCleanup != 0) {
+                return FailInstruction(instruction, "terminal RET paths use inconsistent cleanup");
+            }
         } else if (instruction.IsCall()) {
             FlowKey next = state.key;
             if (!instruction.isIndirectBranch && instruction.hasBranchTarget &&
@@ -1411,7 +1465,7 @@ std::vector<uint8_t> Translator::GenerateBytecode(const TranslationResult& resul
 
 namespace {
 
-enum class OracleFault : uint8_t { None, DivideError, Unsupported, Memory, ControlFlow };
+enum class OracleFault : uint8_t { None, DivideError, Unsupported, Memory, ControlFlow, Breakpoint };
 
 struct OracleState {
     std::array<uint64_t, 16> gpr{};
@@ -2348,6 +2402,17 @@ bool ExecuteOracle(
                 state.rflags = (state.rflags & ~mask) | result;
                 break;
             }
+            case InstructionMnemonic::Int3:
+                // This from-scratch software x86 interpreter has no concept
+                // of a real hardware trap; it can only report that a real
+                // CPU would fault here (mirroring the DivideError case
+                // below), not what happens after -- that is exactly what
+                // the native differential path this oracle feeds proves
+                // instead, against the real synthesized handler and real
+                // hardware.
+                state.fault = OracleFault::Breakpoint;
+                error = "IR model reached INT3";
+                return false;
             default:
                 goto unsupported;
         }
@@ -2807,7 +2872,10 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
         const bool expectedDivideFault = !pathCompleted &&
             pathOracle.fault == OracleFault::DivideError &&
             config.expectDivideFault;
-        if (!pathCompleted && !expectedDivideFault) {
+        const bool expectedBreakpointFault = !pathCompleted &&
+            pathOracle.fault == OracleFault::Breakpoint &&
+            config.expectBreakpointFault;
+        if (!pathCompleted && !expectedDivideFault && !expectedBreakpointFault) {
             result.error = "native differential path-mask oracle failed closed";
             if (!pathError.empty()) result.error += ": " + pathError;
             return result;
@@ -2855,7 +2923,8 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
             evidence.nativeExceptionCode != 0u;
         const bool vmRaisedFault = evidence.vmFaulted ||
             evidence.vmFault != VMMicroFault::None;
-        if (config.expectDivideFault && (nativeRaisedFault || vmRaisedFault)) {
+        if ((config.expectDivideFault || config.expectBreakpointFault) &&
+            (nativeRaisedFault || vmRaisedFault)) {
             // The x86/x64 #DE vector is a single hardware fault for both the
             // divisor=0 and quotient-overflow sub-cases, but Windows' SEH
             // translation reports them under two different NTSTATUS codes:
@@ -2865,16 +2934,89 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
             // set VM_MICRO_ERR_DIVIDE), so either native code is a match.
             constexpr uint32_t kDivideByZeroExceptionCode = 0xC0000094u;
             constexpr uint32_t kIntegerOverflowExceptionCode = 0xC0000095u;
-            if (!nativeRaisedFault || !vmRaisedFault ||
-                (evidence.nativeExceptionCode != kDivideByZeroExceptionCode &&
-                 evidence.nativeExceptionCode != kIntegerOverflowExceptionCode) ||
-                evidence.vmFault != VMMicroFault::DivideError) {
-                result.error = "native differential divide-fault evidence does not "
+            // STATUS_BREAKPOINT: real #BP from VM_UOP_INT3's inline 0xCC/
+            // CD 03 (see EmitBusinessCoreVariant), classified as
+            // VMMicroFault::ExplicitTrap by the evidence provider.
+            constexpr uint32_t kBreakpointExceptionCode = 0x80000003u;
+            const bool classificationOk = config.expectDivideFault
+                ? (nativeRaisedFault && vmRaisedFault &&
+                   (evidence.nativeExceptionCode == kDivideByZeroExceptionCode ||
+                    evidence.nativeExceptionCode == kIntegerOverflowExceptionCode) &&
+                   evidence.vmFault == VMMicroFault::DivideError)
+                : (nativeRaisedFault && vmRaisedFault &&
+                   evidence.nativeExceptionCode == kBreakpointExceptionCode &&
+                   evidence.vmFault == VMMicroFault::ExplicitTrap);
+            if (!classificationOk) {
+                result.error = "native differential divide/breakpoint-fault evidence does not "
                     "match on both sides (native=" +
                     std::to_string(evidence.nativeExceptionCode) + " faulted=" +
                     std::to_string(nativeRaisedFault) + ", vm fault=" +
                     std::to_string(static_cast<int>(evidence.vmFault)) + " faulted=" +
                     std::to_string(vmRaisedFault) + ")";
+                return result;
+            }
+            // Equivalence, not just classification: both test families place
+            // the faulting instruction as the function's very first
+            // instruction, so neither side may show any register/flag
+            // change from the pristine corpus input at the instant of the
+            // fault -- proving the fault is architecturally transparent
+            // rather than merely "eventually reported the right code".
+            // evidence.*FaultGpr is already architecture-width-masked (see
+            // the worker harness/provider), so the pristine input must be
+            // masked the same way before comparing on x86 -- otherwise every
+            // case fails spuriously on the upper 32 bits of a 64-bit random
+            // corpus value that the real 32-bit CPU/VM never even had.
+            const uint64_t gprCompareMask = architecture == VMNativeDifferentialArchitecture::X64
+                ? (std::numeric_limits<uint64_t>::max)() : 0xFFFFFFFFULL;
+            for (uint8_t family = 0; family < 16; ++family) {
+                const uint64_t expectedGpr = request.initialGpr[family] & gprCompareMask;
+                if (evidence.nativeFaultGpr[family] != expectedGpr ||
+                    evidence.vmFaultGpr[family] != expectedGpr) {
+                    result.error = "native differential fault-time register state diverged "
+                        "from the pristine input (family=" + std::to_string(family) +
+                        " native=" + std::to_string(evidence.nativeFaultGpr[family]) +
+                        " vm=" + std::to_string(evidence.vmFaultGpr[family]) +
+                        " initial=" + std::to_string(expectedGpr) + ")";
+                    return result;
+                }
+            }
+            // RF (Resume Flag) is excluded: real hardware sets it
+            // automatically in the CONTEXT/trap frame whenever any
+            // fault-class exception is delivered, purely as a "don't
+            // re-trigger an instruction breakpoint on resume" artifact of
+            // fault delivery itself -- it says nothing about whether the
+            // guest's own architectural state was disturbed, and the VM's
+            // software-tracked virtualFlags never models it (see
+            // VM_FLAG_PUSH_CLEARED_MASK in vm_isa.h for the same exclusion
+            // elsewhere). Comparing it here would fail every real hardware
+            // fault regardless of correctness.
+            constexpr uint64_t kFaultRflagsMask =
+                static_cast<uint64_t>(VM_FLAG_ARCHITECTURAL_MASK) & ~static_cast<uint64_t>(VM_FLAG_RF);
+            const uint64_t expectedFaultRflags = request.initialRflags & kFaultRflagsMask;
+            if ((evidence.nativeFaultRflags & kFaultRflagsMask) != expectedFaultRflags ||
+                (evidence.vmFaultRflags & kFaultRflagsMask) != expectedFaultRflags) {
+                result.error = "native differential fault-time RFLAGS diverged from the "
+                    "pristine input (native=" + std::to_string(evidence.nativeFaultRflags) +
+                    " vm=" + std::to_string(evidence.vmFaultRflags) + " initial=" +
+                    std::to_string(expectedFaultRflags) + ")";
+                return result;
+            }
+            // Same first-instruction property lets the native fault EIP be
+            // pinned exactly: the faulting instruction (including any
+            // prefix bytes) is always the corpus's first byte, so the
+            // exception address is a fixed, corpus-independent offset from
+            // that start -- 0 for DIV/IDIV and for the one-byte 0xCC INT3;
+            // measured (not textbook-assumed) behavior for the two-byte
+            // "CD 03" INT n form is that Windows' vector-3 trap handler
+            // still reports (instruction-end - 1), i.e. offset 1, because it
+            // does not distinguish which encoding triggered vector 3.
+            // config.expectedNativeFaultOffset tells us which this corpus
+            // expects.
+            if (evidence.nativeFaultOffset != config.expectedNativeFaultOffset) {
+                result.error = "native differential fault EIP is not where this encoding's "
+                    "architectural rule requires (nativeFaultOffset=" +
+                    std::to_string(evidence.nativeFaultOffset) + " expected=" +
+                    std::to_string(config.expectedNativeFaultOffset) + ")";
                 return result;
             }
             ++result.casesVerified;

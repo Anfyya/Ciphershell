@@ -36,6 +36,14 @@ std::atomic<bool> g_nativeGuardActive{false};
 uintptr_t g_nativeRecoveryRip = 0;
 DWORD g_nativeExceptionCode = 0;
 uintptr_t g_nativeExceptionAddress = 0;
+// Family-ordered (rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15; see
+// vm_native_exec_trampoline_x64/x86.asm) GPR/RFLAGS snapshot taken from the
+// exception CONTEXT itself, i.e. the architectural state that was live at
+// the very instant the fault fired -- not the (never reached) post-fault
+// trampoline state. This is what lets the caller prove the native side
+// never mutated guest-visible state before the CPU trapped.
+std::array<uint64_t, 16> g_nativeFaultGpr{};
+uint64_t g_nativeFaultRflags = 0;
 
 LONG CALLBACK NativeDifferentialVectoredHandler(EXCEPTION_POINTERS* info) {
     if (!g_nativeGuardActive.load(std::memory_order_acquire)) {
@@ -45,8 +53,21 @@ LONG CALLBACK NativeDifferentialVectoredHandler(EXCEPTION_POINTERS* info) {
     g_nativeExceptionAddress =
         reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
 #if defined(_M_X64)
+    {
+        const CONTEXT& ctx = *info->ContextRecord;
+        g_nativeFaultGpr = {ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp,
+            ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13,
+            ctx.R14, ctx.R15};
+        g_nativeFaultRflags = ctx.EFlags;
+    }
     info->ContextRecord->Rip = g_nativeRecoveryRip;
 #elif defined(_M_IX86)
+    {
+        const CONTEXT& ctx = *info->ContextRecord;
+        g_nativeFaultGpr = {ctx.Eax, ctx.Ecx, ctx.Edx, ctx.Ebx, ctx.Esp, ctx.Ebp,
+            ctx.Esi, ctx.Edi, 0, 0, 0, 0, 0, 0, 0, 0};
+        g_nativeFaultRflags = ctx.EFlags;
+    }
     info->ContextRecord->Eip = static_cast<DWORD>(g_nativeRecoveryRip);
 #endif
     g_nativeGuardActive.store(false, std::memory_order_release);
@@ -185,6 +206,26 @@ bool RunNativeHalf(
             for (auto& value : outcome.nativeFinalGpr) value &= 0xFFFFFFFFu;
             outcome.nativeFinalRflags &= 0xFFFFFFFFu;
         }
+    } else {
+        // state.gpr was never written back (the trampoline only does that
+        // on a normal return, which a fault preempts), so it is still
+        // exactly the pre-call value for every family -- including families
+        // 8..15 on x86, which have no real physical register and therefore
+        // no CONTEXT field to read at all. Use it as the base and overwrite
+        // only the families this architecture actually has with what the
+        // CONTEXT really measured, instead of zero-filling the nonexistent
+        // x86 R8..R15 (which would wrongly read as "corrupted" against the
+        // pristine input).
+        outcome.nativeFaultGpr = state.gpr;
+        const size_t realFamilies = header.architectureIsX64 ? 16u : 8u;
+        for (size_t i = 0; i < realFamilies; ++i) {
+            outcome.nativeFaultGpr[i] = g_nativeFaultGpr[i];
+        }
+        outcome.nativeFaultRflags = g_nativeFaultRflags;
+        if (!header.architectureIsX64) {
+            for (auto& value : outcome.nativeFaultGpr) value &= 0xFFFFFFFFu;
+            outcome.nativeFaultRflags &= 0xFFFFFFFFu;
+        }
     }
     outcome.nativeFinalMemory.assign(corpusMemory, corpusMemory + header.memorySize);
     CS_NDIFF_CHECKPOINT("RunNativeHalf: end");
@@ -290,8 +331,12 @@ private:
 uint32_t InvokeContextEntry(
     ContextEntry entry,
     VM_MICRO_EXECUTION_CONTEXT* context,
+    const std::array<uint8_t, 16>& familyToVregSlot,
+    bool architectureIsX64,
     DWORD* exceptionCode,
-    uintptr_t* exceptionAddress)
+    uintptr_t* exceptionAddress,
+    std::array<uint64_t, 16>* faultGpr,
+    uint64_t* faultRflags)
 {
     *exceptionCode = 0;
     *exceptionAddress = 0;
@@ -301,6 +346,18 @@ uint32_t InvokeContextEntry(
         *exceptionAddress = reinterpret_cast<uintptr_t>(
             GetExceptionInformation()->ExceptionRecord->ExceptionAddress),
         EXCEPTION_EXECUTE_HANDLER)) {
+        // context is a stack-local of RunVmHalf (a frame below this one, never
+        // unwound by an exception this function itself handles), so it still
+        // holds exactly the guest register/flags state that was live the
+        // instant the fault fired -- proving (or disproving) that the VM
+        // never wrote a partial/incorrect result before signalling the fault.
+        for (uint8_t family = 0; family < 16; ++family) {
+            uint64_t value = context->vregs[familyToVregSlot[family]];
+            if (!architectureIsX64) value &= 0xFFFFFFFFu;
+            (*faultGpr)[family] = value;
+        }
+        *faultRflags = architectureIsX64
+            ? context->virtualFlags : (context->virtualFlags & 0xFFFFFFFFu);
         return VM_MICRO_ERR_HANDLER_BUG;
     }
 }
@@ -375,7 +432,11 @@ bool RunVmHalf(
     const auto entry = reinterpret_cast<ContextEntry>(loaded.Base() + header.contextEntryOffset);
     DWORD exceptionCode = 0;
     uintptr_t exceptionAddress = 0;
-    const uint32_t runtimeError = InvokeContextEntry(entry, &context, &exceptionCode, &exceptionAddress);
+    std::array<uint64_t, 16> faultGpr{};
+    uint64_t faultRflags = 0;
+    const uint32_t runtimeError = InvokeContextEntry(entry, &context,
+        header.familyToVregSlot, header.architectureIsX64 != 0,
+        &exceptionCode, &exceptionAddress, &faultGpr, &faultRflags);
 
     outcome.vmExecuted = true;
     outcome.vmFaulted = exceptionCode != 0;
@@ -396,6 +457,9 @@ bool RunVmHalf(
         }
         outcome.vmFinalRflags = header.architectureIsX64
             ? context.virtualFlags : (context.virtualFlags & 0xFFFFFFFFu);
+    } else {
+        outcome.vmFaultGpr = faultGpr;
+        outcome.vmFaultRflags = faultRflags;
     }
     outcome.vmFinalMemory.assign(corpusMemory, corpusMemory + header.memorySize);
     return true;

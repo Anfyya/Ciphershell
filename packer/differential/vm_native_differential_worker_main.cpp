@@ -130,6 +130,10 @@ int main(int argc, char** argv) {
     response.nativeFinalRflags = outcome.nativeFinalRflags;
     response.vmFinalGpr = outcome.vmFinalGpr;
     response.vmFinalRflags = outcome.vmFinalRflags;
+    response.nativeFaultGpr = outcome.nativeFaultGpr;
+    response.nativeFaultRflags = outcome.nativeFaultRflags;
+    response.vmFaultGpr = outcome.vmFaultGpr;
+    response.vmFaultRflags = outcome.vmFaultRflags;
     response.memorySize = header.memorySize;
 
     std::vector<uint8_t> out;

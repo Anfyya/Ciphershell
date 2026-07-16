@@ -165,6 +165,19 @@ struct VMNativeDifferentialCaseEvidence {
     uint64_t handlerInstructionCount = 0;
     VMNativeDifferentialSnapshot nativeState{};
     VMNativeDifferentialSnapshot vmState{};
+    // Diagnostic-only offsets of the faulting address relative to the native
+    // code buffer / handler image base respectively; 0 when there was no
+    // fault on that side. Verify() uses these, together with *FaultGpr/
+    // *FaultRflags below, to prove the fault itself -- not just its
+    // classification -- is architecturally equivalent on both sides.
+    uint64_t nativeFaultOffset = 0;
+    uint64_t vmFaultOffset = 0;
+    // Architectural GPR/RFLAGS state at the instant of the fault; only
+    // meaningful when nativeFaulted/vmFaulted is set.
+    std::array<uint64_t, 16> nativeFaultGpr{};
+    uint64_t nativeFaultRflags = 0;
+    std::array<uint64_t, 16> vmFaultGpr{};
+    uint64_t vmFaultRflags = 0;
 };
 
 class VMNativeDifferentialEvidenceProvider;
@@ -185,6 +198,20 @@ struct VMNativeDifferentialConfig {
     // one side faulting without the other (or a different fault) still
     // fails the whole run.
     bool expectDivideFault = false;
+    // INT3(0xCC)/INT 3(CD 03) 两种编码都会让宿主 CPU 真的产生
+    // STATUS_BREAKPOINT。和 expectDivideFault 一样，双方都出现这个异常才算
+    // 匹配；任一方独自异常、或异常代码不是断点，仍然按原样 fail-closed。
+    bool expectBreakpointFault = false;
+    // Expected value of evidence.nativeFaultOffset (offset of the faulting
+    // address from the start of the native code buffer) when
+    // expectDivideFault/expectBreakpointFault fires. Defaults to 0 (the
+    // faulting instruction, including any prefix bytes, is the corpus's
+    // first byte -- true for DIV/IDIV). Measured (not assumed) real
+    // behavior for the two INT3 encodings: Windows' vector-3 trap handler
+    // unconditionally reports (instruction-end-address - 1) regardless of
+    // whether the trap actually came from the 1-byte 0xCC or the 2-byte
+    // "CD 03" form, so callers set this to 0 for 0xCC and 1 for CD 03.
+    uint64_t expectedNativeFaultOffset = 0;
     // 纯粹的调用方标注：这次差分校验用的是哪个 VM Variant Group 的
     // handler 镜像/opcode map（即 evidenceProvider 背后那个 Group）。
     // Verify() 原样抄进 result，不参与判定——是为多 Group 场景下把每条

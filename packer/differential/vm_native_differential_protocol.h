@@ -123,6 +123,19 @@ struct VMNativeDifferentialResponseBody {
     std::array<uint64_t, 16> vmFinalGpr{};
     uint64_t vmFinalRflags = 0;
     uint32_t memorySize = 0;
+
+    // Architectural GPR/RFLAGS state captured at the instant of the fault
+    // itself (native: from the vectored handler's CONTEXT; VM: from the
+    // execution context's vregs, read inside the SEH handler before any
+    // unwind can touch it), independent of nativeFaultOffset/vmFaultOffset
+    // above. Only meaningful when the corresponding *Faulted flag is set.
+    // This is what lets a caller prove the fault is architecturally
+    // transparent -- neither side silently mutated guest state before
+    // signalling -- rather than merely classifying *that* a fault happened.
+    std::array<uint64_t, 16> nativeFaultGpr{};
+    uint64_t nativeFaultRflags = 0;
+    std::array<uint64_t, 16> vmFaultGpr{};
+    uint64_t vmFaultRflags = 0;
 };
 
 #pragma pack(pop)
