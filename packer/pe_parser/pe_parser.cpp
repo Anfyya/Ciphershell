@@ -7,12 +7,20 @@
 #include "pe_utils.h"
 #include <cstring>
 #include <algorithm>
+#include <sstream>
 
 namespace CipherShell {
 
 namespace {
 bool IsPowerOfTwo(uint32_t value) {
     return value != 0 && (value & (value - 1u)) == 0;
+}
+
+// 纯诊断用途：把数值格式化进错误信息，不参与任何校验判定。
+std::string IntToHex(uint64_t value) {
+    std::ostringstream stream;
+    stream << std::hex << value;
+    return stream.str();
 }
 
 bool CheckedAdd(DWORD left, DWORD right, DWORD& result) {
@@ -265,8 +273,18 @@ bool PEParser::ParseDataDirectories(CS_PE_IMAGE* image) {
                               const char* name) {
         const IMAGE_DATA_DIRECTORY dir = directory(index);
         if (dir.VirtualAddress == 0 && dir.Size == 0) return true;
-        if (dir.VirtualAddress == 0 || dir.Size == 0 || !(this->*parser)(image)) {
+        if (dir.VirtualAddress == 0 || dir.Size == 0) {
             SetError(image, std::string("Malformed ") + name + " directory");
+            return false;
+        }
+        if (!(this->*parser)(image)) {
+            // 部分 parser（目前是 ParseLoadConfig）在失败前已经用 SetError
+            // 写入了具体是哪个校验、哪些数值触发的失败；不要用这条通用消息
+            // 把那份诊断信息覆盖掉。其余还没做到这一步的 parser 继续用这条
+            // 通用消息兜底，行为不变。
+            if (image->errorMessage.empty()) {
+                SetError(image, std::string("Malformed ") + name + " directory");
+            }
             return false;
         }
         return true;
@@ -937,6 +955,9 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     // 1. 先验证目录 RVA 与原始文件范围。
     const DWORD loadConfigOffset = RVAToOffset(image, loadConfigDir.VirtualAddress);
     if (loadConfigOffset == 0 || loadConfigOffset >= image->rawSize) {
+        SetError(image, "load config: directory RVA 0x" +
+            IntToHex(loadConfigDir.VirtualAddress) +
+            " does not map into the file (rawSize=0x" + IntToHex(image->rawSize) + ")");
         return false;
     }
 
@@ -944,17 +965,36 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     const uint64_t rawAvailable64 = (std::min)(
         static_cast<uint64_t>(loadConfigDir.Size),
         static_cast<uint64_t>(image->rawSize) - loadConfigOffset);
-    if (rawAvailable64 > 0xFFFFFFFFull) return false;
+    if (rawAvailable64 > 0xFFFFFFFFull) {
+        SetError(image, "load config: rawAvailable64 0x" + IntToHex(rawAvailable64) +
+            " exceeds 32-bit range");
+        return false;
+    }
     const DWORD rawAvailable = static_cast<DWORD>(rawAvailable64);
 
     // 2. 至少有 sizeof(DWORD) 后，读取 Load Config 开头的 Size 字段。
-    if (rawAvailable < sizeof(DWORD)) return false;
+    if (rawAvailable < sizeof(DWORD)) {
+        SetError(image, "load config: rawAvailable 0x" + IntToHex(rawAvailable) +
+            " is smaller than the leading Size DWORD");
+        return false;
+    }
 
     DWORD declaredSize = 0;
     std::memcpy(&declaredSize, image->rawData + loadConfigOffset, sizeof(DWORD));
     // 4. declaredSize 自身不合法或超过文件可用范围时解析失败。
-    if (declaredSize < sizeof(DWORD)) return false;
-    if (declaredSize > rawAvailable) return false;
+    if (declaredSize < sizeof(DWORD)) {
+        SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
+            " is smaller than sizeof(DWORD)");
+        return false;
+    }
+    if (declaredSize > rawAvailable) {
+        SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
+            " (the structure's own leading Size field) exceeds rawAvailable 0x" +
+            IntToHex(rawAvailable) + " (directory.Size=0x" +
+            IntToHex(loadConfigDir.Size) + ", rawSize-offset=0x" +
+            IntToHex(static_cast<uint64_t>(image->rawSize) - loadConfigOffset) + ")");
+        return false;
+    }
 
     // 5. effectiveSize 必须使用 declaredSize，而非整个目录大小。
     const DWORD effectiveSize = declaredSize;
@@ -1033,6 +1073,10 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         if (local.guardCFFunctionTable < imageBase ||
             local.guardCFFunctionTable - imageBase > 0xFFFFFFFFULL ||
             local.guardCFFunctionCount > 0x1000000ULL) {
+            SetError(image, "load config: Guard CF function table VA 0x" +
+                IntToHex(local.guardCFFunctionTable) + " (imageBase=0x" +
+                IntToHex(imageBase) + ") or count 0x" +
+                IntToHex(local.guardCFFunctionCount) + " is out of range");
             return false;
         }
         const DWORD tableRVA = static_cast<DWORD>(
@@ -1042,6 +1086,12 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             static_cast<uint64_t>(entrySize);  // 64 位乘法，无溢出截断
         if (tableOffset == 0 ||
             tableBytes > static_cast<uint64_t>(image->rawSize) - tableOffset) {
+            SetError(image, "load config: Guard CF function table rva=0x" +
+                IntToHex(tableRVA) + " fileOffset=0x" + IntToHex(tableOffset) +
+                " entrySize=0x" + IntToHex(entrySize) + " count=0x" +
+                IntToHex(local.guardCFFunctionCount) +
+                " does not fit in the file (rawSize=0x" +
+                IntToHex(image->rawSize) + ")");
             return false;
         }
         std::vector<DWORD> guardRVAs;
@@ -1063,6 +1113,9 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         if (local.seHandlerTable < imageBase ||
             local.seHandlerTable - imageBase > 0xFFFFFFFFULL ||
             local.seHandlerCount > 0x1000000ULL) {
+            SetError(image, "load config: SafeSEH handler table VA 0x" +
+                IntToHex(local.seHandlerTable) + " or count 0x" +
+                IntToHex(local.seHandlerCount) + " is out of range");
             return false;
         }
         const DWORD sehRVA = static_cast<DWORD>(local.seHandlerTable - imageBase);
@@ -1071,6 +1124,10 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         const DWORD tableOffset = RVAToOffset(image, sehRVA);
         if (tableOffset == 0 ||
             tableBytes > static_cast<uint64_t>(image->rawSize) - tableOffset) {
+            SetError(image, "load config: SafeSEH handler table rva=0x" +
+                IntToHex(sehRVA) + " fileOffset=0x" + IntToHex(tableOffset) +
+                " does not fit in the file (rawSize=0x" +
+                IntToHex(image->rawSize) + ")");
             return false;
         }
         // 每个 handler RVA 必须位于映像范围、能映射到文件数据、且位于可执行 section。
@@ -1085,6 +1142,8 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
                 image->rawData + tableOffset + static_cast<size_t>(i * sizeof(DWORD)),
                 sizeof(handlerRVA));
             if (!handlerRvaIsValid(handlerRVA)) {
+                SetError(image, "load config: SafeSEH handler[" + std::to_string(i) +
+                    "] rva=0x" + IntToHex(handlerRVA) + " is not executable/file-backed");
                 return false;
             }
             sehRVAs.push_back(handlerRVA);

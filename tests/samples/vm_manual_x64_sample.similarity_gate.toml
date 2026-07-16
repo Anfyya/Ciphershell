@@ -1,14 +1,14 @@
 # Config for tests/scripts/vm_per_build_similarity_gate.py.
 #
-# Identical to config/default.toml except [vm].enabled and
-# [vm].variant_group_count. Everything else (including target_functions
-# staying empty, so hotspot-based auto-selection decides which of the
-# sample's functions get virtualized, same as protection_level>=4's preset)
-# is left at the production default -- this file only needs to force a
-# single VM Variant Group so both builds land their handler bodies at
-# vm_group=0 and are directly comparable, instead of the default adaptive
-# group count scattering the same candidate function across a different
-# group id on each independently-seeded build.
+# Same as config/default.toml except the vm section below turns protection
+# on and pins a single variant group. Everything else, including leaving
+# the target function list empty so hotspot-based auto-selection decides
+# which of the sample's functions get virtualized, matches the production
+# default. Pinning a single group makes both of the gate's independently
+# seeded builds land their handler bodies at the same group id so they are
+# directly comparable, instead of the default adaptive group count
+# scattering the same candidate function across a different group id on
+# each build.
 
 [global]
 protection_level = 4
@@ -85,3 +85,13 @@ nanomite_patches = true
 [performance]
 auto_hotspot_analysis = true
 max_vm_overhead_ratio = 15.0
+
+# Diagnostic note for anyone editing this file: ConfigParser::ExtractSection
+# (packer/config/config_parser.cpp) locates a section with a plain
+# substring search for a section header written literally, with no
+# awareness of comments or line boundaries. An earlier revision of this
+# file explained that fact by quoting the vm section's own header inside a
+# comment placed above the real header, and that quote was itself matched
+# as the section start, silently truncating every real field below out of
+# what got fed into the vm-section parser. Keep any section-header-shaped
+# text out of comments that precede the real header it is naming.
