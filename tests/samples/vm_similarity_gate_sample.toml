@@ -1,14 +1,16 @@
-# Config for tests/scripts/vm_per_build_similarity_gate.py.
+# Config for tests/scripts/vm_per_build_similarity_gate.py, packing
+# vm_similarity_gate_sample.cpp (a DLL, see that file's header comment for
+# why a DLL rather than an EXE).
 #
 # Same as config/default.toml except the vm section below turns protection
-# on and pins a single variant group. Everything else, including leaving
-# the target function list empty so hotspot-based auto-selection decides
-# which of the sample's functions get virtualized, matches the production
-# default. Pinning a single group makes both of the gate's independently
-# seeded builds land their handler bodies at the same group id so they are
-# directly comparable, instead of the default adaptive group count
-# scattering the same candidate function across a different group id on
-# each build.
+# on, names the sample's five exported functions explicitly, and pins a
+# single variant group. Naming the exports explicitly makes selection
+# deterministic and independent of hotspot-level auto-selection (which
+# would otherwise skip functions the analyzer classifies as "hot"). Pinning
+# a single group makes both of the gate's independently seeded builds land
+# their handler bodies at the same group id so they are directly
+# comparable, instead of the default adaptive group count scattering the
+# same candidate function across a different group id on each build.
 
 [global]
 protection_level = 4
@@ -20,7 +22,7 @@ randomize_section_names = true
 [vm]
 enabled = true
 strength = 80
-target_functions = []
+target_functions = ["add", "sub2", "max2", "is_zero", "local1"]
 target_rvas = []
 register_count = 24
 stack_size = 0x20000
@@ -89,9 +91,10 @@ max_vm_overhead_ratio = 15.0
 # Diagnostic note for anyone editing this file: ConfigParser::ExtractSection
 # (packer/config/config_parser.cpp) locates a section with a plain
 # substring search for a section header written literally, with no
-# awareness of comments or line boundaries. An earlier revision of this
-# file explained that fact by quoting the vm section's own header inside a
-# comment placed above the real header, and that quote was itself matched
-# as the section start, silently truncating every real field below out of
-# what got fed into the vm-section parser. Keep any section-header-shaped
-# text out of comments that precede the real header it is naming.
+# awareness of comments or line boundaries. A previous revision of a
+# sibling config file explained that fact by quoting a section's own
+# header inside a comment placed above the real header, and that quote was
+# itself matched as the section start, silently truncating every real
+# field below out of what got fed into that section's parser. Keep any
+# section-header-shaped text out of comments that precede the real header
+# it is naming.

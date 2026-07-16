@@ -151,6 +151,28 @@ if(MSVC)
     target_link_options(vm_manual_x64_sample PRIVATE /GUARD:NO)
 endif()
 
+# vm_per_build_similarity_gate 的真正打包目标：一个导出 5 个 noinline 函数的
+# DLL，而不是 vm_manual_x64_sample 那个纯 EXE。纯 EXE 的 AddressOfEntryPoint
+# 指向 CRT 启动代码（例如 __scrt_common_main_seh），不是 main 本身；CI 已经
+# 实测到 x86 下从那里开始的无边界递归反汇编会撞上 FunctionDiscovery 正确
+# 拒绝的控制流（"branch target is not a decoded instruction boundary"），
+# 而 x86 没有 x64 那样的 .pdata 表可以独立兜底，导致整个函数发现失败、VM
+# 保护完全无法应用、这条门禁自然也就没有 handler 机器码可比较。导出函数让
+# FunctionDiscovery 通过 PE 导出表直接拿到独立、可靠的根，不需要先成功
+# 反汇编 CRT 启动代码。
+add_library(vm_similarity_gate_sample SHARED
+    samples/vm_similarity_gate_sample.cpp
+)
+
+set_target_properties(vm_similarity_gate_sample PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
+if(MSVC)
+    target_compile_options(vm_similarity_gate_sample PRIVATE /guard:cf-)
+    target_link_options(vm_similarity_gate_sample PRIVATE /GUARD:NO)
+endif()
+
 add_executable(test_e2e_packaging
     test_e2e_packaging.cpp
 )
@@ -239,8 +261,8 @@ add_test(
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vm_per_build_similarity_gate.py"
         --ciphershell "$<TARGET_FILE:ciphershell>"
-        --sample "$<TARGET_FILE:vm_manual_x64_sample>"
-        --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_manual_x64_sample.similarity_gate.toml"
+        --sample "$<TARGET_FILE:vm_similarity_gate_sample>"
+        --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_similarity_gate_sample.toml"
         --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
