@@ -1205,7 +1205,7 @@ def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
 
     build = subprocess.run(
         [cmake, "--build", str(build_dir),
-         "--target", "vm_micro_op_ratio_probe", "-j"],
+         "--target", "vm_micro_op_ratio_probe", "--config", "Release", "-j"],
         capture_output=True, text=True, timeout=900)
     if build.returncode != 0:
         return [Violation(
@@ -1213,13 +1213,23 @@ def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
             "building vm_micro_op_ratio_probe against the real Translator "
             "failed:\n" + build.stdout[-4000:] + build.stderr[-4000:])]
 
-    exe = build_dir / "bin" / "vm_micro_op_ratio_probe"
-    if not exe.is_file():
-        exe = build_dir / "bin" / "vm_micro_op_ratio_probe.exe"
-    if not exe.is_file():
+    # Single-config generators (Makefiles/Ninja) put the binary straight in
+    # bin/; multi-config generators (Visual Studio) nest it under bin/<CONFIG>/
+    # regardless of the -DCMAKE_BUILD_TYPE passed at configure time, since
+    # that variable is a single-config-only concept and config is instead
+    # selected by --config at build time.
+    candidates = [
+        build_dir / "bin" / "vm_micro_op_ratio_probe",
+        build_dir / "bin" / "vm_micro_op_ratio_probe.exe",
+        build_dir / "bin" / "Release" / "vm_micro_op_ratio_probe.exe",
+        build_dir / "bin" / "Debug" / "vm_micro_op_ratio_probe.exe",
+    ]
+    exe = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if exe is None:
         return [Violation(
             probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
-            f"build succeeded but the probe executable was not found under {build_dir / 'bin'}")]
+            f"build succeeded but the probe executable was not found in any of: "
+            + ", ".join(str(candidate) for candidate in candidates))]
 
     run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
     output = run.stdout + run.stderr

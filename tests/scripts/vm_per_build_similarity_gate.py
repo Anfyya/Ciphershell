@@ -52,19 +52,21 @@ def parse_args() -> argparse.Namespace:
                         help="path to the sample PE input to pack twice")
     parser.add_argument("--workdir", type=Path, required=True,
                         help="scratch directory for the two build outputs")
-    parser.add_argument("--level", type=int, default=4,
-                        help="protection level passed as -l (default: 4, "
-                             "matches the level this repo's own manual VM "
-                             "testing notes use for tests/samples/"
-                             "vm_manual_x64_sample.cpp)")
+    parser.add_argument("--config", type=Path, required=True,
+                        help="toml config forcing [vm].enabled=true and a "
+                             "single variant_group_count=1 (group id must be "
+                             "comparable across two independently-seeded "
+                             "builds; the default adaptive group count "
+                             "assigns the same candidate function to a "
+                             "different group id per build)")
     parser.add_argument("--similarity-threshold", type=float, default=0.15,
                         help="max allowed handler-body byte similarity (0..1)")
     return parser.parse_args()
 
 
-def run_build(ciphershell: Path, sample: Path, output: Path) -> str:
+def run_build(ciphershell: Path, sample: Path, output: Path, config: Path) -> str:
     proc = subprocess.run(
-        [str(ciphershell), str(sample), "-o", str(output), "-l", "4"],
+        [str(ciphershell), str(sample), "-o", str(output), "-c", str(config)],
         capture_output=True, text=True, timeout=600)
     log = proc.stdout + proc.stderr
     if proc.returncode != 0:
@@ -143,13 +145,16 @@ def main() -> int:
     if not args.sample.is_file():
         print(f"[FAIL] sample input not found: {args.sample}", file=sys.stderr)
         return 2
+    if not args.config.is_file():
+        print(f"[FAIL] config not found: {args.config}", file=sys.stderr)
+        return 2
     args.workdir.mkdir(parents=True, exist_ok=True)
     output1 = args.workdir / "per_build_similarity_gate_1.exe"
     output2 = args.workdir / "per_build_similarity_gate_2.exe"
 
     try:
-        log1 = run_build(args.ciphershell, args.sample, output1)
-        log2 = run_build(args.ciphershell, args.sample, output2)
+        log1 = run_build(args.ciphershell, args.sample, output1, args.config)
+        log2 = run_build(args.ciphershell, args.sample, output2, args.config)
 
         groups1 = parse_groups(log1)
         groups2 = parse_groups(log2)

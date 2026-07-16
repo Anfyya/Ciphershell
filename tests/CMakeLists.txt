@@ -139,6 +139,18 @@ set_target_properties(vm_manual_x64_sample PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
 )
 
+if(MSVC)
+    # Explicitly off (redundant with the project default, since CMake never
+    # turns CFG on here) so this target's x64 IMAGE_LOAD_CONFIG_DIRECTORY64
+    # stays close to the legacy/security-cookie-only shape PEParser::
+    # ParseLoadConfig was written and regression-tested against
+    # (TestLoadConfigDeclaredSizeExceedsAvailable in test_pe_hardening.cpp),
+    # rather than picking up whatever newer Guard CF/XFG fields the current
+    # toolset's default IMAGE_LOAD_CONFIG_DIRECTORY64 layout happens to add.
+    target_compile_options(vm_manual_x64_sample PRIVATE /guard:cf-)
+    target_link_options(vm_manual_x64_sample PRIVATE /GUARD:NO)
+endif()
+
 add_executable(test_e2e_packaging
     test_e2e_packaging.cpp
 )
@@ -228,6 +240,7 @@ add_test(
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vm_per_build_similarity_gate.py"
         --ciphershell "$<TARGET_FILE:ciphershell>"
         --sample "$<TARGET_FILE:vm_manual_x64_sample>"
+        --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_manual_x64_sample.similarity_gate.toml"
         --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
