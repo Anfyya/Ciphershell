@@ -227,7 +227,61 @@ void TestLoadConfigDeclaredSizeExceedsAvailable() {
     };
     auto lay = BuildPe(true, {0xCC}, rd.buf, dirs, {});
     auto* img = Parse(lay);
-    // declaredSize > rawAvailable → 解析失败。
+    // declaredSize > rawAvailable（真实文件边界）→ 解析失败。
+    CS_TEST_CHECK(!img->loadConfig.valid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestLoadConfigDeclaredSizeExceedsDirectorySizeButFitsFile() {
+    // 已被证实的真实 CI 场景：当前主流 MSVC/LINK.EXE 工具链下，Load Config
+    // 结构体新增字段（GuardXFG/CastGuard/...）后实际变大，但 DataDirectory
+    // 数组里登记的 Size 有时仍是旧版本/偏小的值，与结构体自己开头的 Size
+    // 字段（declaredSize）不一致——只要 declaredSize 仍完整落在文件真实
+    // 边界内，这是良性现象，不应该被当成畸形 PE 拒绝（Windows 加载器本身
+    // 读取 Load Config 时也是直接信任结构体内部的 Size 字段，不会用
+    // DataDirectory.Size 做二次限制）。这里复现的正是 CI 里 x86 构建实际
+    // 打出的数值形状：declaredSize=0xc0 类的完整结构体，directory.Size 被
+    // 故意登记成一个明显更小的 0x40。
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    const uint32_t declaredSize = sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64);
+    rd.u32(declaredSize);  // Size：结构体自己声明的完整大小
+    rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) - sizeof(DWORD));
+    rd.u64(0xDEADBEEF12345678ULL);  // SecurityCookie
+    rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags) -
+        (offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + sizeof(DWORD64)));
+    rd.u32(0x00004100u);  // GuardFlags：IMAGE_GUARD_CF_INSTRUMENTED 置位
+
+    constexpr uint32_t kSmallDirectorySize = 0x40;  // 明显小于 declaredSize
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
+         kSmallDirectorySize}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->loadConfig.valid);
+    CS_TEST_CHECK(img->loadConfig.securityCookie == 0xDEADBEEF12345678ULL);
+    CS_TEST_CHECK(img->loadConfig.hasCFG);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestLoadConfigDeclaredSizeExceedsAbsoluteStructuralBound() {
+    // 反面：declaredSize 落在文件真实边界内，但大到不像任何已知版本的
+    // IMAGE_LOAD_CONFIG_DIRECTORY64（超过 4x sizeof）——绝对结构上限这道
+    // 关卡必须独立于 directory.Size 依然把这种离谱声明拒绝掉，不能因为放宽
+    // 了 directory.Size 那条校验，就把整条防线拆空。
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    const uint32_t declaredSize =
+        static_cast<uint32_t>(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)) * 5u;  // > 4x 上限
+    rd.u32(declaredSize);
+    rd.pad(declaredSize - sizeof(DWORD));  // 文件里确实有这么多字节，不是越界问题
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff), declaredSize}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
+    auto* img = Parse(lay);
     CS_TEST_CHECK(!img->loadConfig.valid);
     CipherShell::PEParser p; p.FreeImage(img);
 }
@@ -1785,6 +1839,8 @@ void TestEmitterHeaderRelocation() {
 int main() {
     TestLoadConfigShortNoGuardFlags();
     TestLoadConfigDeclaredSizeExceedsAvailable();
+    TestLoadConfigDeclaredSizeExceedsDirectorySizeButFitsFile();
+    TestLoadConfigDeclaredSizeExceedsAbsoluteStructuralBound();
     TestLoadConfigShortNoSEHandler();
     TestSafeSEHValid();
     TestSafeSEHHandlerNotExecutable();

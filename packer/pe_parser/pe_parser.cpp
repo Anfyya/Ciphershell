@@ -961,10 +961,19 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
         return false;
     }
 
-    // rawAvailable = min(directory.Size, rawSize - directoryOffset)
-    const uint64_t rawAvailable64 = (std::min)(
-        static_cast<uint64_t>(loadConfigDir.Size),
-        static_cast<uint64_t>(image->rawSize) - loadConfigOffset);
+    // rawAvailable = rawSize - directoryOffset：真正能防止越界读取的边界是
+    // "结构体必须完整落在文件里"，不是 directory.Size 本身。LINK.EXE 有据
+    // 可查的已知行为：新增字段（GuardXFG/CastGuard/…）让 Load Config
+    // 结构体实际变大后，DataDirectory 数组里登记的 Size 有时仍是旧版本/
+    // 偏小的值，与结构体自己开头的 Size 字段不一致——这是当前主流 MSVC
+    // 工具链下的良性现象，不是畸形/恶意 PE 的特征；Windows 加载器本身读取
+    // Load Config 时，也是直接信任结构体内部的 Size 字段，不会拿
+    // DataDirectory.Size 做二次限制。因此不再用 directory.Size 限制
+    // declaredSize，只保留"必须落在文件真实边界内"（下面）和"不能超过
+    // 已知结构体的绝对合理上限"（下面 structuralUpperBound）这两道真正
+    // 防越界/防离谱声明的关卡。
+    const uint64_t rawAvailable64 =
+        static_cast<uint64_t>(image->rawSize) - loadConfigOffset;
     if (rawAvailable64 > 0xFFFFFFFFull) {
         SetError(image, "load config: rawAvailable64 0x" + IntToHex(rawAvailable64) +
             " exceeds 32-bit range");
@@ -981,7 +990,8 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
 
     DWORD declaredSize = 0;
     std::memcpy(&declaredSize, image->rawData + loadConfigOffset, sizeof(DWORD));
-    // 4. declaredSize 自身不合法或超过文件可用范围时解析失败。
+    // 4. declaredSize 自身不合法、超过文件可用范围、或大到不像任何已知版本
+    // 的 IMAGE_LOAD_CONFIG_DIRECTORY64/32 时解析失败。
     if (declaredSize < sizeof(DWORD)) {
         SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
             " is smaller than sizeof(DWORD)");
@@ -989,10 +999,28 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
     }
     if (declaredSize > rawAvailable) {
         SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
-            " (the structure's own leading Size field) exceeds rawAvailable 0x" +
-            IntToHex(rawAvailable) + " (directory.Size=0x" +
-            IntToHex(loadConfigDir.Size) + ", rawSize-offset=0x" +
+            " (the structure's own leading Size field) does not fit in the file "
+            "(rawAvailable=0x" + IntToHex(rawAvailable) + ", rawSize-offset=0x" +
             IntToHex(static_cast<uint64_t>(image->rawSize) - loadConfigOffset) + ")");
+        return false;
+    }
+    // 绝对结构上限：即便落在文件边界内，也不能大到不像任何已知版本的
+    // IMAGE_LOAD_CONFIG_DIRECTORY64/32。用编译当前所链接头文件里的
+    // sizeof(乘以宽裕倍数) 而不是写死某个历史数值，未来 Windows SDK 继续
+    // 新增字段时这个上限自动跟着当前工具链的结构体定义一起变大，不需要
+    // 再回来改这个常量；同时仍然拒绝真正被构造成离谱大小的伪造声明。
+    constexpr DWORD kLoadConfigSizeSlack = 4;
+    const size_t knownStructSize = image->is64Bit
+        ? sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)
+        : sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32);
+    const DWORD structuralUpperBound =
+        static_cast<DWORD>(knownStructSize) * kLoadConfigSizeSlack;
+    if (declaredSize > structuralUpperBound) {
+        SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
+            " exceeds the absolute structural upper bound 0x" +
+            IntToHex(structuralUpperBound) + " (" +
+            std::to_string(kLoadConfigSizeSlack) + "x sizeof(IMAGE_LOAD_CONFIG_DIRECTORY" +
+            (image->is64Bit ? "64" : "32") + ")=0x" + IntToHex(knownStructSize) + ")");
         return false;
     }
 
