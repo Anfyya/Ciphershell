@@ -1348,6 +1348,7 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     }
 
     std::set<std::pair<uint8_t, uint8_t>> referencedHandlers;
+    std::set<uint8_t> referencedSemantics;
     std::unordered_set<uint32_t> evidenceFunctionRVAs;
     result.handlerReferences.reserve(records.size());
     for (const auto& record : records) {
@@ -1405,6 +1406,7 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
             recordEvidence.references.push_back({
                 item.byteOffset, item.encodedSize, semantic, variant});
             referencedHandlers.emplace(semantic, variant);
+            referencedSemantics.emplace(semantic);
         }
         result.handlerReferences.push_back(std::move(recordEvidence));
     }
@@ -1463,12 +1465,31 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.handlerBodyDigest = synthesized.microSelectionDigest;
     result.dispatchKeyDigest = synthesized.dispatchKeyDigest;
     result.variantSelectorDigest = synthesized.variantSelectorDigest;
-    result.plaintextHandlers.reserve(referencedHandlers.size());
+    // Keep handlerReferences bound to the K values selected by the real
+    // bytecode, but close the plaintext sidecar over every synthesized K for
+    // each referenced semantic.  This makes same-(semantic,K) cross-build
+    // comparisons possible without changing runtime dispatch selection.
+    if (synthesisConfig.variantCount == 0 ||
+        referencedSemantics.size() >
+            (std::numeric_limits<size_t>::max)() /
+                synthesisConfig.variantCount ||
+        referencedSemantics.size() >
+            (std::numeric_limits<uint32_t>::max)() /
+                synthesisConfig.variantCount) {
+        result.error =
+            "VM_RUNTIME: plaintext handler evidence count is invalid";
+        return result;
+    }
+    const size_t expectedPlaintextHandlerCount =
+        referencedSemantics.size() * synthesisConfig.variantCount;
+    result.plaintextHandlers.reserve(expectedPlaintextHandlerCount);
     for (const auto& handler : synthesized.handlers) {
-        if (referencedHandlers.count({handler.semantic, handler.variant}) == 0)
+        if (referencedSemantics.count(handler.semantic) == 0)
             continue;
         if (handler.semantic == VM_HANDLER_INVALID ||
-            handler.slot == VM_HANDLER_INVALID || handler.plaintextBody.empty() ||
+            handler.slot == VM_HANDLER_INVALID ||
+            handler.variant >= synthesisConfig.variantCount ||
+            handler.plaintextBody.empty() ||
             handler.plaintextBody.size() >
                 (std::numeric_limits<uint32_t>::max)() ||
             handler.semanticCoreSize == 0 ||
@@ -1521,16 +1542,43 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
         result.error = "VM_RUNTIME: synthesized plaintext handler evidence is empty";
         return result;
     }
-    if (result.plaintextHandlers.size() != referencedHandlers.size()) {
-        result.error = "VM_RUNTIME: referenced handler evidence set is incomplete";
+    if (result.plaintextHandlers.size() != expectedPlaintextHandlerCount) {
+        result.error =
+            "VM_RUNTIME: referenced semantic handler evidence set is incomplete";
         return result;
     }
-    for (size_t index = 1; index < result.plaintextHandlers.size(); ++index) {
-        const auto& previous = result.plaintextHandlers[index - 1];
-        const auto& current = result.plaintextHandlers[index];
-        if (previous.semantic == current.semantic &&
-            previous.variant == current.variant) {
-            result.error = "VM_RUNTIME: duplicate plaintext handler evidence key";
+    size_t evidenceIndex = 0;
+    for (const uint8_t semantic : referencedSemantics) {
+        for (uint32_t variant = 0; variant < synthesisConfig.variantCount;
+             ++variant, ++evidenceIndex) {
+            if (evidenceIndex >= result.plaintextHandlers.size() ||
+                result.plaintextHandlers[evidenceIndex].semantic != semantic ||
+                result.plaintextHandlers[evidenceIndex].variant != variant) {
+                result.error =
+                    "VM_RUNTIME: referenced semantic handler evidence K set "
+                    "is missing, duplicated, or out of order";
+                return result;
+            }
+        }
+    }
+    if (evidenceIndex != result.plaintextHandlers.size()) {
+        result.error =
+            "VM_RUNTIME: plaintext handler evidence contains an unexpected key";
+        return result;
+    }
+    for (const auto& referenced : referencedHandlers) {
+        const auto found = std::lower_bound(result.plaintextHandlers.begin(),
+            result.plaintextHandlers.end(), referenced,
+            [](const VMHandlerPlaintextEvidence& handler,
+               const std::pair<uint8_t, uint8_t>& key) {
+                return std::pair<uint8_t, uint8_t>{
+                           handler.semantic, handler.variant} < key;
+            });
+        if (found == result.plaintextHandlers.end() ||
+            found->semantic != referenced.first ||
+            found->variant != referenced.second) {
+            result.error =
+                "VM_RUNTIME: bytecode-selected handler evidence is missing";
             return result;
         }
     }

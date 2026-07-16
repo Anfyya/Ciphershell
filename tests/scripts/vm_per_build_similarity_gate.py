@@ -20,7 +20,8 @@ handler 体；sidecar 正文有独立摘要并与同次构建日志绑定。脚�
 from __future__ import annotations
 
 import argparse
-import itertools
+from collections import Counter
+import math
 import re
 import struct
 import subprocess
@@ -75,6 +76,17 @@ TRACE_EVENT_RE = re.compile(
     r"function_rva=0x([0-9a-fA-F]+) "
     r"bytecode_end=0x([0-9a-fA-F]+) semantic=(\d+) variant=(\d+)"
 )
+ABI_RESULT_RE = re.compile(
+    r"VM_ABI_RESULT architecture=(32|64) packed=(0|1) "
+    r"stack_delta=(-?\d+) gpr=(\d+)/(\d+) xmm=(\d+)/(\d+) return=(-?\d+)"
+)
+UNWIND_RESULT_RE = re.compile(
+    r"VM_UNWIND_RESULT architecture=64 metadata=1 lookup=4/4 "
+    r"body=1 lea=1 pop=1 ret=1 gpr=8/8 xmm=10/10"
+)
+STDCALL_RESULT_RE = re.compile(
+    r"VM_X86_STDCALL_RESULT packed=(0|1) metadata=(0|1) ret_imm16=8"
+)
 TARGET_EXPORT_NAMES = {
     "add", "sub2", "max2", "is_zero", "local1",
     "relocated_ptr", "relocated_read", "relocated_write",
@@ -104,8 +116,26 @@ def parse_args() -> argparse.Namespace:
                              "builds; the default adaptive group count "
                              "assigns the same candidate function to a "
                              "different group id per build)")
-    parser.add_argument("--similarity-threshold", type=float, default=0.15,
-                        help="max allowed handler-body byte similarity (0..1)")
+    parser.add_argument(
+        "--similarity-threshold", type=float, default=0.15,
+        help="legacy alias for the delivered encrypted-handler threshold; "
+             "values above the 0.15 hard ceiling are rejected")
+    parser.add_argument(
+        "--encrypted-similarity-threshold", type=float,
+        help="max delivered encrypted-handler 4-gram Dice similarity "
+             "(default: --similarity-threshold, hard ceiling: 0.15)")
+    parser.add_argument(
+        "--codec-similarity-threshold", type=float, default=0.15,
+        help="max persistent value-codec 4-gram Dice similarity "
+             "(hard ceiling: 0.15)")
+    parser.add_argument(
+        "--business-core-similarity-threshold", type=float, default=0.35,
+        help="max business-lowering 4-gram Dice similarity after removing "
+             "codec ranges (hard ceiling: 0.35)")
+    parser.add_argument(
+        "--core-variant-similarity-threshold", type=float, default=0.35,
+        help="max core-variant 4-gram Dice similarity "
+             "(hard ceiling: 0.35)")
     return parser.parse_args()
 
 
@@ -150,6 +180,43 @@ def parse_runtime_result(log: str, output: Path) -> tuple[int, ...]:
     return tuple(int(value) for value in matches[0])
 
 
+def validate_abi_evidence(log: str, output: Path, expect_packed: bool) -> None:
+    matches = ABI_RESULT_RE.findall(log)
+    if len(matches) != 1:
+        raise GateFailure(
+            f"runtime did not publish exactly one ABI result for {output}:\n{log}")
+    architecture, packed, stack_delta, gpr_ok, gpr_total, xmm_ok, \
+        xmm_total, returned = (int(value) for value in matches[0])
+    expected_packed = 1 if expect_packed else 0
+    expected_return = 0x12345678 - 0x10203040
+    if packed != expected_packed or stack_delta != 0 or \
+            returned != expected_return:
+        raise GateFailure(
+            f"runtime ABI result is not bound to the requested raw/packed "
+            f"execution for {output}: {matches[0]}")
+    if architecture == 64:
+        if (gpr_ok, gpr_total, xmm_ok, xmm_total) != (8, 8, 10, 10):
+            raise GateFailure(f"x64 nonvolatile ABI evidence failed for {output}")
+        unwind_count = len(UNWIND_RESULT_RE.findall(log))
+        if unwind_count != (1 if expect_packed else 0) or \
+                STDCALL_RESULT_RE.search(log):
+            raise GateFailure(
+                f"x64 packed unwind evidence is missing, duplicated, or mixed "
+                f"with x86 evidence for {output}")
+    elif architecture == 32:
+        if (gpr_ok, gpr_total, xmm_ok, xmm_total) != (4, 4, 0, 0):
+            raise GateFailure(f"x86 nonvolatile ABI evidence failed for {output}")
+        stdcall_matches = STDCALL_RESULT_RE.findall(log)
+        expected_stdcall = (str(expected_packed), str(expected_packed))
+        if len(stdcall_matches) != 1 or stdcall_matches[0] != expected_stdcall or \
+                UNWIND_RESULT_RE.search(log):
+            raise GateFailure(
+                f"x86 stdcall RET 8 evidence is missing, malformed, or mixed "
+                f"with x64 evidence for {output}")
+    else:
+        raise GateFailure(f"unsupported ABI evidence architecture for {output}")
+
+
 def run_packed_runtime(
         runner: Path, output: Path, expect_trace: bool = False
         ) -> tuple[tuple[int, int, int, int], tuple[int, ...], str]:
@@ -165,6 +232,7 @@ def run_packed_runtime(
         raise GateFailure(
             f"packed VM runtime execution failed (exit={proc.returncode}) for "
             f"{output}:\n{log}")
+    validate_abi_evidence(log, output, expect_trace)
     return parse_return_flags(log, output), parse_runtime_result(log, output), log
 
 
@@ -181,6 +249,7 @@ def run_packed_exe(
         raise GateFailure(
             f"packed VM EXE execution failed (exit={proc.returncode}) for "
             f"{output}:\n{log}")
+    validate_abi_evidence(log, output, expect_trace)
     return parse_return_flags(log, output), parse_runtime_result(log, output), log
 
 
@@ -405,9 +474,10 @@ def load_plaintext_evidence(
 
     Only synthesizer-published semantic-body ranges are present: randomized
     junk handlers and the jump-over opaque islands in each handler's storage
-    envelope are deliberately excluded. Ranges are compared independently by
-    (semantic, K-variant), avoiding false mismatch from one variable-length
-    handler shifting every handler that follows it.
+    envelope are deliberately excluded.  For every semantic referenced by
+    bytecode, the sidecar must contain all four production K variants.  Ranges
+    are compared independently by (semantic, K), avoiding false mismatch from
+    one variable-length handler shifting every handler that follows it.
     """
     data = path.read_bytes()
     cursor = 0
@@ -483,25 +553,36 @@ def load_plaintext_evidence(
                 codec_ranges.append((codec_offset, codec_size))
                 previous_end = codec_offset + codec_size
 
-            business_core = bytearray()
             codec = bytearray()
-            cursor_in_core = 0
             for codec_offset, codec_size in codec_ranges:
                 relative = codec_offset - core_offset
-                business_core.extend(core[cursor_in_core:relative])
                 codec.extend(core[relative:relative + codec_size])
-                cursor_in_core = relative + codec_size
-            business_core.extend(core[cursor_in_core:])
             variant_relative = (core_variant_offset - core_offset
                                 if core_variant_size else 0)
             core_variant = (core[variant_relative:
                                  variant_relative + core_variant_size]
                             if core_variant_size else b"")
-            if len(business_core) < 32 or \
-                    (codec_ranges and len(codec) < 32) or \
-                    (core_variant_size and len(core_variant) < 32):
-                raise GateFailure(
-                    f"plaintext evidence has an undersized meaningful stage in {path}")
+
+            # The business stage is the complete production core with only
+            # value-codec ranges removed.  core_variant remains part of that
+            # real lowering, but is also gated independently so the surrounding
+            # business instructions cannot dilute it.  Short selector/lowering
+            # ranges are legal evidence and are scored by the explicit
+            # short-segment rule in four_gram_counts(); they are never dropped.
+            excluded_ranges = [
+                (offset - core_offset, size, "codec")
+                for offset, size in codec_ranges
+            ]
+            excluded_ranges.sort()
+            business_core = bytearray()
+            cursor_in_core = 0
+            for relative, size, stage_name in excluded_ranges:
+                if relative < cursor_in_core:
+                    raise GateFailure(
+                        f"overlapping {stage_name} evidence range in {path}")
+                business_core.extend(core[cursor_in_core:relative])
+                cursor_in_core = relative + size
+            business_core.extend(core[cursor_in_core:])
             canonical.extend(record_header)
             canonical.extend(range_header)
             canonical.extend(core)
@@ -565,10 +646,32 @@ def load_plaintext_evidence(
                 "bytecode": bytecode,
                 "references": references,
             }
-        if referenced_handlers != set(handlers):
+        handler_keys = set(handlers)
+        if not referenced_handlers.issubset(handler_keys):
             raise GateFailure(
-                f"plaintext evidence contains unreferenced or missing handlers in "
+                f"plaintext evidence is missing referenced handlers in "
                 f"{path}, group={group}")
+        referenced_semantics = {
+            semantic for semantic, _ in referenced_handlers}
+        handler_semantics = {semantic for semantic, _ in handler_keys}
+        if handler_semantics != referenced_semantics:
+            raise GateFailure(
+                f"plaintext evidence contains a semantic that no VM record "
+                f"references in {path}, group={group}")
+        expected_variants = {0, 1, 2, 3}
+        incomplete_variants = {
+            semantic: sorted(
+                variant for key_semantic, variant in handler_keys
+                if key_semantic == semantic)
+            for semantic in sorted(handler_semantics)
+            if {variant for key_semantic, variant in handler_keys
+                if key_semantic == semantic} != expected_variants
+        }
+        if incomplete_variants:
+            raise GateFailure(
+                f"plaintext evidence does not contain the complete production "
+                f"K=0..3 set for every referenced semantic in {path}, "
+                f"group={group}: {incomplete_variants}")
         if semantic_evidence_digest(bytes(canonical)) != digest:
             raise GateFailure(
                 f"plaintext handler evidence digest mismatch in {path}, group={group}")
@@ -583,7 +686,7 @@ def load_plaintext_evidence(
 
 def assert_trace_binding_tamper_rejected(path: Path, workdir: Path) -> None:
     data = bytearray(path.read_bytes())
-    # CSVMPLN2 fixed header is 16 bytes; first group traceRVA starts at +20
+    # CSVMPLN3 fixed header is 16 bytes; first group traceRVA starts at +20
     # within the 44-byte group header.  Changing it must invalidate the
     # canonical digest that binds trace storage to handler/reference evidence.
     trace_rva_offset = 16 + 20
@@ -716,19 +819,109 @@ def validate_runtime_trace(
             f"trace={sorted(traced_functions)}")
 
 
-def plaintext_similarity(
+def four_gram_counts(material: bytes) -> Counter[tuple[int, bytes]]:
+    """Return a multiset of byte 4-grams with an exact short-range rule.
+
+    A nonempty range shorter than four bytes contributes one token containing
+    both its exact length and exact bytes.  Thus two identical short ranges
+    score 1.0 and every non-identical short pair scores 0.0; short evidence is
+    never silently dropped.  For normal ranges, an insertion shifts at most
+    the nearby 4-grams instead of making an identical suffix look unrelated.
+    """
+    if not material:
+        raise GateFailure("cannot score an empty live handler stage")
+    if len(material) < 4:
+        return Counter({(len(material), material): 1})
+    return Counter(
+        (4, material[index:index + 4])
+        for index in range(len(material) - 3))
+
+
+def four_gram_dice(left: bytes, right: bytes) -> tuple[float, int, int]:
+    left_grams = four_gram_counts(left)
+    right_grams = four_gram_counts(right)
+    intersection = sum((left_grams & right_grams).values())
+    total = sum(left_grams.values()) + sum(right_grams.values())
+    if total == 0:
+        raise GateFailure("4-gram Dice denominator is empty")
+    return 2.0 * intersection / total, intersection, total
+
+
+def assert_distinct_core_variant(
+        kind: str, label: str, left: bytes, right: bytes) -> None:
+    if not left or not right:
+        raise GateFailure(
+            f"{kind} {label} has an empty core_variant in one build")
+    if left == right:
+        raise GateFailure(
+            f"{kind} {label} core_variant is byte-identical across seeds")
+
+
+def run_similarity_negative_self_checks() -> None:
+    """Fail closed if the scorer regresses to position-by-position zip logic."""
+    suffix = bytes(range(64))
+    inserted = b"\xff" + suffix
+    similarity, _, _ = four_gram_dice(suffix, inserted)
+    if similarity < 0.95:
+        raise GateFailure(
+            "internal 4-gram self-check failed: a one-byte prefix made an "
+            "identical suffix appear dissimilar")
+    try:
+        assert_distinct_core_variant(
+            "self-check", "group=0 semantic=1 K=0", suffix, suffix)
+    except GateFailure:
+        pass
+    else:
+        raise GateFailure(
+            "internal core_variant self-check failed: identical cores were accepted")
+
+
+def aggregate_stage_similarity(
+        kind: str, stage: str,
+        pairs: list[tuple[str, bytes, bytes]]) -> dict[str, object]:
+    if not pairs:
+        raise GateFailure(f"{kind} has no aligned {stage} evidence")
+    intersection = 0
+    total = 0
+    max_pair_similarity = -1.0
+    max_pair_label = ""
+    for label, left, right in pairs:
+        similarity, pair_intersection, pair_total = four_gram_dice(left, right)
+        intersection += pair_intersection
+        total += pair_total
+        if similarity > max_pair_similarity:
+            max_pair_similarity = similarity
+            max_pair_label = label
+    if total == 0:
+        raise GateFailure(f"{kind} {stage} evidence has an empty denominator")
+    return {
+        "similarity": 2.0 * intersection / total,
+        "intersection": intersection,
+        "total": total,
+        "pairs": len(pairs),
+        "max_pair_similarity": max_pair_similarity,
+        "max_pair_label": max_pair_label,
+    }
+
+
+def plaintext_stage_similarities(
         kind: str,
         groups1: dict[int, dict[str, int]],
         groups2: dict[int, dict[str, int]],
         evidence1: dict[int, dict[str, object]],
         evidence2: dict[int, dict[str, object]],
-        common_groups: list[int]) -> tuple[float, int, int]:
-    matches = 0
-    denominator = 0
-    for group in common_groups:
-        if group not in evidence1 or group not in evidence2:
-            raise GateFailure(
-                f"{kind} plaintext evidence is missing vm_group={group}")
+        group_ids: list[int]) -> dict[str, dict[str, object]]:
+    expected_groups = set(group_ids)
+    if set(groups1) != expected_groups or set(groups2) != expected_groups or \
+            set(evidence1) != expected_groups or set(evidence2) != expected_groups:
+        raise GateFailure(
+            f"{kind} log/sidecar group sets are not exactly aligned: "
+            f"log1={sorted(groups1)} log2={sorted(groups2)} "
+            f"sidecar1={sorted(evidence1)} sidecar2={sorted(evidence2)}")
+
+    stage_pairs: dict[str, list[tuple[str, bytes, bytes]]] = {
+        "business_core": [], "core_variant": [], "codec": []}
+    for group in group_ids:
         proof1 = evidence1[group]
         proof2 = evidence2[group]
         if proof1["digest"] != groups1[group]["semantic_plaintext_digest"] or \
@@ -753,39 +946,171 @@ def plaintext_similarity(
                 f"{kind} per-record handler references differ by function RVA "
                 f"in vm_group={group}")
 
-        for function_rva in sorted(records1):
-            refs1 = records1[function_rva]["references"]
-            refs2 = records2[function_rva]["references"]
-            keys1 = {(reference[2], reference[3]) for reference in refs1}
-            keys2 = {(reference[2], reference[3]) for reference in refs2}
-            semantics = sorted(
-                {key[0] for key in keys1} | {key[0] for key in keys2})
-            for semantic in semantics:
-                bodies1 = [handlers1[key][3] for key in sorted(keys1)
-                           if key[0] == semantic]
-                bodies2 = [handlers2[key][3] for key in sorted(keys2)
-                           if key[0] == semantic]
-                left_total = sum(len(body) for body in bodies1)
-                right_total = sum(len(body) for body in bodies2)
-                denominator += max(left_total, right_total)
-                if len(bodies1) > len(bodies2):
-                    bodies1, bodies2 = bodies2, bodies1
-                if not bodies1:
-                    continue
-                best = 0
-                for pairing in itertools.permutations(bodies2, len(bodies1)):
-                    candidate = sum(
-                        sum(1 for left, right in zip(body1, body2)
-                            if left == right)
-                        for body1, body2 in zip(bodies1, pairing))
-                    best = max(best, candidate)
-                # Choose the most-similar valid pairing. This is conservative:
-                # differing K selectors cannot obtain a lower score merely by
-                # changing variant numbers or instruction order.
-                matches += best
-    if denominator == 0:
-        raise GateFailure(f"{kind} plaintext evidence contains no handler bytes")
-    return matches / denominator, matches, denominator
+        keys1 = set(handlers1)
+        keys2 = set(handlers2)
+        if keys1 != keys2:
+            raise GateFailure(
+                f"{kind} vm_group={group} handler (semantic,K) sets differ: "
+                f"seed1={sorted(keys1)} seed2={sorted(keys2)}")
+        if not keys1:
+            raise GateFailure(
+                f"{kind} vm_group={group} has no live handler keys")
+
+        # Alignment is exactly (group, semantic, K).  There is deliberately no
+        # cross-K permutation and no missing-key denominator penalty: either
+        # build publishing a different key set is a hard evidence failure.
+        for semantic, variant in sorted(keys1):
+            label = f"group={group} semantic={semantic} K={variant}"
+            handler1 = handlers1[(semantic, variant)]
+            handler2 = handlers2[(semantic, variant)]
+            if not isinstance(handler1, dict) or not isinstance(handler2, dict):
+                raise GateFailure(f"{kind} {label} handler record is malformed")
+            business1 = handler1.get("business_core")
+            business2 = handler2.get("business_core")
+            core_variant1 = handler1.get("core_variant")
+            core_variant2 = handler2.get("core_variant")
+            codec1 = handler1.get("codec")
+            codec2 = handler2.get("codec")
+            if not all(isinstance(value, bytes) for value in (
+                    business1, business2, core_variant1, core_variant2,
+                    codec1, codec2)):
+                raise GateFailure(f"{kind} {label} stage bytes are malformed")
+            if not business1 or not business2:
+                raise GateFailure(
+                    f"{kind} {label} has no business lowering after removing "
+                    "codec ranges")
+            if bool(codec1) != bool(codec2):
+                raise GateFailure(
+                    f"{kind} {label} has persistent value-codec evidence in "
+                    "only one build")
+            assert_distinct_core_variant(
+                kind, label, core_variant1, core_variant2)
+            stage_pairs["business_core"].append(
+                (label, business1, business2))
+            stage_pairs["core_variant"].append(
+                (label, core_variant1, core_variant2))
+            # Stack-neutral semantics legitimately have no value-codec range.
+            # Score only exact keys where both builds publish that live stage;
+            # aggregate_stage_similarity still fails closed if the entire
+            # packed product contains no codec-bearing handler at all.
+            if codec1:
+                stage_pairs["codec"].append((label, codec1, codec2))
+
+    return {
+        stage: aggregate_stage_similarity(kind, stage, pairs)
+        for stage, pairs in stage_pairs.items()
+    }
+
+
+def extract_encrypted_handler_regions(
+        kind: str, output: Path,
+        groups: dict[int, dict[str, int]]) -> dict[int, bytes]:
+    """Read the delivered ciphertext from each real packed PE runtime section."""
+    data = output.read_bytes()
+    regions: dict[int, bytes] = {}
+    for group, fields in sorted(groups.items()):
+        raw = fields["raw"]
+        runtime_size = fields["size"]
+        offset = fields["encrypted_handlers_offset"]
+        size = fields["encrypted_handlers_size"]
+        if raw == 0 or runtime_size == 0 or size == 0 or \
+                offset > runtime_size or size > runtime_size - offset or \
+                raw > len(data) or offset > len(data) - raw or \
+                size > len(data) - raw - offset:
+            raise GateFailure(
+                f"{kind} packed PE has a non-file-backed encrypted handler "
+                f"range for vm_group={group}: raw=0x{raw:x} "
+                f"runtime_size=0x{runtime_size:x} offset=0x{offset:x} "
+                f"size=0x{size:x} file_size=0x{len(data):x}")
+        regions[group] = data[raw + offset:raw + offset + size]
+    if not regions:
+        raise GateFailure(f"{kind} packed PE has no encrypted handler regions")
+    return regions
+
+
+def encrypted_handler_similarity(
+        kind: str, output1: Path, output2: Path,
+        groups1: dict[int, dict[str, int]],
+        groups2: dict[int, dict[str, int]],
+        group_ids: list[int]) -> dict[str, object]:
+    regions1 = extract_encrypted_handler_regions(kind, output1, groups1)
+    regions2 = extract_encrypted_handler_regions(kind, output2, groups2)
+    expected = set(group_ids)
+    if set(regions1) != expected or set(regions2) != expected:
+        raise GateFailure(
+            f"{kind} encrypted-handler group sets are not exactly aligned")
+    return aggregate_stage_similarity(
+        kind, "encrypted_handlers", [
+            (f"group={group}", regions1[group], regions2[group])
+            for group in group_ids
+        ])
+
+
+def exact_group_ids(
+        kind: str,
+        groups1: dict[int, dict[str, int]],
+        groups2: dict[int, dict[str, int]]) -> list[int]:
+    if not groups1 or not groups2:
+        raise GateFailure(
+            f"{kind} VM protection was not applied in both builds: "
+            f"seed1={sorted(groups1)} seed2={sorted(groups2)}")
+    if set(groups1) != set(groups2):
+        raise GateFailure(
+            f"{kind} builds produced different VM group sets: "
+            f"seed1={sorted(groups1)} seed2={sorted(groups2)}")
+    return sorted(groups1)
+
+
+def report_and_gate_similarities(
+        kind: str,
+        stages: dict[str, dict[str, object]],
+        encrypted: dict[str, object],
+        thresholds: dict[str, float]) -> None:
+    results = dict(stages)
+    results["encrypted_handlers"] = encrypted
+    for stage in ("business_core", "core_variant", "codec",
+                  "encrypted_handlers"):
+        result = results[stage]
+        similarity = float(result["similarity"])
+        threshold = thresholds[stage]
+        print(
+            f"[{kind.lower()}-diversity] stage={stage} "
+            f"pairs={result['pairs']} "
+            f"matching_4grams={2 * int(result['intersection'])}/"
+            f"{int(result['total'])} dice={similarity:.4f} "
+            f"max_pair={float(result['max_pair_similarity']):.4f} "
+            f"max_pair_key={result['max_pair_label']} "
+            f"threshold={threshold:.4f}")
+        if similarity >= threshold:
+            raise GateFailure(
+                f"{kind} {stage} 4-gram Dice similarity {similarity:.4f} "
+                f"is not below the independent {threshold:.4f} threshold")
+
+
+def resolve_thresholds(args: argparse.Namespace) -> dict[str, float]:
+    encrypted = (args.encrypted_similarity_threshold
+                 if args.encrypted_similarity_threshold is not None
+                 else args.similarity_threshold)
+    thresholds = {
+        "business_core": args.business_core_similarity_threshold,
+        "core_variant": args.core_variant_similarity_threshold,
+        "codec": args.codec_similarity_threshold,
+        "encrypted_handlers": encrypted,
+    }
+    hard_ceilings = {
+        "business_core": 0.35,
+        "core_variant": 0.35,
+        "codec": 0.15,
+        "encrypted_handlers": 0.15,
+    }
+    for stage, threshold in thresholds.items():
+        ceiling = hard_ceilings[stage]
+        if not math.isfinite(threshold) or threshold <= 0.0 or \
+                threshold > ceiling:
+            raise GateFailure(
+                f"invalid {stage} threshold {threshold!r}; it must be in "
+                f"(0,{ceiling}] and cannot loosen the quantitative gate")
+    return thresholds
 
 
 def main() -> int:
@@ -814,6 +1139,8 @@ def main() -> int:
     exe_evidence2_path = args.workdir / "per_build_exe_gate_2.handlers"
 
     try:
+        run_similarity_negative_self_checks()
+        thresholds = resolve_thresholds(args)
         raw_dll_targets = exact_target_export_rvas(args.sample)
         raw_exe_targets = exact_target_export_rvas(args.exe_sample)
         # Establish the real-CPU baseline twice before packing. Both PE
@@ -889,22 +1216,19 @@ def main() -> int:
 
         exe_groups1 = parse_groups(exe_log1)
         exe_groups2 = parse_groups(exe_log2)
-        common_exe_groups = sorted(set(exe_groups1) & set(exe_groups2))
-        if not common_exe_groups:
-            raise GateFailure(
-                "VM protection was not applied to a common group in both EXE builds")
-        if sum(exe_groups1[group]["records"] for group in common_exe_groups) != 8 or \
-           sum(exe_groups2[group]["records"] for group in common_exe_groups) != 8:
+        exe_group_ids = exact_group_ids("EXE", exe_groups1, exe_groups2)
+        if sum(exe_groups1[group]["records"] for group in exe_group_ids) != 8 or \
+           sum(exe_groups2[group]["records"] for group in exe_group_ids) != 8:
             raise GateFailure("packed EXE builds did not contain all eight VM records")
         if any(exe_groups1[group]["vm_records"] != exe_groups1[group]["records"] or
                exe_groups2[group]["vm_records"] != exe_groups2[group]["records"] or
                exe_groups1[group].get("invalid_vm_records", 0) != 0 or
                exe_groups2[group].get("invalid_vm_records", 0) != 0
-               for group in common_exe_groups):
+               for group in exe_group_ids):
             raise GateFailure(
                 "packed EXE metadata did not contain a complete trampoline, "
                 "bytecode body, guest stack, and nonempty opcode stream for every record")
-        for group in common_exe_groups:
+        for group in exe_group_ids:
             for digest_name in ("opcode_map", "handler_body", "dispatch_key", "variant_selector"):
                 if exe_groups1[group][digest_name] == exe_groups2[group][digest_name]:
                     raise GateFailure(
@@ -915,46 +1239,34 @@ def main() -> int:
         validate_runtime_trace(
             "EXE seed2", packed_exe_runtime_log2, exe_groups2,
             exe_evidence2, raw_exe_targets)
-        exe_similarity, exe_matches, exe_bytes = plaintext_similarity(
+        exe_stages = plaintext_stage_similarities(
             "EXE", exe_groups1, exe_groups2, exe_evidence1, exe_evidence2,
-            common_exe_groups)
-        if exe_similarity >= args.similarity_threshold:
-            raise GateFailure(
-                f"EXE handler-body byte similarity {exe_similarity:.4f} across two "
-                f"independently-seeded builds is not below the "
-                f"{args.similarity_threshold:.4f} threshold")
-        print(f"[exe-runtime] groups={common_exe_groups} "
-              f"records1={sum(exe_groups1[g]['records'] for g in common_exe_groups)} "
-              f"records2={sum(exe_groups2[g]['records'] for g in common_exe_groups)} "
-              f"plaintext_matches={exe_matches}/{exe_bytes} "
-              f"similarity={exe_similarity:.4f}")
+            exe_group_ids)
+        exe_encrypted = encrypted_handler_similarity(
+            "EXE", exe_output1, exe_output2, exe_groups1, exe_groups2,
+            exe_group_ids)
+        report_and_gate_similarities(
+            "EXE", exe_stages, exe_encrypted, thresholds)
+        print(f"[exe-runtime] groups={exe_group_ids} "
+              f"records1={sum(exe_groups1[g]['records'] for g in exe_group_ids)} "
+              f"records2={sum(exe_groups2[g]['records'] for g in exe_group_ids)}")
 
         groups1 = parse_groups(log1)
         groups2 = parse_groups(log2)
-        if not groups1 or not groups2:
-            raise GateFailure(
-                "VM protection was not actually applied to any group in "
-                f"one of the two builds (build1 groups={sorted(groups1)}, "
-                f"build2 groups={sorted(groups2)}) -- nothing to compare. "
-                "Full build1 log:\n" + log1 + "\nFull build2 log:\n" + log2)
-        common_groups = sorted(set(groups1) & set(groups2))
-        if not common_groups:
-            raise GateFailure(
-                f"builds produced disjoint VM group ids (build1={sorted(groups1)}, "
-                f"build2={sorted(groups2)}) -- cannot compare handler bodies")
-        if sum(groups1[group]["records"] for group in common_groups) != 8 or \
-           sum(groups2[group]["records"] for group in common_groups) != 8:
+        group_ids = exact_group_ids("DLL", groups1, groups2)
+        if sum(groups1[group]["records"] for group in group_ids) != 8 or \
+           sum(groups2[group]["records"] for group in group_ids) != 8:
             raise GateFailure("packed DLL builds did not contain all eight VM records")
         if any(groups1[group]["vm_records"] != groups1[group]["records"] or
                groups2[group]["vm_records"] != groups2[group]["records"] or
                groups1[group].get("invalid_vm_records", 0) != 0 or
                groups2[group].get("invalid_vm_records", 0) != 0
-               for group in common_groups):
+               for group in group_ids):
             raise GateFailure(
                 "packed DLL metadata did not contain a complete trampoline, "
                 "bytecode body, guest stack, and nonempty opcode stream for every record")
 
-        for group in common_groups:
+        for group in group_ids:
             g1, g2 = groups1[group], groups2[group]
             for digest_name in ("opcode_map", "handler_body", "dispatch_key", "variant_selector"):
                 if g1[digest_name] == g2[digest_name]:
@@ -973,18 +1285,12 @@ def main() -> int:
             "DLL seed2", packed_dll_runtime_log2, groups2, evidence2,
             raw_dll_targets)
 
-        similarity, plaintext_matches, plaintext_bytes = plaintext_similarity(
-            "DLL", groups1, groups2, evidence1, evidence2, common_groups)
-        print(f"[aggregate] groups={common_groups} "
-              f"plaintext_matches={plaintext_matches}/{plaintext_bytes} "
-              f"similarity={similarity:.4f} "
-              f"threshold={args.similarity_threshold:.4f}")
-
-        if similarity >= args.similarity_threshold:
-            raise GateFailure(
-                f"handler-body byte similarity {similarity:.4f} across two "
-                f"independently-seeded builds is not below the "
-                f"{args.similarity_threshold:.4f} threshold")
+        dll_stages = plaintext_stage_similarities(
+            "DLL", groups1, groups2, evidence1, evidence2, group_ids)
+        dll_encrypted = encrypted_handler_similarity(
+            "DLL", output1, output2, groups1, groups2, group_ids)
+        report_and_gate_similarities(
+            "DLL", dll_stages, dll_encrypted, thresholds)
     except GateFailure as failure:
         print(f"[FAIL] {failure}", file=sys.stderr)
         return 1

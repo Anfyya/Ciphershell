@@ -631,13 +631,18 @@ void TestBuilderAndReparseIntegration() {
         "VMRuntimeBuilder 未通过自身产物完整性门禁: " + result.error);
     Require(result.trampolines.size() == 1,
         "VMRuntimeBuilder 集成测试没有生成唯一 trampoline");
-    Require(result.plaintextHandlers.size() == 1u &&
+    Require(result.plaintextHandlers.size() == config.variantCount &&
             result.handlerReferences.size() == 1u &&
             result.handlerReferences.front().references.size() == 1u &&
             result.handlerReferences.front().references.front().semantic ==
                 VM_UOP_RET &&
             result.handlerReferences.front().references.front().variant == 1u,
-        "VMRuntimeBuilder evidence was not restricted to the referenced RET handler");
+        "VMRuntimeBuilder evidence did not preserve the selected RET reference");
+    for (uint32_t variant = 0; variant < config.variantCount; ++variant) {
+        Require(result.plaintextHandlers[variant].semantic == VM_UOP_RET &&
+                result.plaintextHandlers[variant].variant == variant,
+            "VMRuntimeBuilder evidence did not contain the complete, sorted RET K set");
+    }
     const auto& trampoline = result.trampolines.front();
     Require(trampoline.trampolineRVA >= result.sectionRVA,
         "trampoline RVA 位于 runtime section 之前");

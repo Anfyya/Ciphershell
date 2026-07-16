@@ -71,6 +71,10 @@ public:
         AddFixup(label);
     }
     bool Resolve(std::string& error) {
+        if (!encodingError.empty()) {
+            error = encodingError;
+            return false;
+        }
         for (const Fixup& fixup : fixups) {
             if (fixup.label >= labels.size() ||
                 labels[fixup.label] == (std::numeric_limits<size_t>::max)()) {
@@ -99,12 +103,17 @@ public:
     KeyedPermutationPlan coreSelector{};
     std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
 
+    void FailEncoding(const char* error) {
+        if (encodingError.empty()) encodingError = error;
+    }
+
 private:
     struct Fixup { size_t displacement; Label label; };
     void AddFixup(Label label) {
         fixups.push_back({bytes.size(), label});
         U32(0);
     }
+    std::string encodingError;
     std::vector<size_t> labels;
     std::vector<Fixup> fixups;
 };
@@ -194,12 +203,22 @@ void RecordX64StackFunclet(
 class SeedStream {
 public:
     SeedStream(const std::array<uint8_t, 32>& seed, uint64_t domain) {
-        uint64_t first = 0;
-        uint64_t second = 0;
-        std::memcpy(&first, seed.data(), sizeof(first));
-        std::memcpy(&second, seed.data() + 16, sizeof(second));
-        s0 = Mix(first ^ domain ^ 0xA0761D6478BD642FULL);
-        s1 = Mix(second ^ (domain << 1u) ^ 0xE7037ED1A0B428DBULL);
+        std::array<uint64_t, 4> lanes{};
+        for (size_t lane = 0; lane < lanes.size(); ++lane) {
+            std::memcpy(&lanes[lane], seed.data() + lane * sizeof(uint64_t),
+                sizeof(uint64_t));
+        }
+        // A build seed is a 256-bit contract.  The old initialization read
+        // only lanes 0 and 2, so changing bytes 8..15 or 24..31 could leave
+        // every semantic permutation unchanged.  Fold all four lanes into
+        // both generator words before the xorshift warm-up.
+        const uint64_t domainRotate = (domain << 1u) | (domain >> 63u);
+        s0 = Mix(lanes[0] ^ Mix(lanes[1] ^ 0x8EBC6AF09C88C6E3ULL) ^
+            domain ^ 0xA0761D6478BD642FULL);
+        s1 = Mix(lanes[2] ^ Mix(lanes[3] ^ 0x589965CC75374CC3ULL) ^
+            domainRotate ^ 0xE7037ED1A0B428DBULL);
+        s0 = Mix(s0 ^ lanes[3] ^ 0x1D8E4E27C47D124FULL);
+        s1 = Mix(s1 ^ lanes[1] ^ 0xEB44ACCAB455D165ULL);
         if ((s0 | s1) == 0) s1 = 1;
         for (unsigned i = 0; i < 12; ++i) Next64();
     }
@@ -346,6 +365,10 @@ constexpr uint32_t CtxError = CTX_OFFSET(error);
 constexpr uint32_t CtxHalted = CTX_OFFSET(halted);
 constexpr uint32_t CtxMutationScratch = CTX_OFFSET(mutationScratch);
 
+static_assert(sizeof(VM_MICRO_EXECUTION_CONTEXT) <
+        static_cast<size_t>((std::numeric_limits<int32_t>::max)()),
+    "VM context offsets must fit a signed disp32");
+
 constexpr uint8_t JccO = 0x80;
 constexpr uint8_t JccNO = 0x81;
 constexpr uint8_t JccB = 0x82;
@@ -363,10 +386,131 @@ constexpr uint8_t JccGE = 0x8D;
 constexpr uint8_t JccLE = 0x8E;
 constexpr uint8_t JccG = 0x8F;
 
+enum class ContextLoadAddressKind : uint8_t {
+    X64Direct = 1u,
+    X64Indexed = 2u,
+    X86Direct = 3u,
+    X86IndexedEcx = 4u,
+    X86IndexedRegister = 5u
+};
+
+uint64_t MixContextLoadDomain(uint64_t value) {
+    value ^= value >> 30u;
+    value *= 0xBF58476D1CE4E5B9ULL;
+    value ^= value >> 27u;
+    value *= 0x94D049BB133111EBULL;
+    return value ^ (value >> 31u);
+}
+
+bool DeriveContextLoadDisplacements(
+    CodeBuffer& c,
+    ContextLoadAddressKind kind,
+    uint8_t width,
+    uint8_t destination,
+    uint8_t index,
+    uint32_t displacement,
+    int32_t& addressDisplacement,
+    int32_t& loadDisplacement)
+{
+    // The first LEA deliberately computes a seed-keyed, non-dereferenced
+    // intermediate address.  The following load subtracts the same key in
+    // its signed disp32, so the only dereference remains exactly the original
+    // context field.  Derivation is a pure function of the handler-local core
+    // selector and the load identity; adding or reordering unrelated loads
+    // therefore cannot perturb an existing encoding.
+    if (c.coreSelector.roundCount == 0u ||
+        displacement >= static_cast<uint32_t>(
+            (std::numeric_limits<int32_t>::max)())) {
+        c.FailEncoding("context-load displacement cannot be split safely");
+        return false;
+    }
+
+    uint64_t domain = 0x4354584C4F41444BULL ^
+        (static_cast<uint64_t>(static_cast<uint8_t>(kind)) << 56u) ^
+        (static_cast<uint64_t>(width) << 48u) ^
+        (static_cast<uint64_t>(destination) << 40u) ^
+        (static_cast<uint64_t>(index) << 32u) ^ displacement;
+    domain ^= static_cast<uint64_t>(c.coreSelector.layout) << 63u;
+    for (uint8_t roundIndex = 0;
+         roundIndex < c.coreSelector.roundCount; ++roundIndex) {
+        const KeyedPermutationRound& round =
+            c.coreSelector.rounds[roundIndex];
+        const uint64_t descriptor =
+            (static_cast<uint64_t>(static_cast<uint8_t>(round.op)) << 56u) ^
+            (static_cast<uint64_t>(round.rotate) << 48u) ^
+            (static_cast<uint64_t>(round.encoding) << 40u) ^
+            static_cast<uint64_t>(roundIndex);
+        domain = MixContextLoadDomain(domain ^ round.key ^ descriptor);
+    }
+
+    const uint32_t maximumKey = static_cast<uint32_t>(
+        (std::numeric_limits<int32_t>::max)()) - displacement;
+    if (maximumKey == 0u) {
+        c.FailEncoding("context-load address key has no signed disp32 range");
+        return false;
+    }
+    const uint32_t key = 1u + static_cast<uint32_t>(domain % maximumKey);
+    const int64_t first = static_cast<int64_t>(displacement) + key;
+    const int64_t second = -static_cast<int64_t>(key);
+    if (first > (std::numeric_limits<int32_t>::max)() ||
+        second < (std::numeric_limits<int32_t>::min)()) {
+        c.FailEncoding("context-load address split exceeded signed disp32");
+        return false;
+    }
+    addressDisplacement = static_cast<int32_t>(first);
+    loadDisplacement = static_cast<int32_t>(second);
+    return true;
+}
+
+void EmitX64LoadFromSplitBase(
+    CodeBuffer& c,
+    uint8_t destination,
+    uint8_t width,
+    int32_t displacement)
+{
+    const uint8_t rex = static_cast<uint8_t>(
+        (width == 8u ? 0x48u : 0x40u) |
+        ((destination & 8u) ? 0x04u : 0u) |
+        ((destination & 8u) ? 0x01u : 0u));
+    c.U8(rex);
+    if (width == 1u) c.Raw({0x0F, 0xB6});
+    else c.U8(0x8B);
+    c.U8(static_cast<uint8_t>(0x80u |
+        ((destination & 7u) << 3u) | (destination & 7u)));
+    if ((destination & 7u) == 4u) c.U8(0x24u);
+    c.U32(static_cast<uint32_t>(displacement));
+}
+
+void EmitX86LoadFromSplitBase(
+    CodeBuffer& c,
+    uint8_t destination,
+    uint8_t width,
+    int32_t displacement)
+{
+    if (width == 1u) c.Raw({0x0F, 0xB6});
+    else c.U8(0x8B);
+    c.U8(static_cast<uint8_t>(0x80u |
+        ((destination & 7u) << 3u) | (destination & 7u)));
+    if ((destination & 7u) == 4u) c.U8(0x24u);
+    c.U32(static_cast<uint32_t>(displacement));
+}
+
 void X64LoadQ(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x49u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            8u, reg, 0xFFu, displacement, addressDisplacement,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX64LoadFromSplitBase(c, reg, 8u, loadDisplacement);
 }
 
 void X64StoreQ(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -376,9 +520,21 @@ void X64StoreQ(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X64LoadD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x41u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            4u, reg, 0xFFu, displacement, addressDisplacement,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX64LoadFromSplitBase(c, reg, 4u, loadDisplacement);
 }
 
 void X64StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -388,9 +544,21 @@ void X64StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X64LoadByte(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x41u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x0F, 0xB6, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            1u, reg, 0xFFu, displacement, addressDisplacement,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX64LoadFromSplitBase(c, reg, 1u, loadDisplacement);
 }
 
 void X64StoreByteImmediate(CodeBuffer& c, uint32_t displacement, uint8_t value) {
@@ -411,13 +579,24 @@ void X64LoadIndexedQ(
     uint8_t index,
     uint32_t displacement)
 {
+    if (destination > 15u || destination == 15u || destination == 4u ||
+        index > 15u || index == 15u || index == 4u) {
+        c.FailEncoding("x64 indexed context load uses an invalid register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Indexed,
+            8u, destination, index, displacement, addressDisplacement,
+            loadDisplacement)) return;
     const uint8_t rex = static_cast<uint8_t>(0x49u |
         ((destination & 8u) ? 0x04u : 0u) |
         ((index & 8u) ? 0x02u : 0u));
-    c.Raw({rex, 0x8B,
+    c.Raw({rex, 0x8D,
         static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)),
         static_cast<uint8_t>(0xC7u | ((index & 7u) << 3u))});
-    c.U32(displacement);
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX64LoadFromSplitBase(c, destination, 8u, loadDisplacement);
 }
 
 void X64StoreIndexedQ(
@@ -436,8 +615,18 @@ void X64StoreIndexedQ(
 }
 
 void X86LoadD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    c.Raw({0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 7u || reg == 7u || reg == 4u) {
+        c.FailEncoding("x86 context load cannot overwrite the context register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X86Direct,
+            4u, reg, 0xFFu, displacement, addressDisplacement,
+            loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX86LoadFromSplitBase(c, reg, 4u, loadDisplacement);
 }
 
 void X86StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -446,8 +635,18 @@ void X86StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X86LoadByte(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    c.Raw({0x0F, 0xB6, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 7u || reg == 7u || reg == 4u) {
+        c.FailEncoding("x86 context load cannot overwrite the context register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X86Direct,
+            1u, reg, 0xFFu, displacement, addressDisplacement,
+            loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX86LoadFromSplitBase(c, reg, 1u, loadDisplacement);
 }
 
 void X86StoreDImmediate(CodeBuffer& c, uint32_t displacement, uint32_t value) {
@@ -474,8 +673,19 @@ void X86StoreByteRegister(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X86LoadIndexedD(CodeBuffer& c, uint8_t destination, uint32_t displacement) {
-    c.Raw({0x8B, static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)), 0xCF});
-    c.U32(displacement);
+    if (destination > 7u || destination == 7u || destination == 4u) {
+        c.FailEncoding("x86 indexed context load uses an invalid register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c,
+            ContextLoadAddressKind::X86IndexedEcx, 4u, destination, 1u,
+            displacement, addressDisplacement, loadDisplacement)) return;
+    c.Raw({0x8D,
+        static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)), 0xCF});
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX86LoadFromSplitBase(c, destination, 4u, loadDisplacement);
 }
 
 void X86StoreIndexedD(CodeBuffer& c, uint32_t displacement, uint8_t source) {
@@ -577,6 +787,7 @@ bool HasBusinessCoreVariant(VM_MICRO_OPCODE semantic) {
         case VM_UOP_DUP:
         case VM_UOP_SWAP:
         case VM_UOP_ROT:
+        case VM_UOP_DROP:
         case VM_UOP_LOAD:
         case VM_UOP_STORE:
         case VM_UOP_ADD:
@@ -1042,10 +1253,21 @@ void X86LoadIndexedDVariant(
     uint8_t index,
     uint32_t displacement)
 {
-    c.Raw({0x8B, static_cast<uint8_t>(0x84u |
+    if (destination > 7u || destination == 7u || destination == 4u ||
+        index > 7u || index == 7u || index == 4u) {
+        c.FailEncoding("x86 indexed context load uses an invalid register");
+        return;
+    }
+    int32_t addressDisplacement = 0;
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c,
+            ContextLoadAddressKind::X86IndexedRegister, 4u, destination, index,
+            displacement, addressDisplacement, loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x84u |
         ((destination & 7u) << 3u)),
         static_cast<uint8_t>(0xC7u | ((index & 7u) << 3u))});
-    c.U32(displacement);
+    c.U32(static_cast<uint32_t>(addressDisplacement));
+    EmitX86LoadFromSplitBase(c, destination, 4u, loadDisplacement);
 }
 
 void X86StoreIndexedDVariant(
@@ -1590,11 +1812,13 @@ void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
                 else if (bytes == 4u) c.Raw({0x89,0x90});
                 else c.Raw({0x48,0x89,0x90});
             }
+            c.U32(displacement);
         } else if (!store) {
             if (bytes == 1u) c.Raw({0x45,0x31,0xD2,0x44,0x8A,0x90});
             else if (bytes == 2u) c.Raw({0x45,0x31,0xD2,0x66,0x44,0x8B,0x90});
             else if (bytes == 4u) c.Raw({0x44,0x8B,0x90});
             else c.Raw({0x4C,0x8B,0x90});
+            c.U32(displacement);
             X64MovRegister(c, 0, 10);
         } else {
             X64MovRegister(c, 10, 2);
@@ -1602,8 +1826,8 @@ void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
             else if (bytes == 2u) c.Raw({0x66,0x44,0x89,0x90});
             else if (bytes == 4u) c.Raw({0x44,0x89,0x90});
             else c.Raw({0x4C,0x89,0x90});
+            c.U32(displacement);
         }
-        c.U32(displacement);
         c.Jmp(done);
     };
     emit(width.width1, 1u); emit(width.width2, 2u);
@@ -1631,18 +1855,20 @@ void EmitX86MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
                 else if (bytes == 2u) c.Raw({0x66,0x89,0x90});
                 else c.Raw({0x89,0x90});
             }
+            c.U32(displacement);
         } else if (!store) {
             if (bytes == 1u) c.Raw({0x31,0xD2,0x8A,0x90});
             else if (bytes == 2u) c.Raw({0x31,0xD2,0x66,0x8B,0x90});
             else c.Raw({0x8B,0x90});
+            c.U32(displacement);
             c.Raw({0x89,0xD0});
         } else {
             c.Raw({0x89,0xD3});
             if (bytes == 1u) c.Raw({0x88,0x98});
             else if (bytes == 2u) c.Raw({0x66,0x89,0x98});
             else c.Raw({0x89,0x98});
+            c.U32(displacement);
         }
-        c.U32(displacement);
         c.Jmp(done);
     };
     emit(width.width1, 1u); emit(width.width2, 2u); emit(width.width4, 4u);
@@ -1811,6 +2037,268 @@ void EmitKeyedContextCopy(
     }
 }
 
+void EmitKeyedPushIpCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 2u);
+    if (x64) {
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
+        else {
+            X64UnaryGroup(c, 3u, 2u);
+            X64BinaryRegister(c, 0x01, 0, 2);
+        }
+        X64BinaryImmediate32(c, 5u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) c.Raw({0x29,0xD0});
+        else c.Raw({0xF7,0xDA,0x01,0xD0});
+        X86BinaryImmediate32(c, 5u, 0u, key);
+    }
+}
+
+void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 4u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x48,0x92});
+        else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.U8(0x92);
+        else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+    }
+}
+
+void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 6u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        X64BinaryImmediate32(c, 6u, 8u, key);
+        if (strategy == 0u) {
+            X64MovRegister(c, 10u, 0u); X64MovRegister(c, 0u, 2u);
+            X64MovRegister(c, 2u, 8u); X64MovRegister(c, 8u, 10u);
+        } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        X64BinaryImmediate32(c, 6u, 8u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        X86BinaryImmediate32(c, 6u, 1u, key);
+        if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
+        else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        X86BinaryImmediate32(c, 6u, 3u, key);
+    }
+}
+
+void EmitKeyedCarryCore(
+    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 1u);
+    if (x64) {
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (!subtract) {
+            if (strategy == 0u) {
+                X64BinaryRegister(c, 0x01, 0u, 2u);
+                X64BinaryRegister(c, 0x01, 0u, 8u);
+            } else {
+                X64BinaryRegister(c, 0x01, 0u, 8u);
+                X64BinaryRegister(c, 0x01, 0u, 2u);
+            }
+        } else if (strategy == 0u) {
+            X64BinaryRegister(c, 0x29, 0u, 2u);
+            X64BinaryRegister(c, 0x29, 0u, 8u);
+        } else {
+            X64BinaryRegister(c, 0x01, 2u, 8u);
+            X64BinaryRegister(c, 0x29, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 5u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (!subtract) {
+            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
+            else c.Raw({0x01,0xC8,0x01,0xD0});
+        } else if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
+        else c.Raw({0x01,0xCA,0x29,0xD0});
+        X86BinaryImmediate32(c, 5u, 0u, key);
+    }
+}
+
+void EmitKeyedBitwiseCore(
+    CodeBuffer& c, bool x64, bool bitwiseOr, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 3u);
+    if (x64) {
+        X64MovRegister(c, 8u, 2u);
+        if (bitwiseOr) X64UnaryGroup(c, 2u, 8u);
+        X64BinaryImmediate32(c, 4u, 8u, key);
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) {
+            X64BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
+        } else {
+            X64UnaryGroup(c, 2u, 0u); X64UnaryGroup(c, 2u, 2u);
+            X64BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
+            X64UnaryGroup(c, 2u, 0u);
+        }
+        X64BinaryRegister(c, 0x31u, 0u, 8u);
+    } else {
+        X86MovRegister(c, 3u, 2u);
+        if (bitwiseOr) X86UnaryGroup(c, 2u, 3u);
+        X86BinaryImmediate32(c, 4u, 3u, key);
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) {
+            X86BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
+        } else {
+            X86UnaryGroup(c, 2u, 0u); X86UnaryGroup(c, 2u, 2u);
+            X86BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
+            X86UnaryGroup(c, 2u, 0u);
+        }
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+    }
+}
+
+void EmitKeyedUnaryCore(
+    CodeBuffer& c, bool x64, bool negate, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 5u);
+    if (x64) {
+        X64BinaryImmediate32(c, negate ? 0u : 6u, 0u, key);
+        if (negate) {
+            if (strategy == 0u) X64UnaryGroup(c, 3u, 0u);
+            else { X64UnaryGroup(c, 2u, 0u); c.Raw({0x48,0xFF,0xC0}); }
+            X64BinaryImmediate32(c, 0u, 0u, key);
+        } else {
+            if (strategy == 0u) X64UnaryGroup(c, 2u, 0u);
+            else X64BinaryRegister(c, 0x31u, 0u, 9u);
+            X64BinaryImmediate32(c, 6u, 0u, key);
+        }
+    } else {
+        X86BinaryImmediate32(c, negate ? 0u : 6u, 0u, key);
+        if (negate) {
+            if (strategy == 0u) X86UnaryGroup(c, 3u, 0u);
+            else c.Raw({0xF7,0xD0,0x40});
+            X86BinaryImmediate32(c, 0u, 0u, key);
+        } else {
+            if (strategy == 0u) X86UnaryGroup(c, 2u, 0u);
+            else { c.Raw({0x33,0x87}); c.U32(CtxMutationScratch); }
+            X86BinaryImmediate32(c, 6u, 0u, key);
+        }
+    }
+}
+
+void EmitKeyedMultiplyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 7u);
+    if (x64) {
+        X64MovImmediate(c, 8u, key);
+        X64MultiplyRegister(c, 8u, 2u);
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) X64MultiplyRegister(c, 0u, 2u);
+        else c.Raw({0x48,0xF7,0xE2});
+        X64BinaryRegister(c, 0x29u, 0u, 8u);
+    } else {
+        X86MovImmediate(c, 3u, key);
+        c.Raw({0x0F,0xAF,0xDA});
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
+        else c.Raw({0xF7,0xE2});
+        X86BinaryRegister(c, 0x29u, 0u, 3u);
+    }
+}
+
+void EmitKeyedLogicalShiftCore(
+    CodeBuffer& c, bool x64, bool shiftRight, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 0u);
+    if (x64) {
+        X64MovImmediate(c, 8u, key);
+        X64BinaryRegister(c, 0x31u, 0u, 8u);
+        c.Raw({0x48,0x89,0xD1});
+        c.Raw({0x4D,0x89,0xCB});
+        c.Raw({0x49,0xC1,0xFB,0x3F});
+        c.Raw({0x49,0x83,0xE3,0x20});
+        c.Raw({0x49,0x83,0xCB,0x1F});
+        c.Raw({0x44,0x20,0xD9});
+        const std::initializer_list<uint8_t> shiftResult = shiftRight
+            ? std::initializer_list<uint8_t>{0x48,0xD3,0xE8}
+            : std::initializer_list<uint8_t>{0x48,0xD3,0xE0};
+        const std::initializer_list<uint8_t> shiftKey = shiftRight
+            ? std::initializer_list<uint8_t>{0x49,0xD3,0xE8}
+            : std::initializer_list<uint8_t>{0x49,0xD3,0xE0};
+        if (strategy == 0u) { c.Raw(shiftResult); c.Raw(shiftKey); }
+        else { c.Raw(shiftKey); c.Raw(shiftResult); }
+        X64BinaryRegister(c, 0x31u, 0u, 8u);
+    } else {
+        X86MovImmediate(c, 3u, key);
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+        c.Raw({0x88,0xD1,0x80,0xE1,0x1F});
+        const std::initializer_list<uint8_t> shiftResult = shiftRight
+            ? std::initializer_list<uint8_t>{0xD3,0xE8}
+            : std::initializer_list<uint8_t>{0xD3,0xE0};
+        const std::initializer_list<uint8_t> shiftKey = shiftRight
+            ? std::initializer_list<uint8_t>{0xD3,0xEB}
+            : std::initializer_list<uint8_t>{0xD3,0xE3};
+        if (strategy == 0u) { c.Raw(shiftResult); c.Raw(shiftKey); }
+        else { c.Raw(shiftKey); c.Raw(shiftResult); }
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+    }
+}
+
+void EmitKeyedFlagsWriteCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 2u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) {
+            X64MovRegister(c, 11u, 1u); X64UnaryGroup(c, 2u, 11u);
+            X64BinaryRegister(c, 0x21u, 0u, 11u);
+            X64BinaryRegister(c, 0x21u, 2u, 1u);
+            X64BinaryRegister(c, 0x09u, 0u, 2u);
+        } else {
+            X64BinaryRegister(c, 0x31u, 2u, 0u);
+            X64BinaryRegister(c, 0x21u, 2u, 1u);
+            X64BinaryRegister(c, 0x31u, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 6u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
+                                   0x21,0xCA,0x09,0xD0});
+        else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+    }
+}
+
+void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 4u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
+        else {
+            X64MovRegister(c, 11u, 10u); X64UnaryGroup(c, 3u, 11u);
+            X64BinaryRegister(c, 0x31u, 2u, 0u);
+            X64BinaryRegister(c, 0x21u, 2u, 11u);
+            X64BinaryRegister(c, 0x31u, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 6u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
+        else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+    }
+}
+
 bool EmitBusinessCoreVariant(
     CodeBuffer& c,
     bool x64,
@@ -1836,19 +2324,17 @@ bool EmitBusinessCoreVariant(
     };
     if (x64) {
         switch (semantic) {
-            case VM_UOP_PUSH_FLAGS:
-                if (strategy == 0u) X64LoadQ(c, 0, CtxVirtualFlags);
-                else {
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags);
-                    c.Raw({0x49,0x8B,0x02});
-                }
+            case VM_UOP_PUSH_FLAGS: {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+                c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
+                if (strategy != 0u) X64BinaryImmediate32(c, 0u, 10u, k1);
+                c.Raw({0x49,0x8B,0x82});
+                c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
                 return true;
+            }
             case VM_UOP_PUSH_IP:
-                if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xDA});
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                }
+                EmitKeyedPushIpCore(c, true, strategy);
                 return true;
             case VM_UOP_PUSH_IMAGE_BASE:
                 {
@@ -1857,9 +2343,9 @@ bool EmitBusinessCoreVariant(
                     const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
                     const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
                     c.Raw({0x4D,0x8D,0x97}); c.U32(CtxImageBase + k0);
-                    X64BinaryImmediate32(c, 0u, 2u, k1);
-                    X64BinaryImmediate32(c, 5u, 2u, k2);
-                    X64BinaryImmediate32(c, 0u, 2u, k3);
+                    X64BinaryImmediate32(c, 0u, 10u, k1);
+                    X64BinaryImmediate32(c, 5u, 10u, k2);
+                    X64BinaryImmediate32(c, 0u, 10u, k3);
                     c.Raw({0x49,0x8B,0x82});
                     c.U32(0u - (k0 + k1 - k2 + k3));
                 }
@@ -1931,14 +2417,27 @@ bool EmitBusinessCoreVariant(
                 EmitKeyedCopyCore(c, true, strategy);
                 return true;
             case VM_UOP_SWAP:
-                if (strategy == 0u) c.Raw({0x48,0x92});
-                else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
+                EmitKeyedSwapCore(c, true, strategy);
                 return true;
             case VM_UOP_ROT:
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 0); X64MovRegister(c, 0, 2);
-                    X64MovRegister(c, 2, 8); X64MovRegister(c, 8, 10);
-                } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
+                EmitKeyedRotateStackCore(c, true, strategy);
+                return true;
+            case VM_UOP_DROP:
+                // DROP owns the now-unused value-stack slot. Scrubbing that
+                // physical slot is part of the semantic state transition, so
+                // both K variants are real equivalent memory lowerings.
+                {
+                    const uint32_t key = CoreAddressKey(c, strategy + 3u);
+                    // r10 = &ctx.values[rcx] + key.  The SIB index is RCX,
+                    // so REX.X must remain clear (0x4D, not 0x4F/r9).
+                    c.Raw({0x4D,0x8D,0x94,0xCF}); c.U32(CtxValues + key);
+                    if (strategy == 0u) {
+                        c.Raw({0x31,0xC0,0x49,0x89,0x82});
+                        c.U32(0u - key);
+                    } else {
+                        c.Raw({0x49,0xC7,0x82}); c.U32(0u - key); c.U32(0u);
+                    }
+                }
                 return true;
             case VM_UOP_LOAD:
                 if (strategy == 0u) EmitX64MemoryVariant(c, false, 0u);
@@ -1952,52 +2451,28 @@ bool EmitBusinessCoreVariant(
                 EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_ADD_CARRY:
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                    X64BinaryRegister(c, 0x01, 0, 8);
-                } else {
-                    X64BinaryRegister(c, 0x01, 0, 8);
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                }
+                EmitKeyedCarryCore(c, true, false, strategy);
                 return true;
             case VM_UOP_SUB:
                 EmitKeyedAddSubCore(c, true, true, strategy);
                 return true;
             case VM_UOP_SUB_BORROW:
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x29, 0, 2);
-                    X64BinaryRegister(c, 0x29, 0, 8);
-                } else {
-                    X64BinaryRegister(c, 0x01, 2, 8);
-                    X64BinaryRegister(c, 0x29, 0, 2);
-                }
+                EmitKeyedCarryCore(c, true, true, strategy);
                 return true;
             case VM_UOP_AND:
-                if (strategy == 0u) X64BinaryRegister(c, 0x21, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xD0,0x48,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    c.Raw({0x48,0xF7,0xD0});
-                }
+                EmitKeyedBitwiseCore(c, true, false, strategy);
                 return true;
             case VM_UOP_OR:
-                if (strategy == 0u) X64BinaryRegister(c, 0x09, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xD0,0x48,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x21, 0, 2);
-                    c.Raw({0x48,0xF7,0xD0});
-                }
+                EmitKeyedBitwiseCore(c, true, true, strategy);
                 return true;
             case VM_UOP_XOR:
                 EmitKeyedXorCore(c, true, strategy);
                 return true;
             case VM_UOP_NOT:
-                if (strategy == 0u) c.Raw({0x48,0xF7,0xD0});
-                else X64BinaryRegister(c, 0x31, 0, 9);
+                EmitKeyedUnaryCore(c, true, false, strategy);
                 return true;
             case VM_UOP_NEG:
-                if (strategy == 0u) c.Raw({0x48,0xF7,0xD8});
-                else c.Raw({0x48,0xF7,0xD0,0x48,0xFF,0xC0});
+                EmitKeyedUnaryCore(c, true, true, strategy);
                 return true;
             case VM_UOP_MUL:
                 // strategy 0: IMUL rax, rdx (two-operand signed multiply).
@@ -2008,8 +2483,7 @@ bool EmitBusinessCoreVariant(
                 // half (discarded here) and flags differ.  This clobbers
                 // rdx, which is safe because a/b were already latched into
                 // r8/r11 before the core runs.
-                if (strategy == 0u) c.Raw({0x48,0x0F,0xAF,0xC2});
-                else c.Raw({0x48,0xF7,0xE2});
+                EmitKeyedMultiplyCore(c, true, strategy);
                 return true;
             case VM_UOP_BIT_TEST:
                 // Common to both strategies: reduce the raw bit-index operand
@@ -2072,6 +2546,8 @@ bool EmitBusinessCoreVariant(
                 }
                 return true;
             case VM_UOP_SHL: {
+                EmitKeyedLogicalShiftCore(c, true, false, strategy);
+                return true;
                 // strategy 0: native SHL rax,cl.
                 // strategy 1: SHLD rax, r10(=0), cl — a zero source makes shld
                 //   pull zeroes into the top, so dst = dst<<cl ≡ SHL.  r10 is
@@ -2087,30 +2563,14 @@ bool EmitBusinessCoreVariant(
                 // `and rax,r9` trims to width).  This is label-free — every byte
                 // is a fixed Raw — so the variant kernel validator's isolated
                 // re-emission matches the inline bytes exactly.
-                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
-                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
-                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
-                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
-                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
-                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
-                if (strategy == 0u) c.Raw({0x48,0xD3,0xE0});      // shl rax, cl
-                else                c.Raw({0x4C,0x0F,0xA5,0xD0}); // shld rax, r10, cl
-                return true;
             }
             case VM_UOP_SHR: {
+                EmitKeyedLogicalShiftCore(c, true, true, strategy);
+                return true;
                 // Same count pre-mask as SHL.
                 // strategy 0: native SHR rax,cl.
                 // strategy 1: SHRD rax, r10(=0), cl pulls zeroes into the bottom
                 //   so dst = dst>>cl ≡ SHR.
-                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
-                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
-                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
-                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
-                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
-                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
-                if (strategy == 0u) c.Raw({0x48,0xD3,0xE8});      // shr rax, cl
-                else                c.Raw({0x4C,0x0F,0xAD,0xD0}); // shrd rax, r10, cl
-                return true;
             }
             case VM_UOP_SAR:
                 if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
@@ -2176,16 +2636,7 @@ bool EmitBusinessCoreVariant(
                 }
                 return true;
             case VM_UOP_FLAGS_WRITE:
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 1); c.Raw({0x49,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x21, 0, 10);
-                    X64BinaryRegister(c, 0x21, 2, 1);
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                } else {
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                    X64BinaryRegister(c, 0x21, 2, 1);
-                    X64BinaryRegister(c, 0x31, 0, 2);
-                }
+                EmitKeyedFlagsWriteCore(c, true, strategy);
                 return true;
             case VM_UOP_FLAGS_UPDATE: {
                 const auto clear = c.NewLabel();
@@ -2256,13 +2707,7 @@ bool EmitBusinessCoreVariant(
                 else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
                 return true;
             case VM_UOP_SELECT:
-                if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
-                else {
-                    X64MovRegister(c, 11, 10); c.Raw({0x49,0xF7,0xDB});
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                    X64BinaryRegister(c, 0x21, 2, 11);
-                    X64BinaryRegister(c, 0x31, 0, 2);
-                }
+                EmitKeyedSelectCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH:
                 EmitKeyedAddSubCore(c, true, false, strategy);
@@ -2293,16 +2738,17 @@ bool EmitBusinessCoreVariant(
     }
 
     switch (semantic) {
-        case VM_UOP_PUSH_FLAGS:
-            if (strategy == 0u) X86LoadD(c, 0, CtxVirtualFlags);
-            else {
-                c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags);
-                c.Raw({0x8B,0x02});
-            }
+        case VM_UOP_PUSH_FLAGS: {
+            const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+            const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+            c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
+            if (strategy != 0u) X86BinaryImmediate32(c, 0u, 2u, k1);
+            c.Raw({0x8B,0x82});
+            c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
             return true;
+        }
         case VM_UOP_PUSH_IP:
-            if (strategy == 0u) c.Raw({0x29,0xD0});
-            else c.Raw({0xF7,0xDA,0x01,0xD0});
+            EmitKeyedPushIpCore(c, false, strategy);
             return true;
         case VM_UOP_PUSH_IMAGE_BASE:
             {
@@ -2383,12 +2829,29 @@ bool EmitBusinessCoreVariant(
             EmitKeyedCopyCore(c, false, strategy);
             return true;
         case VM_UOP_SWAP:
-            if (strategy == 0u) c.Raw({0x92});
-            else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
+            EmitKeyedSwapCore(c, false, strategy);
             return true;
         case VM_UOP_ROT:
-            if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
-            else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
+            EmitKeyedRotateStackCore(c, false, strategy);
+            return true;
+        case VM_UOP_DROP:
+            // ECX is the decremented value depth from X86RequireAndPop. Both
+            // variants scrub the complete eight-byte physical VM stack slot.
+            {
+                const uint32_t key = CoreAddressKey(c, strategy + 3u);
+                // Value decoding may use ECX as a permutation scratch after
+                // X86RequireAndPop stored the decremented depth. Reload the
+                // authoritative depth before using it as the slot index.
+                X86LoadD(c, 1u, CtxValueDepth);
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxValues + key);
+                if (strategy == 0u) {
+                    c.Raw({0x31,0xC0,0x89,0x82}); c.U32(0u - key);
+                    c.Raw({0x89,0x82}); c.U32(4u - key);
+                } else {
+                    c.Raw({0xC7,0x82}); c.U32(0u - key); c.U32(0u);
+                    c.Raw({0xC7,0x82}); c.U32(4u - key); c.U32(0u);
+                }
+            }
             return true;
         case VM_UOP_LOAD:
             if (strategy == 0u) EmitX86MemoryVariant(c, false, 0u);
@@ -2402,41 +2865,34 @@ bool EmitBusinessCoreVariant(
             EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_ADD_CARRY:
-            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
-            else c.Raw({0x01,0xC8,0x01,0xD0});
+            EmitKeyedCarryCore(c, false, false, strategy);
             return true;
         case VM_UOP_SUB:
             EmitKeyedAddSubCore(c, false, true, strategy);
             return true;
         case VM_UOP_SUB_BORROW:
-            if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
-            else c.Raw({0x01,0xCA,0x29,0xD0});
+            EmitKeyedCarryCore(c, false, true, strategy);
             return true;
         case VM_UOP_AND:
-            if (strategy == 0u) c.Raw({0x21,0xD0});
-            else c.Raw({0xF7,0xD0,0xF7,0xD2,0x09,0xD0,0xF7,0xD0});
+            EmitKeyedBitwiseCore(c, false, false, strategy);
             return true;
         case VM_UOP_OR:
-            if (strategy == 0u) c.Raw({0x09,0xD0});
-            else c.Raw({0xF7,0xD0,0xF7,0xD2,0x21,0xD0,0xF7,0xD0});
+            EmitKeyedBitwiseCore(c, false, true, strategy);
             return true;
         case VM_UOP_XOR:
             EmitKeyedXorCore(c, false, strategy);
             return true;
         case VM_UOP_NOT:
-            if (strategy == 0u) c.Raw({0xF7,0xD0});
-            else { c.Raw({0x33,0x87}); c.U32(CtxMutationScratch); }
+            EmitKeyedUnaryCore(c, false, false, strategy);
             return true;
         case VM_UOP_NEG:
-            if (strategy == 0u) c.Raw({0xF7,0xD8});
-            else c.Raw({0xF7,0xD0,0x40});
+            EmitKeyedUnaryCore(c, false, true, strategy);
             return true;
         case VM_UOP_MUL:
             // Same identity as the x64 case: IMUL EAX,EDX vs. MUL EDX give
             // the same truncated 32-bit product in eax; the clobbered edx
             // is safe for the same reason (a/b already latched earlier).
-            if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
-            else c.Raw({0xF7,0xE2});
+            EmitKeyedMultiplyCore(c, false, strategy);
             return true;
         case VM_UOP_BIT_TEST:
             X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
@@ -2491,6 +2947,8 @@ bool EmitBusinessCoreVariant(
             X86StoreD(c, CtxMutationScratch + 4u, 2);
             return true;
         case VM_UOP_SHL: {
+            EmitKeyedLogicalShiftCore(c, false, false, strategy);
+            return true;
             // strategy 0: native SHL eax,cl.  strategy 1: SHLD eax,ebx(=0),cl ≡
             //   SHL (zero source pulls zeroes into the top).  32-bit mode has no
             //   8-byte operand, so every width (1/2/4) masks the count to 5
@@ -2498,29 +2956,13 @@ bool EmitBusinessCoreVariant(
             //   widths (operand zero-extended, outer `and eax,[scratch]` trims
             //   to width).  Label-free so the validator's isolated re-emission
             //   matches byte-for-byte.  ebx is free across EmitX86BinaryAlu.
-            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
-            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
-            if (strategy == 0u) {
-                c.Raw({0xD3,0xE0});        // shl eax, cl
-            } else {
-                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
-                c.Raw({0x0F,0xA5,0xD8});   // shld eax, ebx, cl
-            }
-            return true;
         }
         case VM_UOP_SHR: {
+            EmitKeyedLogicalShiftCore(c, false, true, strategy);
+            return true;
             // Same count pre-mask as SHL.
             // strategy 0: native SHR eax,cl.  strategy 1: SHRD eax,ebx(=0),cl ≡
             //   SHR (zero source pulls zeroes into the bottom).
-            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
-            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
-            if (strategy == 0u) {
-                c.Raw({0xD3,0xE8});        // shr eax, cl
-            } else {
-                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
-                c.Raw({0x0F,0xAD,0xD8});   // shrd eax, ebx, cl
-            }
-            return true;
         }
         case VM_UOP_SAR:
             if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
@@ -2586,10 +3028,7 @@ bool EmitBusinessCoreVariant(
             }
             return true;
         case VM_UOP_FLAGS_WRITE:
-            if (strategy == 0u) {
-                c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
-                       0x21,0xCA,0x09,0xD0});
-            } else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
+            EmitKeyedFlagsWriteCore(c, false, strategy);
             return true;
         case VM_UOP_FLAGS_UPDATE: {
             const auto clear = c.NewLabel();
@@ -2635,8 +3074,7 @@ bool EmitBusinessCoreVariant(
             else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
             return true;
         case VM_UOP_SELECT:
-            if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
-            else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
+            EmitKeyedSelectCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH:
             EmitKeyedAddSubCore(c, false, false, strategy);
@@ -2675,12 +3113,46 @@ bool EmitTrackedBusinessCoreVariant(
     uint32_t& size)
 {
     const uint32_t begin = static_cast<uint32_t>(c.bytes.size());
+    // DeriveBusinessCoreStrategy already guarantees alternating K choices
+    // while letting the build seed choose which physical strategy starts at
+    // K=0.  Re-XORing a handler-local layout bit here could cancel that
+    // alternation and make all four K entries select one fixed lowering.
     if (!EmitBusinessCoreVariant(c, x64, semantic,
-            static_cast<uint8_t>((c.coreSelector.layout ^ strategy) & 1u)))
+            static_cast<uint8_t>(strategy & 1u)))
         return false;
     if (size == 0u) {
         offset = begin;
         size = static_cast<uint32_t>(c.bytes.size()) - begin;
+    }
+    return true;
+}
+
+bool ValidateBusinessCoreStrategyReemission(
+    const VMHandlerSemanticCodegenConfig& config,
+    bool x64,
+    std::string& error)
+{
+    if (!HasBusinessCoreVariant(config.semantic)) return true;
+
+    std::array<std::vector<uint8_t>, 2> emitted{};
+    for (uint8_t strategy = 0;
+         strategy < static_cast<uint8_t>(emitted.size()); ++strategy) {
+        CodeBuffer code;
+        ConfigurePermutationPlans(code, config);
+        if (!EmitBusinessCoreVariant(code, x64, config.semantic, strategy)) {
+            error = "business core strategy could not be re-emitted";
+            return false;
+        }
+        std::string resolveError;
+        if (!code.Resolve(resolveError) || code.bytes.empty()) {
+            error = "business core strategy re-emission is empty or unresolved";
+            return false;
+        }
+        emitted[strategy] = std::move(code.bytes);
+    }
+    if (emitted[0] == emitted[1]) {
+        error = "business core strategies emitted identical bytes";
+        return false;
     }
     return true;
 }
@@ -3630,6 +4102,8 @@ void EmitX64DataSemantic(
             X64PushOne(c, 8, stackFailure); return;
         case VM_UOP_DROP:
             X64RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             return;
         case VM_UOP_LOAD:
             X64RequireAndPop(c, 1, stackFailure); X64ValidateWidth(c, 0, widthFailure);
@@ -3743,6 +4217,8 @@ void EmitX86DataSemantic(
             c.Raw({0x89,0xD8}); X86PushOne(c, 0, stackFailure); return;
         case VM_UOP_DROP:
             X86RequireAndPop(c, 1, stackFailure);
+            EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
+                coreVariantOffset, coreVariantSize);
             return;
         case VM_UOP_LOAD:
             X86RequireAndPop(c, 1, stackFailure); X86ValidateWidth(c, 0, widthFailure);
@@ -5744,6 +6220,9 @@ bool ValidateVMHandlerSemanticVariantKernel(
             std::equal(expected.begin(), expected.end(),
                 result.code.begin() + offset);
     };
+    if (!ValidateBusinessCoreStrategyReemission(config, x64, error)) {
+        return false;
+    }
     if (HasBusinessCoreVariant(config.semantic)) {
         if (!rangeValid(result.semanticCoreVariantOffset,
                 result.semanticCoreVariantSize) ||

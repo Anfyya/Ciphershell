@@ -287,6 +287,84 @@ std::vector<uint8_t> CanonicalPlaintext(const VMHandlerSynthesisResult& result) 
     return bytes;
 }
 
+enum class ExecutedStage {
+    SemanticCore,
+    BusinessWithoutCodec,
+    CoreVariant,
+    ValueCodec,
+};
+
+std::vector<uint8_t> CanonicalExecutedStage(
+    const VMHandlerSynthesisResult& result,
+    ExecutedStage stage)
+{
+    std::vector<uint8_t> bytes;
+    const auto appendRange = [&](const VMSynthesizedHandler& handler,
+                                 uint32_t offset, uint32_t size) {
+        Require(offset <= handler.plaintextBody.size() &&
+                size <= handler.plaintextBody.size() - offset,
+            "handler executed-stage evidence is outside plaintext body");
+        bytes.insert(bytes.end(),
+            handler.plaintextBody.begin() + offset,
+            handler.plaintextBody.begin() + offset + size);
+    };
+    for (const VMSynthesizedHandler* handler : SortedHandlers(result)) {
+        std::vector<uint8_t> stageBytes;
+        if (stage == ExecutedStage::SemanticCore) {
+            const size_t begin = bytes.size();
+            appendRange(*handler, handler->semanticCoreOffset,
+                handler->semanticCoreSize);
+            stageBytes.assign(bytes.begin() + begin, bytes.end());
+            bytes.resize(begin);
+        } else if (stage == ExecutedStage::CoreVariant) {
+            if (handler->semanticCoreVariantSize == 0u) continue;
+            const size_t begin = bytes.size();
+            appendRange(*handler, handler->semanticCoreVariantOffset,
+                handler->semanticCoreVariantSize);
+            stageBytes.assign(bytes.begin() + begin, bytes.end());
+            bytes.resize(begin);
+        } else if (stage == ExecutedStage::ValueCodec) {
+            for (const auto& range : handler->valueCodecRanges) {
+                const size_t begin = bytes.size();
+                appendRange(*handler, range.offset, range.size);
+                stageBytes.insert(stageBytes.end(), bytes.begin() + begin,
+                    bytes.end());
+                bytes.resize(begin);
+            }
+            if (stageBytes.empty()) continue;
+        } else {
+            uint32_t cursor = handler->semanticCoreOffset;
+            const uint32_t end = handler->semanticCoreOffset +
+                handler->semanticCoreSize;
+            for (const auto& range : handler->valueCodecRanges) {
+                Require(range.offset >= cursor && range.offset <= end &&
+                        range.size <= end - range.offset,
+                    "handler value-codec range is outside semantic core");
+                const size_t begin = bytes.size();
+                appendRange(*handler, cursor, range.offset - cursor);
+                stageBytes.insert(stageBytes.end(), bytes.begin() + begin,
+                    bytes.end());
+                bytes.resize(begin);
+                cursor = range.offset + range.size;
+            }
+            const size_t begin = bytes.size();
+            appendRange(*handler, cursor, end - cursor);
+            stageBytes.insert(stageBytes.end(), bytes.begin() + begin,
+                bytes.end());
+            bytes.resize(begin);
+        }
+        bytes.push_back(handler->semantic);
+        bytes.push_back(handler->variant);
+        const uint32_t size = static_cast<uint32_t>(stageBytes.size());
+        bytes.push_back(static_cast<uint8_t>(size));
+        bytes.push_back(static_cast<uint8_t>(size >> 8u));
+        bytes.push_back(static_cast<uint8_t>(size >> 16u));
+        bytes.push_back(static_cast<uint8_t>(size >> 24u));
+        bytes.insert(bytes.end(), stageBytes.begin(), stageBytes.end());
+    }
+    return bytes;
+}
+
 std::unordered_map<uint32_t, size_t> FourGramCounts(const std::vector<uint8_t>& bytes) {
     std::unordered_map<uint32_t, size_t> counts;
     if (bytes.size() < 4) return counts;
@@ -2422,18 +2500,15 @@ void ValidateOneBuild(
         Require(found->second.size() == config.variantCount, "单语义 K 变体数量错误");
         std::set<uint8_t> variants;
         std::set<std::vector<uint8_t>> bodies;
-        std::set<std::array<uint8_t, 4>> assignments;
         std::set<uint32_t> targets;
         for (const VMSynthesizedHandler* handler : found->second) {
             variants.insert(handler->variant);
             bodies.insert(handler->plaintextBody);
-            assignments.insert(handler->registerAssignment);
             targets.insert(dispatchTargets.at(std::make_tuple(
                 handler->semantic, handler->slot, handler->variant)));
         }
         Require(variants.size() == config.variantCount, "K 变体编号重复");
         Require(bodies.size() == config.variantCount, "K 变体机器码并非全部不同");
-        Require(assignments.size() >= 2, "K 变体未改变内部寄存器分配");
         Require(targets.size() == config.variantCount,
             "同一 semantic 的 K selector 未指向 K 个独立 handler 地址");
     }
@@ -2534,6 +2609,78 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
         std::to_string(storedSimilarity));
     const double liveSimilarity = FourGramDiceSimilarity(
         CanonicalPlaintext(buildA), CanonicalPlaintext(buildB));
+    const double semanticCoreSimilarity = FourGramDiceSimilarity(
+        CanonicalExecutedStage(buildA, ExecutedStage::SemanticCore),
+        CanonicalExecutedStage(buildB, ExecutedStage::SemanticCore));
+    const double businessCoreSimilarity = FourGramDiceSimilarity(
+        CanonicalExecutedStage(buildA, ExecutedStage::BusinessWithoutCodec),
+        CanonicalExecutedStage(buildB, ExecutedStage::BusinessWithoutCodec));
+    const double coreVariantSimilarity = FourGramDiceSimilarity(
+        CanonicalExecutedStage(buildA, ExecutedStage::CoreVariant),
+        CanonicalExecutedStage(buildB, ExecutedStage::CoreVariant));
+    const double valueCodecSimilarity = FourGramDiceSimilarity(
+        CanonicalExecutedStage(buildA, ExecutedStage::ValueCodec),
+        CanonicalExecutedStage(buildB, ExecutedStage::ValueCodec));
+    std::cout << "[stage-similarity] arch=" <<
+        static_cast<uint32_t>(architecture) <<
+        " full=" << liveSimilarity <<
+        " semantic_core=" << semanticCoreSimilarity <<
+        " business_without_codec=" << businessCoreSimilarity <<
+        " core_variant=" << coreVariantSimilarity <<
+        " value_codec=" << valueCodecSimilarity << '\n';
+    std::vector<std::string> identicalCoreVariants;
+    const auto orderedA = SortedHandlers(buildA);
+    const auto orderedB = SortedHandlers(buildB);
+    Require(orderedA.size() == orderedB.size(),
+        "两次构建的生产 handler 集合大小不同");
+    for (size_t index = 0; index < orderedA.size(); ++index) {
+        const auto* left = orderedA[index];
+        const auto* right = orderedB[index];
+        Require(left->semantic == right->semantic &&
+                left->variant == right->variant,
+            "两次构建的生产 handler (semantic,K) 集合未精确对齐");
+        Require((left->semanticCoreVariantSize == 0u) ==
+                (right->semanticCoreVariantSize == 0u),
+            "两次构建的同一 (semantic,K) 仅一侧发布业务核心证据");
+        if (left->semanticCoreVariantSize == 0u) continue;
+        const auto leftCore = Slice(left->plaintextBody,
+            left->semanticCoreVariantOffset,
+            left->semanticCoreVariantSize);
+        const auto rightCore = Slice(right->plaintextBody,
+            right->semanticCoreVariantOffset,
+            right->semanticCoreVariantSize);
+        // TRAP is the fail-closed synthesized sentinel and INT3 has one
+        // canonical breakpoint instruction.  Their narrow instruction bytes
+        // are semantically unique; both remain covered by the full live-body
+        // and stored-ciphertext gates above and by their execution tests.
+        const bool uniqueNarrowCore =
+            left->semantic == VM_UOP_TRAP || left->semantic == VM_UOP_INT3;
+        if (!uniqueNarrowCore && leftCore == rightCore) {
+            identicalCoreVariants.push_back(
+                std::to_string(left->semantic) + ":" +
+                std::to_string(left->variant));
+        }
+    }
+    if (!identicalCoreVariants.empty()) {
+        std::string joined;
+        for (const auto& key : identicalCoreVariants) {
+            if (!joined.empty()) joined += ",";
+            joined += key;
+        }
+        std::cout << "[identical-core-variants] arch=" <<
+            static_cast<uint32_t>(architecture) << " keys=" << joined << '\n';
+    }
+    Require(identicalCoreVariants.empty(),
+        "两次构建仍含逐字节相同的必经业务核心 (semantic,K)");
+    Require(valueCodecSimilarity < 0.15,
+        "两次构建的真实 VM 栈 value codec 仍过度相似: " +
+        std::to_string(valueCodecSimilarity));
+    Require(coreVariantSimilarity < 0.35,
+        "两次构建的实际业务 core variant 仍过度相似: " +
+        std::to_string(coreVariantSimilarity));
+    Require(businessCoreSimilarity < 0.35,
+        "两次构建去除 value codec 后的必经业务代码仍过度相似: " +
+        std::to_string(businessCoreSimilarity));
     Require(liveSimilarity < 0.35,
         "两次构建的必经执行 K 变体仍过度相似: " +
         std::to_string(liveSimilarity));
@@ -2571,15 +2718,19 @@ void TestSemanticBodyRejectsFixedCoreEnvelope() {
             Require(RangeInside(variants[variant].code.size(),
                     variants[variant].semanticBodyOffset,
                     variants[variant].semanticBodySize) &&
-                variants[variant].semanticInputPathOffset >=
-                    variants[variant].semanticBodyOffset &&
+                variants[variant].semanticBodyOffset ==
+                    variants[variant].semanticCoreOffset &&
+                variants[variant].semanticBodySize ==
+                    variants[variant].semanticCoreSize &&
+                variants[variant].semanticInputPathSize == 0u &&
+                variants[variant].semanticResultPathSize == 0u &&
                 variants[variant].semanticCoreVariantOffset >=
                     variants[variant].semanticCoreOffset &&
-                variants[variant].semanticResultPathOffset +
-                    variants[variant].semanticResultPathSize ==
-                    variants[variant].semanticBodyOffset +
-                    variants[variant].semanticBodySize,
-                "semantic 输入/核心/结果证据未全部落在 semanticBody");
+                variants[variant].semanticCoreVariantOffset +
+                    variants[variant].semanticCoreVariantSize <=
+                    variants[variant].semanticCoreOffset +
+                    variants[variant].semanticCoreSize,
+                "semantic 业务 core 证据未精确落在必经 semanticBody");
             coreStrategies.insert(variants[variant].semanticCoreStrategy);
         }
         if (coreStrategies.size() == 2u) {
@@ -2592,70 +2743,175 @@ void TestSemanticBodyRejectsFixedCoreEnvelope() {
     Require(foundBothCoreStrategies,
         "测试 seed 未产生两种 NOT 业务核心等价选型");
 
-    std::set<std::array<uint8_t, 4>> registerAssignments;
-    std::set<std::vector<uint8_t>> inputPaths;
-    std::set<std::vector<uint8_t>> resultPaths;
-    const VMHandlerSemanticCodegenResult* mbaVariant = nullptr;
-    uint8_t mbaVariantIndex = 0;
+    std::set<std::vector<uint8_t>> coreVariants;
+    const VMHandlerSemanticCodegenResult* selectedVariant = nullptr;
+    uint8_t selectedVariantIndex = 0;
     for (uint8_t variant = 0; variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
         const auto& generated = variants[variant];
-        registerAssignments.insert(generated.registerAssignment);
-        inputPaths.insert(Slice(generated.code, generated.semanticInputPathOffset,
-            generated.semanticInputPathSize));
-        resultPaths.insert(Slice(generated.code, generated.semanticResultPathOffset,
-            generated.semanticResultPathSize));
+        coreVariants.insert(Slice(generated.code,
+            generated.semanticCoreVariantOffset,
+            generated.semanticCoreVariantSize));
+        Require(generated.valueCodecRanges.size() == 2u &&
+                RangeInside(generated.code.size(),
+                    generated.valueCodecRanges.front().offset,
+                    generated.valueCodecRanges.front().size) &&
+                RangeInside(generated.code.size(),
+                    generated.valueCodecRanges.back().offset,
+                    generated.valueCodecRanges.back().size),
+            "NOT 必经 pop/push 未发布完整 value codec 证据");
         if (generated.semanticCoreStrategy == 1u) {
-            mbaVariant = &generated;
-            mbaVariantIndex = variant;
+            selectedVariant = &generated;
+            selectedVariantIndex = variant;
         }
     }
-    Require(registerAssignments.size() >= 2u &&
-            inputPaths.size() == VM_HANDLER_VARIANT_COUNT &&
-            resultPaths.size() == VM_HANDLER_VARIANT_COUNT,
-        "K 变体未改变 semanticBody 的真实寄存器/MBA 数据路径");
-    Require(mbaVariant != nullptr && mbaVariant->semanticCoreVariantSize == 3u,
-        "缺少可用于固定核心负向门禁的 NOT MBA 变体");
+    Require(coreVariants.size() >= 2u,
+        "K 变体未改变 semanticBody 的真实业务 lowering");
+    Require(selectedVariant != nullptr &&
+            selectedVariant->semanticCoreVariantSize != 0u,
+        "缺少可用于业务核心负向门禁的 NOT 变体");
 
-    // 保留随机前后包络和真实输入/结果路径，只把业务核心退回固定 NOT。
-    // 固定核心语义仍正确，但不再是 seed/variant 选中的 K 变体，必须拒绝。
-    VMHandlerSemanticCodegenResult fixedCore = *mbaVariant;
-    const std::array<uint8_t, 3> canonicalNot = {0x48, 0xF7, 0xD0};
-    std::copy(canonicalNot.begin(), canonicalNot.end(),
-        fixedCore.code.begin() + fixedCore.semanticCoreVariantOffset);
-    selectedConfig.variant = mbaVariantIndex;
-    std::string fixedCoreError;
+    selectedConfig.variant = selectedVariantIndex;
+
+    VMHandlerSemanticCodegenResult tamperedCore = *selectedVariant;
+    tamperedCore.code[tamperedCore.semanticCoreVariantOffset +
+        tamperedCore.semanticCoreVariantSize / 2u] ^= 0x01u;
+    std::string tamperedCoreError;
     Require(!ValidateVMHandlerSemanticVariantKernel(
-            selectedConfig, fixedCore, fixedCoreError) &&
-        fixedCoreError.find("business core") != std::string::npos,
-        "固定语义核心加随机包络错误通过 K 变体验证");
+            selectedConfig, tamperedCore, tamperedCoreError) &&
+        tamperedCoreError.find("business core") != std::string::npos,
+        "篡改 NOT 业务核心后错误通过 K 变体验证");
 
-    VMHandlerSemanticCodegenResult outsideBody = *mbaVariant;
-    outsideBody.semanticInputPathOffset = outsideBody.variantPrefixOffset;
+    // Replace the complete published core while keeping every surrounding
+    // range and metadata intact.  This remains valid for seed-bound cores of
+    // any size and proves the validator does not rely on the historical
+    // three-byte NOT encoding.
+    VMHandlerSemanticCodegenResult replacedCore = *selectedVariant;
+    std::fill(replacedCore.code.begin() +
+            replacedCore.semanticCoreVariantOffset,
+        replacedCore.code.begin() + replacedCore.semanticCoreVariantOffset +
+            replacedCore.semanticCoreVariantSize,
+        static_cast<uint8_t>(0x90u));
+    std::string replacedCoreError;
+    Require(!ValidateVMHandlerSemanticVariantKernel(
+            selectedConfig, replacedCore, replacedCoreError) &&
+        replacedCoreError.find("business core") != std::string::npos,
+        "替换完整 NOT 业务核心后错误通过 K 变体验证");
+
+    VMHandlerSemanticCodegenResult outsideBody = *selectedVariant;
+    outsideBody.semanticCoreVariantOffset =
+        outsideBody.semanticBodyOffset + outsideBody.semanticBodySize;
     std::string outsideBodyError;
     Require(!ValidateVMHandlerSemanticVariantKernel(
             selectedConfig, outsideBody, outsideBodyError) &&
         outsideBodyError.find("semantic") != std::string::npos,
         "验证器错误接受 semanticBody 之外的变体证据");
 
-    VMHandlerSemanticCodegenResult tamperedLiveInput = *mbaVariant;
-    tamperedLiveInput.code[
-        tamperedLiveInput.semanticInputPathOffset +
-        tamperedLiveInput.semanticInputPathSize / 2u] ^= 0x01u;
-    std::string tamperedInputError;
+    VMHandlerSemanticCodegenResult tamperedDecode = *selectedVariant;
+    tamperedDecode.code[
+        tamperedDecode.valueCodecRanges.front().offset +
+        tamperedDecode.valueCodecRanges.front().size / 2u] ^= 0x01u;
+    std::string tamperedDecodeError;
     Require(!ValidateVMHandlerSemanticVariantKernel(
-            selectedConfig, tamperedLiveInput, tamperedInputError) &&
-        tamperedInputError.find("input path") != std::string::npos,
-        "篡改真实输入值可逆 MBA 轮次后仍通过 handler 验证");
+            selectedConfig, tamperedDecode, tamperedDecodeError) &&
+        tamperedDecodeError.find("value codec") != std::string::npos,
+        "篡改真实 VM 栈解码轮次后仍通过 handler 验证");
 
-    VMHandlerSemanticCodegenResult tamperedLiveResult = *mbaVariant;
-    tamperedLiveResult.code[
-        tamperedLiveResult.semanticResultPathOffset +
-        tamperedLiveResult.semanticResultPathSize / 2u] ^= 0x01u;
-    std::string tamperedResultError;
+    VMHandlerSemanticCodegenResult tamperedEncode = *selectedVariant;
+    tamperedEncode.code[
+        tamperedEncode.valueCodecRanges.back().offset +
+        tamperedEncode.valueCodecRanges.back().size / 2u] ^= 0x01u;
+    std::string tamperedEncodeError;
     Require(!ValidateVMHandlerSemanticVariantKernel(
-            selectedConfig, tamperedLiveResult, tamperedResultError) &&
-        tamperedResultError.find("result path") != std::string::npos,
-        "篡改真实结果值可逆 MBA 轮次后仍通过 handler 验证");
+            selectedConfig, tamperedEncode, tamperedEncodeError) &&
+        tamperedEncodeError.find("value codec") != std::string::npos,
+        "篡改真实 VM 栈编码轮次后仍通过 handler 验证");
+}
+
+void TestSemanticSeedConsumesEveryLane() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = architecture;
+        config.semantic = VM_UOP_PUSH_IMAGE_BASE;
+        config.variant = 2u;
+        config.buildSeed = MakeSeed(0x5Au);
+
+        const auto baseline = GenerateVMHandlerSemanticKernel(config);
+        Require(baseline.success,
+            "baseline semantic generation failed for seed-lane test: " +
+            baseline.error);
+        std::string validationError;
+        Require(ValidateVMHandlerSemanticVariantKernel(
+                config, baseline, validationError),
+            "baseline semantic validation failed for seed-lane test: " +
+            validationError);
+        Require(baseline.semanticCoreVariantSize != 0u &&
+                !baseline.valueCodecRanges.empty(),
+            "baseline seed-lane semantic lacks core/value-codec evidence");
+        const auto baselineCore = Slice(baseline.code,
+            baseline.semanticCoreVariantOffset,
+            baseline.semanticCoreVariantSize);
+
+        const auto replay = GenerateVMHandlerSemanticKernel(config);
+        Require(replay.success && replay.code == baseline.code &&
+                replay.semanticCoreVariantOffset ==
+                    baseline.semanticCoreVariantOffset &&
+                replay.semanticCoreVariantSize ==
+                    baseline.semanticCoreVariantSize &&
+                replay.semanticCoreStrategy == baseline.semanticCoreStrategy &&
+                replay.valueCodecRanges.size() ==
+                    baseline.valueCodecRanges.size(),
+            "same seed did not replay identical semantic code/evidence");
+        for (size_t range = 0; range < baseline.valueCodecRanges.size(); ++range) {
+            Require(replay.valueCodecRanges[range].offset ==
+                        baseline.valueCodecRanges[range].offset &&
+                    replay.valueCodecRanges[range].size ==
+                        baseline.valueCodecRanges[range].size,
+                "same seed did not replay identical value-codec ranges");
+        }
+
+        for (size_t lane = 0; lane < 4u; ++lane) {
+            auto mutatedConfig = config;
+            // PUSH_IMAGE_BASE reads buildSeed[semantic] for its diagnostic
+            // register metadata.  Flip the last byte of each lane instead, so
+            // a changed core/codec proves the 256-bit SeedStream itself
+            // consumed that lane.
+            mutatedConfig.buildSeed[lane * sizeof(uint64_t) + 7u] ^= 0x5Au;
+            const auto mutated = GenerateVMHandlerSemanticKernel(mutatedConfig);
+            Require(mutated.success,
+                "semantic generation failed after mutating seed lane " +
+                std::to_string(lane) + ": " + mutated.error);
+            validationError.clear();
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    mutatedConfig, mutated, validationError),
+                "semantic validation failed after mutating seed lane " +
+                std::to_string(lane) + ": " + validationError);
+            Require(mutated.semanticCoreVariantSize != 0u &&
+                    Slice(mutated.code, mutated.semanticCoreVariantOffset,
+                        mutated.semanticCoreVariantSize) != baselineCore,
+                "same (semantic,K) core ignored build-seed lane " +
+                std::to_string(lane));
+            Require(mutated.valueCodecRanges.size() ==
+                    baseline.valueCodecRanges.size(),
+                "seed mutation changed value-codec range count");
+            bool codecChanged = false;
+            for (size_t range = 0;
+                 range < baseline.valueCodecRanges.size(); ++range) {
+                const auto& baseRange = baseline.valueCodecRanges[range];
+                const auto& changedRange = mutated.valueCodecRanges[range];
+                Require(RangeInside(mutated.code.size(), changedRange.offset,
+                            changedRange.size),
+                    "mutated seed published an invalid value-codec range");
+                if (Slice(baseline.code, baseRange.offset, baseRange.size) !=
+                    Slice(mutated.code, changedRange.offset,
+                        changedRange.size)) {
+                    codecChanged = true;
+                }
+            }
+            Require(codecChanged,
+                "value codec ignored build-seed lane " +
+                std::to_string(lane));
+        }
+    }
 }
 
 void Run(const char* name, void (*test)(), int& failures) {
@@ -2685,5 +2941,7 @@ int main() {
     Run("x64 pack-time handler 合成与差异度", &TestX64, failures);
     Run("semanticBody 真 K 变体负向门禁",
         &TestSemanticBodyRejectsFixedCoreEnvelope, failures);
+    Run("semantic seed 256-bit lane coverage",
+        &TestSemanticSeedConsumesEveryLane, failures);
     return failures == 0 ? 0 : 1;
 }
