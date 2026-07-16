@@ -91,6 +91,34 @@ MICRO_EXECUTOR_NATIVE_FLAG_IDENTIFIERS = {
     "__writeeflags",
 }
 
+# 算术标志（CF/PF/AF/ZF/SF/OF）真正的产生/消费点：VM 内部的 pending-flags
+# 记录、lastAlu 快照、materialize 例程本身，以及软件模型执行器里的等价物。
+FLAG_STATE_IDENTIFIERS = {
+    "VM_FLAG_CF", "VM_FLAG_PF", "VM_FLAG_AF", "VM_FLAG_ZF", "VM_FLAG_SF",
+    "VM_FLAG_OF", "VM_FLAG_STATUS_MASK", "VM_FLAG_ARCHITECTURAL_MASK",
+    "CtxPendingFlags", "CtxLastAlu", "CtxVirtualFlags", "CtxFlagMaterializer",
+    "VM_LAZY_FLAGS_RECORD", "MaterializeFlags", "flagMaterializer",
+    "BuildFlagMaterializer",
+}
+
+# ciphershellpro.md §8 点名的 VM_BRIDGE_SIMD/VM_BRIDGE_X87：本仓库里这两个
+# v3 遗留操作码名字已经不存在（LEGACY_COARSE_OPCODES 早已禁止），真正在生产
+# 路径里承担同一职责的是 AVX/x87 原生指令桥接机制——
+# VMInstructionBridgeBuilder 生成的 thunk、VM_INSTRUCTION_BRIDGE_STATE、
+# VM_MICRO_BRIDGE_AVX/X87 掩码位，以及 handler 里触发它的
+# EmitX64/86BridgeExtended。检查必须落在这套真实机制上，而不是继续找一个
+# 已经不存在的旧符号名字。
+BRIDGE_STATE_IDENTIFIERS = {
+    "VM_INSTRUCTION_BRIDGE_STATE", "VMInstructionBridgeBuilder",
+    "VMInstructionBridgeLink", "usesAvx", "usesX87", "VM_MICRO_BRIDGE_AVX",
+    "VM_MICRO_BRIDGE_X87", "VM_MICRO_BRIDGE_KNOWN_MASK",
+    "VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK", "VM_MICRO_BRIDGE_LINKED",
+    "Fxsave", "Fxrstor", "Xsave", "Xrstor", "extendedState",
+    "extendedStateFlags", "EmitX64BridgeExtended", "EmitX86BridgeExtended",
+    "VM_UOP_BRIDGE_EXTENDED", "nativeCallBridge", "CtxNativeCallBridge",
+    "VM_NATIVE_CALL_STATE", "vm_native_call_bridge", "vm_instruction_bridge",
+}
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -224,6 +252,167 @@ def extract_function_body(code: str, name: str) -> str | None:
     if depth != 0:
         return None
     return code[match.end():index - 1]
+
+
+TOP_LEVEL_FUNCTION_RE = re.compile(
+    r"^[A-Za-z_][\w:<>,\*&\s]*?\b([A-Za-z_]\w*)\s*\(([^;{]*)\)\s*"
+    r"(?:const\s*)?(?:noexcept\s*)?\{",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def extract_top_level_functions(code: str) -> list[tuple[str, int, str]]:
+    """Enumerate every brace-matched function definition that starts at
+    column 0, in source order, as (name, start_offset, body).  This
+    codebase's actual formatting convention is that top-level function
+    definitions are never indented and their bodies always are, so column-0
+    reliably separates real function boundaries from nested blocks without
+    needing a real C++ parser."""
+    functions: list[tuple[str, int, str]] = []
+    search_from = 0
+    for match in TOP_LEVEL_FUNCTION_RE.finditer(code):
+        if match.start() < search_from:
+            continue
+        line_start = code.rfind("\n", 0, match.start()) + 1
+        if code[line_start:match.start()].strip(" "):
+            continue
+        depth = 1
+        index = match.end()
+        while index < len(code) and depth > 0:
+            if code[index] == "{":
+                depth += 1
+            elif code[index] == "}":
+                depth -= 1
+            index += 1
+        if depth != 0:
+            continue
+        functions.append((match.group(1), match.start(), code[match.end():index - 1]))
+        search_from = index
+    return functions
+
+
+def split_switch_case_segments(body: str) -> list[str]:
+    """Split a function body into one segment per `switch` case/default label
+    (generalized beyond `switch (semantic)` -- this codebase also dispatches
+    on things like `instruction.opcode`), plus whatever code sits outside
+    any switch.  A single VM_UOP dispatcher legitimately touches both flag
+    state (its ALU cases) and bridge state (its VM_UOP_BRIDGE_EXTENDED case)
+    in the same function; checking the whole function body would flag that
+    as a false co-occurrence, so real closure only makes sense evaluated
+    case-by-case."""
+    segments: list[str] = []
+    outside = body
+    for switch_match in re.finditer(r"switch\s*\([^)]*\)\s*\{", body):
+        depth = 1
+        index = switch_match.end()
+        while index < len(body) and depth > 0:
+            if body[index] == "{":
+                depth += 1
+            elif body[index] == "}":
+                depth -= 1
+            index += 1
+        if depth != 0:
+            continue
+        switch_body = body[switch_match.end():index - 1]
+        outside = outside.replace(body[switch_match.start():index], "")
+        case_matches = list(re.finditer(
+            r"(?:case\s+[A-Za-z_][\w:]*\s*:|default\s*:)", switch_body))
+        if not case_matches:
+            segments.append(switch_body)
+            continue
+        for position, case_match in enumerate(case_matches):
+            end = (case_matches[position + 1].start()
+                   if position + 1 < len(case_matches) else len(switch_body))
+            segments.append(switch_body[case_match.end():end])
+    segments.append(outside)
+    return segments
+
+
+def arithmetic_flags_bridge_closure_gate(root: Path) -> list[Violation]:
+    """静态证明:CF/PF/AF/ZF/SF/OF 的产生或消费,在真正承担 handler 生成/
+    差分执行职责的生产文件里,不存在任何直接依赖 AVX/x87 原生指令桥接
+    (ciphershellpro.md §8 所称的 VM_BRIDGE_SIMD/VM_BRIDGE_X87)的代码路径。
+
+    做法:把每个文件拆成顶层函数,再把每个函数按 switch case 拆成更细的
+    代码段(否则像 EmitBusinessCoreVariant / ExecuteOne 这类同时覆盖全部
+    VM_UOP 的大 switch,会在同一个函数体内同时看到 ALU 分支引用的 flag
+    标识符和 VM_UOP_BRIDGE_EXTENDED 分支引用的 bridge 标识符,产生误报)。
+    对每个代码段分别检查 FLAG_STATE_IDENTIFIERS 与 BRIDGE_STATE_IDENTIFIERS
+    是否同时出现;只要同一段代码里两者都命中,就说明标志位的产生/消费和
+    bridge 状态耦合在了一起,直接判违规。
+
+    再叠加一条字节级正向证据:桥接 thunk 写入 VM_INSTRUCTION_BRIDGE_STATE.
+    rflags 的值必须是编译期固定立即数 0x00000202(仅保留 x86 RFLAGS 位 1
+    的架构常量和 IF),而不是从 VM 自己的 pending/lastAlu 标志状态加载——
+    这样即使两边未来改用同一个标识符名字,数值层面的输入隔离依然可查。
+    """
+    semantic_path = root / "packer" / "transforms" / "vm_handler_semantic_codegen.cpp"
+    entry_path = root / "packer" / "transforms" / "vm_handler_entry_codegen.cpp"
+    bridge_builder_path = root / "packer" / "transforms" / "vm_instruction_bridge_builder.cpp"
+    micro_semantics_path = root / "packer" / "vm" / "micro_semantics.cpp"
+    paths = (semantic_path, entry_path, bridge_builder_path, micro_semantics_path)
+    violations: list[Violation] = []
+    for path in paths:
+        if not path.is_file():
+            violations.append(Violation(
+                path, 1, "arithmetic-flags-bridge-closure",
+                "required source file is missing"))
+    if violations:
+        return violations
+
+    found_flag_evidence = False
+    found_bridge_evidence = False
+    for path in paths:
+        code = strip_comments_and_literals(
+            path.read_text(encoding="utf-8", errors="strict"))
+        for name, start, body in extract_top_level_functions(code):
+            for segment in split_switch_case_segments(body):
+                tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", segment))
+                flag_hits = tokens & FLAG_STATE_IDENTIFIERS
+                bridge_hits = tokens & BRIDGE_STATE_IDENTIFIERS
+                if flag_hits:
+                    found_flag_evidence = True
+                if bridge_hits:
+                    found_bridge_evidence = True
+                if flag_hits and bridge_hits:
+                    line = code.count("\n", 0, start) + 1
+                    violations.append(Violation(
+                        path, line, "arithmetic-flags-bridge-closure",
+                        f"{name}: arithmetic-flag state {sorted(flag_hits)} "
+                        f"and AVX/x87 bridge state {sorted(bridge_hits)} "
+                        "co-occur in the same code path"))
+    if violations:
+        return violations
+    if not found_flag_evidence or not found_bridge_evidence:
+        violations.append(Violation(
+            semantic_path, 1, "arithmetic-flags-bridge-closure",
+            f"gate found no evidence to check against (flags={found_flag_evidence}, "
+            f"bridge={found_bridge_evidence}) -- identifiers likely renamed "
+            "out from under this gate"))
+        return violations
+
+    semantic_code = strip_comments_and_literals(
+        semantic_path.read_text(encoding="utf-8", errors="strict"))
+    rflags_seed_pattern = re.compile(
+        r"c\.Raw\(\{0xB8,0x02,0x02,0x00,0x00\}\);"
+        r"[A-Za-z0-9_]*StoreStack[QD]\(c,(?:stateBase\+)?"
+        r"offsetof\(VM_INSTRUCTION_BRIDGE_STATE,rflags\),0\)")
+    for function_name in ("void EmitX64BridgeExtended", "void EmitX86BridgeExtended"):
+        body = extract_function_body(semantic_code, function_name)
+        if body is None:
+            violations.append(Violation(
+                semantic_path, 1, "arithmetic-flags-bridge-closure",
+                f"could not locate {function_name} to verify its rflags seed"))
+            continue
+        normalized = re.sub(r"\s+", "", body)
+        if not rflags_seed_pattern.search(normalized):
+            violations.append(Violation(
+                semantic_path, 1, "arithmetic-flags-bridge-closure",
+                f"{function_name} does not seed VM_INSTRUCTION_BRIDGE_STATE."
+                "rflags with the fixed architectural constant 0x202 -- the "
+                "bridged native instruction may be inheriting VM arithmetic "
+                "flags as input"))
+    return violations
 
 
 def extract_switch_semantic_blocks(body: str) -> list[str]:
@@ -1240,6 +1429,7 @@ def main() -> int:
     violations.extend(decryptor_coverage_gate(root))
     violations.extend(vm_group_seed_divergence_gate(root))
     violations.extend(dispatch_table_encoding_gate(root))
+    violations.extend(arithmetic_flags_bridge_closure_gate(root))
 
     # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
     # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，
