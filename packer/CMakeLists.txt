@@ -100,6 +100,27 @@ target_link_libraries(ciphershell PRIVATE
     ciphershell_packer
 )
 
+# ============================================================================
+# 微操作比例统计门禁 probe（ciphershellpro.md §8"双射抗性"）
+# ============================================================================
+# 用真实 Disassembler + Translator 跑一批有代表性的 x86-64 函数字节，汇总
+# "x86 指令数 : 生成微操作数"整体比例。Disassembler/Translator 均不触碰任何
+# Windows API，因此这里不像 tests/ 那样挂 WIN32 门槛——tests/scripts/
+# vm_kernel_static_gate.py 直接构建并运行本可执行文件来做静态门禁之外的
+# 统计验证。
+add_executable(vm_micro_op_ratio_probe
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tests/scripts/vm_micro_op_ratio_probe.cpp
+)
+
+target_link_libraries(vm_micro_op_ratio_probe PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(vm_micro_op_ratio_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
 if(MSVC)
     target_compile_options(ciphershell_packer PRIVATE /sdl)
     target_compile_options(ciphershell PRIVATE /sdl /permissive-)

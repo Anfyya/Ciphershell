@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -1121,6 +1123,131 @@ def dispatch_table_encoding_gate(root: Path) -> list[Violation]:
     return violations
 
 
+def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
+    """ciphershellpro.md §8"双射抗性":静态度量"x86 指令 : 微操作"平均比
+    ≥ 阈值，抽样确认无 1:1 粗粒度直译残留。
+
+    tests/test_vm_micro_core.cpp 里已有的检查只在一两个手写的 2~5 条指令
+    的玩具函数上验证过这个比例；那不是"有代表性的样本函数集合"，只是单个
+    孤立测试点。这里做两件事：
+
+    1. 结构性证明 Translator::FinalizeProgram 对 Heavy 密度真的 fail-closed
+       ——ratio 不够就拒绝产出，而不是只记录不阻断。
+    2. 实际构建并运行 tests/scripts/vm_micro_op_ratio_probe.cpp：它用真实
+       的生产 Disassembler + Translator，对一批经汇编器验证过的、覆盖
+       ALU/逻辑/移位/位测试/乘除/分支/循环/cmov/setcc/符号扩展/lea/栈/xchg
+       的代表性 x86-64 函数字节做 Heavy 虚拟化，汇总真实的
+       微操作数:原生指令数整体比例。Disassembler/Translator 都不触碰任何
+       Windows API，所以这一步在 Linux 静态门禁 job 里就能真正跑通，不需要
+       等 Windows-only 的 ctest。
+    """
+    translator_path = root / "packer" / "transforms" / "translator.cpp"
+    probe_path = root / "tests" / "scripts" / "vm_micro_op_ratio_probe.cpp"
+    probe_cmake_path = root / "packer" / "CMakeLists.txt"
+    zydis_cmake_path = root / "third_party" / "zydis" / "CMakeLists.txt"
+    for path in (translator_path, probe_path, probe_cmake_path):
+        if not path.is_file():
+            return [Violation(path, 1, "micro-op-heavy-ratio-statistical-gate",
+                              "required source file is missing")]
+
+    violations: list[Violation] = []
+
+    # 第 1 步：结构性确认 fail-closed 逻辑真的在生产路径里，而不是只有
+    # microOpRatio 字段被算出来但从未拦截任何东西。
+    translator_code = strip_comments_and_literals(
+        translator_path.read_text(encoding="utf-8", errors="strict"))
+    finalize_body = extract_function_body(
+        translator_code, "bool Translator::FinalizeProgram")
+    finalize_norm = re.sub(r"\s+", "", finalize_body or "")
+    required_fail_closed = (
+        "if(result.density==VMMicroDensity::Heavy&&"
+        "result.microOpRatio<static_cast<double>(m_config.heavyMinimumRatio)){"
+        "returnfalse;}")
+    if required_fail_closed not in finalize_norm:
+        violations.append(Violation(
+            translator_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "Translator::FinalizeProgram no longer fail-closes a Heavy "
+            "translation whose microOpRatio is below heavyMinimumRatio"))
+    if "result.microOpCount=static_cast<uint32_t>(result.instructions.size())" \
+            not in finalize_norm or \
+       "result.microOpRatio=result.nativeInstructionCount==0" not in finalize_norm:
+        violations.append(Violation(
+            translator_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "Translator::FinalizeProgram no longer computes microOpCount/"
+            "microOpRatio from the real emitted instruction stream"))
+    if violations:
+        return violations
+
+    # 第 2 步：真正构建并运行 probe，而不是只检查它的源码存在。
+    if not zydis_cmake_path.is_file():
+        return [Violation(
+            zydis_cmake_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "third_party/zydis submodule is not checked out -- run "
+            "`git submodule update --init --recursive` before this gate "
+            "can build the real Translator")]
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "cmake is not available -- cannot build the real Disassembler/"
+            "Translator to measure the ratio on representative samples")]
+
+    build_dir = root / "build_vm_micro_op_ratio_gate"
+    configure = subprocess.run(
+        [cmake, "-S", str(root), "-B", str(build_dir),
+         "-DCMAKE_BUILD_TYPE=Release"],
+        capture_output=True, text=True, timeout=300)
+    if configure.returncode != 0:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "cmake configure failed:\n" + configure.stdout[-4000:] +
+            configure.stderr[-4000:])]
+
+    build = subprocess.run(
+        [cmake, "--build", str(build_dir),
+         "--target", "vm_micro_op_ratio_probe", "-j"],
+        capture_output=True, text=True, timeout=900)
+    if build.returncode != 0:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "building vm_micro_op_ratio_probe against the real Translator "
+            "failed:\n" + build.stdout[-4000:] + build.stderr[-4000:])]
+
+    exe = build_dir / "bin" / "vm_micro_op_ratio_probe"
+    if not exe.is_file():
+        exe = build_dir / "bin" / "vm_micro_op_ratio_probe.exe"
+    if not exe.is_file():
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"build succeeded but the probe executable was not found under {build_dir / 'bin'}")]
+
+    run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
+    output = run.stdout + run.stderr
+    aggregate_match = re.search(
+        r"\[aggregate\] samples=(\d+) native=(\d+) micro=(\d+) "
+        r"ratio=([\d.]+) threshold=(\d+)", output)
+    if run.returncode != 0 or "VM_MICRO_RATIO_PROBE_PASS" not in output or \
+            aggregate_match is None:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "representative-sample ratio probe did not pass:\n" + output[-4000:])]
+
+    samples = int(aggregate_match.group(1))
+    aggregate_ratio = float(aggregate_match.group(4))
+    threshold = int(aggregate_match.group(5))
+    if samples < 10:
+        violations.append(Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"only {samples} representative samples produced statistics -- "
+            "not enough to call this a representative sample set"))
+    if aggregate_ratio < float(threshold):
+        violations.append(Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"aggregate ratio {aggregate_ratio} across {samples} "
+            f"representative samples is below the {threshold}:1 threshold"))
+    return violations
+
+
 def decryptor_coverage_gate(root: Path) -> list[Violation]:
     """Verify production choice cardinality, exact-byte self-validation and
     exhaustive native execution coverage.  Digest/result field names alone do
@@ -1430,6 +1557,7 @@ def main() -> int:
     violations.extend(vm_group_seed_divergence_gate(root))
     violations.extend(dispatch_table_encoding_gate(root))
     violations.extend(arithmetic_flags_bridge_closure_gate(root))
+    violations.extend(micro_op_heavy_ratio_statistical_gate(root))
 
     # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
     # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，
