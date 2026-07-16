@@ -1666,6 +1666,24 @@ int main(int argc, char* argv[]) {
                           << " raw=0x" << outcome.runtimeResult.sectionRawOffset
                           << " size=0x" << outcome.runtimeResult.sectionSize
                           << " entry=0x" << outcome.runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+                // ciphershellpro.md §8 "Per-build 差异度":opcodeMapDigest/
+                // handlerBodyDigest(明文 handler 体哈希，见
+                // VMHandlerSynthesizer::Synthesize 里对 ExtractPlaintextBodies
+                // 结果取的哈希，不受本次加密 key 影响)/dispatchKeyDigest/
+                // variantSelectorDigest 这四个值 VMRuntimeBuilder 自检时已经算
+                // 好；encryptedHandlers 是相对 sectionRVA 的真实 handler 密文
+                // 字节范围。这里原样打印出来，供 CI 的两次构建相似度校验直接
+                // 解析，不需要再新增一条单独的落盘协议。
+                std::cout << "VM_RUNTIME_DIGESTS vm_group=" << g << std::hex
+                          << " opcode_map=0x" << outcome.runtimeResult.opcodeMapDigest
+                          << " handler_body=0x" << outcome.runtimeResult.handlerBodyDigest
+                          << " dispatch_key=0x" << outcome.runtimeResult.dispatchKeyDigest
+                          << " variant_selector=0x" << outcome.runtimeResult.variantSelectorDigest
+                          << " encrypted_handlers_offset=0x"
+                          << outcome.runtimeResult.integrityExpectation.encryptedHandlers.offset
+                          << " encrypted_handlers_size=0x"
+                          << outcome.runtimeResult.integrityExpectation.encryptedHandlers.size
+                          << std::dec << std::endl;
                 std::cout << "VM_METADATA_SECTION vm_group=" << g << " rva=0x" << std::hex
                           << outcome.emitResult.sectionRVA
                           << " raw=0x" << outcome.emitResult.sectionRawOffset

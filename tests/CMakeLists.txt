@@ -129,6 +129,16 @@ set_target_properties(hello_world_sample PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
 )
 
+# 手动 VM 测试样本：5 个 extern "C" noinline 函数，全部从 main 直接调用，
+# 不会被内联/消除。vm_per_build_similarity_gate 用它做两次独立构建对比。
+add_executable(vm_manual_x64_sample
+    samples/vm_manual_x64_sample.cpp
+)
+
+set_target_properties(vm_manual_x64_sample PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
 add_executable(test_e2e_packaging
     test_e2e_packaging.cpp
 )
@@ -206,3 +216,21 @@ add_test(
         --source-root "${CMAKE_SOURCE_DIR}"
 )
 set_tests_properties(vm_kernel_static_gate PROPERTIES LABELS "vm;hard-gate")
+
+# ciphershellpro.md §8 "Per-build 差异度":同一份输入用两次真实、独立
+# seed 的完整构建，比较 handler 密文字节相似度必须 < 15%，且 opcode map/
+# 分发键/微操作选择四个自检摘要两两不同。ciphershell.exe 只处理 PE，
+# 这条门禁只在这个 Windows-only 的 tests/CMakeLists.txt 里注册，不会在
+# Linux 静态门禁 job 里出现。
+add_test(
+    NAME vm_per_build_similarity_gate
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vm_per_build_similarity_gate.py"
+        --ciphershell "$<TARGET_FILE:ciphershell>"
+        --sample "$<TARGET_FILE:vm_manual_x64_sample>"
+        --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
+)
+set_tests_properties(vm_per_build_similarity_gate PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 300
+)
