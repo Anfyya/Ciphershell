@@ -1033,6 +1033,15 @@ int main(int argc, char* argv[]) {
         if (!discoveryResult.success) {
             std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
                       << discoveryResult.error << std::endl;
+            // discoveryResult.error 只是最终的汇总性失败（比如"没有发现任何
+            // 可信函数边界"）；success=false 时上面这一条会直接 return，之前
+            // 每个候选 root 具体为什么被拒绝（issues）从未被打印过，诊断时
+            // 完全看不到中间过程。这里补上，纯诊断，不改变任何判定逻辑。
+            for (const auto& issue : discoveryResult.issues) {
+                std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x"
+                          << std::hex << issue.rva << std::dec
+                          << " reason=" << issue.reason << std::endl;
+            }
             PrintFeatureStatus("vm", "failed", discoveryResult.error);
             return 1;
         }
