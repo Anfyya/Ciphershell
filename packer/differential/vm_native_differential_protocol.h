@@ -20,6 +20,7 @@ namespace CipherShell {
  * File layout:
  *   [VMNativeDifferentialRequestHeader]
  *   [native code bytes]                    nativeCodeSize
+ *   [native RIP-relative code fixups]      nativeCodeFixupsCount * sizeof(VMNativeDifferentialCodeFixup)
  *   [corpus memory, pre-execution]         memorySize
  *   [vm bytecode, with forced trailing
  *    FLAGS_MATERIALIZE before RET/EXIT]    vmBytecodeSize
@@ -35,7 +36,8 @@ namespace CipherShell {
 
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_REQUEST_MAGIC = 0x43534E44u;  /* "CSND" */
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_RESPONSE_MAGIC = 0x43534E52u; /* "CSNR" */
-constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 1u;
+constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 2u;
+constexpr uint32_t VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE = 64u * 1024u * 1024u;
 
 #pragma pack(push, 1)
 
@@ -57,6 +59,8 @@ struct VMNativeDifferentialRequestHeader {
 
     uint32_t nativeCodeOffset = 0;
     uint32_t nativeCodeSize = 0;
+    uint32_t nativeCodeFixupsOffset = 0;
+    uint32_t nativeCodeFixupsCount = 0;
     uint32_t corpusMemoryOffset = 0;
     uint32_t vmBytecodeOffset = 0;
     uint32_t vmBytecodeSize = 0;
@@ -67,6 +71,19 @@ struct VMNativeDifferentialRequestHeader {
     uint32_t handlerUnwindOffset = 0;
     uint32_t handlerUnwindCount = 0;
     uint64_t totalFileSize = 0;
+};
+
+enum : uint8_t {
+    VM_NATIVE_CODE_FIXUP_RIP_REL32 = 1u
+};
+
+struct VMNativeDifferentialCodeFixup {
+    uint32_t fieldOffset = 0;
+    uint32_t nextInstructionOffset = 0;
+    uint32_t targetRVA = 0;
+    uint8_t kind = 0;
+    uint8_t fieldSize = 0;
+    uint16_t reserved = 0;
 };
 
 struct VMNativeDifferentialRelocation {

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #ifdef _WIN32
@@ -60,6 +61,7 @@ bool EnsureNativeVectoredHandlerRegistered() {
 bool RunNativeHalf(
     const VMNativeDifferentialRequestHeader& header,
     const uint8_t* nativeCode,
+    const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     uint8_t* corpusMemory,
     VMNativeDifferentialWorkerOutcome& outcome,
     std::string& error)
@@ -74,13 +76,54 @@ bool RunNativeHalf(
         return false;
     }
 
-    void* codeBuffer = VirtualAlloc(nullptr, header.nativeCodeSize,
+    void* preferredCodeBase = nullptr;
+    if (header.nativeCodeFixupsCount != 0u) {
+        const uint64_t afterCorpus = header.memoryBase + header.memorySize;
+        if (afterCorpus < header.memoryBase ||
+            afterCorpus > (std::numeric_limits<uintptr_t>::max)() - 0xFFFFu) {
+            error = "native differential near-code allocation address overflows";
+            return false;
+        }
+        const uintptr_t aligned = (static_cast<uintptr_t>(afterCorpus) + 0xFFFFu) &
+            ~static_cast<uintptr_t>(0xFFFFu);
+        preferredCodeBase = reinterpret_cast<void*>(aligned);
+    }
+    void* codeBuffer = VirtualAlloc(preferredCodeBase, header.nativeCodeSize,
         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!codeBuffer) {
-        error = "native differential worker could not allocate the native code buffer";
+        error = header.nativeCodeFixupsCount == 0u
+            ? "native differential worker could not allocate the native code buffer"
+            : "native differential worker could not allocate native code within RIP-rel32 range";
         return false;
     }
     std::memcpy(codeBuffer, nativeCode, header.nativeCodeSize);
+    for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
+        const VMNativeDifferentialCodeFixup& fixup = nativeCodeFixups[index];
+        if (fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32 ||
+            fixup.fieldSize != 4u || fixup.reserved != 0u ||
+            fixup.fieldOffset > header.nativeCodeSize ||
+            4u > header.nativeCodeSize - fixup.fieldOffset ||
+            fixup.nextInstructionOffset > header.nativeCodeSize ||
+            fixup.targetRVA >= header.memorySize) {
+            VirtualFree(codeBuffer, 0, MEM_RELEASE);
+            error = "native differential RIP-relative fixup is malformed";
+            return false;
+        }
+        const uint64_t target = header.memoryBase + fixup.targetRVA;
+        const uint64_t next = reinterpret_cast<uintptr_t>(codeBuffer) +
+            fixup.nextInstructionOffset;
+        const int64_t displacement = static_cast<int64_t>(target) -
+            static_cast<int64_t>(next);
+        if (displacement < (std::numeric_limits<int32_t>::min)() ||
+            displacement > (std::numeric_limits<int32_t>::max)()) {
+            VirtualFree(codeBuffer, 0, MEM_RELEASE);
+            error = "native differential RIP-relative target exceeds signed disp32 range";
+            return false;
+        }
+        const int32_t encoded = static_cast<int32_t>(displacement);
+        std::memcpy(static_cast<uint8_t*>(codeBuffer) + fixup.fieldOffset,
+            &encoded, sizeof(encoded));
+    }
     DWORD oldProtect = 0;
     if (!VirtualProtect(codeBuffer, header.nativeCodeSize, PAGE_EXECUTE_READ, &oldProtect) ||
         !FlushInstructionCache(GetCurrentProcess(), codeBuffer, header.nativeCodeSize)) {
@@ -94,9 +137,10 @@ bool RunNativeHalf(
     state.rflags = header.initialRflags;
     state.entryPoint = reinterpret_cast<uint64_t>(codeBuffer);
 
-    // entryPoint is entered with a genuine CALL so its own RET works, which
-    // writes a native-pointer-sized return address (into this worker's own
-    // trampoline, never dereferenced by entryPoint) just below initialGpr[4].
+    // entryPoint is entered with a genuine CALL so its own RET works.  The
+    // assembly trampoline invokes from initialGpr[4] + pointerSize, therefore
+    // CALL writes its return address at initialGpr[4] and the callee observes
+    // exactly initialGpr[4] as its architectural entry SP, matching the VM.
     // That is an artifact of how this harness invokes the function, not a
     // side effect the function itself produced, so it must not appear in
     // the memory snapshot compared against the VM side, which never
@@ -109,7 +153,7 @@ bool RunNativeHalf(
 #endif
     uint8_t returnSlotSaved[kReturnSlotSize] = {};
     uint8_t* returnSlot = nullptr;
-    const uint64_t returnSlotAddress = header.initialGpr[4] - kReturnSlotSize;
+    const uint64_t returnSlotAddress = header.initialGpr[4];
     if (returnSlotAddress >= header.memoryBase &&
         returnSlotAddress <= header.memoryBase + header.memorySize - kReturnSlotSize) {
         returnSlot = corpusMemory + (returnSlotAddress - header.memoryBase);
@@ -362,6 +406,7 @@ bool RunVmHalf(
 bool RunNativeDifferentialWorkerCase(
     const VMNativeDifferentialRequestHeader& header,
     const uint8_t* nativeCode,
+    const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* corpusMemory,
     const uint8_t* vmBytecode,
     const uint8_t* handlerImage,
@@ -371,6 +416,16 @@ bool RunNativeDifferentialWorkerCase(
     std::string& error)
 {
     outcome = VMNativeDifferentialWorkerOutcome{};
+    if (header.memorySize < 0x1000u ||
+        header.memorySize > VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE ||
+        (header.nativeCodeFixupsCount != 0u && !nativeCodeFixups) ||
+        (!header.architectureIsX64 &&
+         (header.memoryBase > (std::numeric_limits<uint32_t>::max)() ||
+          header.memorySize + 16u >
+            (std::numeric_limits<uint32_t>::max)() - header.memoryBase))) {
+        error = "native differential worker received an invalid corpus/fixup range";
+        return false;
+    }
 
     void* nativeMemory = VirtualAlloc(
         reinterpret_cast<void*>(static_cast<uintptr_t>(header.memoryBase)),
@@ -381,7 +436,8 @@ bool RunNativeDifferentialWorkerCase(
         return false;
     }
     std::memcpy(nativeMemory, corpusMemory, header.memorySize);
-    if (!RunNativeHalf(header, nativeCode, static_cast<uint8_t*>(nativeMemory), outcome, error)) {
+    if (!RunNativeHalf(header, nativeCode, nativeCodeFixups,
+            static_cast<uint8_t*>(nativeMemory), outcome, error)) {
         VirtualFree(nativeMemory, 0, MEM_RELEASE);
         return false;
     }
@@ -412,6 +468,7 @@ bool RunNativeDifferentialWorkerCase(
 bool RunNativeDifferentialWorkerCase(
     const VMNativeDifferentialRequestHeader&,
     const uint8_t*,
+    const VMNativeDifferentialCodeFixup*,
     const uint8_t*,
     const uint8_t*,
     const uint8_t*,

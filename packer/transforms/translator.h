@@ -45,6 +45,11 @@ struct TranslationResult {
     uint32_t totalSize = 0;
     uint32_t registerCount = 0;
     uint32_t returnStackCleanup = 0;
+    // Conservative architectural flag bits defined on every terminal path.
+    // Concrete model/native corpus comparisons refine this per execution path
+    // with the oracle's dynamic undefined mask, so defined-path mismatches are
+    // never hidden by another path where the same flag is ISA-undefined.
+    uint64_t observableRflagsMask = VM_FLAG_ARCHITECTURAL_MASK;
     uint32_t nativeInstructionCount = 0;
     uint32_t microOpCount = 0;
     double microOpRatio = 0.0;
@@ -82,6 +87,10 @@ struct VMIRModelPreflightConfig {
     uint64_t corpusSeed = 0xD1B54A32D192ED03ULL;
     uint32_t corpusCount = 256;
     uint32_t memorySize = 0x10000;
+    // File/image-relative operands must stay below this boundary. Zero uses
+    // half the corpus for unit fixtures; production passes the exact rounded
+    // image span and reserves the remainder for scratch/stack state.
+    uint32_t imageSize = 0;
     uint32_t maxSteps = 1000000;
     // 纯粹的调用方标注：这次校验是替哪个 VM Variant Group 跑的。Verify()
     // 逐字节把它抄进 result，不参与任何校验逻辑本身——只是为了让日志/未来
@@ -164,6 +173,7 @@ struct VMNativeDifferentialConfig {
     uint64_t corpusSeed = 0xD1B54A32D192ED03ULL;
     uint32_t corpusCount = 256;
     uint32_t memorySize = 0x10000;
+    uint32_t imageSize = 0;
     uint32_t timeoutMilliseconds = 1000;
     uint64_t expectedHandlerImageDigest = 0;
     const VMNativeDifferentialEvidenceProvider* evidenceProvider = nullptr;
@@ -282,7 +292,10 @@ private:
     std::vector<const OperandIR*> SemanticOperands(const InstructionIR& instruction) const;
     uint8_t MapRegisterFamily(uint8_t family) const;
     VM_CONDITION MapCondition(BranchKind branchKind) const;
-    bool ValidateFlagDataflow(const Function& function, uint32_t& terminalReturnStackCleanup);
+    bool ValidateFlagDataflow(
+        const Function& function,
+        uint32_t& terminalReturnStackCleanup,
+        uint64_t& observableRflagsMask);
     bool FailInstruction(const InstructionIR& instruction, const std::string& reason);
     static std::string FormatInstructionBytes(const InstructionIR& instruction);
 

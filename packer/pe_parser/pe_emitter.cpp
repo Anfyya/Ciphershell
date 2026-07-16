@@ -643,10 +643,20 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
     PEAppendSectionResult* sectionResult,
     std::string* error)
 {
-    if (!IsValid() || !sectionName || additionalEntries.empty()) {
-        if (error) *error = "base relocation rebuild requires a valid image and fixup list";
+    if (!IsValid() || !sectionName) {
+        if (error) *error = "base relocation rebuild requires a valid image and section name";
         return false;
     }
+    const uint16_t expectedType = m_image->is64Bit
+        ? IMAGE_REL_BASED_DIR64
+        : IMAGE_REL_BASED_HIGHLOW;
+    const uint32_t pointerWidth = m_image->is64Bit ? 8u : 4u;
+    const WORD dllCharacteristics = m_image->is64Bit
+        ? m_image->ntHeaders64->OptionalHeader.DllCharacteristics
+        : m_image->ntHeaders32->OptionalHeader.DllCharacteristics;
+    const bool dynamicBase =
+        (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0;
+
     std::vector<CS_RELOC_ENTRY> entries = m_image->relocs.entries;
     entries.insert(entries.end(), additionalEntries.begin(), additionalEntries.end());
     for (auto& entry : entries) {
@@ -657,14 +667,60 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
         const uint32_t rva = static_cast<uint32_t>(entry.fullRVA);
         entry.pageRVA = rva & ~0xFFFu;
         entry.offset = static_cast<uint16_t>(rva & 0x0FFFu);
-        const bool typeValid = m_image->is64Bit
-            ? entry.type == IMAGE_REL_BASED_DIR64
-            : entry.type == IMAGE_REL_BASED_HIGHLOW;
-        if (!typeValid || RvaToOffset(rva) == 0) {
+        const uint32_t sizeOfHeaders = GetSizeOfHeaders();
+        const bool headerTarget = rva != 0u && rva < sizeOfHeaders &&
+            pointerWidth <= sizeOfHeaders - rva &&
+            PEUtils::CheckRawBounds(m_image, rva, pointerWidth);
+        if (entry.type != expectedType ||
+            (!headerTarget &&
+             !PEUtils::IsFileBackedSpan(m_image, rva, pointerWidth))) {
             if (error) *error = "base relocation contains an unsupported type or unmapped target";
             return false;
         }
     }
+
+    // A DYNAMIC_BASE image must never leave this function with an empty
+    // relocation directory.  When all original relocations were consumed by
+    // protected native bytes and no runtime relocation was added, preserve
+    // ASLR by materialising one genuine pointer-sized, read-only initialized
+    // datum containing the preferred ImageBase.  The loader rebases this
+    // anchor through the ordinary HIGHLOW/DIR64 machinery.
+    //
+    // The anchor and its relocation table share one newly appended section.
+    // AppendSection is transactional, so an allocation/layout failure cannot
+    // strand a successfully appended anchor without a usable relocation
+    // directory (or vice versa).
+    std::vector<uint8_t> sectionPrefix;
+    uint32_t anchorRVA = 0;
+    if (entries.empty() && dynamicBase) {
+        std::string predictError;
+        if (!PredictNextSectionRVA(anchorRVA, &predictError) ||
+            anchorRVA > (std::numeric_limits<uint32_t>::max)() - pointerWidth) {
+            if (error) {
+                *error = predictError.empty()
+                    ? "ASLR relocation anchor RVA overflows"
+                    : "unable to place ASLR relocation anchor: " + predictError;
+            }
+            return false;
+        }
+
+        const uint64_t preferredImageBase = PEUtils::ImageBase(m_image);
+        if (!m_image->is64Bit &&
+            preferredImageBase > (std::numeric_limits<uint32_t>::max)()) {
+            if (error) *error = "PE32 preferred ImageBase exceeds pointer width";
+            return false;
+        }
+        sectionPrefix.resize(pointerWidth, 0);
+        std::memcpy(sectionPrefix.data(), &preferredImageBase, pointerWidth);
+
+        CS_RELOC_ENTRY anchor{};
+        anchor.fullRVA = anchorRVA;
+        anchor.pageRVA = anchorRVA & ~0xFFFu;
+        anchor.offset = static_cast<uint16_t>(anchorRVA & 0x0FFFu);
+        anchor.type = expectedType;
+        entries.push_back(anchor);
+    }
+
     std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
         if (left.fullRVA != right.fullRVA) return left.fullRVA < right.fullRVA;
         return left.type < right.type;
@@ -672,6 +728,20 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
     entries.erase(std::unique(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
         return left.fullRVA == right.fullRVA && left.type == right.type;
     }), entries.end());
+
+    // Only a genuinely fixed-base image may discard an empty relocation
+    // directory.  DYNAMIC_BASE images have received the anchor above.
+    if (entries.empty()) {
+        PEUtils::SetDataDirectory(m_image, IMAGE_DIRECTORY_ENTRY_BASERELOC, 0u, 0u);
+        if (m_image->is64Bit) {
+            m_image->ntHeaders64->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        } else {
+            m_image->ntHeaders32->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        }
+        m_image->relocs.entries.clear();
+        if (sectionResult) *sectionResult = {};
+        return true;
+    }
 
     std::vector<uint8_t> table;
     size_t index = 0;
@@ -702,14 +772,52 @@ bool PEEmitter::RebuildBaseRelocationDirectory(
         index = end;
     }
 
-    PEAppendSectionResult appended = AppendSection(sectionName, table,
-        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
+    if (table.size() > (std::numeric_limits<uint32_t>::max)() -
+            sectionPrefix.size()) {
+        if (error) *error = "base relocation section exceeds PE limits";
+        return false;
+    }
+    std::vector<uint8_t> sectionData;
+    sectionData.reserve(sectionPrefix.size() + table.size());
+    sectionData.insert(sectionData.end(), sectionPrefix.begin(), sectionPrefix.end());
+    sectionData.insert(sectionData.end(), table.begin(), table.end());
+
+    uint32_t relocationDirectoryRVA = 0;
+    if (!sectionPrefix.empty() &&
+        anchorRVA > (std::numeric_limits<uint32_t>::max)() -
+            static_cast<uint32_t>(sectionPrefix.size())) {
+        if (error) *error = "ASLR relocation directory RVA overflows";
+        return false;
+    }
+
+    // A synthetic anchor is real initialized data and therefore remains
+    // read-only/non-discardable.  Ordinary relocation-only sections retain
+    // the conventional discardable attribute.
+    uint32_t characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    if (sectionPrefix.empty()) characteristics |= IMAGE_SCN_MEM_DISCARDABLE;
+    PEAppendSectionResult appended = AppendSection(sectionName, sectionData, characteristics);
     if (!appended.success) {
         if (error) *error = appended.error;
         return false;
     }
+    if (!sectionPrefix.empty() && appended.rva != anchorRVA) {
+        // PredictNextSectionRVA and AppendSection derive the same value from
+        // an unchanged image.  Treat any future divergence as a poisoned
+        // image instead of emitting a relocation that targets the wrong RVA.
+        m_image->isValid = FALSE;
+        m_image->errorMessage = "ASLR relocation anchor placement changed during append";
+        if (error) *error = m_image->errorMessage;
+        return false;
+    }
+    if (!CheckedAdd(appended.rva, static_cast<uint32_t>(sectionPrefix.size()),
+            relocationDirectoryRVA)) {
+        m_image->isValid = FALSE;
+        m_image->errorMessage = "ASLR relocation directory RVA overflowed after append";
+        if (error) *error = m_image->errorMessage;
+        return false;
+    }
     PEUtils::SetDataDirectory(m_image, IMAGE_DIRECTORY_ENTRY_BASERELOC,
-        appended.rva, static_cast<uint32_t>(table.size()));
+        relocationDirectoryRVA, static_cast<uint32_t>(table.size()));
     if (m_image->is64Bit) {
         m_image->ntHeaders64->FileHeader.Characteristics &= ~IMAGE_FILE_RELOCS_STRIPPED;
     } else {

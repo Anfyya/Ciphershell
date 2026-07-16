@@ -292,10 +292,10 @@ uint64_t VMMicroSemanticExecutor::MaterializeFlags(
             const unsigned count = static_cast<unsigned>(b) & countMask;
             if (count == 0) { noChange = true; break; }
             if (static_cast<VM_LAZY_FLAG_KIND>(pending.operation) == VM_LAZY_SHL) {
-                cf = count <= bits ? ((a >> (bits - count)) & 1u) != 0 : false;
+                cf = count < bits ? ((a >> (bits - count)) & 1u) != 0 : false;
                 of = count == 1u ? (((result & sign) != 0) != cf) : false;
             } else {
-                cf = count <= bits ? ((a >> (count - 1u)) & 1u) != 0 : false;
+                cf = count < bits ? ((a >> (count - 1u)) & 1u) != 0 : false;
                 of = static_cast<VM_LAZY_FLAG_KIND>(pending.operation) == VM_LAZY_SHR &&
                     count == 1u ? (a & sign) != 0 : false;
             }
@@ -304,16 +304,18 @@ uint64_t VMMicroSemanticExecutor::MaterializeFlags(
         }
         case VM_LAZY_ROL:
         case VM_LAZY_ROR: {
-            const unsigned bits = width * 8u;
             const unsigned count = static_cast<unsigned>(b) & (width == 8u ? 63u : 31u);
-            const unsigned effective = bits == 0 ? 0 : count % bits;
-            if (effective == 0) { noChange = true; break; }
+            // Only an architectural masked count of zero preserves flags.
+            // For 8/16-bit operands a non-zero count can rotate by a complete
+            // width: the value is unchanged, but CF is still defined and OF
+            // is undefined unless the masked count itself is one.
+            if (count == 0) { noChange = true; break; }
             if (static_cast<VM_LAZY_FLAG_KIND>(pending.operation) == VM_LAZY_ROL) {
                 cf = (result & 1u) != 0;
-                of = effective == 1u ? (((result & sign) != 0) != cf) : false;
+                of = count == 1u ? (((result & sign) != 0) != cf) : false;
             } else {
                 cf = (result & sign) != 0;
-                of = effective == 1u ?
+                of = count == 1u ?
                     (((result & sign) != 0) != ((result & (sign >> 1u)) != 0)) : false;
             }
             break;

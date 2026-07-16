@@ -1,4 +1,5 @@
 #include "translator.h"
+#include "../differential/vm_native_differential_protocol.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,49 @@ bool IsImmediate(const OperandIR* operand) {
 
 bool IsMemory(const OperandIR* operand) {
     return operand && operand->type == OperandType::Memory;
+}
+
+std::vector<const OperandIR*> SemanticOperandsForInstruction(
+    const InstructionIR& instruction)
+{
+    std::vector<const OperandIR*> operands;
+    const bool isShiftRotate =
+        instruction.mnemonic == InstructionMnemonic::Shl ||
+        instruction.mnemonic == InstructionMnemonic::Sal ||
+        instruction.mnemonic == InstructionMnemonic::Shr ||
+        instruction.mnemonic == InstructionMnemonic::Sar ||
+        instruction.mnemonic == InstructionMnemonic::Rol ||
+        instruction.mnemonic == InstructionMnemonic::Ror;
+    const bool hasMoffsMemory = instruction.mnemonic == InstructionMnemonic::Mov &&
+        std::any_of(instruction.operands.begin(), instruction.operands.end(),
+            [](const OperandIR& operand) {
+                return operand.visibility == OperandVisibility::Explicit &&
+                    operand.type == OperandType::Memory &&
+                    !operand.memory.hasBase && !operand.memory.hasIndex &&
+                    operand.memory.hasDisplacement;
+            });
+    for (const auto& operand : instruction.operands) {
+        const bool implicitMoffsAccumulator = hasMoffsMemory &&
+            operand.visibility == OperandVisibility::Implicit &&
+            operand.type == OperandType::Register &&
+            operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
+            operand.regInfo.family == 0u;
+        // Zydis represents the architectural CL source of D2/D3 and the
+        // implicit one of D0/D1 as hidden operands.  They are nevertheless
+        // real semantic inputs and must reach both translation and the
+        // concrete path oracle.
+        const bool implicitShiftCount = isShiftRotate &&
+            operand.visibility == OperandVisibility::Implicit &&
+            (operand.type == OperandType::Register ||
+                operand.type == OperandType::Immediate) &&
+            operand.action == OperandAction::Read;
+        if ((operand.visibility == OperandVisibility::Explicit ||
+                implicitMoffsAccumulator || implicitShiftCount) &&
+            operand.type != OperandType::None) {
+            operands.push_back(&operand);
+        }
+    }
+    return operands;
 }
 
 bool OperandWrites(OperandAction action) {
@@ -158,13 +202,7 @@ void Translator::SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& map)
 const std::vector<TranslationFailure>& Translator::GetLastFailures() const { return m_lastFailures; }
 
 std::vector<const OperandIR*> Translator::SemanticOperands(const InstructionIR& instruction) const {
-    std::vector<const OperandIR*> operands;
-    for (const auto& operand : instruction.operands) {
-        if (operand.visibility == OperandVisibility::Explicit && operand.type != OperandType::None) {
-            operands.push_back(&operand);
-        }
-    }
-    return operands;
+    return SemanticOperandsForInstruction(instruction);
 }
 
 uint8_t Translator::MapRegisterFamily(uint8_t family) const {
@@ -365,6 +403,20 @@ bool Translator::EmitRead(
             operand.regInfo.bitOffset, result);
     }
     if (operand.type == OperandType::Immediate) {
+        if (operand.immediateIsImageAddress) {
+            const uint8_t addressWidth = AddressWidth(instruction);
+            if (!instruction.hasImageRelocation ||
+                !instruction.imageRelocationSupported ||
+                width != addressWidth) {
+                return FailInstruction(instruction,
+                    "relocated image immediate has no exact pointer-width VM semantic");
+            }
+            Emit(result, VM_UOP_PUSH_IMAGE_BASE, {}, instruction.rva);
+            Emit(result, VM_UOP_PUSH_IMM,
+                {operand.immediateResolvedRVA, addressWidth}, instruction.rva);
+            Emit(result, VM_UOP_ADD, {addressWidth}, instruction.rva);
+            return true;
+        }
         Emit(result, VM_UOP_PUSH_IMM, {operand.immediate, width}, instruction.rva);
         return true;
     }
@@ -695,6 +747,13 @@ bool Translator::LowerRet(const InstructionIR& instruction, TranslationResult& r
     if (instruction.machineMode == MachineMode::X64 && cleanup != 0) {
         return FailInstruction(instruction, "x64 RET immediate violates Windows x64 ABI");
     }
+    // This is part of production bytecode, not differential-only
+    // instrumentation. The native return bridge restores virtualFlags to the
+    // architectural frame, so every pending lazy flag must be committed before
+    // RET. Per-corpus verification masks only the bits undefined on the actual
+    // native path; all defined bits therefore remain byte-for-byte checked.
+    Emit(result, VM_UOP_FLAGS_MATERIALIZE,
+        {VM_FLAG_ARCHITECTURAL_MASK}, instruction.rva);
     Emit(result, VM_UOP_RET, {cleanup}, instruction.rva);
     return true;
 }
@@ -1004,11 +1063,14 @@ bool Translator::FinalizeProgram(TranslationResult& result) {
 
 bool Translator::ValidateFlagDataflow(
     const Function& function,
-    uint32_t& terminalReturnStackCleanup)
+    uint32_t& terminalReturnStackCleanup,
+    uint64_t& observableRflagsMask)
 {
     if (function.blocks.empty()) return false;
     terminalReturnStackCleanup = 0;
+    observableRflagsMask = VM_FLAG_ARCHITECTURAL_MASK;
     bool sawTerminalReturn = false;
+    uint64_t terminalUndefined = 0;
     std::map<uint64_t, const InstructionIR*> instructions;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) instructions[instruction.address] = &instruction;
@@ -1021,18 +1083,35 @@ bool Translator::ValidateFlagDataflow(
             return address != other.address ? address < other.address : returns < other.returns;
         }
     };
-    struct FlowState { FlowKey key; uint64_t undefined; };
-    std::vector<FlowState> worklist = {{{function.entryAddress, {}}, 0}};
-    std::map<FlowKey, uint64_t> merged;
-    merged.emplace(worklist.front().key, 0);
-    auto enqueue = [&](const FlowKey& key, uint64_t undefined) {
+    struct FlowState {
+        FlowKey key;
+        uint64_t mayUndefined;
+        uint64_t mustUndefined;
+    };
+    struct FlowLattice {
+        uint64_t mayUndefined;
+        uint64_t mustUndefined;
+    };
+    std::vector<FlowState> worklist = {
+        {{function.entryAddress, {}}, 0, 0}};
+    std::map<FlowKey, FlowLattice> merged;
+    merged.emplace(worklist.front().key, FlowLattice{0, 0});
+    auto enqueue = [&](const FlowKey& key, uint64_t mayUndefined,
+                       uint64_t mustUndefined) {
         auto found = merged.find(key);
         if (found == merged.end()) {
-            merged.emplace(key, undefined);
-            worklist.push_back({key, undefined});
+            merged.emplace(key, FlowLattice{mayUndefined, mustUndefined});
+            worklist.push_back({key, mayUndefined, mustUndefined});
         } else {
-            const uint64_t value = found->second | undefined;
-            if (value != found->second) { found->second = value; worklist.push_back({key, value}); }
+            const uint64_t mergedMay =
+                found->second.mayUndefined | mayUndefined;
+            const uint64_t mergedMust =
+                found->second.mustUndefined & mustUndefined;
+            if (mergedMay != found->second.mayUndefined ||
+                mergedMust != found->second.mustUndefined) {
+                found->second = {mergedMay, mergedMust};
+                worklist.push_back({key, mergedMay, mergedMust});
+            }
         }
     };
     while (!worklist.empty()) {
@@ -1041,19 +1120,95 @@ bool Translator::ValidateFlagDataflow(
         const auto found = instructions.find(state.key.address);
         if (found == instructions.end()) return false;
         const InstructionIR& instruction = *found->second;
-        uint64_t undefined = state.undefined;
-        if ((instruction.flagsRead & undefined) != 0) {
+        uint64_t mayUndefined = state.mayUndefined;
+        uint64_t mustUndefined = state.mustUndefined;
+        if ((instruction.flagsRead & mayUndefined) != 0) {
             return FailInstruction(instruction, "instruction reads flags undefined on a reachable path");
         }
-        undefined &= ~(instruction.flagsWritten | instruction.flagsUndefined);
-        undefined |= instruction.flagsUndefined;
+        const bool isShift =
+            instruction.mnemonic == InstructionMnemonic::Shl ||
+            instruction.mnemonic == InstructionMnemonic::Sal ||
+            instruction.mnemonic == InstructionMnemonic::Shr ||
+            instruction.mnemonic == InstructionMnemonic::Sar;
+        const bool isRotate =
+            instruction.mnemonic == InstructionMnemonic::Rol ||
+            instruction.mnemonic == InstructionMnemonic::Ror;
+        if (isShift || isRotate) {
+            const auto operands = SemanticOperands(instruction);
+            if (operands.size() != 2u) {
+                return FailInstruction(instruction,
+                    "shift/rotate flag dataflow lacks its count operand");
+            }
+            const uint8_t width = WidthBytes(operands[0]->width);
+            if (width != 1u && width != 2u && width != 4u && width != 8u) {
+                return FailInstruction(instruction,
+                    "shift/rotate flag dataflow has an invalid width");
+            }
+            const uint64_t nonStatusWritten =
+                instruction.flagsWritten & ~static_cast<uint64_t>(VM_FLAG_STATUS_MASK);
+            const uint64_t nonStatusUndefined =
+                instruction.flagsUndefined & ~static_cast<uint64_t>(VM_FLAG_STATUS_MASK);
+            mayUndefined &= ~(nonStatusWritten | nonStatusUndefined);
+            mayUndefined |= nonStatusUndefined;
+            mustUndefined &= ~(nonStatusWritten | nonStatusUndefined);
+            mustUndefined |= nonStatusUndefined;
+
+            if (IsImmediate(operands[1])) {
+                const unsigned bits = width * 8u;
+                const unsigned countMask = width == 8u ? 63u : 31u;
+                const unsigned count = static_cast<unsigned>(
+                    operands[1]->immediate) & countMask;
+                if (count != 0u) {
+                    uint64_t written = 0;
+                    uint64_t undefined = 0;
+                    if (isShift) {
+                        written = VM_FLAG_PF | VM_FLAG_ZF | VM_FLAG_SF;
+                        undefined = VM_FLAG_AF;
+                        if (count < bits) written |= VM_FLAG_CF;
+                        else undefined |= VM_FLAG_CF;
+                    } else {
+                        written = VM_FLAG_CF;
+                    }
+                    if (count == 1u) written |= VM_FLAG_OF;
+                    else undefined |= VM_FLAG_OF;
+                    mayUndefined &= ~(written | undefined);
+                    mayUndefined |= undefined;
+                    mustUndefined &= ~(written | undefined);
+                    mustUndefined |= undefined;
+                }
+            } else if (IsRegister(operands[1])) {
+                // CL can select every masked count at run time.  A zero count
+                // preserves incoming flags, while non-zero counts define some
+                // flags and can leave others undefined.  Keep incoming
+                // may-undefined state for conditionally defined bits and add
+                // every bit that is undefined for at least one possible count.
+                if (isShift) {
+                    if (width < 4u) mayUndefined |= VM_FLAG_CF;
+                    mayUndefined |= VM_FLAG_AF | VM_FLAG_OF;
+                    mustUndefined &= ~(static_cast<uint64_t>(VM_FLAG_CF) |
+                        VM_FLAG_PF | VM_FLAG_ZF | VM_FLAG_SF | VM_FLAG_OF);
+                } else {
+                    mayUndefined |= VM_FLAG_OF;
+                    mustUndefined &= ~(static_cast<uint64_t>(VM_FLAG_CF) |
+                        VM_FLAG_OF);
+                }
+            } else {
+                return FailInstruction(instruction,
+                    "shift/rotate flag dataflow count is not scalar");
+            }
+        } else {
+            mayUndefined &= ~(instruction.flagsWritten | instruction.flagsUndefined);
+            mayUndefined |= instruction.flagsUndefined;
+            mustUndefined &= ~(instruction.flagsWritten | instruction.flagsUndefined);
+            mustUndefined |= instruction.flagsUndefined;
+        }
         const uint64_t fallthrough = instruction.address + instruction.length;
         if (instruction.IsReturn()) {
             if (!state.key.returns.empty()) {
                 FlowKey next = state.key;
                 next.address = next.returns.back();
                 next.returns.pop_back();
-                enqueue(next, undefined);
+                enqueue(next, mayUndefined, mustUndefined);
             } else {
                 const auto operands = SemanticOperands(instruction);
                 uint32_t cleanup = 0;
@@ -1062,12 +1217,17 @@ bool Translator::ValidateFlagDataflow(
                     return FailInstruction(instruction, "terminal RET cleanup is invalid");
                 }
                 if (!operands.empty()) cleanup = static_cast<uint32_t>(operands[0]->immediate);
-                if ((undefined & VM_FLAG_STATUS_MASK) != 0) {
-                    return FailInstruction(instruction,
-                        "terminal RET exposes native-undefined arithmetic flags");
-                }
-                if (!sawTerminalReturn) { terminalReturnStackCleanup = cleanup; sawTerminalReturn = true; }
-                else if (terminalReturnStackCleanup != cleanup) {
+                // Keep a conservative function-wide mask for metadata and
+                // identity. The model/native gates additionally execute the
+                // oracle for each concrete corpus case, so a flag defined on
+                // that actual path is still compared even when another path
+                // leaves it undefined.
+                terminalUndefined |=
+                    mayUndefined & VM_FLAG_ARCHITECTURAL_MASK;
+                if (!sawTerminalReturn) {
+                    terminalReturnStackCleanup = cleanup;
+                    sawTerminalReturn = true;
+                } else if (terminalReturnStackCleanup != cleanup) {
                     return FailInstruction(instruction, "terminal RET paths use inconsistent cleanup");
                 }
             }
@@ -1081,25 +1241,29 @@ bool Translator::ValidateFlagDataflow(
                 next.returns.push_back(fallthrough);
                 next.address = instruction.branchTargetRVA;
             } else next.address = fallthrough;
-            enqueue(next, undefined);
+            enqueue(next, mayUndefined, mustUndefined);
         } else if (instruction.IsBranch()) {
             if (instruction.isIndirectBranch || !instruction.hasBranchTarget) {
                 return FailInstruction(instruction, "branch is not statically resolved");
             }
             FlowKey branch = state.key;
             branch.address = instruction.branchTargetRVA;
-            enqueue(branch, undefined);
+            enqueue(branch, mayUndefined, mustUndefined);
             if (instruction.IsConditionalBranch()) {
                 FlowKey next = state.key;
                 next.address = fallthrough;
-                enqueue(next, undefined);
+                enqueue(next, mayUndefined, mustUndefined);
             }
         } else {
             FlowKey next = state.key;
             next.address = fallthrough;
-            enqueue(next, undefined);
+            enqueue(next, mayUndefined, mustUndefined);
         }
         if (merged.size() > 1000000u) return FailInstruction(instruction, "flag CFG state bound exceeded");
+    }
+    if (sawTerminalReturn) {
+        observableRflagsMask = static_cast<uint64_t>(VM_FLAG_ARCHITECTURAL_MASK) &
+            ~terminalUndefined;
     }
     return sawTerminalReturn;
 }
@@ -1171,7 +1335,8 @@ TranslationResult Translator::TranslateFunction(const Function& function) {
     m_functionEnd = function.entryAddress + function.size;
     m_currentFunctionRva = static_cast<uint32_t>(function.entryAddress);
     result.operandCodec = VMSchema::DeriveOperandCodec(m_config.buildSeed, m_currentFunctionRva);
-    if (!ValidateFlagDataflow(function, result.returnStackCleanup)) {
+    if (!ValidateFlagDataflow(function, result.returnStackCleanup,
+            result.observableRflagsMask)) {
         result.failures = m_lastFailures;
         return result;
     }
@@ -1253,6 +1418,7 @@ struct OracleState {
     std::array<uint64_t, VM_MAX_INTERNAL_CALL_DEPTH> callStack{};
     uint32_t callDepth = 0;
     uint64_t rflags = 0;
+    uint64_t undefinedRflagsMask = 0;
     uint64_t ip = 0;
     bool finished = false;
     OracleFault fault = OracleFault::None;
@@ -1436,7 +1602,13 @@ bool OracleReadOperand(
         return true;
     }
     if (operand.type == OperandType::Immediate) {
-        value = OracleTruncate(operand.immediate, width);
+        if (operand.immediateIsImageAddress) {
+            const uint64_t relocated = imageBase + operand.immediateResolvedRVA;
+            if (relocated < imageBase || width != AddressWidth(instruction)) return false;
+            value = OracleTruncate(relocated, width);
+        } else {
+            value = OracleTruncate(operand.immediate, width);
+        }
         return true;
     }
     if (operand.type == OperandType::Memory) {
@@ -1549,23 +1721,38 @@ bool PrepareOracleMemoryRegisters(
     OracleState& state,
     uint64_t memoryBase,
     uint32_t memorySize,
+    uint32_t imageSize,
     std::string& error)
 {
-    const uint64_t center = memoryBase + memorySize / 2u;
-    state.gpr[4] = memoryBase + memorySize - 0x100u;
+    if (imageSize == 0 || imageSize >= memorySize ||
+        memorySize - imageSize < 0x200u) {
+        error = "oracle corpus does not contain separate image and stack/scratch regions";
+        return false;
+    }
+    const uint64_t tailBegin = memoryBase + imageSize;
+    const uint64_t tailEnd = memoryBase + memorySize;
+    const uint64_t scratchEnd = tailBegin + (memorySize - imageSize) / 2u;
+    const uint64_t scratchCenter = tailBegin + (scratchEnd - tailBegin) / 2u;
+    const uint64_t stackCenter = scratchEnd + (tailEnd - scratchEnd) / 2u;
+    state.gpr[4] = stackCenter;
+    bool isX64 = false;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
+            isX64 = isX64 || instruction.machineMode == MachineMode::X64;
             if (instruction.mnemonic == InstructionMnemonic::Leave) {
-                state.gpr[5] = center;
+                state.gpr[5] = stackCenter;
             }
             for (const auto& operand : instruction.operands) {
                 if (operand.type != OperandType::Memory) continue;
                 const uint8_t width = WidthBytes(operand.memory.width ?
                     operand.memory.width : operand.width);
                 if (width == 0 || (operand.memory.isImageAddress || operand.memory.isRipRelative ?
-                    operand.memory.resolvedRVA > memorySize - width : false)) {
+                    operand.memory.resolvedRVA > imageSize - width : false)) {
                     error = "oracle memory operand escapes bounded corpus image";
                     return false;
+                }
+                if (operand.memory.isImageAddress || operand.memory.isRipRelative) {
+                    continue;
                 }
                 if (operand.memory.hasIndex) {
                     if (operand.memory.indexInfo.family >= 16) {
@@ -1584,17 +1771,32 @@ bool PrepareOracleMemoryRegisters(
                         return false;
                     }
                     const int64_t displacement = operand.memory.displacement;
-                    if (displacement < -static_cast<int64_t>(memorySize / 4u) ||
-                        displacement > static_cast<int64_t>(memorySize / 4u)) {
-                        error = "oracle memory displacement exceeds bounded corpus";
+                    const uint8_t family = operand.memory.baseInfo.family;
+                    const bool stackBase = family == 4u || family == 5u;
+                    const uint64_t regionBegin = stackBase ? scratchEnd : tailBegin;
+                    const uint64_t regionEnd = stackBase ? tailEnd : scratchEnd;
+                    const uint64_t selectedCenter = stackBase
+                        ? stackCenter : scratchCenter;
+                    if ((displacement < 0 &&
+                            static_cast<uint64_t>(-(displacement + 1)) + 1u >
+                                selectedCenter - regionBegin) ||
+                        (displacement >= 0 &&
+                            static_cast<uint64_t>(displacement) >
+                                regionEnd - selectedCenter) ||
+                        (displacement >= 0
+                            ? selectedCenter + static_cast<uint64_t>(displacement)
+                            : selectedCenter -
+                                (static_cast<uint64_t>(-(displacement + 1)) + 1u)) >
+                                regionEnd - width) {
+                        error = "oracle memory displacement escapes its isolated scratch/stack region";
                         return false;
                     }
                     if (AddressWidth(instruction) == 4u) {
                         state.gpr[operand.memory.baseInfo.family] =
                             (state.gpr[operand.memory.baseInfo.family] & 0xFFFFFFFF00000000ULL) |
-                            static_cast<uint32_t>(center);
+                            static_cast<uint32_t>(selectedCenter);
                     } else {
-                        state.gpr[operand.memory.baseInfo.family] = center;
+                        state.gpr[operand.memory.baseInfo.family] = selectedCenter;
                     }
                 } else if (!operand.memory.isImageAddress && !operand.memory.isRipRelative) {
                     const uint64_t absolute = static_cast<uint64_t>(operand.memory.displacement);
@@ -1605,6 +1807,15 @@ bool PrepareOracleMemoryRegisters(
                 }
             }
         }
+    }
+    // Model a real function-entry stack.  Win64 enters at RSP == 8 (mod 16)
+    // because the caller aligns before CALL; x86 keeps at least DWORD
+    // alignment.  Re-apply this after memory-base preparation because an
+    // explicit [rsp+disp] operand may have moved SP to the corpus center.
+    if (isX64) {
+        state.gpr[4] = (state.gpr[4] & ~0xFULL) + 8u;
+    } else {
+        state.gpr[4] &= ~0x3ULL;
     }
     return true;
 }
@@ -1635,12 +1846,8 @@ bool ExecuteOracle(
         }
         const InstructionIR& instruction = *found->second;
         const uint64_t fallthrough = instruction.address + instruction.length;
-        std::vector<const OperandIR*> operands;
-        for (const auto& operand : instruction.operands) {
-            if (operand.visibility == OperandVisibility::Explicit && operand.type != OperandType::None) {
-                operands.push_back(&operand);
-            }
-        }
+        const std::vector<const OperandIR*> operands =
+            SemanticOperandsForInstruction(instruction);
         auto read = [&](const OperandIR& operand, uint8_t width, uint64_t& value) {
             return OracleReadOperand(instruction, operand, width, state, imageBase,
                 memoryBase, memory, value);
@@ -1664,6 +1871,13 @@ bool ExecuteOracle(
             }
         };
         uint64_t a = 0, b = 0, result = 0;
+        // Most instructions have count-independent flag effects and can use
+        // the disassembler's conservative metadata verbatim.  Shift/rotate
+        // instructions refine these masks below from the concrete masked
+        // count: x86 leaves every flag unchanged for count zero, defines OF
+        // only for count one, and makes OF undefined for larger counts.
+        uint64_t concreteFlagsWritten = instruction.flagsWritten;
+        uint64_t concreteFlagsUndefined = instruction.flagsUndefined;
         bool advance = true;
         switch (instruction.mnemonic) {
             case InstructionMnemonic::Nop: break;
@@ -1751,20 +1965,36 @@ bool ExecuteOracle(
                 if (!read(*operands[0], width, a) || !read(*operands[1], 1, b)) goto memory_fault;
                 const unsigned bits = width * 8u;
                 const unsigned count = static_cast<unsigned>(b) & (width == 8 ? 63u : 31u);
-                if (count == 0) { result = a; }
+                if (count == 0) {
+                    result = a;
+                    concreteFlagsWritten = 0;
+                    concreteFlagsUndefined = 0;
+                }
                 else if (instruction.mnemonic == InstructionMnemonic::Shl ||
                          instruction.mnemonic == InstructionMnemonic::Sal) {
+                    concreteFlagsWritten = VM_FLAG_PF | VM_FLAG_ZF | VM_FLAG_SF;
+                    concreteFlagsUndefined = VM_FLAG_AF;
+                    if (count < bits) concreteFlagsWritten |= VM_FLAG_CF;
+                    else concreteFlagsUndefined |= VM_FLAG_CF;
+                    if (count == 1u) concreteFlagsWritten |= VM_FLAG_OF;
+                    else concreteFlagsUndefined |= VM_FLAG_OF;
                     result = OracleTruncate(a << count, width);
                     OracleSetFlag(state.rflags, VM_FLAG_CF,
-                        count <= bits && ((a >> (bits - count)) & 1u) != 0);
+                        count < bits && ((a >> (bits - count)) & 1u) != 0);
                     if (count == 1) OracleSetFlag(state.rflags, VM_FLAG_OF,
                         ((result & (1ULL << (bits - 1u))) != 0) != ((state.rflags & VM_FLAG_CF) != 0));
                     else OracleSetFlag(state.rflags, VM_FLAG_OF, false);
                     OracleResultFlags(state.rflags, result, width);
                 } else if (instruction.mnemonic == InstructionMnemonic::Shr ||
                            instruction.mnemonic == InstructionMnemonic::Sar) {
+                    concreteFlagsWritten = VM_FLAG_PF | VM_FLAG_ZF | VM_FLAG_SF;
+                    concreteFlagsUndefined = VM_FLAG_AF;
+                    if (count < bits) concreteFlagsWritten |= VM_FLAG_CF;
+                    else concreteFlagsUndefined |= VM_FLAG_CF;
+                    if (count == 1u) concreteFlagsWritten |= VM_FLAG_OF;
+                    else concreteFlagsUndefined |= VM_FLAG_OF;
                     OracleSetFlag(state.rflags, VM_FLAG_CF,
-                        count <= bits && ((a >> (count - 1u)) & 1u) != 0);
+                        count < bits && ((a >> (count - 1u)) & 1u) != 0);
                     result = instruction.mnemonic == InstructionMnemonic::Shr ?
                         OracleTruncate(a, width) >> count :
                         static_cast<uint64_t>(static_cast<int64_t>(OracleSignExtend(a, width)) >> count);
@@ -1775,6 +2005,10 @@ bool ExecuteOracle(
                     OracleResultFlags(state.rflags, result, width);
                 } else {
                     const unsigned effective = count % bits;
+                    concreteFlagsWritten = VM_FLAG_CF;
+                    concreteFlagsUndefined = 0;
+                    if (count == 1u) concreteFlagsWritten |= VM_FLAG_OF;
+                    else concreteFlagsUndefined |= VM_FLAG_OF;
                     if (effective == 0) {
                         result = a;
                     } else if (instruction.mnemonic == InstructionMnemonic::Rol) {
@@ -1792,6 +2026,18 @@ bool ExecuteOracle(
                         OracleSetFlag(state.rflags, VM_FLAG_OF, effective == 1u ?
                             (((result & (1ULL << (bits - 1u))) != 0) !=
                              ((result & (1ULL << (bits - 2u))) != 0)) : false);
+                    }
+                    // A non-zero masked count that happens to rotate by a
+                    // complete operand width still updates CF.  Only the
+                    // destination value is unchanged in that case.
+                    if (effective == 0) {
+                        if (instruction.mnemonic == InstructionMnemonic::Rol) {
+                            OracleSetFlag(state.rflags, VM_FLAG_CF,
+                                (result & 1u) != 0);
+                        } else {
+                            OracleSetFlag(state.rflags, VM_FLAG_CF,
+                                (result & (1ULL << (bits - 1u))) != 0);
+                        }
                     }
                 }
                 if (!write(*operands[0], width, result)) goto memory_fault;
@@ -1831,6 +2077,12 @@ bool ExecuteOracle(
                     if (!read(*operands[1], WidthBytes(operands[0]->width), a)) goto memory_fault;
                     if (OracleCondition(state.rflags, condition)) {
                         if (!write(*operands[0], WidthBytes(operands[0]->width), a)) goto memory_fault;
+                    } else if (instruction.machineMode == MachineMode::X64 &&
+                               WidthBytes(operands[0]->width) == 4u &&
+                               IsRegister(operands[0])) {
+                        // Intel CMOVcc r32 clears DEST[63:32] even when the
+                        // condition is false; the low 32 bits remain intact.
+                        state.gpr[operands[0]->regInfo.family] &= 0xFFFFFFFFULL;
                     }
                 }
                 break;
@@ -2099,6 +2351,9 @@ bool ExecuteOracle(
             default:
                 goto unsupported;
         }
+        state.undefinedRflagsMask &=
+            ~(concreteFlagsWritten | concreteFlagsUndefined);
+        state.undefinedRflagsMask |= concreteFlagsUndefined;
         if (advance) state.ip = fallthrough;
         continue;
 memory_fault:
@@ -2186,8 +2441,10 @@ VMIRModelPreflightResult VMIRModelPreflightVerifier::Verify(
         for (uint64_t& value : oracle.gpr) value = NextCorpusValue(random);
         oracle.rflags = NextCorpusValue(random) | 0x02u;
         std::string oracleError;
+        const uint32_t imageSize = config.imageSize != 0
+            ? config.imageSize : config.memorySize / 2u;
         if (!PrepareOracleMemoryRegisters(function, oracle, corpusMemoryBase,
-                config.memorySize, oracleError)) {
+                config.memorySize, imageSize, oracleError)) {
             result.failingCase = corpusIndex;
             result.error = oracleError;
             return result;
@@ -2236,9 +2493,13 @@ VMIRModelPreflightResult VMIRModelPreflightVerifier::Verify(
                 return result;
             }
         }
-        if (oracle.rflags != micro.rflags) {
+        const uint64_t caseObservableRflagsMask =
+            static_cast<uint64_t>(VM_FLAG_ARCHITECTURAL_MASK) &
+            ~oracle.undefinedRflagsMask;
+        if (((oracle.rflags ^ micro.rflags) &
+                caseObservableRflagsMask) != 0u) {
             result.failingCase = corpusIndex;
-            result.error = "IR model preflight complete RFLAGS mismatch";
+            result.error = "IR model preflight observable RFLAGS mismatch";
             return result;
         }
         if (oracleMemory != microMemory) {
@@ -2323,14 +2584,17 @@ uint64_t NativeDifferentialInputIdentity(
 bool PrepareNativeDifferentialAddressSpace(
     const Function& function,
     uint32_t memorySize,
+    uint32_t imageSize,
     std::array<uint64_t, 16>& gpr,
     uint64_t& memoryBase,
     std::string& error)
 {
     bool usesAddress16 = false;
     bool usesAddress32 = false;
+    bool isX86 = false;
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
+            isX86 = isX86 || instruction.machineMode == MachineMode::X86;
             for (const auto& operand : instruction.operands) {
                 if (operand.type != OperandType::Memory) continue;
                 usesAddress16 = usesAddress16 || AddressWidth(instruction) == 2u;
@@ -2339,7 +2603,8 @@ bool PrepareNativeDifferentialAddressSpace(
         }
     }
     memoryBase = usesAddress16 ? 0u :
-        (usesAddress32 ? 0x0000000010000000ULL : 0x0000000110000000ULL);
+        ((usesAddress32 || isX86)
+            ? 0x0000000020000000ULL : 0x0000000110000000ULL);
     if (usesAddress16 && memorySize < 0x10000u) {
         error = "native differential 16-bit addressing requires the full 64 KiB corpus";
         return false;
@@ -2347,7 +2612,7 @@ bool PrepareNativeDifferentialAddressSpace(
     OracleState preparation{};
     preparation.gpr = gpr;
     if (!PrepareOracleMemoryRegisters(
-            function, preparation, memoryBase, memorySize, error)) {
+            function, preparation, memoryBase, memorySize, imageSize, error)) {
         return false;
     }
     gpr = preparation.gpr;
@@ -2375,6 +2640,7 @@ uint64_t VMNativeDifferentialVerifier::ComputeTranslationIdentity(
     identity = DifferentialIdentityValue(identity, function.entryAddress);
     identity = DifferentialIdentityValue(identity, function.size);
     identity = DifferentialIdentityValue(identity, translation.registerCount);
+    identity = DifferentialIdentityValue(identity, translation.observableRflagsMask);
     identity = DifferentialIdentityValue(identity, translation.microSelectionDigest);
     identity = DifferentialIdentityBytes(identity, &translation.operandCodec,
         sizeof(translation.operandCodec));
@@ -2386,6 +2652,11 @@ uint64_t VMNativeDifferentialVerifier::ComputeTranslationIdentity(
             identity = DifferentialIdentityValue(identity, instruction.length);
             identity = DifferentialIdentityBytes(identity, instruction.rawBytes.data(),
                 instruction.length);
+            identity = DifferentialIdentityValue(identity, instruction.hasImageRelocation);
+            identity = DifferentialIdentityValue(identity, instruction.imageRelocationSupported);
+            identity = DifferentialIdentityValue(identity, instruction.imageRelocationOffset);
+            identity = DifferentialIdentityValue(identity, instruction.imageRelocationSize);
+            identity = DifferentialIdentityValue(identity, instruction.imageRelocationTargetRVA);
         }
     }
     for (uint32_t semantic = 0; semantic < 256u; ++semantic) {
@@ -2412,8 +2683,23 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
     result.vmGroupId = config.vmGroupId;
     if (!translation.success || translation.bytecode.empty() ||
         function.blocks.empty() || config.corpusCount == 0u ||
-        config.memorySize < 0x1000u || config.timeoutMilliseconds == 0u) {
+        config.memorySize < 0x1000u ||
+        config.memorySize > VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE ||
+        config.timeoutMilliseconds == 0u) {
         result.error = "native differential gate received incomplete translation/configuration";
+        return result;
+    }
+    const uint64_t architecturalFlags = VM_FLAG_ARCHITECTURAL_MASK;
+    const uint64_t mandatoryPreservedFlags =
+        architecturalFlags & ~static_cast<uint64_t>(VM_FLAG_STATUS_MASK);
+    if ((translation.observableRflagsMask & ~architecturalFlags) != 0u ||
+        (translation.observableRflagsMask & mandatoryPreservedFlags) !=
+            mandatoryPreservedFlags) {
+        result.error = "native differential observable RFLAGS mask is invalid or incomplete";
+        return result;
+    }
+    if (translation.usesSimd || translation.usesAvx || translation.usesX87) {
+        result.error = "native differential extended processor-state evidence is unavailable";
         return result;
     }
     if (!function.boundaryTrusted || function.size == 0u ||
@@ -2489,23 +2775,46 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
         for (uint64_t& value : request.initialGpr) {
             value = NextCorpusValue(random);
         }
+        const uint32_t imageSize = config.imageSize != 0
+            ? config.imageSize : config.memorySize / 2u;
         if (!PrepareNativeDifferentialAddressSpace(function, config.memorySize,
+                imageSize,
                 request.initialGpr, request.memoryBase, result.error)) {
             return result;
         }
         /*
-         * The evidence worker executes at CPL3.  IF cannot be cleared there,
+         * The evidence worker executes at CPL3. IF cannot be cleared there,
          * while TF/AC would turn the verifier harness itself into a trap/alignment
-         * source.  Randomize every safely controllable arithmetic bit plus DF/ID,
-         * and bind both executions to the real user-mode fixed state.
+         * source. Both Win32 and Win64 ABIs require DF=0 at function boundaries,
+         * so randomize the arithmetic bits plus ID and bind both executions to
+         * that real ABI/user-mode state.
          */
         request.initialRflags = VM_FLAG_FIXED_1 | VM_FLAG_IF |
             (NextCorpusValue(random) & static_cast<uint64_t>(
-                VM_FLAG_STATUS_MASK | VM_FLAG_DF | VM_FLAG_ID));
+                VM_FLAG_STATUS_MASK | VM_FLAG_ID));
         request.initialMemory.resize(config.memorySize);
         for (uint8_t& byte : request.initialMemory) {
             byte = static_cast<uint8_t>(NextCorpusValue(random));
         }
+        OracleState pathOracle{};
+        pathOracle.gpr = request.initialGpr;
+        pathOracle.rflags = request.initialRflags;
+        std::vector<uint8_t> pathMemory = request.initialMemory;
+        std::string pathError;
+        const bool pathCompleted = ExecuteOracle(function, pathOracle,
+            request.memoryBase, request.memoryBase, pathMemory, 1000000u,
+            pathError);
+        const bool expectedDivideFault = !pathCompleted &&
+            pathOracle.fault == OracleFault::DivideError &&
+            config.expectDivideFault;
+        if (!pathCompleted && !expectedDivideFault) {
+            result.error = "native differential path-mask oracle failed closed";
+            if (!pathError.empty()) result.error += ": " + pathError;
+            return result;
+        }
+        const uint64_t caseObservableRflagsMask =
+            static_cast<uint64_t>(VM_FLAG_ARCHITECTURAL_MASK) &
+            ~pathOracle.undefinedRflagsMask;
         request.inputIdentity = NativeDifferentialInputIdentity(request);
 
         VMNativeDifferentialCaseEvidence evidence{};
@@ -2580,18 +2889,71 @@ VMNativeDifferentialResult VMNativeDifferentialVerifier::Verify(
             result.error = "native differential evidence lacks complete flags or memory snapshots";
             return result;
         }
-        if (evidence.nativeState.gpr != evidence.vmState.gpr) {
-            result.error = "native differential complete GPR mismatch";
+        // The native half must use a real CALL/RET pair.  Its captured SP is
+        // therefore one return-address slot (plus x86 RET imm16 cleanup) above
+        // the logical function-body SP retained by the VM.  Validate that
+        // relationship exactly instead of either comparing unlike states or
+        // ignoring SP balance.
+        const uint64_t pointerSize =
+            architecture == VMNativeDifferentialArchitecture::X64 ? 8u : 4u;
+        const uint64_t stackMask =
+            architecture == VMNativeDifferentialArchitecture::X64
+                ? (std::numeric_limits<uint64_t>::max)() : 0xFFFFFFFFULL;
+        const uint64_t expectedNativeSp =
+            (evidence.vmState.gpr[4] + pointerSize +
+                translation.returnStackCleanup) & stackMask;
+        const uint64_t nativeSp = evidence.nativeState.gpr[4] & stackMask;
+        if (nativeSp != expectedNativeSp) {
+            std::ostringstream detail;
+            detail << "native differential stack-balance mismatch"
+                   << " native_sp=0x" << std::hex << nativeSp
+                   << " vm_logical_sp=0x" << evidence.vmState.gpr[4]
+                   << " expected_native_sp=0x" << expectedNativeSp
+                   << " return_cleanup=0x" << translation.returnStackCleanup;
+            result.error = detail.str();
             return result;
         }
-        const uint64_t architecturalMask = VM_FLAG_ARCHITECTURAL_MASK;
+        for (uint8_t family = 0; family < 16u; ++family) {
+            if (family == 4u) continue;
+            if (evidence.nativeState.gpr[family] == evidence.vmState.gpr[family]) {
+                continue;
+            }
+            std::ostringstream detail;
+            detail << "native differential complete GPR mismatch"
+                   << " family=" << std::dec << static_cast<unsigned>(family)
+                   << " native=0x" << std::hex << evidence.nativeState.gpr[family]
+                   << " vm=0x" << evidence.vmState.gpr[family]
+                   << " initial=0x" << request.initialGpr[family];
+            result.error = detail.str();
+            return result;
+        }
+        const uint64_t architecturalMask = caseObservableRflagsMask;
         if (((evidence.nativeState.rflags ^ evidence.vmState.rflags) &
                 architecturalMask) != 0u) {
-            result.error = "native differential complete architectural RFLAGS mismatch";
+            std::ostringstream detail;
+            detail << "native differential observable architectural RFLAGS mismatch"
+                   << " native=0x" << std::hex << evidence.nativeState.rflags
+                   << " vm=0x" << evidence.vmState.rflags
+                   << " xor=0x" << ((evidence.nativeState.rflags ^
+                        evidence.vmState.rflags) & architecturalMask)
+                   << " mask=0x" << architecturalMask;
+            result.error = detail.str();
             return result;
         }
         if (evidence.nativeState.memory != evidence.vmState.memory) {
-            result.error = "native differential memory side-effect mismatch";
+            const auto mismatch = std::mismatch(
+                evidence.nativeState.memory.begin(), evidence.nativeState.memory.end(),
+                evidence.vmState.memory.begin());
+            std::ostringstream detail;
+            detail << "native differential memory side-effect mismatch";
+            if (mismatch.first != evidence.nativeState.memory.end()) {
+                const size_t offset = static_cast<size_t>(
+                    mismatch.first - evidence.nativeState.memory.begin());
+                detail << " offset=0x" << std::hex << offset
+                       << " native=0x" << static_cast<unsigned>(*mismatch.first)
+                       << " vm=0x" << static_cast<unsigned>(*mismatch.second);
+            }
+            result.error = detail.str();
             return result;
         }
         ++result.casesVerified;

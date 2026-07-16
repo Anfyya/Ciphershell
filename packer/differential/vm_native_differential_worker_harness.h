@@ -43,6 +43,7 @@ struct VMNativeDifferentialWorkerOutcome {
 bool RunNativeDifferentialWorkerCase(
     const VMNativeDifferentialRequestHeader& header,
     const uint8_t* nativeCode,
+    const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* corpusMemory,
     const uint8_t* vmBytecode,
     const uint8_t* handlerImage,

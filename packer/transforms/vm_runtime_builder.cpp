@@ -9,6 +9,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <unordered_set>
 
 namespace CipherShell {
@@ -37,6 +38,8 @@ constexpr uint64_t kRuntimeSectionDigestDomain = 0x4353564D53454354ULL;
 constexpr uint64_t kRuntimeImageDigestDomain = 0x4353564D494D4147ULL;
 constexpr uint64_t kEncryptedHandlerDigestDomain = 0x4353564D48444C52ULL;
 constexpr uint64_t kDispatchTableDigestDomain = 0x4353564D44535054ULL;
+constexpr uint64_t kSemanticPlaintextEvidenceDomain = 0x4353564D504C4E33ULL;
+constexpr uint64_t kRecordBytecodeEvidenceDomain = 0x4353564D52454332ULL;
 constexpr uint64_t kDispatchKeyDomain = 0x4449535041544348ULL;
 
 struct ReferenceRuntimeFingerprint {
@@ -315,6 +318,11 @@ public:
 
 class X64TrampolineAssembler : public CodeBuffer {
 public:
+    struct ImageBasePatch {
+        uint32_t immediateOffset = 0;
+        uint32_t anchorOffset = 0;
+    };
+
     void Endbr() { Raw({0xF3, 0x0F, 0x1E, 0xFA}); }
     void PushFlags() { U8(0x9C); }
     void PopFlags() { U8(0x9D); }
@@ -328,6 +336,11 @@ public:
     }
     void SubRsp(uint32_t value) { Raw({0x48, 0x81, 0xEC}); U32(value); }
     void AddRsp(uint32_t value) { Raw({0x48, 0x81, 0xC4}); U32(value); }
+    void MovRbpRsp() { Raw({0x48, 0x89, 0xE5}); }
+    void LeaRspRbp(uint32_t displacement) {
+        Raw({0x48, 0x8D, 0xA5});
+        U32(displacement);
+    }
     void ProbeStack(uint32_t value) {
         // The caller-provided x64 shadow space remains addressable while RSP is
         // unchanged.  Keep the probe unwind-neutral so a guard-page exception
@@ -388,9 +401,17 @@ public:
     void XorEdxEdx() { Raw({0x31, 0xD2}); }
     void MovEdxImm(uint32_t value) { U8(0xBA); U32(value); }
     void MovR8dImm(uint32_t value) { Raw({0x41, 0xB8}); U32(value); }
-    void LoadImageBaseR9() {
-        Raw({0x65, 0x4C, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00});
-        Raw({0x4D, 0x8B, 0x49, 0x10});
+    ImageBasePatch LoadOwnImageBaseR9() {
+        // RIP belongs to the protected module even when it is a DLL.  PEB.ImageBaseAddress
+        // names the host EXE and therefore cannot be used by an injected DLL trampoline.
+        // Capture the address after LEA, then subtract that instruction's patched RVA.
+        const uint32_t anchorOffset = static_cast<uint32_t>(Offset()) + 7u;
+        Raw({0x4C, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00}); // lea r9,[rip]
+        U8(0xB8);                                         // mov eax, anchor RVA
+        const uint32_t immediateOffset = static_cast<uint32_t>(Offset());
+        U32(0);
+        Raw({0x49, 0x29, 0xC1});                         // sub r9,rax
+        return {immediateOffset, anchorOffset};
     }
     void AddR8R9() { Raw({0x4D, 0x01, 0xC8}); }
     void StoreRaxRsp(uint32_t displacement) { Raw({0x48, 0x89, 0x84, 0x24}); U32(displacement); }
@@ -428,6 +449,7 @@ struct UnwindOperation {
 struct BuiltX64Trampoline {
     std::vector<uint8_t> code;
     std::vector<uint8_t> unwindInfo;
+    X64TrampolineAssembler::ImageBasePatch imageBasePatch{};
 };
 
 struct SavedRegister {
@@ -437,17 +459,45 @@ struct SavedRegister {
 
 std::vector<uint8_t> BuildUnwindInfo(
     uint8_t prologSize,
-    const std::vector<UnwindOperation>& operations)
+    const std::vector<UnwindOperation>& operations,
+    uint8_t frameRegister = 0,
+    uint8_t frameOffset = 0)
 {
+    const auto slotCount = [](const UnwindOperation& operation) -> uint8_t {
+        switch (operation.unwindOp) {
+            case 0: // UWOP_PUSH_NONVOL
+            case 2: // UWOP_ALLOC_SMALL
+            case 3: // UWOP_SET_FPREG
+                return 1;
+            case 1: // UWOP_ALLOC_LARGE, OpInfo 0 in this builder
+            case 4: // UWOP_SAVE_NONVOL
+            case 8: // UWOP_SAVE_XMM128
+                return operation.unwindOp == 1 && operation.opInfo != 0 ? 3 : 2;
+            case 5: // UWOP_SAVE_NONVOL_FAR
+            case 9: // UWOP_SAVE_XMM128_FAR
+                return 3;
+            default:
+                return 0;
+        }
+    };
+    uint32_t unwindSlots = 0;
+    for (const auto& operation : operations) {
+        const uint8_t slots = slotCount(operation);
+        if (slots == 0 || unwindSlots > 0xFFu - slots) return {};
+        unwindSlots += slots;
+    }
+    if (frameRegister > 15u || frameOffset > 15u) return {};
     CodeBuffer output;
     output.U8(0x01); // UNW_VERSION=1, no handler flags.
     output.U8(prologSize);
-    output.U8(static_cast<uint8_t>(operations.size() * 2));
-    output.U8(0x00); // No frame register.
+    output.U8(static_cast<uint8_t>(unwindSlots));
+    output.U8(static_cast<uint8_t>((frameOffset << 4u) | frameRegister));
     for (auto it = operations.rbegin(); it != operations.rend(); ++it) {
+        const uint8_t slots = slotCount(*it);
         output.U8(it->codeOffset);
         output.U8(static_cast<uint8_t>((it->opInfo << 4) | (it->unwindOp & 0x0F)));
-        output.U16(it->extra);
+        if (slots >= 2u) output.U16(it->extra);
+        if (slots == 3u) output.U16(0u);
     }
     while (output.bytes.size() % 4 != 0) output.U8(0);
     return output.bytes;
@@ -455,6 +505,11 @@ std::vector<uint8_t> BuildUnwindInfo(
 
 class X86TrampolineAssembler : public CodeBuffer {
 public:
+    struct ImageBasePatch {
+        uint32_t immediateOffset = 0;
+        uint32_t anchorOffset = 0;
+    };
+
     void Endbr() { Raw({0xF3, 0x0F, 0x1E, 0xFB}); }
     void PushFlags() { U8(0x9C); }
     void PopFlags() { U8(0x9D); }
@@ -511,9 +566,20 @@ public:
     void XsaveEcx() { Raw({0x0F, 0xAE, 0x21}); }
     void XrstorEcx() { Raw({0x0F, 0xAE, 0x29}); }
     void LeaEaxEsp(uint32_t displacement) { Raw({0x8D, 0x84, 0x24}); U32(displacement); }
-    void LoadImageBaseEcx() {
-        Raw({0x64, 0x8B, 0x0D, 0x30, 0x00, 0x00, 0x00});
-        Raw({0x8B, 0x49, 0x08});
+    ImageBasePatch LoadOwnImageBaseEcx() {
+        // A balanced CALL/helper/RET obtains a PE32 code address without reading
+        // PEB.ImageBaseAddress (which names the host EXE for a DLL). Do not use
+        // the traditional call-next/pop idiom here: POP would leave CET shadow
+        // stack state unmatched and make the trampoline's final RET raise #CP.
+        const uint32_t anchorOffset = static_cast<uint32_t>(Offset()) + 5u;
+        Raw({0xE8, 0x02, 0x00, 0x00, 0x00}); // call get_pc
+        Raw({0xEB, 0x04});                    // anchor: jmp after_helper
+        Raw({0x8B, 0x0C, 0x24});              // get_pc: mov ecx,[esp]
+        U8(0xC3);                             // ret (balances normal + shadow stacks)
+        Raw({0x81, 0xE9});                    // after_helper: sub ecx, anchor RVA
+        const uint32_t immediateOffset = static_cast<uint32_t>(Offset());
+        U32(0);
+        return {immediateOffset, anchorOffset};
     }
     void MovEbxImm(uint32_t value) { U8(0xBB); U32(value); }
     void AddEbxEcx() { Raw({0x03, 0xD9}); }
@@ -735,7 +801,11 @@ BuiltX64Trampoline BuildX64Trampoline(
     constexpr uint32_t kExtendedPointerSlot = 0x30;
     constexpr uint32_t kHostStackAllocation =
         kFrameOffset + VM_RUNTIME_X64_FRAME_TO_SCRATCH;
-    const uint32_t kStackAllocation = kHostStackAllocation + guestStackSize;
+    // A pushed RBP supplies a real frame pointer for the Win64 epilog.  Add
+    // eight bytes to the old allocation so RSP remains 16-byte aligned before
+    // every CALL (entry RSP is 8 mod 16, PUSH RBP makes it 0 mod 16).
+    const uint32_t kStackAllocation =
+        kHostStackAllocation + guestStackSize + 8u;
     constexpr uint32_t kFrameR15 = kFrameOffset + 0;
     constexpr uint32_t kFrameR14 = kFrameOffset + 8;
     constexpr uint32_t kFrameR13 = kFrameOffset + 16;
@@ -759,16 +829,26 @@ BuiltX64Trampoline BuildX64Trampoline(
     std::vector<UnwindOperation> unwindOperations;
 
     assembler.Endbr();
-    assembler.ProbeStack(kStackAllocation);
+    // ProbeStack is unwind-neutral and restores entry flags/registers.  Probe
+    // through the pushed frame-pointer slot as well as the fixed allocation.
+    assembler.ProbeStack(kStackAllocation + 8u);
+    assembler.PushReg(5);
+    unwindOperations.push_back({
+        static_cast<uint8_t>(assembler.Offset()), 0, 5, 0
+    });
     assembler.SubRsp(kStackAllocation);
     unwindOperations.push_back({
         static_cast<uint8_t>(assembler.Offset()), 1, 0,
         static_cast<uint16_t>(kStackAllocation / 8)
     });
+    assembler.MovRbpRsp();
+    unwindOperations.push_back({
+        static_cast<uint8_t>(assembler.Offset()), 3, 0, 0
+    });
 
     const SavedRegister nonvolatileGprs[] = {
         {15, kFrameR15}, {14, kFrameR14}, {13, kFrameR13}, {12, kFrameR12},
-        {7, kFrameRdi}, {6, kFrameRsi}, {5, kFrameRbp}, {3, kFrameRbx}
+        {7, kFrameRdi}, {6, kFrameRsi}, {3, kFrameRbx}
     };
     for (const auto& saved : nonvolatileGprs) {
         assembler.StoreReg(saved.number, static_cast<int32_t>(saved.offset));
@@ -795,15 +875,20 @@ BuiltX64Trampoline BuildX64Trampoline(
     for (const auto& saved : volatileGprs) {
         assembler.StoreReg(saved.number, static_cast<int32_t>(saved.offset));
     }
-    assembler.LoadReg(1, static_cast<int32_t>(kStackAllocation + 0x10u));
+    // ProbeStack saved entry RAX/RCX/RFLAGS in the caller home area before
+    // PUSH RBP.  The pushed RBP adds one slot to every positive entry offset.
+    assembler.LoadReg(1, static_cast<int32_t>(kStackAllocation + 0x18u));
     assembler.StoreReg(1, static_cast<int32_t>(kFrameRcx));
-    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x08u));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x10u));
     assembler.StoreReg(0, static_cast<int32_t>(kFrameRax));
-    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x18u));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x20u));
     assembler.StoreReg(0, static_cast<int32_t>(kFrameRflags));
-    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation));
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation + 0x08u));
     assembler.StoreReg(0, static_cast<int32_t>(kFrameReturnAddress));
-    assembler.LeaRaxRsp(kStackAllocation);
+    // The original RBP is the slot immediately above the fixed allocation.
+    assembler.LoadReg(0, static_cast<int32_t>(kStackAllocation));
+    assembler.StoreReg(0, static_cast<int32_t>(kFrameRbp));
+    assembler.LeaRaxRsp(kStackAllocation + 0x08u);
     assembler.StoreReg(0, static_cast<int32_t>(kFrameOriginalRsp));
     assembler.LeaRaxRsp(kExtendedStorageOffset);
     assembler.AddRaxImm(63);
@@ -822,7 +907,7 @@ BuiltX64Trampoline BuildX64Trampoline(
 
     assembler.LeaRcxRsp(kFrameOffset);
     assembler.MovEdxImm(functionRVA);
-    assembler.LoadImageBaseR9();
+    const auto imageBasePatch = assembler.LoadOwnImageBaseR9();
     assembler.MovR8dImm(metadataRVA);
     assembler.AddR8R9();
     assembler.LoadRaxRsp(kExtendedPointerSlot);
@@ -843,22 +928,33 @@ BuiltX64Trampoline BuildX64Trampoline(
     const SavedRegister restoreGprs[] = {
         {15, kFrameR15}, {14, kFrameR14}, {13, kFrameR13}, {12, kFrameR12},
         {11, kFrameR11}, {10, kFrameR10}, {9, kFrameR9}, {8, kFrameR8},
-        {7, kFrameRdi}, {6, kFrameRsi}, {5, kFrameRbp}, {3, kFrameRbx},
+        {7, kFrameRdi}, {6, kFrameRsi}, {3, kFrameRbx},
         {2, kFrameRdx}, {1, kFrameRcx}, {0, kFrameRax}
     };
     for (const auto& restored : restoreGprs) {
         assembler.LoadReg(restored.number, static_cast<int32_t>(restored.offset));
     }
-    assembler.AddRsp(kStackAllocation);
+    // LEA through the declared frame register is a canonical Win64 epilog and
+    // does not overwrite the VM's returned status flags.  POP RBP and RET are
+    // the only following instructions, exactly matching the V1 epilog grammar.
+    assembler.LeaRspRbp(kStackAllocation);
+    assembler.PopReg(5);
     assembler.Ret();
 
     BuiltX64Trampoline result;
     result.code = std::move(assembler.bytes);
-    result.unwindInfo = BuildUnwindInfo(prologSize, unwindOperations);
+    result.unwindInfo = BuildUnwindInfo(
+        prologSize, unwindOperations, 5u, 0u);
+    result.imageBasePatch = imageBasePatch;
     return result;
 }
 
-std::vector<uint8_t> BuildX86Trampoline(
+struct BuiltX86Trampoline {
+    std::vector<uint8_t> code;
+    X86TrampolineAssembler::ImageBasePatch imageBasePatch{};
+};
+
+BuiltX86Trampoline BuildX86Trampoline(
     uint32_t trampolineOffset,
     uint32_t runtimeEntryOffset,
     uint32_t functionRVA,
@@ -898,7 +994,7 @@ std::vector<uint8_t> BuildX86Trampoline(
     assembler.AddEdxImm(kExtendedStorageOffset + 63);
     assembler.AndEdxImm(0xFFFFFFC0u);
     assembler.LeaEaxEsp(kFrameOffset);
-    assembler.LoadImageBaseEcx();
+    const auto imageBasePatch = assembler.LoadOwnImageBaseEcx();
     assembler.MovEbxImm(metadataRVA);
     assembler.AddEbxEcx();
     assembler.PushReg(2); // Extended processor-state pointer in EDX.
@@ -927,7 +1023,10 @@ std::vector<uint8_t> BuildX86Trampoline(
     assembler.PopAll();
     assembler.PopFlags();
     assembler.Ret(returnCleanup);
-    return assembler.bytes;
+    BuiltX86Trampoline result;
+    result.code = std::move(assembler.bytes);
+    result.imageBasePatch = imageBasePatch;
+    return result;
 }
 
 uint64_t GetImageBase(const CS_PE_IMAGE* image) {
@@ -1163,20 +1262,51 @@ bool VMRuntimeBuilder::VerifyRuntimeContents(
 VMRuntimeBuildResult VMRuntimeBuilder::Build(
     CS_PE_IMAGE* image,
     const std::vector<VMFunctionRecord>& records,
+    const std::vector<uint8_t>& plaintextBytecode,
+    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     uint32_t metadataRVA,
     const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
     const VMHandlerSynthesisConfig& requestedSynthesisConfig,
     const char sectionName[8],
     const char unwindSectionName[8],
-    const char relocationSectionName[8])
+    const char relocationSectionName[8],
+    const VMRuntimeTraceBinding* traceBinding)
 {
     VMRuntimeBuildResult result{};
-    if (!image || !image->isValid || !image->rawData || records.empty() || metadataRVA == 0) {
-        result.error = "VM_RUNTIME: invalid image, metadata, or record table";
+    if (!image || !image->isValid || !image->rawData || records.empty() ||
+        plaintextBytecode.empty() || opcodeMap.empty() || metadataRVA == 0) {
+        result.error = "VM_RUNTIME: invalid image, metadata, bytecode, or record table";
         return result;
+    }
+    if (traceBinding != nullptr) {
+        if (traceBinding->traceRVA == 0 || traceBinding->capacity == 0 ||
+            traceBinding->capacity > VM_TRACE_MAX_CAPACITY ||
+            traceBinding->groupId >= 64u ||
+            (traceBinding->architecture != VM_ARCH_X86 &&
+             traceBinding->architecture != VM_ARCH_X64) ||
+            ((traceBinding->architecture == VM_ARCH_X64) !=
+                (image->is64Bit != 0))) {
+            result.error = "VM_RUNTIME: invalid runtime trace evidence binding";
+            return result;
+        }
+        VM_METADATA_HEADER traceMetadata{};
+        if (!ReadMetadataHeader(image, metadataRVA, traceMetadata) ||
+            traceMetadata.architecture != traceBinding->architecture ||
+            std::memcmp(traceMetadata.buildId, traceBinding->buildId.data(),
+                traceBinding->buildId.size()) != 0) {
+            result.error =
+                "VM_RUNTIME: trace build id/architecture is not bound to metadata";
+            return result;
+        }
+        result.traceBinding = *traceBinding;
     }
 
     VMHandlerSynthesisConfig synthesisConfig = requestedSynthesisConfig;
+    if (requestedSynthesisConfig.runtimeTraceEnabled !=
+            (traceBinding != nullptr)) {
+        result.error = "VM_RUNTIME: trace codegen and evidence binding disagree";
+        return result;
+    }
     synthesisConfig.architecture = image->is64Bit
         ? VMHandlerArchitecture::X64 : VMHandlerArchitecture::X86;
     if (synthesisConfig.virtualProtectIatRVA == 0 ||
@@ -1205,6 +1335,88 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
             synthesisConfig.functionDecodePlans.push_back(std::move(plans));
         }
     }
+
+    std::array<uint8_t, 256> reverseOpcodeMap{};
+    reverseOpcodeMap.fill(VM_HANDLER_INVALID);
+    for (const auto& mapping : opcodeMap) {
+        if (mapping.first >= VM_UOP_COUNT) continue;
+        if (reverseOpcodeMap[mapping.second] != VM_HANDLER_INVALID) {
+            result.error = "VM_RUNTIME: plaintext evidence opcode map is invalid";
+            return result;
+        }
+        reverseOpcodeMap[mapping.second] = mapping.first;
+    }
+
+    std::set<std::pair<uint8_t, uint8_t>> referencedHandlers;
+    std::unordered_set<uint32_t> evidenceFunctionRVAs;
+    result.handlerReferences.reserve(records.size());
+    for (const auto& record : records) {
+        if (!evidenceFunctionRVAs.insert(record.functionRVA).second ||
+            record.bytecodeSize == 0 ||
+            record.bytecodeOffset > plaintextBytecode.size() ||
+            record.bytecodeSize >
+                plaintextBytecode.size() - record.bytecodeOffset) {
+            result.error = "VM_RUNTIME: plaintext evidence record range is invalid";
+            return result;
+        }
+        const auto plans = std::find_if(
+            synthesisConfig.functionDecodePlans.begin(),
+            synthesisConfig.functionDecodePlans.end(),
+            [&](const VMHandlerFunctionDecodePlans& candidate) {
+                return candidate.functionRVA == record.functionRVA;
+            });
+        if (plans == synthesisConfig.functionDecodePlans.end()) {
+            result.error = "VM_RUNTIME: plaintext evidence lacks a function decode plan";
+            return result;
+        }
+        std::vector<DecodedMicroInstruction> decoded;
+        std::string decodeError;
+        const uint8_t* recordBytes = plaintextBytecode.data() +
+            record.bytecodeOffset;
+        if (!VMSchema::DecodeStream(recordBytes, record.bytecodeSize,
+                reverseOpcodeMap.data(), plans->codec, decoded, decodeError) ||
+            decoded.empty()) {
+            result.error = "VM_RUNTIME: plaintext evidence bytecode decode failed: " +
+                decodeError;
+            return result;
+        }
+        VMRecordHandlerReferences recordEvidence{};
+        recordEvidence.functionRVA = record.functionRVA;
+        recordEvidence.bytecodeOffset = record.bytecodeOffset;
+        recordEvidence.bytecodeSize = record.bytecodeSize;
+        recordEvidence.bytecodeDigest = HashRuntimeBytes(
+            recordBytes, record.bytecodeSize,
+            kRecordBytecodeEvidenceDomain ^ record.functionRVA);
+        recordEvidence.bytecode.assign(
+            recordBytes, recordBytes + record.bytecodeSize);
+        recordEvidence.references.reserve(decoded.size());
+        for (const auto& item : decoded) {
+            const uint8_t semantic =
+                static_cast<uint8_t>(item.instruction.opcode);
+            const uint8_t variant = item.instruction.handlerVariant;
+            if (semantic >= VM_UOP_COUNT || variant >= synthesisConfig.variantCount ||
+                synthesisConfig.handlerSemanticToSlot[semantic] ==
+                    VM_HANDLER_INVALID || item.encodedSize == 0 ||
+                item.byteOffset > record.bytecodeSize ||
+                item.encodedSize > record.bytecodeSize - item.byteOffset) {
+                result.error = "VM_RUNTIME: bytecode references an unavailable handler";
+                return result;
+            }
+            recordEvidence.references.push_back({
+                item.byteOffset, item.encodedSize, semantic, variant});
+            referencedHandlers.emplace(semantic, variant);
+        }
+        result.handlerReferences.push_back(std::move(recordEvidence));
+    }
+    std::sort(result.handlerReferences.begin(), result.handlerReferences.end(),
+        [](const auto& left, const auto& right) {
+            return left.functionRVA < right.functionRVA;
+        });
+    if (referencedHandlers.empty()) {
+        result.error = "VM_RUNTIME: bytecode references no synthesized handlers";
+        return result;
+    }
+
     VMHandlerSynthesizer synthesizer;
     VMHandlerSynthesisResult synthesized = synthesizer.Synthesize(synthesisConfig);
     if (!synthesized.success) {
@@ -1251,6 +1463,136 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.handlerBodyDigest = synthesized.microSelectionDigest;
     result.dispatchKeyDigest = synthesized.dispatchKeyDigest;
     result.variantSelectorDigest = synthesized.variantSelectorDigest;
+    result.plaintextHandlers.reserve(referencedHandlers.size());
+    for (const auto& handler : synthesized.handlers) {
+        if (referencedHandlers.count({handler.semantic, handler.variant}) == 0)
+            continue;
+        if (handler.semantic == VM_HANDLER_INVALID ||
+            handler.slot == VM_HANDLER_INVALID || handler.plaintextBody.empty() ||
+            handler.plaintextBody.size() >
+                (std::numeric_limits<uint32_t>::max)() ||
+            handler.semanticCoreSize == 0 ||
+            handler.semanticCoreOffset > handler.plaintextBody.size() ||
+            handler.semanticCoreSize >
+                handler.plaintextBody.size() - handler.semanticCoreOffset ||
+            handler.semanticCoreOffset > handler.dispatchTailOffset ||
+            handler.semanticCoreSize >
+                handler.dispatchTailOffset - handler.semanticCoreOffset ||
+            ((handler.semanticCoreVariantSize == 0) !=
+                (handler.semanticCoreVariantOffset == 0)) ||
+            (handler.semanticCoreVariantSize != 0 &&
+                (handler.semanticCoreVariantOffset < handler.semanticCoreOffset ||
+                 handler.semanticCoreVariantSize > handler.semanticCoreSize -
+                    (handler.semanticCoreVariantOffset -
+                        handler.semanticCoreOffset)))) {
+            result.error = "VM_RUNTIME: synthesized plaintext handler evidence is invalid";
+            return result;
+        }
+        uint32_t previousCodecEnd = handler.semanticCoreOffset;
+        for (const auto& range : handler.valueCodecRanges) {
+            if (range.size < 32u || range.offset < previousCodecEnd ||
+                range.offset < handler.semanticCoreOffset ||
+                range.size > handler.semanticCoreSize -
+                    (range.offset - handler.semanticCoreOffset)) {
+                result.error = "VM_RUNTIME: value-codec evidence range is invalid";
+                return result;
+            }
+            previousCodecEnd = range.offset + range.size;
+        }
+        const auto semanticBegin = handler.plaintextBody.begin() +
+            handler.semanticCoreOffset;
+        result.plaintextHandlers.push_back({
+            handler.semantic, handler.slot, handler.variant,
+            static_cast<uint32_t>(handler.plaintextBody.size()),
+            handler.semanticCoreOffset,
+            handler.semanticCoreVariantOffset,
+            handler.semanticCoreVariantSize,
+            std::vector<uint8_t>(semanticBegin,
+                semanticBegin + handler.semanticCoreSize),
+            handler.valueCodecRanges});
+    }
+    std::sort(result.plaintextHandlers.begin(), result.plaintextHandlers.end(),
+        [](const auto& left, const auto& right) {
+            if (left.semantic != right.semantic)
+                return left.semantic < right.semantic;
+            return left.variant < right.variant;
+        });
+    if (result.plaintextHandlers.empty()) {
+        result.error = "VM_RUNTIME: synthesized plaintext handler evidence is empty";
+        return result;
+    }
+    if (result.plaintextHandlers.size() != referencedHandlers.size()) {
+        result.error = "VM_RUNTIME: referenced handler evidence set is incomplete";
+        return result;
+    }
+    for (size_t index = 1; index < result.plaintextHandlers.size(); ++index) {
+        const auto& previous = result.plaintextHandlers[index - 1];
+        const auto& current = result.plaintextHandlers[index];
+        if (previous.semantic == current.semantic &&
+            previous.variant == current.variant) {
+            result.error = "VM_RUNTIME: duplicate plaintext handler evidence key";
+            return result;
+        }
+    }
+    std::vector<uint8_t> semanticEvidenceMaterial;
+    const auto appendU32 = [&](uint32_t value) {
+        for (uint32_t shift = 0; shift < 32; shift += 8) {
+            semanticEvidenceMaterial.push_back(
+                static_cast<uint8_t>(value >> shift));
+        }
+    };
+    const auto appendU64 = [&](uint64_t value) {
+        for (uint32_t shift = 0; shift < 64; shift += 8) {
+            semanticEvidenceMaterial.push_back(
+                static_cast<uint8_t>(value >> shift));
+        }
+    };
+    appendU32(result.traceBinding.architecture);
+    appendU32(result.traceBinding.groupId);
+    appendU32(result.traceBinding.traceRVA);
+    appendU32(result.traceBinding.capacity);
+    semanticEvidenceMaterial.insert(semanticEvidenceMaterial.end(),
+        result.traceBinding.buildId.begin(), result.traceBinding.buildId.end());
+    appendU32(static_cast<uint32_t>(result.plaintextHandlers.size()));
+    appendU32(static_cast<uint32_t>(result.handlerReferences.size()));
+    for (const auto& handler : result.plaintextHandlers) {
+        semanticEvidenceMaterial.push_back(handler.semantic);
+        semanticEvidenceMaterial.push_back(handler.slot);
+        semanticEvidenceMaterial.push_back(handler.variant);
+        semanticEvidenceMaterial.push_back(0);
+        appendU32(handler.handlerBodySize);
+        appendU32(handler.semanticCoreOffset);
+        appendU32(static_cast<uint32_t>(handler.core.size()));
+        appendU32(handler.semanticCoreVariantOffset);
+        appendU32(handler.semanticCoreVariantSize);
+        appendU32(static_cast<uint32_t>(handler.valueCodecRanges.size()));
+        semanticEvidenceMaterial.insert(semanticEvidenceMaterial.end(),
+            handler.core.begin(), handler.core.end());
+        for (const auto& range : handler.valueCodecRanges) {
+            appendU32(range.offset);
+            appendU32(range.size);
+        }
+    }
+    for (const auto& record : result.handlerReferences) {
+        appendU32(record.functionRVA);
+        appendU32(record.bytecodeOffset);
+        appendU32(record.bytecodeSize);
+        appendU64(record.bytecodeDigest);
+        appendU32(static_cast<uint32_t>(record.references.size()));
+        semanticEvidenceMaterial.insert(semanticEvidenceMaterial.end(),
+            record.bytecode.begin(), record.bytecode.end());
+        for (const auto& reference : record.references) {
+            appendU32(reference.bytecodeOffset);
+            appendU32(reference.encodedSize);
+            semanticEvidenceMaterial.push_back(reference.semantic);
+            semanticEvidenceMaterial.push_back(reference.variant);
+            semanticEvidenceMaterial.push_back(0);
+            semanticEvidenceMaterial.push_back(0);
+        }
+    }
+    result.semanticPlaintextEvidenceDigest = HashRuntimeBytes(
+        semanticEvidenceMaterial.data(), semanticEvidenceMaterial.size(),
+        kSemanticPlaintextEvidenceDomain);
     if (image->loadConfig.hasCFG) {
         if (!image->loadConfig.valid ||
             (image->is64Bit && image->loadConfig.guardCFDispatchFunctionPointer == 0) ||
@@ -1264,6 +1606,11 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.cfgVerified = true;
 
     std::vector<uint8_t> blob = runtime.bytes;
+    struct TrampolineImageBasePatch {
+        uint32_t immediateOffset = 0;
+        uint32_t anchorOffset = 0;
+    };
+    std::vector<TrampolineImageBasePatch> imageBasePatches;
     const uint32_t runtimeImageSize = static_cast<uint32_t>(runtime.bytes.size());
     std::unordered_set<uint32_t> functionRVAs;
     constexpr uint32_t kRuntimeContextReserve =
@@ -1294,6 +1641,9 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
                 return result;
             }
             trampoline = std::move(built.code);
+            imageBasePatches.push_back({
+                trampolineOffset + built.imageBasePatch.immediateOffset,
+                trampolineOffset + built.imageBasePatch.anchorOffset});
             const uint32_t unwindOffset = AlignUp(
                 trampolineOffset + static_cast<uint32_t>(trampoline.size()), 4);
             blob.resize(unwindOffset, 0);
@@ -1306,11 +1656,15 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
                 result.error = "VM_RUNTIME: x86 RET cleanup exceeds uint16";
                 return result;
             }
-            trampoline = BuildX86Trampoline(trampolineOffset, runtime.entryRVA,
+            BuiltX86Trampoline built = BuildX86Trampoline(trampolineOffset, runtime.entryRVA,
                 record.functionRVA, metadataRVA,
                 static_cast<uint16_t>(record.returnStackCleanup),
                 record.guestStackSize,
                 (record.flags & VM_RECORD_FLAG_USES_AVX) != 0);
+            trampoline = std::move(built.code);
+            imageBasePatches.push_back({
+                trampolineOffset + built.imageBasePatch.immediateOffset,
+                trampolineOffset + built.imageBasePatch.anchorOffset});
         }
         VMTrampolineRecord link{};
         link.functionRVA = record.functionRVA;
@@ -1345,40 +1699,50 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
         return result;
     }
     std::copy(runtime.bytes.begin(), runtime.bytes.end(), blob.begin());
+    for (const auto& patch : imageBasePatches) {
+        if (!RangeValid(patch.immediateOffset, sizeof(uint32_t), blob.size()) ||
+            patch.anchorOffset > (std::numeric_limits<uint32_t>::max)() - appended.rva) {
+            result.error = "VM_RUNTIME: trampoline image-base patch is outside the emitted section";
+            return result;
+        }
+        const uint32_t anchorRVA = appended.rva + patch.anchorOffset;
+        std::memcpy(blob.data() + patch.immediateOffset, &anchorRVA, sizeof(anchorRVA));
+    }
     if (!emitter.PatchBytes(appended.rva, blob, &result.error)) {
         result.error = "VM_RUNTIME: unable to commit relocated blob: " + result.error;
         return result;
     }
 
-    if (!runtime.relocations.empty()) {
-        if (!relocationSectionName) {
-            result.error = "VM_RUNTIME: relocation section name is missing";
+    if (!relocationSectionName) {
+        result.error = "VM_RUNTIME: relocation section name is missing";
+        return result;
+    }
+    std::vector<CS_RELOC_ENTRY> targetRelocations;
+    targetRelocations.reserve(runtime.relocations.size());
+    for (const auto& relocation : runtime.relocations) {
+        CS_RELOC_ENTRY target{};
+        target.type = relocation.type;
+        target.fullRVA = static_cast<uint64_t>(appended.rva) + relocation.offset;
+        target.pageRVA = static_cast<uint32_t>(target.fullRVA) & ~0xFFFu;
+        target.offset = static_cast<uint16_t>(target.fullRVA & 0x0FFFu);
+        targetRelocations.push_back(target);
+    }
+    // Rebuild even when this PIC runtime contributes no new fixups: VM native
+    // bodies may have consumed original HIGHLOW/DIR64 fields, and merely
+    // pruning the parsed vector would leave the old on-disk directory active.
+    if (!emitter.RebuildBaseRelocationDirectory(targetRelocations,
+            relocationSectionName, nullptr, &result.error)) {
+        result.error = "VM_RUNTIME: unable to rebuild target relocation directory: " + result.error;
+        return result;
+    }
+    for (const auto& target : targetRelocations) {
+        const auto found = std::find_if(image->relocs.entries.begin(), image->relocs.entries.end(),
+            [&](const CS_RELOC_ENTRY& entry) {
+                return entry.fullRVA == target.fullRVA && entry.type == target.type;
+            });
+        if (found == image->relocs.entries.end()) {
+            result.error = "VM_RUNTIME: target relocation verification failed";
             return result;
-        }
-        std::vector<CS_RELOC_ENTRY> targetRelocations;
-        targetRelocations.reserve(runtime.relocations.size());
-        for (const auto& relocation : runtime.relocations) {
-            CS_RELOC_ENTRY target{};
-            target.type = relocation.type;
-            target.fullRVA = static_cast<uint64_t>(appended.rva) + relocation.offset;
-            target.pageRVA = static_cast<uint32_t>(target.fullRVA) & ~0xFFFu;
-            target.offset = static_cast<uint16_t>(target.fullRVA & 0x0FFFu);
-            targetRelocations.push_back(target);
-        }
-        if (!emitter.RebuildBaseRelocationDirectory(targetRelocations,
-                relocationSectionName, nullptr, &result.error)) {
-            result.error = "VM_RUNTIME: unable to rebuild target relocation directory: " + result.error;
-            return result;
-        }
-        for (const auto& target : targetRelocations) {
-            const auto found = std::find_if(image->relocs.entries.begin(), image->relocs.entries.end(),
-                [&](const CS_RELOC_ENTRY& entry) {
-                    return entry.fullRVA == target.fullRVA && entry.type == target.type;
-                });
-            if (found == image->relocs.entries.end()) {
-                result.error = "VM_RUNTIME: target relocation verification failed";
-                return result;
-            }
         }
     }
     result.relocationsVerified = true;

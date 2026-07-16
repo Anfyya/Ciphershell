@@ -246,7 +246,8 @@ inline bool ValidateUnwindCodes(
     const CS_RUNTIME_FUNCTION& runtimeFunction,
     uint32_t unwindOffset,
     const CS_UNWIND_INFO_HEADER& header,
-    uint8_t version) {
+    uint8_t version,
+    uint8_t flags) {
     const uint32_t count = header.countOfCodes;
     const uint8_t frameRegister = header.frameRegisterAndOffset & 0x0Fu;
     const uint8_t frameOffset = header.frameRegisterAndOffset >> 4;
@@ -314,15 +315,22 @@ inline bool ValidateUnwindCodes(
         sawNormalCode = true;
         if (sawFirstEpilog && (epilogSlotCount & 1u) != 0) return false;
 
-        // PUSH_MACHFRAME 是唯一合法使用 CodeOffset==0 的普通 unwind operation，且必须
-        // 位于逻辑代码数组末尾。它仍参与降序状态更新；其他 UWOP 继续要求非零 offset。
+        // PUSH_MACHFRAME 可在根记录中合法使用 CodeOffset==0，且必须位于
+        // 逻辑代码数组末尾。另一个有意限定的例外是 MSVC 为 shrink-wrapped
+        // prolog 生成的零长度 CHAININFO fragment：它会用 CodeOffset==0 记录
+        // SAVE_NONVOL，真正的主 prolog 由链尾 RUNTIME_FUNCTION 描述。除这两种
+        // 精确形状外，普通 UWOP 仍必须使用非零 offset。
         const bool isPushMachFrame = op == kUwopPushMachFrame;
+        const bool isZeroOffsetChainedSave =
+            (flags & kUnwindFlagChainInfo) != 0 && header.sizeOfProlog == 0 &&
+            op == kUwopSaveNonvol && codeOffset == 0;
         if (isPushMachFrame) {
             if (codeOffset != 0 || opInfo > 1 || index + 1u != count ||
                 codeOffset > previousCodeOffset) {
                 return false;
             }
-        } else if (codeOffset == 0 || codeOffset > header.sizeOfProlog ||
+        } else if ((!isZeroOffsetChainedSave && codeOffset == 0) ||
+                   codeOffset > header.sizeOfProlog ||
                    codeOffset > previousCodeOffset) {
             return false;
         }
@@ -341,7 +349,10 @@ inline bool ValidateUnwindCodes(
         case kUwopAllocSmall:
             break;
         case kUwopSetFpReg:
-            if (opInfo != 0 || frameRegister == 0 || sawSetFpReg) return false;
+            // MSVC 14.44 会把头部 FrameOffset 复写到 SET_FPREG.OpInfo；兼容
+            // 该已证实编码与传统的保留值 0，但仍拒绝其他非零值。
+            if ((opInfo != 0 && opInfo != frameOffset) ||
+                frameRegister == 0 || sawSetFpReg) return false;
             sawSetFpReg = true;
             break;
         case kUwopSaveNonvol:
@@ -415,7 +426,7 @@ inline bool ValidateRuntimeFunctionInternal(
         !IsFileBackedSpan(image, runtimeFunction.unwindData, static_cast<uint32_t>(totalSize64))) {
         return false;
     }
-    if (!ValidateUnwindCodes(image, runtimeFunction, offset, header, version)) return false;
+    if (!ValidateUnwindCodes(image, runtimeFunction, offset, header, version, flags)) return false;
 
     const uint32_t tailOffset = offset + static_cast<uint32_t>(baseSize64);
     if ((flags & kUnwindFlagChainInfo) != 0) {

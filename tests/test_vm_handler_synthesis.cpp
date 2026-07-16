@@ -2361,6 +2361,31 @@ void ValidateOneBuild(
             handler.dispatchTailOffset + handler.dispatchTailSize ==
                 handler.plaintextBody.size(),
             "direct-threaded 解码/跳转尾不在 handler 末尾");
+        Require(handler.semanticBodySize != 0 &&
+                handler.semanticBodyOffset <= handler.dispatchTailOffset &&
+                handler.semanticBodySize <=
+                    handler.dispatchTailOffset - handler.semanticBodyOffset,
+            "真实 semantic-body 证据范围越过 handler 或落入分发尾");
+        if (handler.semantic != VM_UOP_TRAP) {
+            VMHandlerSemanticCodegenConfig semanticConfig{};
+            semanticConfig.architecture =
+                static_cast<uint32_t>(config.architecture);
+            semanticConfig.buildSeed = config.buildSeed;
+            semanticConfig.semantic =
+                static_cast<VM_MICRO_OPCODE>(handler.semantic);
+            semanticConfig.variant = handler.variant;
+            const VMHandlerSemanticCodegenResult generated =
+                GenerateVMHandlerSemanticKernel(semanticConfig);
+            Require(generated.success &&
+                    handler.semanticBodySize == generated.semanticBodySize &&
+                    std::equal(
+                        generated.code.begin() + generated.semanticBodyOffset,
+                        generated.code.begin() + generated.semanticBodyOffset +
+                            generated.semanticBodySize,
+                        handler.plaintextBody.begin() +
+                            handler.semanticBodyOffset),
+                "semantic-body 证据不是正式 codegen 的真实语义正文");
+        }
         Require(handler.bodyDigest != 0 && handler.dispatchTailDigest != 0,
             "handler 或分发尾 digest 为空");
         Require(handler.semanticComplete,
@@ -2611,6 +2636,26 @@ void TestSemanticBodyRejectsFixedCoreEnvelope() {
             selectedConfig, outsideBody, outsideBodyError) &&
         outsideBodyError.find("semantic") != std::string::npos,
         "验证器错误接受 semanticBody 之外的变体证据");
+
+    VMHandlerSemanticCodegenResult tamperedLiveInput = *mbaVariant;
+    tamperedLiveInput.code[
+        tamperedLiveInput.semanticInputPathOffset +
+        tamperedLiveInput.semanticInputPathSize / 2u] ^= 0x01u;
+    std::string tamperedInputError;
+    Require(!ValidateVMHandlerSemanticVariantKernel(
+            selectedConfig, tamperedLiveInput, tamperedInputError) &&
+        tamperedInputError.find("input path") != std::string::npos,
+        "篡改真实输入值可逆 MBA 轮次后仍通过 handler 验证");
+
+    VMHandlerSemanticCodegenResult tamperedLiveResult = *mbaVariant;
+    tamperedLiveResult.code[
+        tamperedLiveResult.semanticResultPathOffset +
+        tamperedLiveResult.semanticResultPathSize / 2u] ^= 0x01u;
+    std::string tamperedResultError;
+    Require(!ValidateVMHandlerSemanticVariantKernel(
+            selectedConfig, tamperedLiveResult, tamperedResultError) &&
+        tamperedResultError.find("result path") != std::string::npos,
+        "篡改真实结果值可逆 MBA 轮次后仍通过 handler 验证");
 }
 
 void Run(const char* name, void (*test)(), int& failures) {

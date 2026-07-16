@@ -13,6 +13,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -279,7 +280,7 @@ void TestDigestAndDispatchTargetRejection() {
 
 class OwnedBuilderImage final {
 public:
-    OwnedBuilderImage() {
+    explicit OwnedBuilderImage(bool is64Bit = true) {
         constexpr uint32_t headersSize = 0x400u;
         constexpr uint32_t textRawOffset = headersSize;
         constexpr uint32_t textRawSize = 0x400u;
@@ -290,23 +291,45 @@ public:
         auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image.rawData);
         dos->e_magic = IMAGE_DOS_SIGNATURE;
         dos->e_lfanew = 0x80;
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
-            image.rawData + dos->e_lfanew);
-        nt->Signature = IMAGE_NT_SIGNATURE;
-        nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
-        nt->FileHeader.NumberOfSections = 1;
-        nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
-        nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
-        nt->OptionalHeader.ImageBase = kImageBase64;
-        nt->OptionalHeader.AddressOfEntryPoint = 0x1000u;
-        nt->OptionalHeader.BaseOfCode = 0x1000u;
-        nt->OptionalHeader.SectionAlignment = 0x1000u;
-        nt->OptionalHeader.FileAlignment = 0x200u;
-        nt->OptionalHeader.SizeOfHeaders = headersSize;
-        nt->OptionalHeader.SizeOfImage = 0x2000u;
-        nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
-
-        IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+        IMAGE_SECTION_HEADER* section = nullptr;
+        if (is64Bit) {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+                image.rawData + dos->e_lfanew);
+            nt->Signature = IMAGE_NT_SIGNATURE;
+            nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+            nt->FileHeader.NumberOfSections = 1;
+            nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+            nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+            nt->OptionalHeader.ImageBase = kImageBase64;
+            nt->OptionalHeader.AddressOfEntryPoint = 0x1000u;
+            nt->OptionalHeader.BaseOfCode = 0x1000u;
+            nt->OptionalHeader.SectionAlignment = 0x1000u;
+            nt->OptionalHeader.FileAlignment = 0x200u;
+            nt->OptionalHeader.SizeOfHeaders = headersSize;
+            nt->OptionalHeader.SizeOfImage = 0x2000u;
+            nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+            image.ntHeaders64 = nt;
+            section = IMAGE_FIRST_SECTION(nt);
+        } else {
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(
+                image.rawData + dos->e_lfanew);
+            nt->Signature = IMAGE_NT_SIGNATURE;
+            nt->FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+            nt->FileHeader.NumberOfSections = 1;
+            nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+            nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+            nt->OptionalHeader.ImageBase = static_cast<DWORD>(kImageBase32);
+            nt->OptionalHeader.AddressOfEntryPoint = 0x1000u;
+            nt->OptionalHeader.BaseOfCode = 0x1000u;
+            nt->OptionalHeader.BaseOfData = 0x2000u;
+            nt->OptionalHeader.SectionAlignment = 0x1000u;
+            nt->OptionalHeader.FileAlignment = 0x200u;
+            nt->OptionalHeader.SizeOfHeaders = headersSize;
+            nt->OptionalHeader.SizeOfImage = 0x2000u;
+            nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+            image.ntHeaders32 = nt;
+            section = IMAGE_FIRST_SECTION(nt);
+        }
         std::memcpy(section->Name, ".text", 5);
         section->Misc.VirtualSize = textRawSize;
         section->VirtualAddress = 0x1000u;
@@ -319,11 +342,9 @@ public:
             static_cast<BYTE>(0x90));
 
         image.dosHeader = dos;
-        image.ntHeaders64 = nt;
-        image.ntHeaders32 = nullptr;
         image.sections = section;
         image.numSections = 1;
-        image.is64Bit = TRUE;
+        image.is64Bit = is64Bit ? TRUE : FALSE;
         image.isValid = TRUE;
     }
 
@@ -350,7 +371,11 @@ std::array<uint8_t, 32> MakeBuildSeed() {
     return seed;
 }
 
-VMHandlerSynthesisConfig MakeBuilderConfig(uint32_t functionRVA) {
+VMHandlerSynthesisConfig MakeBuilderConfig(
+    uint32_t functionRVA,
+    std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+    bool is64Bit = true)
+{
     const std::array<uint8_t, 32> seed = MakeBuildSeed();
     MutationConfig mutation{};
     mutation.seed = seed;
@@ -361,7 +386,8 @@ VMHandlerSynthesisConfig MakeBuilderConfig(uint32_t functionRVA) {
     mutation.embedJunkHandlers = true;
     mutation.requestedJunkHandlerCount = 4;
     for (const auto& descriptor : VMSchema::Opcodes()) {
-        if (descriptor.runtimeSupportedX64) {
+        if (is64Bit ? descriptor.runtimeSupportedX64 :
+                descriptor.runtimeSupportedX86) {
             mutation.validOpcodes.push_back(
                 static_cast<uint8_t>(descriptor.opcode));
         }
@@ -370,9 +396,11 @@ VMHandlerSynthesisConfig MakeBuilderConfig(uint32_t functionRVA) {
     Require(engine.Initialize(mutation),
         "runtime builder 集成测试无法初始化 MutationEngine");
     const auto isa = engine.GenerateMutatedISA();
+    opcodeMap = isa.opcodeMap;
 
     VMHandlerSynthesisConfig config{};
-    config.architecture = VMHandlerArchitecture::X64;
+    config.architecture = is64Bit ? VMHandlerArchitecture::X64 :
+        VMHandlerArchitecture::X86;
     config.buildSeed = seed;
     config.handlerSemanticToSlot = isa.handlerSemanticToSlot;
     config.handlerSlotToSemantic = isa.handlerSlotToSemantic;
@@ -399,32 +427,254 @@ VMHandlerSynthesisConfig MakeBuilderConfig(uint32_t functionRVA) {
     return config;
 }
 
+std::vector<uint8_t> MakeBuilderBytecode(
+    const VMHandlerSynthesisConfig& config,
+    const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
+    uint8_t variant)
+{
+    CipherShell::MicroInstruction instruction{};
+    instruction.opcode = VM_UOP_RET;
+    instruction.handlerVariant = variant;
+    instruction.operandCount = 1u;
+    instruction.operands[0] = 0u;
+    std::vector<uint8_t> bytecode;
+    std::string error;
+    Require(!config.functionDecodePlans.empty() &&
+            VMSchema::Encode(instruction, opcodeMap,
+                config.functionDecodePlans.front().codec, bytecode, error) &&
+            !bytecode.empty(),
+        "runtime builder integration could not encode evidence bytecode: " + error);
+    return bytecode;
+}
+
+#if defined(_M_X64)
+void VerifyX64TrampolineVirtualUnwind(const VMRuntimeBuildResult& result) {
+    Require(result.trampolines.size() == 1u,
+        "RtlVirtualUnwind regression requires exactly one trampoline");
+    const auto& trampoline = result.trampolines.front();
+    const auto unwind = std::find_if(
+        result.unwindEntries.begin(), result.unwindEntries.end(),
+        [&](const auto& candidate) {
+            return candidate.beginRVA == trampoline.trampolineRVA;
+        });
+    Require(unwind != result.unwindEntries.end() &&
+            unwind->endRVA == trampoline.trampolineRVA +
+                trampoline.trampolineSize,
+        "x64 trampoline RUNTIME_FUNCTION range is missing or truncated");
+
+    const auto& emitted = result.integrityExpectation.expectedSectionBytes;
+    Require(trampoline.trampolineRVA >= result.sectionRVA &&
+            unwind->unwindRVA >= result.sectionRVA,
+        "x64 trampoline unwind RVAs precede the runtime section");
+    const uint32_t codeOffset = trampoline.trampolineRVA - result.sectionRVA;
+    const uint32_t unwindOffset = unwind->unwindRVA - result.sectionRVA;
+    Require(static_cast<uint64_t>(codeOffset) + trampoline.trampolineSize <=
+                emitted.size() &&
+            static_cast<uint64_t>(unwindOffset) + 4u <= emitted.size(),
+        "x64 trampoline code/unwind bytes exceed the emitted section");
+    const uint8_t* code = emitted.data() + codeOffset;
+    const uint8_t* unwindInfo = emitted.data() + unwindOffset;
+    Require((unwindInfo[0] & 0x07u) == 1u &&
+            (unwindInfo[0] & 0xF8u) == 0u &&
+            (unwindInfo[3] & 0x0Fu) == 5u &&
+            (unwindInfo[3] >> 4u) == 0u,
+        "x64 trampoline unwind header does not declare a V1 RBP frame");
+
+    size_t epilogOffset = trampoline.trampolineSize;
+    uint32_t stackAllocation = 0;
+    for (size_t offset = 0; offset + 9u <= trampoline.trampolineSize; ++offset) {
+        if (code[offset] != 0x48u || code[offset + 1u] != 0x8Du ||
+            code[offset + 2u] != 0xA5u || code[offset + 7u] != 0x5Du ||
+            code[offset + 8u] != 0xC3u) {
+            continue;
+        }
+        std::memcpy(&stackAllocation, code + offset + 3u,
+            sizeof(stackAllocation));
+        epilogOffset = offset;
+        break;
+    }
+    Require(epilogOffset < trampoline.trampolineSize &&
+            stackAllocation >= 0x4000u &&
+            (stackAllocation & 0x0Fu) == 0u &&
+            unwindInfo[1] < epilogOffset,
+        "x64 trampoline lacks its canonical LEA/POP/RET epilog");
+
+    auto* mapped = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, emitted.size(), MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE));
+    Require(mapped != nullptr,
+        "VirtualAlloc failed for RtlVirtualUnwind trampoline image");
+    std::memcpy(mapped, emitted.data(), emitted.size());
+    DWORD oldProtection = 0;
+    Require(VirtualProtect(mapped, emitted.size(), PAGE_EXECUTE_READ,
+                &oldProtection) != FALSE,
+        "VirtualProtect failed for RtlVirtualUnwind trampoline image");
+
+    const DWORD64 imageBase = reinterpret_cast<DWORD64>(mapped) -
+        result.sectionRVA;
+    RUNTIME_FUNCTION nativeFunction{};
+    nativeFunction.BeginAddress = unwind->beginRVA;
+    nativeFunction.EndAddress = unwind->endRVA;
+    nativeFunction.UnwindData = unwind->unwindRVA;
+
+    std::vector<uint8_t> stack(
+        static_cast<size_t>(stackAllocation) + 0x4000u, 0);
+    uintptr_t entryRsp = reinterpret_cast<uintptr_t>(
+        stack.data() + stack.size() - 0x100u);
+    entryRsp = (entryRsp & ~static_cast<uintptr_t>(0x0Fu)) + 8u;
+    const uintptr_t frameRsp = entryRsp - 8u - stackAllocation;
+    Require(frameRsp >= reinterpret_cast<uintptr_t>(stack.data()) &&
+            entryRsp + sizeof(uint64_t) <=
+                reinterpret_cast<uintptr_t>(stack.data() + stack.size()),
+        "synthetic unwind stack range is invalid");
+
+    const auto store64 = [](uintptr_t address, uint64_t value) {
+        std::memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    };
+    constexpr uint64_t returnAddress = 0x00007FF612345678ULL;
+    constexpr uint64_t originalRbp = 0x0000000013579BDFULL;
+    constexpr uint64_t expectedRbx = 0x0102030405060708ULL;
+    constexpr uint64_t expectedRsi = 0x1112131415161718ULL;
+    constexpr uint64_t expectedRdi = 0x2122232425262728ULL;
+    constexpr uint64_t expectedR12 = 0x3132333435363738ULL;
+    constexpr uint64_t expectedR13 = 0x4142434445464748ULL;
+    constexpr uint64_t expectedR14 = 0x5152535455565758ULL;
+    constexpr uint64_t expectedR15 = 0x6162636465666768ULL;
+    store64(entryRsp, returnAddress);
+    store64(entryRsp - 8u, originalRbp);
+    store64(frameRsp + 0x40u, expectedR15);
+    store64(frameRsp + 0x48u, expectedR14);
+    store64(frameRsp + 0x50u, expectedR13);
+    store64(frameRsp + 0x58u, expectedR12);
+    store64(frameRsp + 0x80u, expectedRdi);
+    store64(frameRsp + 0x88u, expectedRsi);
+    store64(frameRsp + 0x98u, expectedRbx);
+
+    const auto unwindAt = [&](uint32_t relativeOffset, uintptr_t rsp,
+                              uint64_t rbp, bool restoreSavedRegisters) {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL | CONTEXT_FLOATING_POINT;
+        context.Rip = imageBase + trampoline.trampolineRVA + relativeOffset;
+        context.Rsp = rsp;
+        context.Rbp = rbp;
+        if (!restoreSavedRegisters) {
+            context.Rbx = expectedRbx;
+            context.Rsi = expectedRsi;
+            context.Rdi = expectedRdi;
+            context.R12 = expectedR12;
+            context.R13 = expectedR13;
+            context.R14 = expectedR14;
+            context.R15 = expectedR15;
+        }
+        PVOID handlerData = nullptr;
+        DWORD64 establisherFrame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, context.Rip,
+            &nativeFunction, &context, &handlerData, &establisherFrame,
+            nullptr);
+        Require(context.Rip == returnAddress &&
+                context.Rsp == entryRsp + sizeof(uint64_t) &&
+                context.Rbp == originalRbp &&
+                context.Rbx == expectedRbx && context.Rsi == expectedRsi &&
+                context.Rdi == expectedRdi && context.R12 == expectedR12 &&
+                context.R13 == expectedR13 && context.R14 == expectedR14 &&
+                context.R15 == expectedR15,
+            "RtlVirtualUnwind did not reconstruct the x64 trampoline caller");
+    };
+
+    // SizeOfProlog is the first instruction boundary after the prolog. Use
+    // that exact boundary so RtlVirtualUnwind is never handed a PC in the
+    // middle of the function body's first instruction.
+    const uint32_t bodyOffset = static_cast<uint32_t>(unwindInfo[1]);
+    Require(bodyOffset < epilogOffset,
+        "x64 trampoline has no function-body byte after its prolog");
+    unwindAt(bodyOffset, frameRsp, frameRsp, true);
+    unwindAt(static_cast<uint32_t>(epilogOffset), frameRsp, frameRsp, false);
+    unwindAt(static_cast<uint32_t>(epilogOffset + 7u), entryRsp - 8u,
+        frameRsp, false);
+    unwindAt(static_cast<uint32_t>(epilogOffset + 8u), entryRsp,
+        originalRbp, false);
+
+    VirtualFree(mapped, 0, MEM_RELEASE);
+}
+#endif
+
 void TestBuilderAndReparseIntegration() {
     constexpr uint32_t functionRVA = 0x1000u;
     OwnedBuilderImage owned;
     VMFunctionRecord record{};
     record.functionRVA = functionRVA;
     record.functionSize = 0x20u;
-    record.bytecodeSize = 1;
     record.guestStackSize = 0x4000u;
 
     std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> runtimeKeyShare{};
     for (size_t index = 0; index < runtimeKeyShare.size(); ++index) {
         runtimeKeyShare[index] = static_cast<uint8_t>(0x41u + index);
     }
-    const VMHandlerSynthesisConfig config = MakeBuilderConfig(functionRVA);
+    std::unordered_map<uint8_t, uint8_t> opcodeMap;
+    const VMHandlerSynthesisConfig config = MakeBuilderConfig(
+        functionRVA, opcodeMap);
+    const std::vector<uint8_t> bytecode = MakeBuilderBytecode(
+        config, opcodeMap, 1u);
+    record.bytecodeSize = static_cast<uint32_t>(bytecode.size());
     const char runtimeSection[8] = {'.','t','v','m','r','t',0,0};
     const char unwindSection[8] = {'.','t','v','m','u','w',0,0};
     const char relocationSection[8] = {'.','t','v','m','r','l',0,0};
 
     VMRuntimeBuilder builder;
     const VMRuntimeBuildResult result = builder.Build(
-        &owned.image, {record}, 0x1080u, runtimeKeyShare, config,
+        &owned.image, {record}, bytecode, opcodeMap,
+        0x1080u, runtimeKeyShare, config,
         runtimeSection, unwindSection, relocationSection);
     Require(result.success && result.executionReady &&
             result.runtimeContentVerified &&
             result.referenceRuntimeBlobFreeVerified,
         "VMRuntimeBuilder 未通过自身产物完整性门禁: " + result.error);
+    Require(result.trampolines.size() == 1,
+        "VMRuntimeBuilder 集成测试没有生成唯一 trampoline");
+    Require(result.plaintextHandlers.size() == 1u &&
+            result.handlerReferences.size() == 1u &&
+            result.handlerReferences.front().references.size() == 1u &&
+            result.handlerReferences.front().references.front().semantic ==
+                VM_UOP_RET &&
+            result.handlerReferences.front().references.front().variant == 1u,
+        "VMRuntimeBuilder evidence was not restricted to the referenced RET handler");
+    const auto& trampoline = result.trampolines.front();
+    Require(trampoline.trampolineRVA >= result.sectionRVA,
+        "trampoline RVA 位于 runtime section 之前");
+    const uint32_t trampolineOffset = trampoline.trampolineRVA - result.sectionRVA;
+    const auto& emitted = result.integrityExpectation.expectedSectionBytes;
+#if defined(_M_X64)
+    VerifyX64TrampolineVirtualUnwind(result);
+#endif
+    Require(static_cast<uint64_t>(trampolineOffset) + trampoline.trampolineSize <=
+            emitted.size(),
+        "x64 trampoline range exceeds emitted runtime section");
+    const std::array<uint8_t, 13> forbiddenPebImageBase = {
+        0x65,0x4C,0x8B,0x0C,0x25,0x60,0x00,0x00,0x00,0x4D,0x8B,0x49,0x10
+    };
+    const auto pebUse = std::search(
+        emitted.begin() + trampolineOffset,
+        emitted.begin() + trampolineOffset + trampoline.trampolineSize,
+        forbiddenPebImageBase.begin(), forbiddenPebImageBase.end());
+    Require(pebUse == emitted.begin() + trampolineOffset + trampoline.trampolineSize,
+        "DLL trampoline 仍错误读取宿主 EXE 的 PEB.ImageBaseAddress");
+
+    bool foundSelfBase = false;
+    for (uint32_t offset = 0; offset + 15u <= trampoline.trampolineSize; ++offset) {
+        const uint8_t* code = emitted.data() + trampolineOffset + offset;
+        if (std::memcmp(code, "\x4c\x8d\x0d\x00\x00\x00\x00\xb8", 8) != 0 ||
+            std::memcmp(code + 12, "\x49\x29\xc1", 3) != 0) {
+            continue;
+        }
+        uint32_t patchedAnchorRVA = 0;
+        std::memcpy(&patchedAnchorRVA, code + 8, sizeof(patchedAnchorRVA));
+        Require(patchedAnchorRVA == trampoline.trampolineRVA + offset + 7u,
+            "trampoline 自身 RIP anchor RVA 回填错误");
+        foundSelfBase = true;
+        break;
+    }
+    Require(foundSelfBase,
+        "trampoline 未生成可用于 DLL/EXE 的 position-independent image base");
     std::string error;
     // 见 RequireVerified 注释：先落地布尔结果，避免实参求值顺序把消息拼接在
     // VerifyRuntimeContents 写入 error 之前完成。
@@ -455,6 +705,88 @@ void TestBuilderAndReparseIntegration() {
     parser.FreeImage(reparsed);
 }
 
+void TestBuilderX86SelfBaseAndCetBalance() {
+    constexpr uint32_t functionRVA = 0x1000u;
+    OwnedBuilderImage owned(false);
+    VMFunctionRecord record{};
+    record.functionRVA = functionRVA;
+    record.functionSize = 0x20u;
+    record.guestStackSize = 0x4000u;
+
+    std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE> runtimeKeyShare{};
+    for (size_t index = 0; index < runtimeKeyShare.size(); ++index) {
+        runtimeKeyShare[index] = static_cast<uint8_t>(0x71u + index);
+    }
+    std::unordered_map<uint8_t, uint8_t> opcodeMap;
+    const VMHandlerSynthesisConfig config = MakeBuilderConfig(
+        functionRVA, opcodeMap, false);
+    const std::vector<uint8_t> bytecode = MakeBuilderBytecode(
+        config, opcodeMap, 2u);
+    record.bytecodeSize = static_cast<uint32_t>(bytecode.size());
+    const char runtimeSection[8] = {'.','x','v','m','r','t',0,0};
+    const char unwindSection[8] = {'.','x','v','m','u','w',0,0};
+    const char relocationSection[8] = {'.','x','v','m','r','l',0,0};
+
+    VMRuntimeBuilder builder;
+    const VMRuntimeBuildResult result = builder.Build(
+        &owned.image, {record}, bytecode, opcodeMap,
+        0x1080u, runtimeKeyShare, config,
+        runtimeSection, unwindSection, relocationSection);
+    Require(result.success && result.executionReady &&
+            result.architecture == VM_ARCH_X86,
+        "x86 VMRuntimeBuilder integration failed: " + result.error);
+    Require(result.trampolines.size() == 1u,
+        "x86 VMRuntimeBuilder did not emit exactly one trampoline");
+
+    const auto& trampoline = result.trampolines.front();
+    Require(trampoline.trampolineRVA >= result.sectionRVA,
+        "x86 trampoline RVA precedes runtime section");
+    const uint32_t trampolineOffset = trampoline.trampolineRVA - result.sectionRVA;
+    const auto& emitted = result.integrityExpectation.expectedSectionBytes;
+    Require(static_cast<uint64_t>(trampolineOffset) + trampoline.trampolineSize <=
+            emitted.size(),
+        "x86 trampoline range exceeds emitted runtime section");
+    const auto begin = emitted.begin() + trampolineOffset;
+    const auto end = begin + trampoline.trampolineSize;
+
+    const std::array<uint8_t, 10> forbiddenPebImageBase = {
+        0x64,0x8B,0x0D,0x30,0x00,0x00,0x00,0x8B,0x49,0x08
+    };
+    Require(std::search(begin, end, forbiddenPebImageBase.begin(),
+                forbiddenPebImageBase.end()) == end,
+        "x86 DLL trampoline still reads host EXE PEB.ImageBaseAddress");
+    const std::array<uint8_t, 6> forbiddenUnbalancedGetPc = {
+        0xE8,0x00,0x00,0x00,0x00,0x59
+    };
+    Require(std::search(begin, end, forbiddenUnbalancedGetPc.begin(),
+                forbiddenUnbalancedGetPc.end()) == end,
+        "x86 trampoline contains CET-unbalanced call-next/pop get-PC sequence");
+
+    const std::array<uint8_t, 13> balancedPrefix = {
+        0xE8,0x02,0x00,0x00,0x00,
+        0xEB,0x04,
+        0x8B,0x0C,0x24,
+        0xC3,
+        0x81,0xE9
+    };
+    const auto selfBase = std::search(
+        begin, end, balancedPrefix.begin(), balancedPrefix.end());
+    Require(selfBase != end &&
+            static_cast<size_t>(end - selfBase) >= balancedPrefix.size() + 4u,
+        "x86 trampoline lacks balanced position-independent image-base sequence");
+    uint32_t patchedAnchorRVA = 0;
+    std::memcpy(&patchedAnchorRVA,
+        &*(selfBase + balancedPrefix.size()), sizeof(patchedAnchorRVA));
+    const uint32_t sequenceOffset = static_cast<uint32_t>(selfBase - begin);
+    Require(patchedAnchorRVA == trampoline.trampolineRVA + sequenceOffset + 5u,
+        "x86 trampoline self-address anchor RVA was patched incorrectly");
+
+    std::string error;
+    const bool verified = VMRuntimeBuilder::VerifyRuntimeContents(
+        &owned.image, result, error);
+    Require(verified, "x86 VMRuntimeBuilder post-build verification failed: " + error);
+}
+
 } // namespace
 
 int main() {
@@ -463,6 +795,7 @@ int main() {
         TestPhysicalTamperRejection();
         TestDigestAndDispatchTargetRejection();
         TestBuilderAndReparseIntegration();
+        TestBuilderX86SelfBaseAndCetBalance();
         std::cout << "VM runtime 产物完整性测试通过" << std::endl;
         return 0;
     } catch (const std::exception& exception) {

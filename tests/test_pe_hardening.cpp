@@ -266,6 +266,24 @@ void TestLoadConfigDeclaredSizeExceedsDirectorySizeButFitsFile() {
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
+void TestLoadConfigDeclaredSizeCannotUseOverlay() {
+    // Size DWORD 落在 .rdata 末尾，但声明的 8 字节依赖 overlay 才能凑齐。
+    // 单看 rawSize-offset 会错误放行；结构必须整体位于 .rdata 内。
+    Writer rd;
+    rd.pad(kFileAlign - sizeof(DWORD));
+    const size_t lcOff = rd.mark();
+    rd.u32(8);
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff), 8}
+    };
+    auto lay = BuildPe(true, {0xCC}, rd.buf, dirs, std::vector<uint8_t>(4, 0));
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && !img->isValid);
+    CS_TEST_CHECK(!img->loadConfig.valid);
+    CS_TEST_CHECK(img->errorMessage.find("load config") != std::string::npos);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
 void TestLoadConfigDeclaredSizeExceedsAbsoluteStructuralBound() {
     // 反面：declaredSize 落在文件真实边界内，但大到不像任何已知版本的
     // IMAGE_LOAD_CONFIG_DIRECTORY64（超过 4x sizeof）——绝对结构上限这道
@@ -623,7 +641,8 @@ CipherShell::CS_PE_IMAGE* ParseSingleExceptionWithUnwind(const std::vector<uint8
 }
 
 void TestExceptionPushMachFrameCodeOffsetZeroAccepted() {
-    // PUSH_MACHFRAME 是唯一允许 CodeOffset=0 的普通 UWOP；OpInfo=1 表示带 error code。
+    // 非 CHAININFO 普通 prolog 中，PUSH_MACHFRAME 是唯一允许 CodeOffset=0
+    // 的 UWOP；OpInfo=1 表示带 error code。
     auto* img = ParseSingleExceptionWithUnwind({
         0x01, 0x00, 0x01, 0x00,
         0x00, static_cast<uint8_t>(0x10 | CipherShell::PEUtils::kUwopPushMachFrame),
@@ -670,6 +689,126 @@ void TestExceptionOtherUwopCodeOffsetZeroRejected() {
         0x01, 0x00, 0x01, 0x00,
         0x00, CipherShell::PEUtils::kUwopAllocSmall,
         0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+CipherShell::CS_PE_IMAGE* ParseChainedExceptionWithOuterUnwind(
+    uint8_t sizeOfProlog, const std::vector<uint8_t>& unwindCodes, uint8_t countOfCodes) {
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t outerUnwindRel = rd.mark();
+    rd.u8(static_cast<uint8_t>(0x01 | (0x4 << 3)));  // Version=1, Flags=CHAININFO
+    rd.u8(sizeOfProlog);
+    rd.u8(countOfCodes);
+    rd.u8(0x00);
+    rd.put(unwindCodes.data(), unwindCodes.size());
+    if ((countOfCodes & 1u) != 0) rd.u16(0);  // CHAININFO 尾必须 DWORD 对齐
+
+    const size_t chainedRel = rd.mark();
+    IMAGE_RUNTIME_FUNCTION_ENTRY chained{};
+    chained.BeginAddress = kExcTextVA;
+    chained.EndAddress = kExcTextVA + 4;
+    chained.UnwindData = 0;
+    rd.put(&chained, sizeof(chained));
+    const size_t innerUnwindRel = rd.mark();
+    auto innerUnwind = BuildUnwindInfoValid();
+    rd.put(innerUnwind.data(), innerUnwind.size());
+    chained.UnwindData = kExcRdataVA + static_cast<uint32_t>(innerUnwindRel);
+    std::memcpy(rd.buf.data() + chainedRel, &chained, sizeof(chained));
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + 8;
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(outerUnwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+    return Parse(BuildPe(true, std::vector<uint8_t>(8, 0xCC), rd.buf,
+        {{IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+          kExcRdataVA + static_cast<uint32_t>(entryRel),
+          sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}}, {}));
+}
+
+void TestExceptionZeroPrologChainedSaveNonvolAccepted() {
+    // MSVC shrink-wrapped fragment：零长度 prolog 在 offset 0 保存 R15/R14/R13/RBP，
+    // 完整主 prolog 由 CHAININFO 尾部的 RUNTIME_FUNCTION 描述。
+    auto* img = ParseChainedExceptionWithOuterUnwind(0,
+        {
+            0x00, static_cast<uint8_t>(0xF0 | CipherShell::PEUtils::kUwopSaveNonvol),
+            0x01, 0x00,  // R15
+            0x00, static_cast<uint8_t>(0xE0 | CipherShell::PEUtils::kUwopSaveNonvol),
+            0x02, 0x00,  // R14
+            0x00, static_cast<uint8_t>(0xD0 | CipherShell::PEUtils::kUwopSaveNonvol),
+            0x03, 0x00,  // R13
+            0x00, static_cast<uint8_t>(0x50 | CipherShell::PEUtils::kUwopSaveNonvol),
+            0x04, 0x00   // RBP
+        }, 8);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionRootSaveNonvolCodeOffsetZeroRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x00, 0x02, 0x00,
+        0x00, static_cast<uint8_t>(0x30 | CipherShell::PEUtils::kUwopSaveNonvol),
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionNonzeroPrologChainedSaveAtZeroRejected() {
+    auto* img = ParseChainedExceptionWithOuterUnwind(1,
+        {0x00, static_cast<uint8_t>(0x30 | CipherShell::PEUtils::kUwopSaveNonvol),
+         0x00, 0x00}, 2);
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionZeroPrologChainedOtherUwopAtZeroRejected() {
+    auto* img = ParseChainedExceptionWithOuterUnwind(0,
+        {0x00, static_cast<uint8_t>(0x30 | CipherShell::PEUtils::kUwopPushNonvol)}, 1);
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionSetFpRegOpInfoMatchesFrameOffsetAccepted() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x01, 0x01, 0x55,  // FrameRegister=RBP, FrameOffset=5
+        0x01, static_cast<uint8_t>(0x50 | CipherShell::PEUtils::kUwopSetFpReg),
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionSetFpRegReservedZeroAccepted() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x01, 0x01, 0x55,
+        0x01, CipherShell::PEUtils::kUwopSetFpReg,
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionSetFpRegOtherOpInfoRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x01, 0x01, 0x55,
+        0x01, static_cast<uint8_t>(0x40 | CipherShell::PEUtils::kUwopSetFpReg),
+        0x00, 0x00
+    });
+    CS_TEST_CHECK(img && !img->isValid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestExceptionDuplicateSetFpRegRejected() {
+    auto* img = ParseSingleExceptionWithUnwind({
+        0x01, 0x02, 0x02, 0x55,
+        0x02, static_cast<uint8_t>(0x50 | CipherShell::PEUtils::kUwopSetFpReg),
+        0x01, CipherShell::PEUtils::kUwopSetFpReg
     });
     CS_TEST_CHECK(img && !img->isValid);
     CipherShell::PEParser p; p.FreeImage(img);
@@ -1834,12 +1973,236 @@ void TestEmitterHeaderRelocation() {
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
+WORD GetFileCharacteristics(const CipherShell::CS_PE_IMAGE* image) {
+    return image->is64Bit
+        ? image->ntHeaders64->FileHeader.Characteristics
+        : image->ntHeaders32->FileHeader.Characteristics;
+}
+
+WORD GetDllCharacteristics(const CipherShell::CS_PE_IMAGE* image) {
+    return image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.DllCharacteristics
+        : image->ntHeaders32->OptionalHeader.DllCharacteristics;
+}
+
+void SetFileCharacteristics(CipherShell::CS_PE_IMAGE* image, WORD value) {
+    if (image->is64Bit) image->ntHeaders64->FileHeader.Characteristics = value;
+    else image->ntHeaders32->FileHeader.Characteristics = value;
+}
+
+void SetDllCharacteristics(CipherShell::CS_PE_IMAGE* image, WORD value) {
+    if (image->is64Bit) image->ntHeaders64->OptionalHeader.DllCharacteristics = value;
+    else image->ntHeaders32->OptionalHeader.DllCharacteristics = value;
+}
+
+void VerifyDynamicBaseEmptyRelocationsGetsAnchor(bool is64) {
+    auto lay = BuildPe(is64, {0xC3, 0xCC, 0xCC, 0xCC}, {}, {}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    SetDllCharacteristics(img, static_cast<WORD>(
+        GetDllCharacteristics(img) | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE));
+    SetFileCharacteristics(img, static_cast<WORD>(
+        GetFileCharacteristics(img) | IMAGE_FILE_RELOCS_STRIPPED));
+
+    const uint64_t preferredImageBase = CipherShell::PEUtils::ImageBase(img);
+    const WORD sectionsBefore = img->numSections;
+    const uint32_t pointerWidth = is64 ? 8u : 4u;
+    const uint16_t expectedType = is64
+        ? IMAGE_REL_BASED_DIR64
+        : IMAGE_REL_BASED_HIGHLOW;
+    const char relocationName[8] = {'.', 'a', 's', 'l', 'r', 'r', 'l', 0};
+    CipherShell::PEAppendSectionResult appended{};
+    std::string error;
+    CipherShell::PEEmitter emitter(img);
+    CS_TEST_CHECK(emitter.RebuildBaseRelocationDirectory(
+        {}, relocationName, &appended, &error));
+    CS_TEST_CHECK(appended.success);
+    CS_TEST_CHECK(img->numSections == sectionsBefore + 1u);
+    CS_TEST_CHECK((GetDllCharacteristics(img) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+    CS_TEST_CHECK((GetFileCharacteristics(img) & IMAGE_FILE_RELOCS_STRIPPED) == 0);
+
+    // anchor 是实际 file-backed 的只读初始化数据，不可写、不可执行、不可丢弃。
+    const IMAGE_SECTION_HEADER& section = img->sections[appended.sectionIndex];
+    CS_TEST_CHECK((section.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0);
+    CS_TEST_CHECK((section.Characteristics & IMAGE_SCN_MEM_READ) != 0);
+    CS_TEST_CHECK((section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0);
+    CS_TEST_CHECK((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0);
+    CS_TEST_CHECK((section.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) == 0);
+
+    CS_TEST_CHECK(img->relocs.entries.size() == 1u);
+    const CipherShell::CS_RELOC_ENTRY& anchorRelocation = img->relocs.entries[0];
+    CS_TEST_CHECK(anchorRelocation.fullRVA == appended.rva);
+    CS_TEST_CHECK(anchorRelocation.type == expectedType);
+    CS_TEST_CHECK(anchorRelocation.pageRVA == (appended.rva & ~0xFFFu));
+    CS_TEST_CHECK(anchorRelocation.offset == (appended.rva & 0x0FFFu));
+
+    const uint32_t anchorOffset = emitter.RvaToOffset(appended.rva);
+    CS_TEST_CHECK(anchorOffset != 0u);
+    uint64_t storedImageBase = 0;
+    std::memcpy(&storedImageBase, img->rawData + anchorOffset, pointerWidth);
+    CS_TEST_CHECK(storedImageBase == preferredImageBase);
+
+    const IMAGE_DATA_DIRECTORY directory = CipherShell::PEUtils::GetDataDirectory(
+        img, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    CS_TEST_CHECK(directory.VirtualAddress == appended.rva + pointerWidth);
+    CS_TEST_CHECK(directory.Size == 12u);
+    const uint32_t directoryOffset = emitter.RvaToOffset(directory.VirtualAddress);
+    CS_TEST_CHECK(directoryOffset != 0u);
+    IMAGE_BASE_RELOCATION block{};
+    std::memcpy(&block, img->rawData + directoryOffset, sizeof(block));
+    CS_TEST_CHECK(block.VirtualAddress == (appended.rva & ~0xFFFu));
+    CS_TEST_CHECK(block.SizeOfBlock == 12u);
+    uint16_t encoded = 0;
+    uint16_t padding = 0xFFFFu;
+    std::memcpy(&encoded, img->rawData + directoryOffset + sizeof(block), sizeof(encoded));
+    std::memcpy(&padding, img->rawData + directoryOffset + sizeof(block) + sizeof(encoded),
+        sizeof(padding));
+    CS_TEST_CHECK(encoded == static_cast<uint16_t>(
+        (expectedType << 12u) | (appended.rva & 0x0FFFu)));
+    CS_TEST_CHECK(padding == 0u);
+
+    // 再走一次正式 parser，证明目录布局不是只在 emitter 的内存元数据中成立。
+    BYTE* reparsedBytes = new BYTE[img->rawSize];
+    std::memcpy(reparsedBytes, img->rawData, img->rawSize);
+    CipherShell::PEParser reparsingParser;
+    auto* reparsed = reparsingParser.LoadFromBuffer(reparsedBytes, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid);
+    CS_TEST_CHECK(reparsed->relocs.entries.size() == 1u);
+    CS_TEST_CHECK(reparsed->relocs.entries[0].fullRVA == appended.rva);
+    CS_TEST_CHECK(reparsed->relocs.entries[0].type == expectedType);
+    reparsingParser.FreeImage(reparsed);
+
+    CipherShell::PEParser p;
+    p.FreeImage(img);
+}
+
+void TestEmitterDynamicBaseEmptyRelocationsGetsX86Anchor() {
+    VerifyDynamicBaseEmptyRelocationsGetsAnchor(false);
+}
+
+void TestEmitterDynamicBaseEmptyRelocationsGetsX64Anchor() {
+    VerifyDynamicBaseEmptyRelocationsGetsAnchor(true);
+}
+
+void TestEmitterFixedBaseEmptyRelocationsMayStripDirectory() {
+    auto lay = BuildPe(false, {0xC3, 0xCC, 0xCC, 0xCC}, {}, {}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    SetDllCharacteristics(img, static_cast<WORD>(
+        GetDllCharacteristics(img) & ~IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE));
+    SetFileCharacteristics(img, static_cast<WORD>(
+        GetFileCharacteristics(img) & ~IMAGE_FILE_RELOCS_STRIPPED));
+    CipherShell::PEUtils::SetDataDirectory(
+        img, IMAGE_DIRECTORY_ENTRY_BASERELOC, img->sections[0].VirtualAddress, 12u);
+
+    const WORD sectionsBefore = img->numSections;
+    const char relocationName[8] = {'.', 'f', 'i', 'x', 'r', 'l', 0, 0};
+    CipherShell::PEAppendSectionResult appended{};
+    std::string error;
+    CipherShell::PEEmitter emitter(img);
+    CS_TEST_CHECK(emitter.RebuildBaseRelocationDirectory(
+        {}, relocationName, &appended, &error));
+    CS_TEST_CHECK(!appended.success);
+    CS_TEST_CHECK(img->numSections == sectionsBefore);
+    CS_TEST_CHECK(img->relocs.entries.empty());
+    const IMAGE_DATA_DIRECTORY directory = CipherShell::PEUtils::GetDataDirectory(
+        img, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    CS_TEST_CHECK(directory.VirtualAddress == 0u && directory.Size == 0u);
+    CS_TEST_CHECK((GetDllCharacteristics(img) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) == 0);
+    CS_TEST_CHECK((GetFileCharacteristics(img) & IMAGE_FILE_RELOCS_STRIPPED) != 0);
+
+    CipherShell::PEParser p;
+    p.FreeImage(img);
+}
+
+void VerifyEmitterDynamicBaseAnchorFailureRollsBack(bool is64) {
+    auto lay = BuildPe(is64, {0xC3, 0xCC, 0xCC, 0xCC}, {}, {}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    SetDllCharacteristics(img, static_cast<WORD>(
+        GetDllCharacteristics(img) | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE));
+    SetFileCharacteristics(img, static_cast<WORD>(
+        GetFileCharacteristics(img) | IMAGE_FILE_RELOCS_STRIPPED));
+    if (is64) img->ntHeaders64->OptionalHeader.SectionAlignment = 0x1800u;
+    else img->ntHeaders32->OptionalHeader.SectionAlignment = 0x1800u;
+
+    BYTE* const dataBefore = img->rawData;
+    const DWORD sizeBefore = img->rawSize;
+    const WORD sectionsBefore = img->numSections;
+    const std::vector<uint8_t> bytesBefore(img->rawData, img->rawData + img->rawSize);
+    const char relocationName[8] = {'.', 'b', 'a', 'd', 'r', 'l', 0, 0};
+    std::string error;
+    CipherShell::PEEmitter emitter(img);
+    CS_TEST_CHECK(!emitter.RebuildBaseRelocationDirectory(
+        {}, relocationName, nullptr, &error));
+    CS_TEST_CHECK(error.find("anchor") != std::string::npos);
+    CS_TEST_CHECK(img->rawData == dataBefore);
+    CS_TEST_CHECK(img->rawSize == sizeBefore);
+    CS_TEST_CHECK(img->numSections == sectionsBefore);
+    CS_TEST_CHECK(std::memcmp(img->rawData, bytesBefore.data(), bytesBefore.size()) == 0);
+    CS_TEST_CHECK((GetDllCharacteristics(img) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+
+    CipherShell::PEParser p;
+    p.FreeImage(img);
+}
+
+void TestEmitterDynamicBaseAnchorFailureRollsBack() {
+    VerifyEmitterDynamicBaseAnchorFailureRollsBack(false);
+    VerifyEmitterDynamicBaseAnchorFailureRollsBack(true);
+}
+
+void TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(const char* fixturePath) {
+    CS_TEST_CHECK(fixturePath && fixturePath[0] != '\0');
+    CipherShell::PEParser parser;
+    auto* img = parser.LoadFromFile(fixturePath);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK((GetDllCharacteristics(img) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+    CS_TEST_CHECK(!img->relocs.entries.empty());
+
+    // 模拟生产路径已经消费完所有原生 relocation；其余输入仍是 MSVC 正常
+    // 链接出的完整 PE，不用手工 image 代替真实格式与目录布局。
+    img->relocs.entries.clear();
+    SetFileCharacteristics(img, static_cast<WORD>(
+        GetFileCharacteristics(img) | IMAGE_FILE_RELOCS_STRIPPED));
+    const WORD sectionsBefore = img->numSections;
+    const char relocationName[8] = {'.', 'm', 's', 'r', 'l', 0, 0, 0};
+    CipherShell::PEAppendSectionResult appended{};
+    std::string error;
+    CipherShell::PEEmitter emitter(img);
+    CS_TEST_CHECK(emitter.RebuildBaseRelocationDirectory(
+        {}, relocationName, &appended, &error));
+    CS_TEST_CHECK(appended.success);
+    CS_TEST_CHECK(img->numSections == sectionsBefore + 1u);
+    CS_TEST_CHECK(img->relocs.entries.size() == 1u);
+    CS_TEST_CHECK(img->relocs.entries[0].fullRVA == appended.rva);
+    CS_TEST_CHECK((GetDllCharacteristics(img) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+    CS_TEST_CHECK((GetFileCharacteristics(img) & IMAGE_FILE_RELOCS_STRIPPED) == 0);
+
+    BYTE* reparsedBytes = new BYTE[img->rawSize];
+    std::memcpy(reparsedBytes, img->rawData, img->rawSize);
+    CipherShell::PEParser reparsingParser;
+    auto* reparsed = reparsingParser.LoadFromBuffer(reparsedBytes, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid);
+    CS_TEST_CHECK(reparsed->relocs.entries.size() == 1u);
+    CS_TEST_CHECK((GetDllCharacteristics(reparsed) &
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0);
+    CS_TEST_CHECK((GetFileCharacteristics(reparsed) & IMAGE_FILE_RELOCS_STRIPPED) == 0);
+    reparsingParser.FreeImage(reparsed);
+    parser.FreeImage(img);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     TestLoadConfigShortNoGuardFlags();
     TestLoadConfigDeclaredSizeExceedsAvailable();
     TestLoadConfigDeclaredSizeExceedsDirectorySizeButFitsFile();
+    TestLoadConfigDeclaredSizeCannotUseOverlay();
     TestLoadConfigDeclaredSizeExceedsAbsoluteStructuralBound();
     TestLoadConfigShortNoSEHandler();
     TestSafeSEHValid();
@@ -1857,6 +2220,14 @@ int main() {
     TestExceptionPushMachFrameBadOpInfoRejected();
     TestExceptionPushMachFrameMustBeLogicalLast();
     TestExceptionOtherUwopCodeOffsetZeroRejected();
+    TestExceptionZeroPrologChainedSaveNonvolAccepted();
+    TestExceptionRootSaveNonvolCodeOffsetZeroRejected();
+    TestExceptionNonzeroPrologChainedSaveAtZeroRejected();
+    TestExceptionZeroPrologChainedOtherUwopAtZeroRejected();
+    TestExceptionSetFpRegOpInfoMatchesFrameOffsetAccepted();
+    TestExceptionSetFpRegReservedZeroAccepted();
+    TestExceptionSetFpRegOtherOpInfoRejected();
+    TestExceptionDuplicateSetFpRegRejected();
     TestExceptionBeginNotLessThanEnd();
     TestExceptionRangeNotExecutable();
     TestExceptionRangeNotFileBacked();
@@ -1897,5 +2268,11 @@ int main() {
     TestEmitterConsecutiveAppend();
     TestEmitterFailureRollback();
     TestEmitterHeaderRelocation();
+    TestEmitterDynamicBaseEmptyRelocationsGetsX86Anchor();
+    TestEmitterDynamicBaseEmptyRelocationsGetsX64Anchor();
+    TestEmitterFixedBaseEmptyRelocationsMayStripDirectory();
+    TestEmitterDynamicBaseAnchorFailureRollsBack();
+    CS_TEST_CHECK(argc == 2);
+    TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);
     return 0;
 }

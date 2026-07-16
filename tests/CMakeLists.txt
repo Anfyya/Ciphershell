@@ -151,26 +151,75 @@ if(MSVC)
     target_link_options(vm_manual_x64_sample PRIVATE /GUARD:NO)
 endif()
 
-# vm_per_build_similarity_gate 的真正打包目标：一个导出 5 个 noinline 函数的
-# DLL，而不是 vm_manual_x64_sample 那个纯 EXE。纯 EXE 的 AddressOfEntryPoint
-# 指向 CRT 启动代码（例如 __scrt_common_main_seh），不是 main 本身；CI 已经
-# 实测到 x86 下从那里开始的无边界递归反汇编会撞上 FunctionDiscovery 正确
-# 拒绝的控制流（"branch target is not a decoded instruction boundary"），
-# 而 x86 没有 x64 那样的 .pdata 表可以独立兜底，导致整个函数发现失败、VM
-# 保护完全无法应用、这条门禁自然也就没有 handler 机器码可比较。导出函数让
-# FunctionDiscovery 通过 PE 导出表直接拿到独立、可靠的根，不需要先成功
-# 反汇编 CRT 启动代码。
+# per-build 门禁同时打包并执行真实 MSVC DLL 与 EXE。两种样本都显式导出
+# 八个 noinline VM 目标，使 PE32/PE32+ 的函数边界来源稳定一致；这不是跳过
+# EXE 入口，而是让同一组被 main/runner 实际调用的函数在 DLL/EXE 两种容器
+# 中都经过正式 discovery、packer、trampoline、bytecode 与 runtime 路径。
+if(HAVE_NASM)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(CS_VM_FLAGS_PROBE_ASM samples/vm_flags_probe_x64.asm)
+        set(CS_VM_ABI_PROBE_ASM samples/vm_abi_probe_x64.asm)
+    else()
+        set(CS_VM_FLAGS_PROBE_ASM samples/vm_flags_probe_x86.asm)
+        set(CS_VM_ABI_PROBE_ASM samples/vm_abi_probe_x86.asm)
+    endif()
+else()
+    message(FATAL_ERROR
+        "The real PE VM runtime gate requires NASM for its flags and ABI probes")
+endif()
+
 add_library(vm_similarity_gate_sample SHARED
     samples/vm_similarity_gate_sample.cpp
+)
+
+add_executable(vm_similarity_gate_runner
+    samples/vm_similarity_gate_runner.cpp
+    samples/vm_abi_unwind_gate.cpp
+    ${CS_VM_FLAGS_PROBE_ASM}
+    ${CS_VM_ABI_PROBE_ASM}
+)
+
+add_executable(vm_runtime_gate_exe
+    samples/vm_runtime_gate_exe.cpp
+    samples/vm_abi_unwind_gate.cpp
+    ${CS_VM_FLAGS_PROBE_ASM}
+    ${CS_VM_ABI_PROBE_ASM}
+)
+
+add_executable(function_discovery_fixture
+    samples/function_discovery_fixture.cpp
 )
 
 set_target_properties(vm_similarity_gate_sample PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
 )
 
+set_target_properties(vm_similarity_gate_runner PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
+set_target_properties(vm_runtime_gate_exe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
+set_target_properties(function_discovery_fixture PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/samples
+)
+
 if(MSVC)
-    target_compile_options(vm_similarity_gate_sample PRIVATE /guard:cf-)
+    # Keep every named export large enough for the production five-byte entry
+    # trampoline in both PE32 and PE32+. The functions and ABI remain ordinary
+    # MSVC code; /Od only prevents Release from collapsing add/local1 into
+    # unpatchable 3-byte bodies.
+    target_compile_options(vm_similarity_gate_sample PRIVATE /guard:cf- /Od /Ob0)
     target_link_options(vm_similarity_gate_sample PRIVATE /GUARD:NO)
+    target_compile_options(vm_runtime_gate_exe PRIVATE
+        $<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf->
+        $<$<COMPILE_LANGUAGE:C,CXX>:/Od>
+        $<$<COMPILE_LANGUAGE:C,CXX>:/Ob0>)
+    target_link_options(vm_runtime_gate_exe PRIVATE /GUARD:NO /DYNAMICBASE /FIXED:NO)
+    target_compile_options(function_discovery_fixture PRIVATE /guard:cf- /Od /Ob0)
+    target_link_options(function_discovery_fixture PRIVATE /GUARD:NO /OPT:NOICF)
 endif()
 
 add_executable(test_e2e_packaging
@@ -209,11 +258,28 @@ target_link_libraries(test_pe_hardening PRIVATE
 )
 
 target_include_directories(test_pe_hardening PRIVATE ${CMAKE_SOURCE_DIR})
+add_dependencies(test_pe_hardening vm_runtime_gate_exe)
+
+# 只读取同一 CMake 配置由 MSVC 实际编译链接的 PE。Win32 覆盖 CRT OEP
+# direct-tail、真实 .text 间隙候选和派生 direct-call root；x64 覆盖真实 .pdata。
+add_executable(test_function_discovery
+    test_function_discovery.cpp
+)
+
+target_link_libraries(test_function_discovery PRIVATE
+    ciphershell_packer
+)
+
+target_include_directories(test_function_discovery PRIVATE ${CMAKE_SOURCE_DIR})
+add_dependencies(test_function_discovery function_discovery_fixture)
 
 add_test(NAME cli_options COMMAND test_cli_options)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
 add_test(NAME fail_closed_baseline COMMAND test_fail_closed)
-add_test(NAME pe_hardening_regression COMMAND test_pe_hardening)
+add_test(NAME pe_hardening_regression
+    COMMAND test_pe_hardening "$<TARGET_FILE:vm_runtime_gate_exe>")
+add_test(NAME function_discovery_regression
+    COMMAND test_function_discovery "$<TARGET_FILE:function_discovery_fixture>")
 add_test(NAME vm_handler_synthesis COMMAND test_vm_handler_synthesis)
 set_tests_properties(vm_handler_synthesis PROPERTIES LABELS "vm;hard-gate")
 add_test(NAME vm_public_entry COMMAND test_vm_public_entry)
@@ -262,6 +328,8 @@ add_test(
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vm_per_build_similarity_gate.py"
         --ciphershell "$<TARGET_FILE:ciphershell>"
         --sample "$<TARGET_FILE:vm_similarity_gate_sample>"
+        --runner "$<TARGET_FILE:vm_similarity_gate_runner>"
+        --exe-sample "$<TARGET_FILE:vm_runtime_gate_exe>"
         --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_similarity_gate_sample.toml"
         --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
 )

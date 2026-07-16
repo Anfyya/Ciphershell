@@ -146,23 +146,37 @@ MicroInstruction Uop(
 }
 
 std::vector<uint8_t> BuildBytecode(const TestISA& isa) {
-    const std::array<MicroInstruction, 3> program = {
-        Uop(VM_UOP_PUSH_IMM, {kExpectedRax,
+    std::vector<MicroInstruction> program;
+    program.push_back(Uop(VM_UOP_PUSH_IMM, {kExpectedRax,
 #if defined(_M_X64)
             8
 #else
             4
 #endif
-        }, 1),
-        Uop(VM_UOP_POP_VREG, {0,
+        }, 1));
+    program.push_back(Uop(VM_UOP_POP_VREG, {0,
 #if defined(_M_X64)
             8
 #else
             4
 #endif
-            , 0, 1}, 2),
-        Uop(VM_UOP_EXIT, {0}, 3)
-    };
+            , 0, 1}, 2));
+    // Drive the authenticated reader well beyond the first 64-byte ChaCha block.
+    // This also detects generated x64 stack references that encode +0x80..+0x9f
+    // with a signed disp8 and silently write below the reader's allocated frame.
+    for (uint32_t index = 0; index < 24u; ++index) {
+        program.push_back(Uop(VM_UOP_PUSH_IMM,
+            {0x1122334455660000ULL + index,
+#if defined(_M_X64)
+             8
+#else
+             4
+#endif
+            }, static_cast<uint8_t>(index & 3u)));
+        program.push_back(Uop(VM_UOP_DROP, {},
+            static_cast<uint8_t>((index + 1u) & 3u)));
+    }
+    program.push_back(Uop(VM_UOP_EXIT, {0}, 3));
     std::vector<uint8_t> bytecode;
     for (const auto& instruction : program) {
         std::string error;
@@ -173,6 +187,8 @@ std::vector<uint8_t> BuildBytecode(const TestISA& isa) {
     const auto validation = VMSchema::ValidateStream(
         bytecode.data(), bytecode.size(), isa.reverse.data(), isa.codec, 24);
     Require(validation.success, "公开入口测试字节码校验失败: " + validation.error);
+    Require(bytecode.size() > 128u,
+        "公开入口测试未跨过 ChaCha reader 的高位栈槽/多 block 边界");
     return bytecode;
 }
 

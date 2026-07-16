@@ -79,6 +79,9 @@ int main(int argc, char** argv) {
         return 4;
     }
     if (!RangeInside(request.size(), header.nativeCodeOffset, header.nativeCodeSize) ||
+        !RangeInside(request.size(), header.nativeCodeFixupsOffset,
+            static_cast<uint64_t>(header.nativeCodeFixupsCount) *
+                sizeof(VMNativeDifferentialCodeFixup)) ||
         !RangeInside(request.size(), header.corpusMemoryOffset, header.memorySize) ||
         !RangeInside(request.size(), header.vmBytecodeOffset, header.vmBytecodeSize) ||
         !RangeInside(request.size(), header.handlerImageOffset, header.handlerImageSize) ||
@@ -91,6 +94,8 @@ int main(int argc, char** argv) {
     }
 
     const uint8_t* nativeCode = request.data() + header.nativeCodeOffset;
+    const auto* nativeCodeFixups = reinterpret_cast<const VMNativeDifferentialCodeFixup*>(
+        request.data() + header.nativeCodeFixupsOffset);
     const uint8_t* corpusMemory = request.data() + header.corpusMemoryOffset;
     const uint8_t* vmBytecode = request.data() + header.vmBytecodeOffset;
     const uint8_t* handlerImage = request.data() + header.handlerImageOffset;
@@ -101,7 +106,8 @@ int main(int argc, char** argv) {
 
     VMNativeDifferentialWorkerOutcome outcome{};
     std::string error;
-    if (!RunNativeDifferentialWorkerCase(header, nativeCode, corpusMemory, vmBytecode,
+    if (!RunNativeDifferentialWorkerCase(header, nativeCode, nativeCodeFixups,
+            corpusMemory, vmBytecode,
             handlerImage, handlerRelocations, handlerUnwindEntries, outcome, error)) {
         std::fprintf(stderr, "vm_native_differential_worker: %s\n", error.c_str());
         return 6;

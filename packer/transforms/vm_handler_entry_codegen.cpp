@@ -32,7 +32,8 @@ constexpr uint32_t kKnownMetadataFlags = kRequiredMetadataFlags |
     VM_METADATA_FLAG_UNWIND_VERIFIED |
     VM_METADATA_FLAG_CFG_ENABLED |
     VM_METADATA_FLAG_HANDLER_MUTATED |
-    VM_METADATA_FLAG_JUNK_HANDLERS;
+    VM_METADATA_FLAG_JUNK_HANDLERS |
+    VM_METADATA_FLAG_RUNTIME_TRACE;
 constexpr uint32_t kKnownRecordFlags =
     VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
@@ -134,6 +135,8 @@ constexpr uint32_t CtxError =
     static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, error));
 constexpr uint32_t CtxHalted =
     static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, halted));
+constexpr uint32_t CtxTraceState =
+    static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, traceState));
 
 constexpr uint32_t MetaCookie =
     static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, cookie));
@@ -197,6 +200,12 @@ constexpr uint32_t MetaMetadataTag =
     static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, metadataTag));
 constexpr uint32_t MetaRuntimeBaseRVA =
     static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, runtimeBaseRVA));
+constexpr uint32_t MetaTraceRVA =
+    static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, traceRVA));
+constexpr uint32_t MetaTraceCapacity =
+    static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, traceCapacity));
+constexpr uint32_t MetaTraceGroup =
+    static_cast<uint32_t>(offsetof(VM_METADATA_HEADER, traceGroup));
 
 constexpr uint32_t RecordFunctionRVA =
     static_cast<uint32_t>(offsetof(VM_FUNCTION_RECORD, functionRVA));
@@ -1469,7 +1478,7 @@ bool BuildFlagMaterializer(
 
         const auto emitShift = [&](uint8_t kind) {
             const size_t nonzero = code.NewLabel();
-            const size_t countInRange = code.NewLabel();
+            const size_t countBelowWidth = code.NewLabel();
             const size_t afterCf = code.NewLabel();
             code.Raw({0x44,0x89,0xC9,0x83,0xE1}); code.U8(kind == VM_LAZY_SHL ||
                 kind == VM_LAZY_SHR || kind == VM_LAZY_SAR ? 0x3F : 0x3F);
@@ -1482,9 +1491,12 @@ bool BuildFlagMaterializer(
             code.Raw({0xC6,0x44,0x24,0x24,0x01}); code.Jmp32(consume);
             code.Bind(nonzero);
             code.Raw({0x89,0xFA,0xC1,0xE2,0x03,0x39,0xD1});
-            code.Jcc32(0x86, countInRange);
+            // Intel leaves CF undefined when count is greater than or equal
+            // to the operand width.  JB is intentional here; JBE would make
+            // the exact-width r8/r16 boundary spuriously observable.
+            code.Jcc32(0x82, countBelowWidth);
             code.Raw({0xC6,0x44,0x24,0x20,0x00}); code.Jmp32(afterCf);
-            code.Bind(countInRange);
+            code.Bind(countBelowWidth);
             if (kind == VM_LAZY_SHL) {
                 code.Raw({0x29,0xCA,0x89,0xD1,0x4C,0x89,0xC0,0x48,0xD3,0xE8});
             } else {
@@ -1516,8 +1528,16 @@ bool BuildFlagMaterializer(
         const auto emitRotate = [&](bool left) {
             const size_t nonzero = code.NewLabel();
             const size_t notOne = code.NewLabel();
-            code.Raw({0x89,0xF9,0xC1,0xE1,0x03,0xFF,0xC9,
-                      0x44,0x21,0xC9,0x85,0xC9});
+            // Keep the architectural masked count here, rather than reducing
+            // it modulo the operand width.  ROL/ROR r8/r16 by a complete
+            // width leave the value unchanged but still define CF; OF is
+            // defined only when this masked count is exactly one.
+            code.Raw({0x44,0x89,0xC9,0x83,0xE1,0x3F});
+            const size_t width64 = code.NewLabel();
+            code.Raw({0x83,0xFF,0x08}); code.Jcc32(0x84, width64);
+            code.Raw({0x83,0xE1,0x1F});
+            code.Bind(width64);
+            code.Raw({0x85,0xC9});
             code.Jcc32(0x85, nonzero);
             code.Raw({0xC6,0x44,0x24,0x24,0x01}); code.Jmp32(consume);
             code.Bind(nonzero);
@@ -1693,15 +1713,17 @@ bool BuildFlagMaterializer(
 
         const auto shift = [&](uint8_t kind) {
             const size_t nonzero = code.NewLabel();
-            const size_t inRange = code.NewLabel();
+            const size_t belowWidth = code.NewLabel();
             const size_t afterCf = code.NewLabel();
             const size_t notOne = code.NewLabel();
             code.Raw({0x8B,0x4D,0xB8,0x83,0xE1,0x1F,0x85,0xC9});
             code.Jcc32(0x85, nonzero); code.Raw({0xC6,0x45,0xD8,0x01}); code.Jmp32(consume);
             code.Bind(nonzero);
             code.Raw({0x8B,0x55,0xC8,0xC1,0xE2,0x03,0x3B,0xCA});
-            code.Jcc32(0x86, inRange); code.Raw({0xC6,0x45,0xD4,0x00}); code.Jmp32(afterCf);
-            code.Bind(inRange);
+            // CF is undefined for count >= operand width; use unsigned JB,
+            // not JBE, so the exact-width r8/r16 case stays unobservable.
+            code.Jcc32(0x82, belowWidth); code.Raw({0xC6,0x45,0xD4,0x00}); code.Jmp32(afterCf);
+            code.Bind(belowWidth);
             if (kind == VM_LAZY_SHL) {
                 code.Raw({0x2B,0xD1,0x8B,0x4D,0xBC,0x87,0xCA,0xD3,0xEA,0x89,0xD0});
             } else {
@@ -1728,8 +1750,10 @@ bool BuildFlagMaterializer(
         const auto rotate = [&](bool left) {
             const size_t nonzero = code.NewLabel();
             const size_t notOne = code.NewLabel();
-            code.Raw({0x8B,0x4D,0xC8,0xC1,0xE1,0x03,0x49,
-                      0x23,0x4D,0xB8,0x85,0xC9});
+            // x86 always masks the architectural rotate count to five bits.
+            // Do not reduce it modulo r8/r16 width: a full-width rotation
+            // still updates CF and leaves OF undefined.
+            code.Raw({0x8B,0x4D,0xB8,0x83,0xE1,0x1F,0x85,0xC9});
             code.Jcc32(0x85, nonzero); code.Raw({0xC6,0x45,0xD8,0x01}); code.Jmp32(consume);
             code.Bind(nonzero);
             if (left) code.Raw({0x8A,0x45,0xB4,0x24,0x01,0x88,0x45,0xD4});
@@ -1792,14 +1816,40 @@ bool BuildFlagMaterializer(
     return true;
 }
 
-void EmitX64DwordLoad(CodeBuffer& code, uint8_t reg, uint8_t displacement) {
-    code.Raw({0x8B, static_cast<uint8_t>(0x44u | ((reg & 7u) << 3u)),
-              0x24, displacement});
+void EmitX64DwordLoad(CodeBuffer& code, uint8_t reg, uint32_t displacement) {
+    if (displacement <= 0x7Fu) {
+        code.Raw({0x8B, static_cast<uint8_t>(0x44u | ((reg & 7u) << 3u)),
+                  0x24, static_cast<uint8_t>(displacement)});
+    } else {
+        code.Raw({0x8B, static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)), 0x24});
+        code.U32(displacement);
+    }
 }
 
-void EmitX64DwordStore(CodeBuffer& code, uint8_t reg, uint8_t displacement) {
-    code.Raw({0x89, static_cast<uint8_t>(0x44u | ((reg & 7u) << 3u)),
-              0x24, displacement});
+void EmitX64DwordStore(CodeBuffer& code, uint8_t reg, uint32_t displacement) {
+    if (displacement <= 0x7Fu) {
+        code.Raw({0x89, static_cast<uint8_t>(0x44u | ((reg & 7u) << 3u)),
+                  0x24, static_cast<uint8_t>(displacement)});
+    } else {
+        code.Raw({0x89, static_cast<uint8_t>(0x84u | ((reg & 7u) << 3u)), 0x24});
+        code.U32(displacement);
+    }
+}
+
+void EmitX64XmmLoad(CodeBuffer& code, uint32_t displacement) {
+    if (displacement <= 0x7Fu) {
+        code.Raw({0xF3,0x0F,0x6F,0x44,0x24,static_cast<uint8_t>(displacement)});
+    } else {
+        code.Raw({0xF3,0x0F,0x6F,0x84,0x24}); code.U32(displacement);
+    }
+}
+
+void EmitX64XmmStore(CodeBuffer& code, uint32_t displacement) {
+    if (displacement <= 0x7Fu) {
+        code.Raw({0xF3,0x0F,0x7F,0x44,0x24,static_cast<uint8_t>(displacement)});
+    } else {
+        code.Raw({0xF3,0x0F,0x7F,0x84,0x24}); code.U32(displacement);
+    }
 }
 
 void EmitX64QuarterRound(
@@ -2065,6 +2115,47 @@ bool BuildOperandDecoder(
         code.U32(config.layout.dispatchTableOffset);
         result.dispatchDecoderSize = static_cast<uint32_t>(code.Offset()) -
             result.dispatchDecoderOffset;
+        if (config.runtimeTraceEnabled) {
+            // Optional runtime evidence is emitted only after a real, nonzero
+            // semantic handler target has been decoded.  The target in RAX is
+            // preserved verbatim; this path never substitutes or bypasses it.
+            const size_t traceReserve = code.NewLabel();
+            const size_t traceOverflow = code.NewLabel();
+            const size_t traceDone = code.NewLabel();
+            code.Raw({0x48,0x89,0x44,0x24,0x18});
+            code.Raw({0x4D,0x8B,0x97}); code.U32(CtxTraceState);
+            code.Raw({0x4D,0x85,0xD2}); code.Jcc32(0x84, traceDone);
+            code.Raw({0x41,0x8B,0x42,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,nextSequence))});
+            code.Bind(traceReserve);
+            code.Raw({0x41,0x3B,0x42,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,capacity))});
+            code.Jcc32(0x83, traceOverflow);
+            code.Raw({0x8D,0x48,0x01,0xF0,0x41,0x0F,0xB1,0x4A,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,nextSequence))});
+            code.Jcc32(0x85, traceReserve);
+        code.Raw({0x89,0xC1,0x48,0xC1,0xE1,0x04,
+                  0x49,0x8D,0x54,0x0A,
+                  static_cast<uint8_t>(sizeof(VM_TRACE_HEADER))});
+        code.Raw({0x4D,0x8B,0x87}); code.U32(CtxRecord);
+        code.Raw({0x45,0x8B,0x08,0x44,0x89,0x4A,0x04});
+        code.Raw({0x4D,0x8B,0x8F}); code.U32(CtxVip);
+        code.Raw({0x4D,0x2B,0x8F}); code.U32(CtxBytecodeBegin);
+        code.Raw({0x44,0x89,0x4A,0x08});
+        code.Raw({0x45,0x0F,0xB6,0x8F}); code.U32(CtxCurrentSemantic);
+        code.Raw({0x44,0x88,0x4A,0x0C});
+        code.Raw({0x45,0x0F,0xB6,0x8F}); code.U32(CtxCurrentVariant);
+        code.Raw({0x44,0x88,0x4A,0x0D,0x66,0xC7,0x42,0x0E,0x00,0x00,
+                  0xFF,0xC0,0x87,0x02,
+                  0xF0,0x41,0xFF,0x42,
+                  static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,committedCount))});
+        code.Jmp32(traceDone);
+        code.Bind(traceOverflow);
+        code.Raw({0xB8,0x01,0x00,0x00,0x00,0x41,0x87,0x42,
+                  static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,overflow))});
+        code.Bind(traceDone);
+        code.Raw({0x48,0x8B,0x44,0x24,0x18});
+        }
         code.Jmp32(epilog);
 
         code.Bind(unsupported);
@@ -2135,15 +2226,15 @@ bool BuildOperandDecoder(
             code.Raw({0x41,0x8B,0x44,0x24,static_cast<uint8_t>(i * 4u)});
             EmitX64DwordStore(code, 0, static_cast<uint8_t>(0x70u + i * 4u));
         }
-        code.Raw({0x44,0x89,0x5C,0x24,0x90}); // counter (r11d)
+        code.Raw({0x44,0x89,0x9C,0x24}); code.U32(0x90u); // counter (r11d)
         code.Raw({0x49,0x8B,0x9F}); code.U32(CtxRecord);
         code.Raw({0x8B,0x83}); code.U32(RecordNonce + 0u); EmitX64DwordStore(code,0,0x94);
         code.Raw({0x8B,0x83}); code.U32(RecordNonce + 4u); EmitX64DwordStore(code,0,0x98);
         code.Raw({0x8B,0x83}); code.U32(RecordNonce + 8u); EmitX64DwordStore(code,0,0x9C);
-        code.Raw({0xF3,0x0F,0x6F,0x44,0x24,0x60,0xF3,0x0F,0x7F,0x44,0x24,0x20,
-                  0xF3,0x0F,0x6F,0x44,0x24,0x70,0xF3,0x0F,0x7F,0x44,0x24,0x30,
-                  0xF3,0x0F,0x6F,0x44,0x24,0x80,0xF3,0x0F,0x7F,0x44,0x24,0x40,
-                  0xF3,0x0F,0x6F,0x44,0x24,0x90,0xF3,0x0F,0x7F,0x44,0x24,0x50});
+        EmitX64XmmLoad(code, 0x60u); EmitX64XmmStore(code, 0x20u);
+        EmitX64XmmLoad(code, 0x70u); EmitX64XmmStore(code, 0x30u);
+        EmitX64XmmLoad(code, 0x80u); EmitX64XmmStore(code, 0x40u);
+        EmitX64XmmLoad(code, 0x90u); EmitX64XmmStore(code, 0x50u);
         code.U8(0xBF); code.U32(10);
         code.Bind(readerRounds);
         EmitChaChaDoubleRoundX64(code, 0x20);
@@ -2320,6 +2411,49 @@ bool BuildOperandDecoder(
         code.Raw({0x01,0xD8,0x2D}); code.U32(config.layout.dispatchTableOffset);
         result.dispatchDecoderSize = static_cast<uint32_t>(code.Offset()) -
             result.dispatchDecoderOffset;
+        if (config.runtimeTraceEnabled) {
+            // Preserve the real decoded target in the decoder's unused bottom
+            // local while publishing a saturating, bounded event into the
+            // authenticated RW/NX trace section.
+            const size_t traceReserve = code.NewLabel();
+            const size_t traceOverflow = code.NewLabel();
+            const size_t traceDone = code.NewLabel();
+            code.Raw({0x89,0x45,0xD0});
+            code.Raw({0x8B,0x97}); code.U32(CtxTraceState);
+            code.Raw({0x85,0xD2}); code.Jcc32(0x84, traceDone);
+            code.Raw({0x8B,0x42,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,nextSequence))});
+            code.Bind(traceReserve);
+            code.Raw({0x3B,0x42,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,capacity))});
+            code.Jcc32(0x83, traceOverflow);
+            code.Raw({0x8D,0x48,0x01,0xF0,0x0F,0xB1,0x4A,
+                      static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,nextSequence))});
+            code.Jcc32(0x85, traceReserve);
+        code.Raw({0x50,0x89,0xC1,0xC1,0xE1,0x04,
+                  0x8D,0x4C,0x0A,
+                  static_cast<uint8_t>(sizeof(VM_TRACE_HEADER)),0x51});
+        code.Raw({0x8B,0x87}); code.U32(CtxRecord);
+        code.Raw({0x8B,0x00,0x89,0x41,0x04});
+        code.Raw({0x8B,0x87}); code.U32(CtxVip);
+        code.Raw({0x2B,0x87}); code.U32(CtxBytecodeBegin);
+        code.Raw({0x89,0x41,0x08});
+        code.Raw({0x8A,0x87}); code.U32(CtxCurrentSemantic);
+        code.Raw({0x88,0x41,0x0C});
+        code.Raw({0x8A,0x87}); code.U32(CtxCurrentVariant);
+        code.Raw({0x88,0x41,0x0D,0x66,0xC7,0x41,0x0E,0x00,0x00,
+                  0x8B,0x44,0x24,0x04,0x40,0x87,0x01});
+        code.Raw({0x8B,0x97}); code.U32(CtxTraceState);
+        code.Raw({0xF0,0xFF,0x42,
+                  static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,committedCount)),
+                  0x83,0xC4,0x08});
+        code.Jmp32(traceDone);
+        code.Bind(traceOverflow);
+        code.Raw({0xB8,0x01,0x00,0x00,0x00,0x87,0x42,
+                  static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,overflow))});
+        code.Bind(traceDone);
+        code.Raw({0x8B,0x45,0xD0});
+        }
         code.Jmp32(epilog);
         code.Bind(unsupported);
         code.Raw({0xC7,0x87}); code.U32(CtxError); code.U32(VM_MICRO_ERR_OPCODE_UNSUPPORTED);
@@ -2573,6 +2707,8 @@ bool BuildPublicEntryX64(
               0x4C,0x8B,0xAC,0x24}); code.U32(stack + 8u * 8u + 0x28u);
     code.Raw({0x48,0x89,0x7C,0x24,0x50}); // preserve image base across rep stosb
     code.Raw({0x45,0x31,0xF6,0x45,0x31,0xFF}); // ctx/record null
+    if (config.runtimeTraceEnabled)
+        code.Raw({0x48,0xC7,0x44,0x24,0x58,0x00,0x00,0x00,0x00});
 
     const size_t failMetadata = code.NewLabel();
     const size_t failRecord = code.NewLabel();
@@ -2681,6 +2817,78 @@ bool BuildPublicEntryX64(
     code.Raw({0x48,0x33,0x86}); code.U32(MetaMetadataTag);
     code.Jcc32(0x85, failAuth);
 
+    if (config.runtimeTraceEnabled) {
+    // The trace tuple is part of the authenticated metadata.  Bind it to the
+    // dedicated section header before exposing its pointer to the VM context.
+    const size_t traceDisabled = code.NewLabel();
+    const size_t traceValidated = code.NewLabel();
+    code.Raw({0xF7,0x86}); code.U32(MetaFlags);
+    code.U32(VM_METADATA_FLAG_RUNTIME_TRACE);
+    code.Jcc32(0x84, traceDisabled);
+    code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+    code.Raw({0x85,0xC0}); code.Jcc32(0x84, failMetadata);
+    code.Raw({0x3B,0x86}); code.U32(MetaImageSize);
+    code.Jcc32(0x83, failMetadata);
+    code.Raw({0x8B,0x8E}); code.U32(MetaTraceCapacity);
+    code.Raw({0x85,0xC9}); code.Jcc32(0x84, failMetadata);
+    code.Raw({0x81,0xF9}); code.U32(VM_TRACE_MAX_CAPACITY);
+    code.Jcc32(0x87, failMetadata);
+    code.Raw({0x89,0xCA,0xC1,0xE2,0x04,0x83,0xC2,
+              static_cast<uint8_t>(sizeof(VM_TRACE_HEADER))});
+    code.Raw({0x44,0x8B,0x86}); code.U32(MetaImageSize);
+    code.Raw({0x41,0x29,0xC0,0x44,0x39,0xC2});
+    code.Jcc32(0x87, failMetadata);
+    code.Raw({0x4C,0x8D,0x14,0x07});
+    const auto cmpTrace32 = [&](uint8_t offset, uint32_t expected) {
+        code.Raw({0x41,0x81,0x7A,offset}); code.U32(expected);
+        code.Jcc32(0x85, failMetadata);
+    };
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,magic)),
+        VM_TRACE_MAGIC);
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,version)),
+        VM_TRACE_VERSION);
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,headerSize)),
+        sizeof(VM_TRACE_HEADER));
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,eventSize)),
+        sizeof(VM_TRACE_EVENT));
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,architecture)),
+        VM_ARCH_X64);
+    code.Raw({0x41,0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,capacity))});
+    code.Raw({0x3B,0x8E}); code.U32(MetaTraceCapacity);
+    code.Jcc32(0x85, failMetadata);
+    code.Raw({0x41,0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,groupId))});
+    code.Raw({0x3B,0x8E}); code.U32(MetaTraceGroup);
+    code.Jcc32(0x85, failMetadata);
+    code.Raw({0x49,0x8B,0x42,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId)),
+              0x48,0x33,0x86}); code.U32(MetaBuildId);
+    code.Raw({0x49,0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId) + 8u),
+              0x48,0x33,0x8E}); code.U32(MetaBuildId + 8u);
+    code.Raw({0x48,0x09,0xC8}); code.Jcc32(0x85, failMetadata);
+    code.Raw({0x49,0x83,0x7A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,reserved)),0x00});
+    code.Jcc32(0x85, failMetadata);
+    code.Raw({0x4C,0x89,0x54,0x24,0x58});
+    code.Jmp32(traceValidated);
+    code.Bind(traceDisabled);
+    code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+    code.Raw({0x0B,0x86}); code.U32(MetaTraceCapacity);
+    code.Raw({0x0B,0x86}); code.U32(MetaTraceGroup);
+    code.Jcc32(0x85, failMetadata);
+    code.Bind(traceValidated);
+    } else {
+        code.Raw({0xF7,0x86}); code.U32(MetaFlags);
+        code.U32(VM_METADATA_FLAG_RUNTIME_TRACE);
+        code.Jcc32(0x85, failMetadata);
+        code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+        code.Raw({0x0B,0x86}); code.U32(MetaTraceCapacity);
+        code.Raw({0x0B,0x86}); code.U32(MetaTraceGroup);
+        code.Jcc32(0x85, failMetadata);
+    }
+
     // Authenticated layout/order checks.
     code.Raw({0x8B,0x86}); code.U32(MetaRecordCount);
     code.Raw({0x85,0xC0}); code.Jcc32(0x84, failMetadata);
@@ -2778,6 +2986,10 @@ bool BuildPublicEntryX64(
     code.Raw({0x41,0xC7,0x86}); code.U32(CtxArchitecture); code.U32(VM_ARCH_X64);
     code.Raw({0x49,0x8D,0x86}); code.U32(kRuntimeKeyOffset);
     code.Raw({0x49,0x89,0x86}); code.U32(CtxRollingKey);
+    if (config.runtimeTraceEnabled) {
+        code.Raw({0x48,0x8B,0x44,0x24,0x58,0x49,0x89,0x86});
+        code.U32(CtxTraceState);
+    }
     code.Raw({0x8B,0x86}); code.U32(MetaReverseOpcodeMapOffset);
     code.Raw({0x48,0x8D,0x0C,0x06,0x49,0x89,0x8E}); code.U32(CtxReverseOpcodeMap);
     code.Raw({0x8B,0x86}); code.U32(MetaRegisterMapOffset);
@@ -3219,6 +3431,8 @@ bool BuildPublicEntryX86(
     code.Raw({0x8B,0x5D,0x08,0x8B,0x75,0x10,
               0xC7,0x45,0xF0,0x00,0x00,0x00,0x00,
               0xC7,0x45,0xEC,0x00,0x00,0x00,0x00});
+    if (config.runtimeTraceEnabled)
+        code.Raw({0xC7,0x45,0xC0,0x00,0x00,0x00,0x00});
     const size_t failMetadata = code.NewLabel();
     const size_t failRecord = code.NewLabel();
     const size_t failAuth = code.NewLabel();
@@ -3310,6 +3524,83 @@ bool BuildPublicEntryX86(
               0x33,0x86}); code.U32(MetaMetadataTag);
     code.Raw({0x33,0x96}); code.U32(MetaMetadataTag + 4u);
     code.Raw({0x09,0xD0}); code.Jcc32(0x85, failAuth);
+    if (config.runtimeTraceEnabled) {
+    const size_t traceDisabled = code.NewLabel();
+    const size_t traceValidated = code.NewLabel();
+    code.Raw({0xF7,0x86}); code.U32(MetaFlags);
+    code.U32(VM_METADATA_FLAG_RUNTIME_TRACE);
+    code.Jcc32(0x84, traceDisabled);
+    code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+    code.Raw({0x85,0xC0}); code.Jcc32(0x84, failMetadata);
+    code.Raw({0x3B,0x86}); code.U32(MetaImageSize);
+    code.Jcc32(0x83, failMetadata);
+    code.Raw({0x8B,0x8E}); code.U32(MetaTraceCapacity);
+    code.Raw({0x85,0xC9}); code.Jcc32(0x84, failMetadata);
+    code.Raw({0x81,0xF9}); code.U32(VM_TRACE_MAX_CAPACITY);
+    code.Jcc32(0x87, failMetadata);
+    code.Raw({0x89,0xCA,0xC1,0xE2,0x04,0x83,0xC2,
+              static_cast<uint8_t>(sizeof(VM_TRACE_HEADER))});
+    code.Raw({0x8B,0x8E}); code.U32(MetaImageSize);
+    code.Raw({0x29,0xC1,0x39,0xCA}); code.Jcc32(0x87, failMetadata);
+    // EDI is used by key recovery/zeroing below the prolog; reload the
+    // authenticated image base argument instead of treating EDI as live.
+    code.Raw({0x8B,0x55,0x14,0x01,0xC2,0x89,0x55,0xC0});
+    const auto cmpTrace32 = [&](uint8_t offset, uint32_t expected) {
+        code.Raw({0x81,0x7A,offset}); code.U32(expected);
+        code.Jcc32(0x85, failMetadata);
+    };
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,magic)),
+        VM_TRACE_MAGIC);
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,version)),
+        VM_TRACE_VERSION);
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,headerSize)),
+        sizeof(VM_TRACE_HEADER));
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,eventSize)),
+        sizeof(VM_TRACE_EVENT));
+    cmpTrace32(static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,architecture)),
+        VM_ARCH_X86);
+    code.Raw({0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,capacity)),
+              0x3B,0x8E}); code.U32(MetaTraceCapacity);
+    code.Jcc32(0x85, failMetadata);
+    code.Raw({0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,groupId)),
+              0x3B,0x8E}); code.U32(MetaTraceGroup);
+    code.Jcc32(0x85, failMetadata);
+    code.Raw({0x8B,0x42,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId)),
+              0x33,0x86}); code.U32(MetaBuildId);
+    code.Raw({0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId) + 4u),
+              0x33,0x8E}); code.U32(MetaBuildId + 4u);
+    code.Raw({0x09,0xC8,0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId) + 8u),
+              0x33,0x8E}); code.U32(MetaBuildId + 8u);
+    code.Raw({0x09,0xC8,0x8B,0x4A,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,buildId) + 12u),
+              0x33,0x8E}); code.U32(MetaBuildId + 12u);
+    code.Raw({0x09,0xC8}); code.Jcc32(0x85, failMetadata);
+    code.Raw({0x8B,0x42,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,reserved)),
+              0x0B,0x42,
+              static_cast<uint8_t>(offsetof(VM_TRACE_HEADER,reserved) + 4u)});
+    code.Jcc32(0x85, failMetadata);
+    code.Jmp32(traceValidated);
+    code.Bind(traceDisabled);
+    code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+    code.Raw({0x0B,0x86}); code.U32(MetaTraceCapacity);
+    code.Raw({0x0B,0x86}); code.U32(MetaTraceGroup);
+    code.Jcc32(0x85, failMetadata);
+    code.Bind(traceValidated);
+    } else {
+        code.Raw({0xF7,0x86}); code.U32(MetaFlags);
+        code.U32(VM_METADATA_FLAG_RUNTIME_TRACE);
+        code.Jcc32(0x85, failMetadata);
+        code.Raw({0x8B,0x86}); code.U32(MetaTraceRVA);
+        code.Raw({0x0B,0x86}); code.U32(MetaTraceCapacity);
+        code.Raw({0x0B,0x86}); code.U32(MetaTraceGroup);
+        code.Jcc32(0x85, failMetadata);
+    }
     // Authenticated table order and record lookup.
     code.Raw({0x8B,0x86}); code.U32(MetaRecordCount); code.Raw({0x85,0xC0});
     code.Jcc32(0x84, failMetadata);
@@ -3395,6 +3686,10 @@ bool BuildPublicEntryX86(
     code.Raw({0x8B,0x45,0x18,0x89,0x87}); code.U32(CtxExtendedState);
     code.Raw({0xC7,0x87}); code.U32(CtxArchitecture); code.U32(VM_ARCH_X86);
     code.Raw({0x8D,0x87}); code.U32(kRuntimeKeyOffset); code.Raw({0x89,0x87}); code.U32(CtxRollingKey);
+    if (config.runtimeTraceEnabled) {
+        code.Raw({0x8B,0x45,0xC0,0x89,0x87}); code.U32(CtxTraceState);
+        code.Raw({0xC7,0x87}); code.U32(CtxTraceState + 4u); code.U32(0);
+    }
     const auto metaPointer = [&](uint32_t metaOffset, uint32_t ctxOffset) {
         code.Raw({0x8B,0x86}); code.U32(metaOffset);
         code.Raw({0x03,0xC6,0x89,0x87}); code.U32(ctxOffset);

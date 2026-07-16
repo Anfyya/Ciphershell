@@ -8,8 +8,8 @@
 extern "C" {
 #endif
 
-#define VM_METADATA_VERSION 0x00040000u
-#define VM_RUNTIME_VERSION  0x00040000u
+#define VM_METADATA_VERSION 0x00050000u
+#define VM_RUNTIME_VERSION  0x00050000u
 #define VM_KEY_ENCODING_VERSION 0x00010000u
 #define VM_RUNTIME_KEY_SHARE_SIZE 32u
 #define VM_ARCH_X86 0x00000086u
@@ -21,6 +21,10 @@ extern "C" {
 #define VM_HANDLER_VARIANT_COUNT 4u
 #define VM_HANDLER_INVALID 0xFFu
 #define VM_HANDLER_JUNK 0xFEu
+#define VM_TRACE_MAGIC 0x52545343u /* "CSTR" */
+#define VM_TRACE_VERSION 0x00010000u
+#define VM_TRACE_DEFAULT_CAPACITY 16384u
+#define VM_TRACE_MAX_CAPACITY 1048576u
 
 enum {
     VM_METADATA_FLAG_AUTHENTICATED = 0x00000001u,
@@ -35,7 +39,8 @@ enum {
     VM_METADATA_FLAG_LAZY_FLAGS = 0x00000200u,
     VM_METADATA_FLAG_HANDLER_SYNTHESIZED = 0x00000400u,
     VM_METADATA_FLAG_DIRECT_THREADED = 0x00000800u,
-    VM_METADATA_FLAG_HANDLER_ENCRYPTED = 0x00001000u
+    VM_METADATA_FLAG_HANDLER_ENCRYPTED = 0x00001000u,
+    VM_METADATA_FLAG_RUNTIME_TRACE = 0x00002000u
 };
 
 enum {
@@ -86,6 +91,8 @@ typedef struct VM_METADATA_HEADER {
     uint8_t encodedMasterKey[32];
     uint64_t metadataTag;
     uint32_t runtimeBaseRVA;
+    uint32_t traceCapacity;
+    uint32_t traceGroup;
 } VM_METADATA_HEADER;
 
 typedef struct VM_FUNCTION_RECORD {
@@ -104,6 +111,32 @@ typedef struct VM_FUNCTION_RECORD {
     uint32_t guestStackSize;
 } VM_FUNCTION_RECORD;
 
+typedef struct VM_TRACE_HEADER {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t headerSize;
+    uint32_t eventSize;
+    uint32_t capacity;
+    volatile uint32_t nextSequence;
+    volatile uint32_t committedCount;
+    volatile uint32_t overflow;
+    uint32_t architecture;
+    uint32_t groupId;
+    uint8_t buildId[16];
+    uint32_t reserved[2];
+} VM_TRACE_HEADER;
+
+typedef struct VM_TRACE_EVENT {
+    volatile uint32_t sequence;
+    uint32_t functionRVA;
+    uint32_t bytecodeEndOffset;
+    uint8_t semantic;
+    uint8_t variant;
+    uint16_t reserved;
+} VM_TRACE_EVENT;
+
+/* Legacy v4 summary ABI retained for source compatibility.  Version 5
+ * metadata never points traceRVA at this structure. */
 typedef struct VM_TRACE_STATE {
     uint32_t enterCount;
     uint32_t lastFunctionRVA;
@@ -118,9 +151,11 @@ typedef struct VM_TRACE_STATE {
 
 #ifdef __cplusplus
 }
-static_assert(sizeof(VM_METADATA_HEADER) == 192, "VM metadata header size mismatch");
+static_assert(sizeof(VM_METADATA_HEADER) == 200, "VM metadata header size mismatch");
 static_assert(sizeof(VM_FUNCTION_RECORD) == 64, "VM function record size mismatch");
-static_assert(sizeof(VM_TRACE_STATE) == 32, "VM trace state size mismatch");
+static_assert(sizeof(VM_TRACE_HEADER) == 64, "VM trace header size mismatch");
+static_assert(sizeof(VM_TRACE_EVENT) == 16, "VM trace event size mismatch");
+static_assert(sizeof(VM_TRACE_STATE) == 32, "legacy VM trace state size mismatch");
 #endif
 
 #endif // CS_RUNTIME_VM_METADATA_H

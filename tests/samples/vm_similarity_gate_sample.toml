@@ -1,9 +1,8 @@
 # Config for tests/scripts/vm_per_build_similarity_gate.py, packing
-# vm_similarity_gate_sample.cpp (a DLL, see that file's header comment for
-# why a DLL rather than an EXE).
+# the companion real MSVC DLL and EXE fixtures.
 #
 # Same as config/default.toml except the vm section below turns protection
-# on, names the sample's five exported functions explicitly, and pins a
+# on, names the samples' eight exported functions explicitly, and pins a
 # single variant group. Naming the exports explicitly makes selection
 # deterministic and independent of hotspot-level auto-selection (which
 # would otherwise skip functions the analyzer classifies as "hot"). Pinning
@@ -22,7 +21,7 @@ randomize_section_names = true
 [vm]
 enabled = true
 strength = 80
-target_functions = ["add", "sub2", "max2", "is_zero", "local1"]
+target_functions = ["add", "sub2", "max2", "is_zero", "local1", "relocated_ptr", "relocated_read", "relocated_write"]
 target_rvas = []
 register_count = 24
 stack_size = 0x20000

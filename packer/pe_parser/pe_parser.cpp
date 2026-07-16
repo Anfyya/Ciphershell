@@ -1004,6 +1004,13 @@ bool PEParser::ParseLoadConfig(CS_PE_IMAGE* image) {
             IntToHex(static_cast<uint64_t>(image->rawSize) - loadConfigOffset) + ")");
         return false;
     }
+    // 文件总长边界还不够：结构必须完整落在同一个 file-backed
+    // section 内，不得借助紧随 section 的 overlay 补齐声明大小。
+    if (!PEUtils::IsFileBackedSpan(image, loadConfigDir.VirtualAddress, declaredSize)) {
+        SetError(image, "load config: declaredSize 0x" + IntToHex(declaredSize) +
+            " crosses the containing file-backed section boundary");
+        return false;
+    }
     // 绝对结构上限：即便落在文件边界内，也不能大到不像任何已知版本的
     // IMAGE_LOAD_CONFIG_DIRECTORY64/32。用编译当前所链接头文件里的
     // sizeof(乘以宽裕倍数) 而不是写死某个历史数值，未来 Windows SDK 继续

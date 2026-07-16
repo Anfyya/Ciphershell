@@ -242,6 +242,55 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
         "native=SUB vs VM-bytecode=ADD 必须被判定语义分歧");
 }
 
+void TestFunctionEntryStackAndRetCleanupDifferential() {
+    const auto seed = MakeSeed(0xD2);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
+    constexpr uint64_t kEntry = 0x1000;
+
+#if defined(_M_IX86)
+    // Function-entry ESP semantics, not a synthetic pre-CALL ESP:
+    //   mov eax,[esp+4] ; add eax,[esp+8] ; ret
+    const std::vector<uint8_t> cdeclBytes = {
+        0x8B,0x44,0x24,0x04, 0x03,0x44,0x24,0x08, 0xC3};
+    const Function cdeclFunction =
+        DecodeStandaloneFunction(disassembler, cdeclBytes, kEntry);
+    Translator cdeclTranslator;
+    const TranslationResult cdeclTranslation =
+        TranslateStandaloneFunction(cdeclFunction, build, cdeclTranslator);
+    RunDifferentialCase(cdeclFunction, cdeclTranslation, build, 16, true,
+        "x86 cdecl 函数入口 ESP/栈参数真实 CPU 差分");
+
+    // Same body with callee cleanup: ret 8.  The verifier must account for
+    // the physical CALL return slot and still strictly prove the +8 cleanup.
+    const std::vector<uint8_t> stdcallBytes = {
+        0x8B,0x44,0x24,0x04, 0x03,0x44,0x24,0x08, 0xC2,0x08,0x00};
+    const Function stdcallFunction =
+        DecodeStandaloneFunction(disassembler, stdcallBytes, kEntry);
+    Translator stdcallTranslator;
+    const TranslationResult stdcallTranslation =
+        TranslateStandaloneFunction(stdcallFunction, build, stdcallTranslator);
+    RunDifferentialCase(stdcallFunction, stdcallTranslation, build, 16, true,
+        "x86 ret imm16 清栈/入口 ESP 真实 CPU 差分");
+#else
+    // Win64 fifth integer argument lives at [rsp+28h] at function entry.
+    // This simultaneously verifies entry RSP (8 mod 16), shadow space, and
+    // the native CALL wrapper's return-address normalization.
+    const std::vector<uint8_t> stackArgumentBytes = {
+        0x8B,0x44,0x24,0x28, 0x03,0xC1, 0xC3};
+    const Function stackArgumentFunction =
+        DecodeStandaloneFunction(disassembler, stackArgumentBytes, kEntry);
+    Translator stackArgumentTranslator;
+    const TranslationResult stackArgumentTranslation =
+        TranslateStandaloneFunction(
+            stackArgumentFunction, build, stackArgumentTranslator);
+    RunDifferentialCase(stackArgumentFunction, stackArgumentTranslation,
+        build, 16, true,
+        "x64 函数入口 RSP/影子空间后栈参数真实 CPU 差分");
+#endif
+}
+
 void TestMulNativeDifferentialMatchesRealCpu() {
     // 覆盖新加入的 VM_UOP_MUL 双策略业务核心(EmitBusinessCoreVariant 的
     // IMUL reg,reg 与 MUL reg 两条真实不同字节序列)：证明无论 build 的
@@ -396,6 +445,24 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
         0xC1, 0xE8, 0x21, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};  // shr eax,33
     const std::vector<uint8_t> shr8 = {
         0x48, 0xC1, 0xE8, 0x28, 0x48, 0x83, 0xC0, 0x00, 0xC3};        // shr rax,40
+    // Real D2/D3 encodings: Zydis exposes CL as an implicit read operand.
+    // These cases also keep terminal undefined flags open deliberately so the
+    // per-corpus path oracle, rather than a trailing flag-closing instruction,
+    // decides exactly which bits native and VM must compare.
+    const std::vector<uint8_t> shlCl0 = {
+        0xB1,0x00, 0xD3,0xE0, 0xC3};                                  // mov cl,0; shl eax,cl
+    const std::vector<uint8_t> shlCl1 = {
+        0xB1,0x01, 0xD3,0xE0, 0xC3};                                  // mov cl,1; shl eax,cl
+    const std::vector<uint8_t> shlCl2 = {
+        0xB1,0x02, 0xD3,0xE0, 0xC3};                                  // mov cl,2; shl eax,cl
+    const std::vector<uint8_t> shlAlClOverWidth = {
+        0xB1,0x09, 0xD2,0xE0, 0xC3};                                  // mov cl,9; shl al,cl
+    const std::vector<uint8_t> shlAlClExactWidth = {
+        0xB1,0x08, 0xD2,0xE0, 0xC3};                                  // mov cl,8; shl al,cl
+    const std::vector<uint8_t> rolAlClFullWidth = {
+        0xB1,0x08, 0xD2,0xC0, 0xC3};                                  // mov cl,8; rol al,cl
+    const std::vector<uint8_t> rorAxClFullWidth = {
+        0xB1,0x10, 0x66,0xD3,0xC8, 0xC3};                             // mov cl,16; ror ax,cl
 
     const struct { const std::vector<uint8_t>* bytes; uint64_t preflightSeed; const char* name; } cases[] = {
         {&shl4, 0x9A04ULL, "SHL(shl eax,5) width4"},
@@ -404,6 +471,13 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
         {&shr4, 0x9A24ULL, "SHR(shr eax,5) width4"},
         {&shr4mask, 0x9A34ULL, "SHR(shr eax,33) width4 count-mask"},
         {&shr8, 0x9A18ULL, "SHR(shr rax,40) width8"},
+        {&shlCl0, 0x9A40ULL, "SHL(shl eax,cl) masked count=0 preserves flags"},
+        {&shlCl1, 0x9A41ULL, "SHL(shl eax,cl) count=1 defines OF"},
+        {&shlCl2, 0x9A42ULL, "SHL(shl eax,cl) count>1 leaves OF undefined"},
+        {&shlAlClExactWidth, 0x9A48ULL, "SHL(shl al,cl) count==width leaves CF undefined"},
+        {&shlAlClOverWidth, 0x9A49ULL, "SHL(shl al,cl) count>width"},
+        {&rolAlClFullWidth, 0x9A58ULL, "ROL(rol al,cl) full-width count"},
+        {&rorAxClFullWidth, 0x9A60ULL, "ROR(ror ax,cl) full-width count"},
     };
 
     for (const auto& testCase : cases) {
@@ -439,6 +513,22 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
             DecodeStandaloneFunction(disassembler, shr4, kEntry), build, shrTranslator);
     RunDifferentialCase(shl4Function, shrTranslation, build, 8, false,
         "native=SHL vs VM-bytecode=SHR 必须被判定语义分歧");
+
+    // Full-width r8 rotates leave the value unchanged but still define CF.
+    // ROL reports the resulting LSB while ROR reports the resulting MSB, so
+    // crossing the two translations is a real-worker negative control that
+    // fails if the verifier incorrectly masks full-width rotate CF.
+    const Function rolFullWidthFunction = DecodeStandaloneFunction(
+        disassembler, rolAlClFullWidth, kEntry);
+    Translator rorFullWidthTranslator;
+    const TranslationResult rorFullWidthTranslation =
+        TranslateStandaloneFunction(
+            DecodeStandaloneFunction(disassembler,
+                std::vector<uint8_t>{0xB1,0x08,0xD2,0xC8,0xC3}, kEntry),
+            build, rorFullWidthTranslator);
+    RunDifferentialCase(rolFullWidthFunction, rorFullWidthTranslation,
+        build, 32, false,
+        "native=ROL al,8 vs VM-bytecode=ROR al,8 must expose defined CF");
 }
 
 void TestRemainingArithmeticFamiliesNativeDifferential() {
@@ -560,6 +650,164 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
     }
 }
 
+void TestBranchToRetMaterializesObservableFlags() {
+    const auto seed = MakeSeed(0xD4);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // cmp ecx,edx ; jz ret ; mov eax,eax ; ret. Both paths retain exactly the
+    // CMP flags, while the conditional edge targets the original RET directly.
+    // Differential bytecode must rebase that edge to FLAGS_MATERIALIZE.
+    const std::vector<uint8_t> bytes = {
+        0x39,0xD1, 0x74,0x02, 0x89,0xC0, 0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+    RunDifferentialCase(function, translation, build, 32, true,
+        "branch-to-RET observable flags materialization");
+}
+
+void TestUndefinedFlagsReadFailsClosed() {
+    const auto seed = MakeSeed(0xD5);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64), "Disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // imul eax,ecx leaves ZF undefined; JZ consumes ZF. A
+    // terminal undefined flag may be excluded from observation, but reading
+    // it later is nondeterministic and must remain fail-closed.
+    const std::vector<uint8_t> bytes = {
+        0x0F,0xAF,0xC1, 0x74,0x00, 0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    TranslationConfig config{};
+    config.virtualRegisterCount = 24;
+    config.buildSeed = build.translatorSeed;
+    config.density = VMMicroDensity::Light;
+    config.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+    Require(translator.Initialize(config), "Translator initialization failed");
+    translator.SetOpcodeMap(build.isa.opcodeMap);
+    translator.SetRegisterMap(build.isa.registerMap);
+    const TranslationResult translation = translator.TranslateFunction(function);
+    Require(!translation.success,
+        "undefined ZF consumed by JZ was incorrectly accepted");
+    bool foundReason = false;
+    for (const auto& failure : translation.failures) {
+        if (failure.reason.find(
+                "instruction reads flags undefined on a reachable path") !=
+                std::string::npos) {
+            foundReason = true;
+            break;
+        }
+    }
+    Require(foundReason,
+        "undefined-flags rejection did not identify the first flag read");
+
+    auto requireShiftFlagReadRejected = [&](const std::vector<uint8_t>& bytes,
+                                            const char* label) {
+        const Function candidate =
+            DecodeStandaloneFunction(disassembler, bytes, kEntry);
+        Translator candidateTranslator;
+        TranslationConfig candidateConfig{};
+        candidateConfig.virtualRegisterCount = 24;
+        candidateConfig.buildSeed = build.translatorSeed;
+        candidateConfig.density = VMMicroDensity::Light;
+        candidateConfig.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+        Require(candidateTranslator.Initialize(candidateConfig),
+            "undefined shift-flag fixture translator initialization failed");
+        candidateTranslator.SetOpcodeMap(build.isa.opcodeMap);
+        candidateTranslator.SetRegisterMap(build.isa.registerMap);
+        const TranslationResult candidateTranslation =
+            candidateTranslator.TranslateFunction(candidate);
+        bool identifiedFlagRead = false;
+        for (const auto& failure : candidateTranslation.failures) {
+            if (failure.reason.find(
+                    "instruction reads flags undefined on a reachable path") !=
+                    std::string::npos) {
+                identifiedFlagRead = true;
+                break;
+            }
+        }
+        Require(!candidateTranslation.success && identifiedFlagRead,
+            std::string(label) +
+                " did not fail closed at the undefined flag consumer");
+    };
+
+    // shl al,8 leaves CF undefined (the equality boundary is not defined),
+    // so a following ADC must never be virtualized as deterministic code.
+    requireShiftFlagReadRejected(
+        {0xC0,0xE0,0x08, 0x80,0xD3,0x00, 0xC3},
+        "immediate exact-width SHL followed by ADC");
+    // A subsequent count-zero shift preserves that undefined CF rather than
+    // repairing it, so the later ADC must still be rejected.
+    requireShiftFlagReadRejected(
+        {0xC0,0xE0,0x08, 0xC0,0xE0,0x00,
+         0x80,0xD3,0x00, 0xC3},
+        "count-zero SHL preserving an undefined incoming CF");
+    // With CL unknown at translation time, r8 admits counts >= 8 (undefined
+    // CF) and every width admits counts > 1 (undefined OF).
+    requireShiftFlagReadRejected(
+        {0xD2,0xE0, 0x80,0xD3,0x00, 0xC3},
+        "CL-dependent r8 SHL followed by ADC");
+    requireShiftFlagReadRejected(
+        {0xD3,0xE0, 0x0F,0x90,0xC3, 0xC3},
+        "CL-dependent r32 SHL followed by SETO");
+
+    // At function entry CF is defined.  An immediate zero count preserves it,
+    // so the same ADC consumer is valid and must continue through the real
+    // native worker instead of being rejected by an over-conservative lattice.
+    const Function countZeroPreservesCf = DecodeStandaloneFunction(
+        disassembler,
+        {0xC0,0xE0,0x00, 0x80,0xD3,0x00, 0xC3}, kEntry);
+    Translator countZeroTranslator;
+    const TranslationResult countZeroTranslation =
+        TranslateStandaloneFunction(
+            countZeroPreservesCf, build, countZeroTranslator);
+    RunDifferentialCase(countZeroPreservesCf, countZeroTranslation,
+        build, 16, true,
+        "count-zero SHL preserves defined incoming CF for ADC");
+
+}
+
+#if defined(_M_X64)
+void TestCmovR32PreservesOrClearsUpperHalf() {
+    const auto seed = MakeSeed(0xD6);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(true), "Disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // cmp ecx,ecx sets ZF. In 64-bit mode CMOV r32 clears RAX[63:32]
+    // regardless of whether the low-32 destination assignment is taken.
+    const std::vector<uint8_t> notTakenBytes = {
+        0x39,0xC9, 0x0F,0x45,0xC2, 0xC3};
+    const std::vector<uint8_t> takenBytes = {
+        0x39,0xC9, 0x0F,0x44,0xC2, 0xC3};
+    const struct {
+        const std::vector<uint8_t>* bytes;
+        const char* label;
+    } cases[] = {
+        {&notTakenBytes, "x64 CMOV r32 not-taken clears upper RAX"},
+        {&takenBytes, "x64 CMOV r32 taken zero-extends RAX"},
+    };
+    for (const auto& testCase : cases) {
+        const Function function =
+            DecodeStandaloneFunction(disassembler, *testCase.bytes, kEntry);
+        Translator translator;
+        const TranslationResult translation =
+            TranslateStandaloneFunction(function, build, translator);
+        RunDifferentialCase(function, translation, build, 32, true,
+            testCase.label);
+    }
+}
+#endif
+
 #endif // _M_X64 || _M_IX86
 
 void Run(const char* name, void (*test)(), int& failures) {
@@ -581,6 +829,16 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
+    Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
+        &TestFunctionEntryStackAndRetCleanupDifferential, failures);
+    Run("branch-to-RET flags materialization",
+        &TestBranchToRetMaterializesObservableFlags, failures);
+    Run("undefined flags consumed later fail closed",
+        &TestUndefinedFlagsReadFailsClosed, failures);
+#if defined(_M_X64)
+    Run("x64 CMOV r32 upper-half semantics",
+        &TestCmovR32PreservesOrClearsUpperHalf, failures);
+#endif
     Run("分发表编码分化: 两套加密查表路径均由隔离原生 CPU 执行",
         &TestDispatchTableEncodingSchemesExecuteNatively, failures);
     Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",

@@ -8,6 +8,7 @@ struct CommandLineOptions {
     std::string inputFile;
     std::string outputFile;
     std::string configFile;
+    std::string vmHandlerEvidenceFile;
     int protectionLevel = 1;
     bool verbose = false;
     bool showHelp = false;

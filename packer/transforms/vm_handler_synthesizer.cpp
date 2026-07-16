@@ -351,7 +351,14 @@ bool BuildHandler(
     handler.variant = variant;
 
     if (semantic == VM_UOP_TRAP) {
+        handler.semanticBodyOffset = static_cast<uint32_t>(code.Offset());
         EmitTrapKernel(code, x64);
+        handler.semanticBodySize = static_cast<uint32_t>(code.Offset()) -
+            handler.semanticBodyOffset;
+        handler.semanticCoreOffset = handler.semanticBodyOffset;
+        handler.semanticCoreSize = handler.semanticBodySize;
+        handler.semanticCoreVariantOffset = handler.semanticBodyOffset;
+        handler.semanticCoreVariantSize = handler.semanticBodySize;
         const std::array<uint8_t, 8> x64Registers = {0,2,8,10,11,9,1,3};
         const std::array<uint8_t, 6> x86Registers = {0,2,1,5,6,3};
         for (size_t index = 0; index < handler.registerAssignment.size(); ++index) {
@@ -394,6 +401,36 @@ bool BuildHandler(
             return false;
         }
         const uint32_t semanticKernelBase = static_cast<uint32_t>(code.Offset());
+        if (generated.semanticBodySize == 0 ||
+            generated.semanticBodyOffset > generated.code.size() ||
+            generated.semanticBodySize >
+                generated.code.size() - generated.semanticBodyOffset ||
+            generated.semanticBodyOffset >
+                (std::numeric_limits<uint32_t>::max)() - semanticKernelBase) {
+            error = "semantic body evidence cannot be embedded";
+            return false;
+        }
+        handler.semanticBodyOffset =
+            semanticKernelBase + generated.semanticBodyOffset;
+        handler.semanticBodySize = generated.semanticBodySize;
+        handler.semanticCoreOffset =
+            semanticKernelBase + generated.semanticCoreOffset;
+        handler.semanticCoreSize = generated.semanticCoreSize;
+        handler.semanticCoreVariantOffset = generated.semanticCoreVariantSize != 0
+            ? semanticKernelBase + generated.semanticCoreVariantOffset : 0u;
+        handler.semanticCoreVariantSize = generated.semanticCoreVariantSize;
+        handler.valueCodecRanges.reserve(generated.valueCodecRanges.size());
+        for (const auto& range : generated.valueCodecRanges) {
+            if (range.size == 0 || range.offset > generated.code.size() ||
+                range.size > generated.code.size() - range.offset ||
+                range.offset > (std::numeric_limits<uint32_t>::max)() -
+                    semanticKernelBase) {
+                error = "value codec evidence range cannot be embedded";
+                return false;
+            }
+            handler.valueCodecRanges.push_back({
+                semanticKernelBase + range.offset, range.size});
+        }
         for (const auto& funclet : generated.stackFunclets) {
             if (funclet.offset > generated.code.size() || funclet.size == 0 ||
                 funclet.size > generated.code.size() - funclet.offset ||
@@ -976,6 +1013,7 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     entryConfig.flushInstructionCacheIatRVA = config.flushInstructionCacheIatRVA;
     entryConfig.functionPlanCount = static_cast<uint32_t>(functionPlans.size());
     entryConfig.emitCetLandingPads = config.emitCetLandingPads;
+    entryConfig.runtimeTraceEnabled = config.runtimeTraceEnabled;
 
     VMHandlerEntryCodegen entryGenerator;
     VMHandlerEntryCodegenResult entry = entryGenerator.Generate(entryConfig);
@@ -1450,10 +1488,46 @@ bool VMHandlerSynthesizer::Validate(
             handler.dispatchTailSize == 0 ||
             handler.dispatchTailOffset + handler.dispatchTailSize !=
                 handler.plaintextBody.size() ||
+            handler.semanticBodySize == 0 ||
+            handler.semanticBodyOffset > handler.dispatchTailOffset ||
+            handler.semanticBodySize >
+                handler.dispatchTailOffset - handler.semanticBodyOffset ||
+            handler.semanticCoreSize == 0 ||
+            handler.semanticCoreOffset < handler.semanticBodyOffset ||
+            handler.semanticCoreSize > handler.semanticBodySize -
+                (handler.semanticCoreOffset - handler.semanticBodyOffset) ||
+            ((handler.semanticCoreVariantSize == 0) !=
+                (handler.semanticCoreVariantOffset == 0)) ||
+            (handler.semanticCoreVariantSize != 0 &&
+                (handler.semanticCoreVariantOffset < handler.semanticCoreOffset ||
+                 handler.semanticCoreVariantSize > handler.semanticCoreSize -
+                    (handler.semanticCoreVariantOffset -
+                        handler.semanticCoreOffset))) ||
             !handler.semanticComplete || handler.bodyDigest == 0 ||
             handler.dispatchTailDigest == 0) {
-            error = "synthesized handler descriptor is inconsistent";
+            error = "synthesized handler descriptor is inconsistent: semantic=" +
+                std::to_string(handler.semantic) + " variant=" +
+                std::to_string(handler.variant) + " body=" +
+                std::to_string(handler.semanticBodyOffset) + "/" +
+                std::to_string(handler.semanticBodySize) + " core=" +
+                std::to_string(handler.semanticCoreOffset) + "/" +
+                std::to_string(handler.semanticCoreSize) + " variant_core=" +
+                std::to_string(handler.semanticCoreVariantOffset) + "/" +
+                std::to_string(handler.semanticCoreVariantSize) + " tail=" +
+                std::to_string(handler.dispatchTailOffset) + "/" +
+                std::to_string(handler.dispatchTailSize);
             return false;
+        }
+        uint32_t previousCodecEnd = handler.semanticCoreOffset;
+        for (const auto& range : handler.valueCodecRanges) {
+            if (range.size < 32u || range.offset < previousCodecEnd ||
+                range.offset < handler.semanticCoreOffset ||
+                range.size > handler.semanticCoreSize -
+                    (range.offset - handler.semanticCoreOffset)) {
+                error = "synthesized value-codec range is invalid";
+                return false;
+            }
+            previousCodecEnd = range.offset + range.size;
         }
         const uint64_t handlerDomain = 0x48414E444C455235ULL ^
             (static_cast<uint64_t>(handler.semantic) << 24u) ^

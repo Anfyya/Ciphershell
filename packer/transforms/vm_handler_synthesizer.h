@@ -50,6 +50,7 @@ struct VMHandlerSynthesisConfig {
     uint32_t flushInstructionCacheIatRVA = 0;
     bool encryptHandlerBodies = true;
     bool emitCetLandingPads = true;
+    bool runtimeTraceEnabled = false;
 };
 
 struct VMHandlerRelocation {
@@ -73,6 +74,11 @@ struct VMSynthesizedStackFunclet {
     uint8_t nonvolatileRegister = 0;
 };
 
+struct VMSynthesizedCodeRange {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+
 struct VMSynthesizedHandler {
     uint8_t semantic = VM_HANDLER_INVALID;
     uint8_t slot = VM_HANDLER_INVALID;
@@ -81,6 +87,19 @@ struct VMSynthesizedHandler {
     uint32_t storageSize = 0;
     uint32_t dispatchTailOffset = 0;
     uint32_t dispatchTailSize = 0;
+    /*
+     * Handler-relative range containing the real semantic data path.  This is
+     * deliberately narrower than plaintextBody: the outer storage envelope
+     * contains jump-over opaque islands which are encrypted into the product
+     * but must never be counted as executable per-build diversity evidence.
+     */
+    uint32_t semanticBodyOffset = 0;
+    uint32_t semanticBodySize = 0;
+    uint32_t semanticCoreOffset = 0;
+    uint32_t semanticCoreSize = 0;
+    uint32_t semanticCoreVariantOffset = 0;
+    uint32_t semanticCoreVariantSize = 0;
+    std::vector<VMSynthesizedCodeRange> valueCodecRanges;
     /*
      * x64 only: body-relative funclet range whose live stack state contains
      * the direct-tail 0x28-byte Win64 call frame.  The range ends immediately

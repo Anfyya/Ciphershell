@@ -538,15 +538,6 @@ bool Disassembler::DecodeInstruction(
                     operand.memory.resolvedRVA = static_cast<uint32_t>(targetRVA);
                     operand.memory.resolvedVA = absolute;
                     operand.memory.isImageAddress = true;
-                } else if (!operand.memory.hasBase && !operand.memory.hasIndex &&
-                           operand.memory.hasDisplacement && m_imageBase) {
-                    const uint64_t absolute = static_cast<uint32_t>(source.mem.disp.value);
-                    if (absolute >= m_imageBase && absolute - m_imageBase <=
-                            std::numeric_limits<uint32_t>::max()) {
-                        operand.memory.resolvedRVA = static_cast<uint32_t>(absolute - m_imageBase);
-                        operand.memory.resolvedVA = absolute;
-                        operand.memory.isImageAddress = true;
-                    }
                 }
                 break;
             }
@@ -616,7 +607,8 @@ std::vector<BasicBlock> Disassembler::BuildBasicBlocks(
             instructionBoundaries.count(instruction.branchTargetRVA) != 0) {
             blockStarts.insert(instruction.branchTargetRVA);
         }
-        if ((instruction.IsBranch() || instruction.IsReturn()) && i + 1 < instructions.size()) {
+        if ((instruction.IsBranch() || instruction.IsReturn() ||
+                instruction.IsInterrupt()) && i + 1 < instructions.size()) {
             blockStarts.insert(instructions[i + 1].address);
         }
     }
@@ -632,7 +624,8 @@ std::vector<BasicBlock> Disassembler::BuildBasicBlocks(
         }
         if (current.instructions.empty()) current.startAddress = instruction.address;
         current.instructions.push_back(instruction);
-        if (instruction.IsBranch() || instruction.IsReturn()) {
+        if (instruction.IsBranch() || instruction.IsReturn() ||
+            instruction.IsInterrupt()) {
             current.endAddress = instruction.address + instruction.length;
             current.instructionCount = static_cast<uint32_t>(current.instructions.size());
             blocks.push_back(std::move(current));
@@ -660,7 +653,7 @@ std::vector<BasicBlock> Disassembler::BuildBasicBlocks(
             }
         };
         if (last.hasBranchTarget) addSuccessor(last.branchTargetRVA);
-        if (!last.IsReturn() &&
+        if (!last.IsReturn() && !last.IsInterrupt() &&
             (!last.IsBranch() || last.IsConditionalBranch()) && i + 1 < blocks.size()) {
             addSuccessor(blocks[i + 1].startAddress);
         }
@@ -778,7 +771,7 @@ bool Disassembler::AnalyzeFunctionRange(
             decoded.emplace(offset, instruction);
             const uint32_t fallthrough = offset + instruction.length;
 
-            if (instruction.IsReturn()) {
+            if (instruction.IsReturn() || instruction.IsInterrupt()) {
                 hasTerminal = true;
                 break;
             }
@@ -831,7 +824,11 @@ bool Disassembler::AnalyzeFunctionRange(
     std::unordered_set<uint64_t> boundaries;
     for (const auto& instruction : instructions) boundaries.insert(instruction.address);
     for (const auto& instruction : instructions) {
-        if (instruction.hasBranchTarget && !instruction.IsCall() &&
+        if (!instruction.hasBranchTarget || instruction.IsCall()) continue;
+        const bool targetInsideCandidate =
+            instruction.branchTargetRVA >= functionRVA &&
+            instruction.branchTargetRVA - functionRVA < rangeSize;
+        if (targetInsideCandidate &&
             boundaries.count(instruction.branchTargetRVA) == 0) {
             SetError(instruction.address, "branch target is not a decoded instruction boundary");
             return false;

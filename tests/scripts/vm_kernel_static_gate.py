@@ -1196,7 +1196,8 @@ def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
     configure = subprocess.run(
         [cmake, "-S", str(root), "-B", str(build_dir),
          "-DCMAKE_BUILD_TYPE=Release"],
-        capture_output=True, text=True, timeout=300)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=300)
     if configure.returncode != 0:
         return [Violation(
             probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
@@ -1206,7 +1207,8 @@ def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
     build = subprocess.run(
         [cmake, "--build", str(build_dir),
          "--target", "vm_micro_op_ratio_probe", "--config", "Release", "-j"],
-        capture_output=True, text=True, timeout=900)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=900)
     if build.returncode != 0:
         return [Violation(
             probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
@@ -1231,7 +1233,9 @@ def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
             f"build succeeded but the probe executable was not found in any of: "
             + ", ".join(str(candidate) for candidate in candidates))]
 
-    run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
+    run = subprocess.run(
+        [str(exe)], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120)
     output = run.stdout + run.stderr
     aggregate_match = re.search(
         r"\[aggregate\] samples=(\d+) native=(\d+) micro=(\d+) "
