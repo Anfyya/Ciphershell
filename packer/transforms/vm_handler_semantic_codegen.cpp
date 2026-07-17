@@ -1795,6 +1795,59 @@ void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
     c.Bind(done);
 }
 
+// Two distinct x64 GPR indices from the safe local-scratch pool
+// {8,11,12,13}, seed-derived per (semantic,strategy). Excludes 0 (the
+// live shift operand), 1/2 (RCX/RDX -- the count is moved through
+// `mov rcx,rdx` and every count-consuming instruction below implicitly
+// reads CL, so RCX must stay the count register end to end), 4 (RSP), 9
+// (the width mask X64MaskForWidthInR11 computed and re-applies to the
+// result after this core returns, so it must survive the whole core body
+// unclobbered), 10 (EmitX64BinaryAlu zeroes it as "auxiliary" *before*
+// calling into this core and reads it back via X64FinishPrelatched right
+// after), and 15 (the runtime's context-pointer register -- see
+// X64LoadQ/X64LoadD's own "cannot overwrite the context register" guard;
+// every Ctx*-prefixed load/store in this file is `[r15+share...]`, not
+// `[rdi+...]`, despite what an earlier draft of this comment claimed).
+//
+// 14 is ALSO excluded, empirically: every register in the pool was
+// individually verified against the real native-differential suite
+// (test_vm_native_differential) one at a time, not just reasoned about
+// from reading the surrounding code, because the 10-exclusion above was
+// itself found that way after a first pass missed it (every corpus case
+// that exercised FLAGS_LAZY after a SHL/SHR/SAR/ROL/ROR access-violated,
+// because the core's own key scratch had clobbered what EmitX64BinaryAlu
+// still expected to be a clean zero). 8/11/12/13 each pass in isolation;
+// 14 alone reproduces the same class of FLAGS_LAZY access violation, for
+// a reason not yet root-caused (most likely some other handler or the
+// direct-threaded dispatch stub itself also treats r14 as reserved) --
+// it is excluded on that empirical evidence, not a traced justification
+// like the others. Do not add it back without either root-causing why or
+// re-running the full isolated single-register verification above.
+//
+// This is what actually changes the per-build 4-gram content of the
+// ModRM/REX bytes this core emits -- the round-keyed immediates alone
+// (already seed-derived) are exactly what the codec-similarity stage
+// strips out before measuring business_core, so on their own they cannot
+// move that number; only the *structural* bytes (which physical register
+// a given instruction touches) can.
+std::pair<uint8_t, uint8_t> DeriveShiftCoreScratchRegisters(
+    const CodeBuffer& c, VM_MICRO_OPCODE semantic, uint8_t strategy)
+{
+    static constexpr std::array<uint8_t, 4> kPool = {8u,11u,12u,13u};
+    const uint64_t domain = 0x5348495254524547ULL ^
+        (static_cast<uint64_t>(semantic) << 16u) ^
+        (static_cast<uint64_t>(strategy) << 8u);
+    const auto& round = c.coreSelector.rounds[domain % c.coreSelector.roundCount];
+    const uint64_t mixed = round.key ^ domain ^
+        (static_cast<uint64_t>(round.rotate) << 32u) ^
+        (static_cast<uint64_t>(round.encoding) << 40u);
+    const size_t first = static_cast<size_t>(mixed % kPool.size());
+    const size_t secondOffset = 1u + static_cast<size_t>(
+        (mixed >> 16u) % (kPool.size() - 1u));
+    const size_t second = (first + secondOffset) % kPool.size();
+    return {kPool[first], kPool[second]};
+}
+
 void EmitX64ShiftRotateVariant(
     CodeBuffer& c,
     VM_MICRO_OPCODE semantic,
@@ -1803,6 +1856,9 @@ void EmitX64ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X64DispatchWidth(c, 0, width);
+    const auto scratch = DeriveShiftCoreScratchRegisters(c, semantic, strategy);
+    const uint8_t scratchA = scratch.first;
+    const uint8_t scratchB = scratch.second;
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         const auto deriveKey = [&](size_t share) {
@@ -1845,22 +1901,22 @@ void EmitX64ShiftRotateVariant(
 
         c.Raw({0x48,0x89,0xD1});
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, 11u, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, 11u);
+            X64MovImmediate(c, scratchB, keys[share]);
+            X64BinaryRegister(c, 0x31u, 0u, scratchB);
         }
         const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
             (semantic == VM_UOP_ROL ? 0u : 1u);
         const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
         emitClOperation(0u, valueGroup);
 
-        X64MovImmediate(c, 8u, keys[shareOrder[0u]]);
-        emitClOperation(8u, keyGroup);
+        X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
+        emitClOperation(scratchA, keyGroup);
         for (size_t position = 1u; position < shareOrder.size(); ++position) {
-            X64MovImmediate(c, 11u, keys[shareOrder[position]]);
-            emitClOperation(11u, keyGroup);
-            X64BinaryRegister(c, 0x31u, 8u, 11u);
+            X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
+            emitClOperation(scratchB, keyGroup);
+            X64BinaryRegister(c, 0x31u, scratchA, scratchB);
         }
-        X64BinaryRegister(c, 0x31u, 0u, 8u);
+        X64BinaryRegister(c, 0x31u, 0u, scratchA);
         if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
         else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
         else if (bytes == 4u) c.Raw({0x89,0xC0});
@@ -2562,29 +2618,59 @@ void EmitKeyedLogicalShiftCore(
     if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
     if (x64) {
+        // See DeriveShiftCoreScratchRegisters (used by the SAR/ROL/ROR core
+        // right below): same pool, same exclusions (0/1/2/4/7/9 stay live
+        // across the whole EmitX64BinaryAlu-latched core body), same reason
+        // -- register choice, not the already-keyed immediates, is what
+        // moves this core's 4-gram content once value_codec strips the
+        // immediates back out.
+        const auto scratch = DeriveShiftCoreScratchRegisters(
+            c, shiftRight ? VM_UOP_SHR : VM_UOP_SHL, strategy);
+        const uint8_t scratchA = scratch.first;
+        const uint8_t scratchB = scratch.second;
         std::array<uint64_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveShare(share);
         }
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, 8u, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, 8u);
+            X64MovImmediate(c, scratchA, keys[share]);
+            X64BinaryRegister(c, 0x31u, 0u, scratchA);
         }
         c.Raw({0x48,0x89,0xD1});
-        c.Raw({0x4D,0x89,0xCB});
-        c.Raw({0x49,0xC1,0xFB,0x3F});
-        c.Raw({0x49,0x83,0xE3,0x20});
-        c.Raw({0x49,0x83,0xCB,0x1F});
-        c.Raw({0x44,0x20,0xD9});
+        // scratchB <- r9 (the width mask X64MaskForWidthInR11 already
+        // computed and left live in r9 for this whole core, same as
+        // EmitX64ShiftRotateVariant's sibling core above): all-ones only
+        // for width 8, so (sar 63)&32 is 32 only there, and |31 turns that
+        // into the exact 5-bit/6-bit shift-count mask this build needs.
+        X64MovRegister(c, scratchB, 9u);
+        X64ShiftImmediate(c, 7u, scratchB, 0x3F);
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x48u | ((scratchB & 8u) ? 1u : 0u));
+            c.Raw({rex, 0x83, static_cast<uint8_t>(
+                0xE0u | (scratchB & 7u)), 0x20});
+        }
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x48u | ((scratchB & 8u) ? 1u : 0u));
+            c.Raw({rex, 0x83, static_cast<uint8_t>(
+                0xC8u | (scratchB & 7u)), 0x1F});
+        }
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x40u | ((scratchB & 8u) ? 0x04u : 0u));
+            c.Raw({rex, 0x20, static_cast<uint8_t>(
+                0xC1u | ((scratchB & 7u) << 3u))});
+        }
 
         const auto shiftShares = [&] {
-            X64MovImmediate(c, 8u, keys[shareOrder[0u]]);
-            X64ShiftCl(c, shiftRight ? 5u : 4u, 8u);
+            X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
+            X64ShiftCl(c, shiftRight ? 5u : 4u, scratchA);
             for (size_t position = 1u;
                  position < shareOrder.size(); ++position) {
-                X64MovImmediate(c, 11u, keys[shareOrder[position]]);
-                X64ShiftCl(c, shiftRight ? 5u : 4u, 11u);
-                X64BinaryRegister(c, 0x31u, 8u, 11u);
+                X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
+                X64ShiftCl(c, shiftRight ? 5u : 4u, scratchB);
+                X64BinaryRegister(c, 0x31u, scratchA, scratchB);
             }
         };
         if (strategy == 0u) {
@@ -2594,7 +2680,7 @@ void EmitKeyedLogicalShiftCore(
             shiftShares();
             X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
         }
-        X64BinaryRegister(c, 0x31u, 0u, 8u);
+        X64BinaryRegister(c, 0x31u, 0u, scratchA);
     } else {
         std::array<uint32_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
