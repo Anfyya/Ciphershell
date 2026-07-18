@@ -8,7 +8,9 @@
 // 处理，不需要给每个标签页单独一个子类化窗口。
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <cstdint>

@@ -5,7 +5,9 @@
 // CoInitializeEx）初始化过 OLE——RegisterDragDrop 依赖它。
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <oleidl.h>
 

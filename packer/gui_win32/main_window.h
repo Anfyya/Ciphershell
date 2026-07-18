@@ -6,7 +6,9 @@
 // 消息都统一落在这一个 WndProc 里处理，不需要给每页单独写一个窗口过程。
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <memory>

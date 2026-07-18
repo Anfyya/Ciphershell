@@ -3,7 +3,9 @@
 // 只做：初始化 OLE（COM 文件对话框 IFileOpenDialog/IFileSaveDialog、拖放
 // IDropTarget 都依赖它）、初始化 ComCtl32 通用控件、创建主窗口、跑消息
 // 循环。所有界面/业务逻辑都在 MainWindow 里，这里不下沉任何决策。
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <commctrl.h>
 #include <ole2.h>
