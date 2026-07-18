@@ -101,6 +101,17 @@ target_link_libraries(ciphershell PRIVATE
 )
 
 # ============================================================================
+# GUI（原生 Win32，独立可执行文件 ciphershell_gui.exe）
+# ============================================================================
+# 不并入上面的 ciphershell_packer / ciphershell 目标——GUI 与打包核心逻辑
+# 解耦，只通过子进程调用 ciphershell.exe。只在真正的 Windows 目标上构建，
+# 和 stub/tests 用同样的 WIN32 门槛写法（见本文件所在目录的上一级
+# CMakeLists.txt）。
+if(WIN32)
+    add_subdirectory(gui_win32)
+endif()
+
+# ============================================================================
 # 微操作比例统计门禁 probe（ciphershellpro.md §8"双射抗性"）
 # ============================================================================
 # 用真实 Disassembler + Translator 跑一批有代表性的 x86-64 函数字节，汇总

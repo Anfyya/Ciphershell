@@ -1,0 +1,6 @@
+// CipherShell GUI - 资源脚本。
+// 只嵌入应用清单（ComCtl32 v6 通用控件 + per-monitor DPI 感知），
+// 参见 app.manifest 里的注释。
+#include <winuser.h>
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
