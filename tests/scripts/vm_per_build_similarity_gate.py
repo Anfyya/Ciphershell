@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""ciphershellpro.md §8 "Per-build 差异度" 校验:同一份输入用两次独立构建
-（各自的 build seed 都来自 ciphershell.exe 内部 BCryptGenRandom，本脚本不
-覆盖、不注入固定种子），比较两次产物里 handler 机器码字节的相似度必须
-< 15%，并且 opcode map / 分发键（dispatch key）/ 微操作选择（variant
-selector）四个自检摘要必须两两不同。
+"""ciphershellpro.md §8.1 "跨 seed 字节多样性防回退门禁" 校验:同一份输入用
+两次独立构建（各自的 build seed 都来自 ciphershell.exe 内部
+BCryptGenRandom，本脚本不覆盖、不注入固定种子），比较两次产物里 handler
+机器码字节的相似度必须低于按架构分别校准的阈值，并且 opcode map / 分发键
+（dispatch key）/ 微操作选择（variant selector）四个自检摘要必须两两不同。
+只证明字节层面的多样性没有退化，不证明攻击者的分析框架/去虚拟化流程无法
+跨产品复用，见 ciphershellpro.md §8.1 的完整边界说明。
 
 这是 Windows-only 校验：ciphershell.exe 只处理 PE 输入，且这里比较的是
 MSVC 工具链下的真实完整构建产物，不在非 Windows 环境下运行或伪造。CI 的
