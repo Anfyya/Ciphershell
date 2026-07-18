@@ -92,6 +92,34 @@ TARGET_EXPORT_NAMES = {
     "relocated_ptr", "relocated_read", "relocated_write",
 }
 
+# Independent per-(vm_group,semantic,K) pair ceilings.  The aggregate
+# similarity below is a Dice score pooled over every live handler pair
+# (`pairs` in the printed line), so it is a population mean: it can stay
+# comfortably under its own threshold while one specific handler pair is far
+# more similar across the two seeds than that average suggests.  These
+# ceilings gate `max_pair_similarity` independently so a single degenerate
+# handler cannot hide behind a healthy mean.
+#
+# Values are calibrated from 3 independent real-seed runs each on x64 and
+# Win32 (12 EXE/DLL samples total; see codex_change.log v2.7.2) rather than
+# a single sample, because max_pair is a max-over-~64-72-pairs statistic and
+# is measurably noisier run-to-run than the aggregate it sits next to: the
+# worst observed core_variant pair alone ranged 0.39-0.52 across 3 x64 runs
+# with no code change in between. Ceilings sit well above the observed
+# range (not just above one sample) so the check has real teeth against a
+# future regression without being flaky against that already-measured
+# seed-to-seed spread:
+#   business_core max_pair observed range across all runs: 0.38-0.41
+#   core_variant  max_pair observed range across all runs: 0.37-0.52
+#   codec         max_pair observed range across all runs: 0.00-0.19
+#   encrypted_handlers max_pair observed: ~0.0001 (ciphertext; stays ~0)
+MAX_PAIR_CEILINGS = {
+    "business_core": 0.55,
+    "core_variant": 0.65,
+    "codec": 0.30,
+    "encrypted_handlers": 0.15,
+}
+
 
 class GateFailure(Exception):
     pass
@@ -129,9 +157,14 @@ def parse_args() -> argparse.Namespace:
         help="max persistent value-codec 4-gram Dice similarity "
              "(hard ceiling: 0.15)")
     parser.add_argument(
-        "--business-core-similarity-threshold", type=float, default=0.35,
+        "--business-core-similarity-threshold", type=float, required=True,
         help="max business-lowering 4-gram Dice similarity after removing "
-             "codec ranges (hard ceiling: 0.35)")
+             "codec ranges (hard ceiling: 0.30). This is an anti-regression "
+             "baseline measured separately per target architecture (see "
+             "codex_change.log v2.7.2), not a validated attacker-difficulty "
+             "bound, so it has no single shared default: the caller "
+             "(tests/CMakeLists.txt) must pass the value for the "
+             "architecture actually being built")
     parser.add_argument(
         "--core-variant-similarity-threshold", type=float, default=0.35,
         help="max core-variant 4-gram Dice similarity "
@@ -1073,18 +1106,33 @@ def report_and_gate_similarities(
         result = results[stage]
         similarity = float(result["similarity"])
         threshold = thresholds[stage]
+        max_pair_similarity = float(result["max_pair_similarity"])
+        max_pair_ceiling = MAX_PAIR_CEILINGS[stage]
         print(
             f"[{kind.lower()}-diversity] stage={stage} "
             f"pairs={result['pairs']} "
             f"matching_4grams={2 * int(result['intersection'])}/"
             f"{int(result['total'])} dice={similarity:.4f} "
-            f"max_pair={float(result['max_pair_similarity']):.4f} "
+            f"max_pair={max_pair_similarity:.4f} "
             f"max_pair_key={result['max_pair_label']} "
-            f"threshold={threshold:.4f}")
+            f"threshold={threshold:.4f} "
+            f"max_pair_ceiling={max_pair_ceiling:.4f}")
         if similarity >= threshold:
             raise GateFailure(
                 f"{kind} {stage} 4-gram Dice similarity {similarity:.4f} "
                 f"is not below the independent {threshold:.4f} threshold")
+        # The aggregate check above is a population mean over every live
+        # (vm_group,semantic,K) pair and can pass while one specific pair is
+        # far more similar across seeds than that mean suggests.  Gate the
+        # single worst pair independently so it cannot hide behind the
+        # aggregate; see MAX_PAIR_CEILINGS for how these were calibrated.
+        if max_pair_similarity >= max_pair_ceiling:
+            raise GateFailure(
+                f"{kind} {stage} single-pair 4-gram Dice similarity "
+                f"{max_pair_similarity:.4f} at {result['max_pair_label']} "
+                f"is not below the independent per-pair ceiling "
+                f"{max_pair_ceiling:.4f}; the aggregate mean can stay low "
+                "while this one handler pair does not")
 
 
 def resolve_thresholds(args: argparse.Namespace) -> dict[str, float]:
@@ -1098,7 +1146,15 @@ def resolve_thresholds(args: argparse.Namespace) -> dict[str, float]:
         "encrypted_handlers": encrypted,
     }
     hard_ceilings = {
-        "business_core": 0.35,
+        # 0.30 is the looser of the two real per-architecture business_core
+        # baselines measured for v2.7.2 (x64 0.30, Win32 0.28; see
+        # codex_change.log). It replaces the old 0.35, which was never
+        # validated against any attacker-difficulty bound and had drifted
+        # well above what real builds actually produce. This ceiling only
+        # bounds how loose --business-core-similarity-threshold may be
+        # set (a per-architecture anti-regression baseline supplied by the
+        # caller); it is not itself a claim about analysis difficulty.
+        "business_core": 0.30,
         "core_variant": 0.35,
         "codec": 0.15,
         "encrypted_handlers": 0.15,

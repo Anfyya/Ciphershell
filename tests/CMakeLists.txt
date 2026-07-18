@@ -317,11 +317,18 @@ add_test(
 )
 set_tests_properties(vm_kernel_static_gate PROPERTIES LABELS "vm;hard-gate")
 
-# ciphershellpro.md §8 "Per-build 差异度":同一份输入用两次真实、独立
-# seed 的完整构建，比较 handler 密文字节相似度必须 < 15%，且 opcode map/
-# 分发键/微操作选择四个自检摘要两两不同。ciphershell.exe 只处理 PE，
-# 这条门禁只在这个 Windows-only 的 tests/CMakeLists.txt 里注册，不会在
-# Linux 静态门禁 job 里出现。
+# ciphershellpro.md §8 "跨 seed 字节多样性防回退门禁":同一份输入用两次
+# 真实、独立 seed 的完整构建，比较 handler 密文字节相似度必须 < 15%，且
+# opcode map/分发键/微操作选择四个自检摘要两两不同。business_core 聚合
+# 阈值按架构分别设置，是各自实测当前值加小余量的防回退基线，不是已验证
+# 的攻击者分析难度下限（见 ciphershellpro.md §8 与 codex_change.log
+# v2.7.2）。ciphershell.exe 只处理 PE，这条门禁只在这个 Windows-only 的
+# tests/CMakeLists.txt 里注册，不会在 Linux 静态门禁 job 里出现。
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(CS_BUSINESS_CORE_SIMILARITY_THRESHOLD 0.30)
+else()
+    set(CS_BUSINESS_CORE_SIMILARITY_THRESHOLD 0.28)
+endif()
 add_test(
     NAME vm_per_build_similarity_gate
     COMMAND "${Python3_EXECUTABLE}"
@@ -332,6 +339,7 @@ add_test(
         --exe-sample "$<TARGET_FILE:vm_runtime_gate_exe>"
         --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_similarity_gate_sample.toml"
         --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
+        --business-core-similarity-threshold ${CS_BUSINESS_CORE_SIMILARITY_THRESHOLD}
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
     LABELS "vm;hard-gate"
