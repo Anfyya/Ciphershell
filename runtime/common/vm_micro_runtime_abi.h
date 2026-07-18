@@ -165,6 +165,8 @@ typedef struct VM_MICRO_EXECUTION_CONTEXT {
     uint32_t error;
     uint32_t halted;
     uint64_t mutationScratch;
+    /* Optional authenticated RW/NX evidence buffer. Zero in normal builds. */
+    uint64_t traceState;
 } VM_MICRO_EXECUTION_CONTEXT;
 #pragma pack(pop)
 

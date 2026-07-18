@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -99,62 +101,119 @@ bool BuildContiguousNativeCode(
     return true;
 }
 
-// Appends a differential-only VM_UOP_FLAGS_MATERIALIZE before the terminal
-// RET/EXIT so the synthesized handler chain's virtualFlags is fully
-// up to date at the comparison point, exactly like a real CPU's RFLAGS
-// always is.  Production bytecode never carries this instruction: nothing
-// downstream of a returned function is entitled to see pending-but-never-
-// consumed flags, so paying for eager materialization there would be pure
-// overhead.  Any branch that targeted the original RET is retargeted to the
-// inserted instruction so it still falls through into the same RET.
+bool RebaseNativeImageAddresses(
+    const Function& function,
+    uint64_t corpusImageBase,
+    std::vector<uint8_t>& code,
+    std::string& error)
+{
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (!instruction.hasImageRelocation) continue;
+            if (!instruction.imageRelocationSupported ||
+                (instruction.imageRelocationSize != 4u &&
+                 instruction.imageRelocationSize != 8u) ||
+                instruction.rva < function.entryAddress) {
+                error = "native differential encountered an unsupported image relocation";
+                return false;
+            }
+            const uint64_t instructionOffset =
+                instruction.rva - function.entryAddress;
+            const uint64_t fieldOffset = instructionOffset +
+                instruction.imageRelocationOffset;
+            if (fieldOffset > code.size() ||
+                instruction.imageRelocationSize > code.size() -
+                    static_cast<size_t>(fieldOffset)) {
+                error = "native differential image relocation escapes copied function bytes";
+                return false;
+            }
+            const uint64_t relocated = corpusImageBase +
+                instruction.imageRelocationTargetRVA;
+            if (relocated < corpusImageBase ||
+                (instruction.imageRelocationSize == 4u &&
+                 relocated > (std::numeric_limits<uint32_t>::max)())) {
+                error = "native differential image relocation overflows target pointer width";
+                return false;
+            }
+            std::memcpy(code.data() + static_cast<size_t>(fieldOffset),
+                &relocated, instruction.imageRelocationSize);
+        }
+    }
+    return true;
+}
+
+bool BuildNativeCodeFixups(
+    const Function& function,
+    const std::vector<uint8_t>& code,
+    std::vector<VMNativeDifferentialCodeFixup>& fixups,
+    std::string& error)
+{
+    fixups.clear();
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            const OperandIR* ripOperand = nullptr;
+            for (const auto& operand : instruction.operands) {
+                if (operand.type != OperandType::Memory ||
+                    !operand.memory.isRipRelative) continue;
+                if (ripOperand) {
+                    error = "native differential instruction has multiple RIP-relative operands";
+                    return false;
+                }
+                ripOperand = &operand;
+            }
+            if (!ripOperand) continue;
+            if (instruction.rva < function.entryAddress ||
+                instruction.displacementSize != 4u ||
+                instruction.displacementOffset == 0u ||
+                instruction.displacementOffset + 4u > instruction.length) {
+                error = "native differential RIP-relative field is not an exact disp32";
+                return false;
+            }
+            const uint64_t instructionOffset =
+                instruction.rva - function.entryAddress;
+            const uint64_t fieldOffset = instructionOffset +
+                instruction.displacementOffset;
+            const uint64_t nextOffset = instructionOffset + instruction.length;
+            if (fieldOffset > code.size() || 4u > code.size() -
+                    static_cast<size_t>(fieldOffset) || nextOffset > code.size()) {
+                error = "native differential RIP-relative fixup escapes copied code";
+                return false;
+            }
+            VMNativeDifferentialCodeFixup fixup{};
+            fixup.fieldOffset = static_cast<uint32_t>(fieldOffset);
+            fixup.nextInstructionOffset = static_cast<uint32_t>(nextOffset);
+            fixup.targetRVA = ripOperand->memory.resolvedRVA;
+            fixup.kind = VM_NATIVE_CODE_FIXUP_RIP_REL32;
+            fixup.fieldSize = 4u;
+            fixups.push_back(fixup);
+        }
+    }
+    return true;
+}
+
+// Differential execution must consume the exact bytecode emitted into the
+// protected PE. In particular, RET flag materialization belongs to Translator
+// production lowering; adding or rebasing instructions only in this provider
+// would validate a program that never ships.
 bool BuildDifferentialBytecode(
     const TranslationResult& translation,
     const std::unordered_map<uint8_t, uint8_t>& opcodeMap,
     std::vector<uint8_t>& bytecode,
     std::string& error)
 {
-    if (translation.instructions.empty() ||
+    (void)opcodeMap;
+    if (translation.instructions.empty() || translation.bytecode.empty() ||
         translation.microOffsets.size() != translation.instructions.size()) {
         error = "native differential translation instruction/offset bookkeeping is incomplete";
         return false;
     }
-    const MicroInstruction lastInstruction = translation.instructions.back();
+    const MicroInstruction& lastInstruction = translation.instructions.back();
     if (lastInstruction.opcode != VM_UOP_RET && lastInstruction.opcode != VM_UOP_EXIT) {
         error = "native differential translated program does not end with RET/EXIT";
         return false;
     }
-    const uint32_t tailOffset = translation.microOffsets.back();
 
-    MicroInstruction materialize{};
-    materialize.opcode = VM_UOP_FLAGS_MATERIALIZE;
-    materialize.operandCount = 1;
-    materialize.operands[0] = VM_FLAG_ARCHITECTURAL_MASK;
-    uint32_t materializeSize = 0;
-    if (!VMSchema::EncodedSize(materialize, translation.operandCodec, materializeSize, error)) {
-        return false;
-    }
-
-    std::vector<MicroInstruction> augmented(
-        translation.instructions.begin(), translation.instructions.end() - 1);
-    for (auto& instruction : augmented) {
-        const auto* descriptor = VMSchema::Lookup(instruction.opcode);
-        if (!descriptor || !descriptor->branch || descriptor->branchTargetOperand < 0) continue;
-        const auto operandIndex = static_cast<uint8_t>(descriptor->branchTargetOperand);
-        if (instruction.operands[operandIndex] == tailOffset) {
-            instruction.operands[operandIndex] += materializeSize;
-        }
-    }
-    augmented.push_back(materialize);
-    augmented.push_back(lastInstruction);
-
-    bytecode.clear();
-    for (const auto& instruction : augmented) {
-        std::string encodeError;
-        if (!VMSchema::Encode(instruction, opcodeMap, translation.operandCodec, bytecode, encodeError)) {
-            error = "native differential could not encode augmented bytecode: " + encodeError;
-            return false;
-        }
-    }
+    bytecode = translation.bytecode;
     return true;
 }
 
@@ -205,7 +264,8 @@ bool VMWindowsNativeDifferentialEvidenceProvider::Initialize(
     error = "native differential evidence provider is Windows-only";
     return false;
 #else
-    if (memorySize < 0x1000u) {
+    if (memorySize < 0x1000u ||
+        memorySize > VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE) {
         error = "native differential evidence provider requires a real corpus memory size";
         return false;
     }
@@ -372,6 +432,15 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
     if (!BuildContiguousNativeCode(function, nativeCode, error)) {
         return false;
     }
+    if (!RebaseNativeImageAddresses(
+            function, request.memoryBase, nativeCode, error)) {
+        return false;
+    }
+    std::vector<VMNativeDifferentialCodeFixup> nativeCodeFixups;
+    if (!BuildNativeCodeFixups(
+            function, nativeCode, nativeCodeFixups, error)) {
+        return false;
+    }
     std::vector<uint8_t> vmBytecode;
     if (!BuildDifferentialBytecode(translation, opcodeMap, vmBytecode, error)) {
         return false;
@@ -399,27 +468,58 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
     header.operandCodec = translation.operandCodec;
     header.contextEntryOffset = m_impl->contextEntryOffset;
 
-    uint32_t offset = static_cast<uint32_t>(sizeof(VMNativeDifferentialRequestHeader));
-    header.nativeCodeOffset = offset; header.nativeCodeSize = static_cast<uint32_t>(nativeCode.size());
-    offset += header.nativeCodeSize;
-    header.corpusMemoryOffset = offset;
-    offset += header.memorySize;
-    header.vmBytecodeOffset = offset; header.vmBytecodeSize = static_cast<uint32_t>(vmBytecode.size());
-    offset += header.vmBytecodeSize;
-    header.handlerImageOffset = offset;
+    if (nativeCode.size() > (std::numeric_limits<uint32_t>::max)() ||
+        nativeCodeFixups.size() > (std::numeric_limits<uint32_t>::max)() ||
+        vmBytecode.size() > (std::numeric_limits<uint32_t>::max)() ||
+        m_impl->handlerImage.size() > (std::numeric_limits<uint32_t>::max)() ||
+        m_impl->relocations.size() > (std::numeric_limits<uint32_t>::max)() ||
+        m_impl->unwindEntries.size() > (std::numeric_limits<uint32_t>::max)()) {
+        error = "native differential request component exceeds uint32 protocol limits";
+        return false;
+    }
+    header.nativeCodeSize = static_cast<uint32_t>(nativeCode.size());
+    header.nativeCodeFixupsCount = static_cast<uint32_t>(nativeCodeFixups.size());
+    header.vmBytecodeSize = static_cast<uint32_t>(vmBytecode.size());
     header.handlerImageSize = static_cast<uint32_t>(m_impl->handlerImage.size());
-    offset += header.handlerImageSize;
-    header.handlerRelocationsOffset = offset;
     header.handlerRelocationsCount = static_cast<uint32_t>(m_impl->relocations.size());
-    offset += header.handlerRelocationsCount * static_cast<uint32_t>(sizeof(VMNativeDifferentialRelocation));
-    header.handlerUnwindOffset = offset;
     header.handlerUnwindCount = static_cast<uint32_t>(m_impl->unwindEntries.size());
-    offset += header.handlerUnwindCount * static_cast<uint32_t>(sizeof(VMNativeDifferentialUnwindEntry));
+
+    uint64_t offset = sizeof(VMNativeDifferentialRequestHeader);
+    auto reserveRegion = [&](uint64_t size, uint32_t& regionOffset) {
+        if (offset > (std::numeric_limits<uint32_t>::max)() ||
+            size > (std::numeric_limits<uint32_t>::max)() - offset) {
+            return false;
+        }
+        regionOffset = static_cast<uint32_t>(offset);
+        offset += size;
+        return true;
+    };
+    if (!reserveRegion(header.nativeCodeSize, header.nativeCodeOffset) ||
+        !reserveRegion(static_cast<uint64_t>(header.nativeCodeFixupsCount) *
+                sizeof(VMNativeDifferentialCodeFixup),
+            header.nativeCodeFixupsOffset) ||
+        !reserveRegion(header.memorySize, header.corpusMemoryOffset) ||
+        !reserveRegion(header.vmBytecodeSize, header.vmBytecodeOffset) ||
+        !reserveRegion(header.handlerImageSize, header.handlerImageOffset) ||
+        !reserveRegion(static_cast<uint64_t>(header.handlerRelocationsCount) *
+                sizeof(VMNativeDifferentialRelocation),
+            header.handlerRelocationsOffset) ||
+        !reserveRegion(static_cast<uint64_t>(header.handlerUnwindCount) *
+                sizeof(VMNativeDifferentialUnwindEntry),
+            header.handlerUnwindOffset)) {
+        error = "native differential request layout exceeds protocol/file limits";
+        return false;
+    }
     header.totalFileSize = offset;
 
-    std::vector<uint8_t> requestBlob(offset);
+    std::vector<uint8_t> requestBlob(static_cast<size_t>(offset));
     std::memcpy(requestBlob.data(), &header, sizeof(header));
     std::memcpy(requestBlob.data() + header.nativeCodeOffset, nativeCode.data(), nativeCode.size());
+    if (!nativeCodeFixups.empty()) {
+        std::memcpy(requestBlob.data() + header.nativeCodeFixupsOffset,
+            nativeCodeFixups.data(),
+            nativeCodeFixups.size() * sizeof(VMNativeDifferentialCodeFixup));
+    }
     std::memcpy(requestBlob.data() + header.corpusMemoryOffset, request.initialMemory.data(),
         header.memorySize);
     std::memcpy(requestBlob.data() + header.vmBytecodeOffset, vmBytecode.data(), vmBytecode.size());
@@ -581,12 +681,20 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
     //      fault bucket rather than silently misreporting a real cause.
     constexpr uint32_t kDivideByZeroExceptionCode = 0xC0000094u;
     constexpr uint32_t kIntegerOverflowExceptionCode = 0xC0000095u;
+    // STATUS_BREAKPOINT: VM_UOP_INT3's business-core variants emit a literal
+    // 0xCC or CD 03 inline in the synthesized handler (see EmitBusinessCore
+    // Variant's VM_UOP_INT3 case in vm_handler_semantic_codegen.cpp) instead
+    // of simulating the trap, so this is a real hardware #BP caught by the
+    // same SEH wrapper as everything else, never a soft VM_MICRO_ERR_* code.
+    constexpr uint32_t kBreakpointExceptionCode = 0x80000003u;
     if (!evidence.vmFaulted) {
         evidence.vmFault = VMMicroFault::None;
     } else if (response.vmRuntimeError == VM_MICRO_ERR_DIVIDE ||
                response.vmExceptionCode == kDivideByZeroExceptionCode ||
                response.vmExceptionCode == kIntegerOverflowExceptionCode) {
         evidence.vmFault = VMMicroFault::DivideError;
+    } else if (response.vmExceptionCode == kBreakpointExceptionCode) {
+        evidence.vmFault = VMMicroFault::ExplicitTrap;
     } else {
         evidence.vmFault = VMMicroFault::UnsupportedSemantic;
     }
@@ -607,6 +715,10 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
         evidence.nativeState.memory.assign(
             responseBlob.begin() + sizeof(response),
             responseBlob.begin() + sizeof(response) + response.memorySize);
+    } else {
+        evidence.nativeFaultOffset = response.nativeFaultOffset;
+        evidence.nativeFaultGpr = response.nativeFaultGpr;
+        evidence.nativeFaultRflags = response.nativeFaultRflags;
     }
     if (!evidence.vmFaulted) {
         for (uint8_t family = 0; family < 16; ++family) {
@@ -617,6 +729,10 @@ bool VMWindowsNativeDifferentialEvidenceProvider::ExecuteCase(
         evidence.vmState.memory.assign(
             responseBlob.begin() + sizeof(response) + response.memorySize,
             responseBlob.begin() + sizeof(response) + 2u * static_cast<size_t>(response.memorySize));
+    } else {
+        evidence.vmFaultOffset = response.vmFaultOffset;
+        evidence.vmFaultGpr = response.vmFaultGpr;
+        evidence.vmFaultRflags = response.vmFaultRflags;
     }
     return true;
 #endif

@@ -2,6 +2,7 @@
 #include "../pe_parser/pe_utils.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 
 namespace CipherShell {
@@ -398,6 +399,38 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
         reason = "function marked as SEH/exception user";
         return false;
     }
+    const uint64_t functionBegin = func.entryAddress;
+    const uint64_t functionEnd = functionBegin + func.size;
+    const uint64_t relocationWidth = image->is64Bit ? 8u : 4u;
+    if (functionEnd < functionBegin) {
+        reason = "function range overflows while validating base relocations";
+        return false;
+    }
+    for (const CS_RELOC_ENTRY& relocation : image->relocs.entries) {
+        if (relocation.fullRVA >
+                (std::numeric_limits<uint64_t>::max)() - relocationWidth) {
+            reason = "base relocation range overflows";
+            return false;
+        }
+        const uint64_t relocationEnd = relocation.fullRVA + relocationWidth;
+        if (relocationEnd <= functionBegin || relocation.fullRVA >= functionEnd) {
+            continue;
+        }
+        bool represented = false;
+        for (const auto& block : func.blocks) {
+            for (const auto& instruction : block.instructions) {
+                represented = represented ||
+                    (instruction.hasImageRelocation &&
+                     instruction.imageRelocationSupported &&
+                     static_cast<uint64_t>(instruction.rva) +
+                        instruction.imageRelocationOffset == relocation.fullRVA);
+            }
+        }
+        if (!represented) {
+            reason = "base relocation overlaps VM function bytes without an exact supported field";
+            return false;
+        }
+    }
     if (image->is64Bit && !image->exceptions.entries.empty()) {
         uint32_t begin = static_cast<uint32_t>(func.entryAddress);
         uint32_t end = begin + func.size;
@@ -435,6 +468,39 @@ bool CapabilityChecker::IsFunctionVmSafe(const CS_PE_IMAGE* image, const Functio
             if (instr.isIndirectBranch && !instr.IsCall()) {
                 reason = "indirect non-call control flow has no statically verifiable VM target";
                 return false;
+            }
+            if (instr.hasImageRelocation && !instr.imageRelocationSupported) {
+                reason = "base relocation inside VM instruction is ambiguous or unsupported";
+                return false;
+            }
+            for (const auto& operand : instr.operands) {
+                uint64_t target = (std::numeric_limits<uint64_t>::max)();
+                if (operand.type == OperandType::Memory &&
+                    (operand.memory.isImageAddress ||
+                     operand.memory.isRipRelative)) {
+                    target = operand.memory.resolvedRVA;
+                    if (instr.mnemonic != InstructionMnemonic::Lea) {
+                        const uint64_t width = (operand.memory.width + 7u) / 8u;
+                        if (width == 0 || target >
+                                (std::numeric_limits<uint64_t>::max)() - width) {
+                            reason = "image-relative memory operand range is invalid";
+                            return false;
+                        }
+                        const uint64_t targetEnd = target + width;
+                        if (target < functionEnd && targetEnd > functionBegin) {
+                            reason = "image-relative memory operand reads native function bytes that VM destroys";
+                            return false;
+                        }
+                        continue;
+                    }
+                } else if (operand.type == OperandType::Immediate &&
+                           operand.immediateIsImageAddress) {
+                    target = operand.immediateResolvedRVA;
+                }
+                if (target > functionBegin && target < functionEnd) {
+                    reason = "image-relative operand targets native function interior that VM destroys";
+                    return false;
+                }
             }
         }
     }

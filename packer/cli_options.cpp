@@ -63,6 +63,11 @@ bool ParseCommandLine(
             if (!ReadOptionValue(argc, argv, i, argument, options.configFile, error)) return false;
             continue;
         }
+        if (!positionalOnly && argument == "--vm-handler-evidence") {
+            if (!ReadOptionValue(argc, argv, i, argument,
+                    options.vmHandlerEvidenceFile, error)) return false;
+            continue;
+        }
         if (!positionalOnly && (argument == "-l" || argument == "--level")) {
             std::string value;
             if (!ReadOptionValue(argc, argv, i, argument, value, error)) return false;

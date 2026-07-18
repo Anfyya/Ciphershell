@@ -28,6 +28,115 @@ const IMAGE_SECTION_HEADER* ExecutableSectionForRva(const CS_PE_IMAGE* image, ui
     return nullptr;
 }
 
+bool IsFileBackedExecutableRva(const CS_PE_IMAGE* image, uint32_t rva) {
+    const IMAGE_SECTION_HEADER* section = ExecutableSectionForRva(image, rva);
+    if (!image || !section || rva < section->VirtualAddress) return false;
+    const uint32_t sectionOffset = rva - section->VirtualAddress;
+    if (sectionOffset >= section->SizeOfRawData) return false;
+    const uint64_t rawOffset = static_cast<uint64_t>(section->PointerToRawData) +
+        sectionOffset;
+    return rawOffset < image->rawSize;
+}
+
+void AnnotateImageRelocations(
+    const CS_PE_IMAGE* image,
+    std::vector<Function>& functions)
+{
+    if (!image || !image->rawData) return;
+    const uint64_t imageBase = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.ImageBase
+        : image->ntHeaders32->OptionalHeader.ImageBase;
+    const uint32_t imageSize = image->is64Bit
+        ? image->ntHeaders64->OptionalHeader.SizeOfImage
+        : image->ntHeaders32->OptionalHeader.SizeOfImage;
+    const uint16_t expectedType = image->is64Bit
+        ? IMAGE_REL_BASED_DIR64 : IMAGE_REL_BASED_HIGHLOW;
+    const uint8_t expectedWidth = image->is64Bit ? 8u : 4u;
+
+    std::unordered_map<uint32_t, const CS_RELOC_ENTRY*> relocations;
+    std::unordered_set<uint32_t> duplicateRelocations;
+    relocations.reserve(image->relocs.entries.size());
+    for (const CS_RELOC_ENTRY& relocation : image->relocs.entries) {
+        if (relocation.fullRVA <= (std::numeric_limits<uint32_t>::max)()) {
+            const uint32_t rva = static_cast<uint32_t>(relocation.fullRVA);
+            if (!relocations.emplace(rva, &relocation).second) {
+                duplicateRelocations.insert(rva);
+            }
+        }
+    }
+
+    for (Function& function : functions) {
+        for (BasicBlock& block : function.blocks) {
+            for (InstructionIR& instruction : block.instructions) {
+                for (uint32_t byte = 0; byte < instruction.length; ++byte) {
+                    const auto found = relocations.find(instruction.rva + byte);
+                    if (found == relocations.end()) continue;
+                    if (instruction.hasImageRelocation) {
+                        instruction.imageRelocationSupported = false;
+                        continue;
+                    }
+                    instruction.hasImageRelocation = true;
+                    instruction.imageRelocationOffset = static_cast<uint8_t>(byte);
+                    instruction.imageRelocationSize = expectedWidth;
+                    const CS_RELOC_ENTRY& relocation = *found->second;
+                    if (duplicateRelocations.count(instruction.rva + byte) != 0u ||
+                        relocation.type != expectedType ||
+                        byte + expectedWidth > instruction.length) {
+                        continue;
+                    }
+                    const uint32_t fileOffset = PEUtils::RvaToOffset(
+                        image, static_cast<uint32_t>(relocation.fullRVA));
+                    if (fileOffset == 0u || fileOffset > image->rawSize ||
+                        expectedWidth > image->rawSize - fileOffset) {
+                        continue;
+                    }
+                    uint64_t absolute = 0;
+                    std::memcpy(&absolute, image->rawData + fileOffset, expectedWidth);
+                    if (absolute < imageBase || absolute - imageBase >= imageSize) {
+                        continue;
+                    }
+                    const uint32_t targetRVA = static_cast<uint32_t>(absolute - imageBase);
+                    bool fieldSupported = false;
+                    if (instruction.immediateOffset == byte &&
+                        instruction.immediateSize == expectedWidth) {
+                        for (OperandIR& operand : instruction.operands) {
+                            if (operand.type != OperandType::Immediate ||
+                                operand.immediateRelative) continue;
+                            operand.immediateIsImageAddress = true;
+                            operand.immediateResolvedRVA = targetRVA;
+                            fieldSupported = true;
+                            break;
+                        }
+                    } else if (instruction.displacementOffset == byte &&
+                               instruction.displacementSize == expectedWidth) {
+                        for (OperandIR& operand : instruction.operands) {
+                            if (operand.type == OperandType::Memory &&
+                                !operand.memory.hasBase &&
+                                !operand.memory.hasIndex &&
+                                operand.memory.hasDisplacement) {
+                                const uint64_t memoryWidth = (std::max)(1u,
+                                    static_cast<uint32_t>(
+                                        (operand.memory.width + 7u) / 8u));
+                                if (targetRVA > imageSize ||
+                                    memoryWidth > imageSize - targetRVA) {
+                                    break;
+                                }
+                                operand.memory.isImageAddress = true;
+                                operand.memory.resolvedVA = absolute;
+                                operand.memory.resolvedRVA = targetRVA;
+                                fieldSupported = true;
+                                break;
+                            }
+                        }
+                    }
+                    instruction.imageRelocationTargetRVA = targetRVA;
+                    instruction.imageRelocationSupported = fieldSupported;
+                }
+            }
+        }
+    }
+}
+
 bool RawRangeForFunction(
     CS_PE_IMAGE* image,
     uint32_t beginRVA,
@@ -263,15 +372,34 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
         pending.push_back(root.first);
         queued.insert(root.first);
     }
-    // Direct calls from trusted .pdata functions are also credible leaf roots.
-    for (const auto& function : result.functions) {
+
+    // A successfully recursive-decoded candidate can still be unsafe to destroy:
+    // x86 CRT startup functions, for example, contain separately entered SEH
+    // funclets that leave gaps in the entry-rooted CFG.  Direct control transfers
+    // decoded outside that candidate's own envelope remain credible independent
+    // roots, but the gapped candidate itself must stay rejected below.
+    auto queueExternalDirectTargets = [&](const Function& function) {
+        const uint64_t begin = function.entryAddress;
+        const uint64_t end = begin + function.size;
         for (const InstructionIR* instruction : Instructions(function)) {
-            if (!instruction->IsCall() || !instruction->hasBranchTarget ||
-                !ExecutableSectionForRva(image, instruction->branchTargetRVA)) continue;
+            if (!instruction->hasBranchTarget || instruction->isIndirectBranch) continue;
             const uint32_t target = instruction->branchTargetRVA;
-            if (rootSources.emplace(target, "direct_call").second) knownBoundaries.insert(target);
+            if (target >= begin && static_cast<uint64_t>(target) < end) continue;
+            const bool isDirectCall = instruction->IsCall();
+            const bool isDirectTail = instruction->IsBranch() &&
+                !instruction->IsConditionalBranch();
+            if ((!isDirectCall && !isDirectTail) ||
+                !IsFileBackedExecutableRva(image, target)) continue;
+            const char* source = isDirectCall ? "direct_call" : "direct_tail";
+            if (rootSources.emplace(target, source).second) knownBoundaries.insert(target);
             if (queued.insert(target).second) pending.push_back(target);
         }
+    };
+
+    // Direct calls and direct tail transfers from trusted .pdata functions are
+    // also credible independent roots.
+    for (const auto& function : result.functions) {
+        queueExternalDirectTargets(function);
     }
 
     std::unordered_set<uint32_t> decodedStarts;
@@ -330,14 +458,6 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
             result.issues.push_back({root, "recursive decoder produced an empty function"});
             continue;
         }
-        // For a boundary inferred without unwind/symbol metadata, every byte in
-        // the destroyed native range must belong to a decoded instruction.  A
-        // gap can be an inline table or adjacent data and is therefore rejected.
-        if (function.decodedBytes != function.size) {
-            result.issues.push_back({root,
-                "inferred function range contains undecoded gaps and is not safe to destroy"});
-            continue;
-        }
 
         const uint64_t candidateEnd = static_cast<uint64_t>(root) + function.size;
         bool overlaps = false;
@@ -353,18 +473,26 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
             continue;
         }
 
+        // Harvest only external direct roots from the successfully decoded CFG
+        // before applying the stricter destroy-safe gap rule.  This lets x86 CRT
+        // startup lead discovery to user main without ever accepting the CRT
+        // function (and its inline/SEH gaps) as patchable native code.
+        queueExternalDirectTargets(function);
+
+        // For a boundary inferred without unwind/symbol metadata, every byte in
+        // the destroyed native range must belong to a decoded instruction.  A
+        // gap can be an inline table or adjacent data and is therefore rejected.
+        if (function.decodedBytes != function.size) {
+            result.issues.push_back({root,
+                "inferred function range contains undecoded gaps and is not safe to destroy"});
+            continue;
+        }
+
         function.boundaryTrusted = true;
         const auto source = rootSources.find(root);
         function.discoverySource = source != rootSources.end() ? source->second : "direct_call";
         decodedStarts.insert(root);
 
-        for (const InstructionIR* instruction : Instructions(function)) {
-            if (!instruction->IsCall() || !instruction->hasBranchTarget ||
-                !ExecutableSectionForRva(image, instruction->branchTargetRVA)) continue;
-            const uint32_t target = instruction->branchTargetRVA;
-            if (rootSources.emplace(target, "direct_call").second) knownBoundaries.insert(target);
-            if (queued.insert(target).second) pending.push_back(target);
-        }
         result.functions.push_back(std::move(function));
     }
 
@@ -374,6 +502,7 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
     }
     if (!ValidateFunctionOwnership(result)) return result;
     AssignFunctionNames(image, result.functions);
+    AnnotateImageRelocations(image, result.functions);
 
     // 函数级 SEH 判定：
     // - SafeSEH handler 表中的入口 RVA 对应函数标记 usesSEH（handler 与函数入口

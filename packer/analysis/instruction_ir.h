@@ -257,6 +257,8 @@ struct OperandIR {
     uint64_t immediate = 0;
     bool immediateSigned = false;
     bool immediateRelative = false;
+    bool immediateIsImageAddress = false;
+    uint32_t immediateResolvedRVA = 0;
     MemoryOperandIR memory{};
 };
 
@@ -277,6 +279,16 @@ struct InstructionIR {
     uint8_t displacementSize = 0;
     uint8_t immediateOffset = 0;
     uint8_t immediateSize = 0;
+    // PE base-relocation metadata for an encoded absolute image address.
+    // FunctionDiscovery binds the relocation to the exact instruction field;
+    // VM lowering and the native differential worker then both rebase it to
+    // their actual module/corpus base. Unsupported or ambiguous in-instruction
+    // relocations remain marked and are rejected by CapabilityChecker.
+    bool hasImageRelocation = false;
+    bool imageRelocationSupported = false;
+    uint8_t imageRelocationOffset = 0;
+    uint8_t imageRelocationSize = 0;
+    uint32_t imageRelocationTargetRVA = 0;
     std::vector<OperandIR> operands;
 
     BranchKind branchKind = BranchKind::None;

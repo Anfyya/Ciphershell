@@ -13,6 +13,34 @@
 namespace CipherShell {
 namespace {
 
+enum class KeyedPermutationOp : uint8_t {
+    Xor = 0,
+    Add = 1,
+    Rotate = 2,
+    Multiply = 3,
+    Not = 4,
+    Negate = 5,
+    ByteSwap = 6,
+    XorShift = 7
+};
+
+struct KeyedPermutationRound {
+    KeyedPermutationOp op = KeyedPermutationOp::Xor;
+    uint64_t key = 0;
+    uint64_t inverse = 0;
+    uint8_t rotate = 1;
+    uint8_t encoding = 0;
+};
+
+constexpr size_t kValueCodecRoundCount = 8u;
+constexpr size_t kCoreSelectorRoundCount = 8u;
+
+struct KeyedPermutationPlan {
+    std::array<KeyedPermutationRound, kCoreSelectorRoundCount> rounds{};
+    uint8_t roundCount = 0;
+    uint8_t layout = 0;
+};
+
 class CodeBuffer {
 public:
     using Label = size_t;
@@ -43,6 +71,10 @@ public:
         AddFixup(label);
     }
     bool Resolve(std::string& error) {
+        if (!encodingError.empty()) {
+            error = encodingError;
+            return false;
+        }
         for (const Fixup& fixup : fixups) {
             if (fixup.label >= labels.size() ||
                 labels[fixup.label] == (std::numeric_limits<size_t>::max)()) {
@@ -67,6 +99,13 @@ public:
 
     std::vector<VMHandlerSemanticStackFunclet> stackFunclets;
     std::vector<uint8_t> bytes;
+    KeyedPermutationPlan valueCodec{};
+    KeyedPermutationPlan coreSelector{};
+    std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
+
+    void FailEncoding(const char* error) {
+        if (encodingError.empty()) encodingError = error;
+    }
 
 private:
     struct Fixup { size_t displacement; Label label; };
@@ -74,6 +113,7 @@ private:
         fixups.push_back({bytes.size(), label});
         U32(0);
     }
+    std::string encodingError;
     std::vector<size_t> labels;
     std::vector<Fixup> fixups;
 };
@@ -163,12 +203,22 @@ void RecordX64StackFunclet(
 class SeedStream {
 public:
     SeedStream(const std::array<uint8_t, 32>& seed, uint64_t domain) {
-        uint64_t first = 0;
-        uint64_t second = 0;
-        std::memcpy(&first, seed.data(), sizeof(first));
-        std::memcpy(&second, seed.data() + 16, sizeof(second));
-        s0 = Mix(first ^ domain ^ 0xA0761D6478BD642FULL);
-        s1 = Mix(second ^ (domain << 1u) ^ 0xE7037ED1A0B428DBULL);
+        std::array<uint64_t, 4> lanes{};
+        for (size_t lane = 0; lane < lanes.size(); ++lane) {
+            std::memcpy(&lanes[lane], seed.data() + lane * sizeof(uint64_t),
+                sizeof(uint64_t));
+        }
+        // A build seed is a 256-bit contract.  The old initialization read
+        // only lanes 0 and 2, so changing bytes 8..15 or 24..31 could leave
+        // every semantic permutation unchanged.  Fold all four lanes into
+        // both generator words before the xorshift warm-up.
+        const uint64_t domainRotate = (domain << 1u) | (domain >> 63u);
+        s0 = Mix(lanes[0] ^ Mix(lanes[1] ^ 0x8EBC6AF09C88C6E3ULL) ^
+            domain ^ 0xA0761D6478BD642FULL);
+        s1 = Mix(lanes[2] ^ Mix(lanes[3] ^ 0x589965CC75374CC3ULL) ^
+            domainRotate ^ 0xE7037ED1A0B428DBULL);
+        s0 = Mix(s0 ^ lanes[3] ^ 0x1D8E4E27C47D124FULL);
+        s1 = Mix(s1 ^ lanes[1] ^ 0xEB44ACCAB455D165ULL);
         if ((s0 | s1) == 0) s1 = 1;
         for (unsigned i = 0; i < 12; ++i) Next64();
     }
@@ -193,6 +243,99 @@ private:
     uint64_t s0 = 0;
     uint64_t s1 = 0;
 };
+
+uint64_t OddInverse(uint64_t value, bool x64) {
+    // Newton iteration in Z/(2^N).  Starting with one correct bit doubles the
+    // number of correct low bits each iteration.  Truncation supplies the
+    // modulus for both word sizes.
+    uint64_t inverse = value;
+    for (unsigned iteration = 0; iteration < 6u; ++iteration)
+        inverse *= 2u - value * inverse;
+    if (!x64) inverse = static_cast<uint32_t>(inverse);
+    return inverse;
+}
+
+KeyedPermutationPlan DerivePermutationPlan(
+    const VMHandlerSemanticCodegenConfig& config,
+    uint64_t domain,
+    uint8_t roundCount,
+    uint8_t operationFamilyCount = 4u)
+{
+    SeedStream random(config.buildSeed, domain ^
+        (static_cast<uint64_t>(config.architecture) << 48u));
+    KeyedPermutationPlan plan{};
+    plan.roundCount = roundCount;
+    plan.layout = static_cast<uint8_t>(random.Next32() & 1u);
+    const bool x64 = config.architecture == VM_ARCH_X64;
+    const uint8_t width = x64 ? 64u : 32u;
+    for (uint8_t base = 0; base < roundCount;
+         base = static_cast<uint8_t>(base + operationFamilyCount)) {
+        std::array<uint8_t, 8> order = {0u,1u,2u,3u,4u,5u,6u,7u};
+        for (uint8_t index = static_cast<uint8_t>(operationFamilyCount - 1u);
+             index != 0u; --index) {
+            const uint8_t selected = static_cast<uint8_t>(
+                random.Next32() % (static_cast<uint32_t>(index) + 1u));
+            std::swap(order[index], order[selected]);
+        }
+        const uint8_t count = static_cast<uint8_t>(
+            std::min<size_t>(operationFamilyCount, roundCount - base));
+        for (uint8_t index = 0; index < count; ++index) {
+            KeyedPermutationRound& round = plan.rounds[base + index];
+            round.op = static_cast<KeyedPermutationOp>(order[index]);
+            round.encoding = static_cast<uint8_t>(random.Next32() & 1u);
+            uint64_t key = random.Next64();
+            if (!x64) key = static_cast<uint32_t>(key);
+            switch (round.op) {
+                case KeyedPermutationOp::Xor:
+                case KeyedPermutationOp::Add:
+                    if (key == 0u) key = x64
+                        ? 0xD6E8FEB86659FD93ULL : 0x6659FD93u;
+                    round.key = key;
+                    break;
+                case KeyedPermutationOp::Rotate:
+                    round.rotate = static_cast<uint8_t>(
+                        1u + random.Next32() % (width - 1u));
+                    round.key = round.rotate;
+                    break;
+                case KeyedPermutationOp::Multiply:
+                    key |= 1u;
+                    if (key == 1u) key = x64
+                        ? 0x9E3779B97F4A7C15ULL : 0x7F4A7C15u;
+                    round.key = key;
+                    round.inverse = OddInverse(key, x64);
+                    break;
+                case KeyedPermutationOp::Not:
+                case KeyedPermutationOp::Negate:
+                case KeyedPermutationOp::ByteSwap:
+                    round.key = key;
+                    break;
+                case KeyedPermutationOp::XorShift:
+                    round.rotate = static_cast<uint8_t>(
+                        1u + random.Next32() % (width - 1u));
+                    round.key = key;
+                    break;
+            }
+        }
+    }
+    return plan;
+}
+
+void ConfigurePermutationPlans(
+    CodeBuffer& code,
+    const VMHandlerSemanticCodegenConfig& config)
+{
+    // Value-stack encoding is a build-wide contract: every handler in one
+    // runtime must agree on the representation that survives between
+    // dispatches.  The core selector is handler-specific so no K variant can
+    // borrow a core template from another seed/variant.
+    code.valueCodec = DerivePermutationPlan(config,
+        0x56414C5545434F44ULL, static_cast<uint8_t>(kValueCodecRoundCount), 4u);
+    code.coreSelector = DerivePermutationPlan(config,
+        0x434F524553454C45ULL ^
+            (static_cast<uint64_t>(config.semantic) << 13u) ^
+            (static_cast<uint64_t>(config.variant) << 41u),
+        static_cast<uint8_t>(kCoreSelectorRoundCount), 8u);
+}
 
 #define CTX_OFFSET(field) static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, field))
 #define RECORD_OFFSET(base, field) \
@@ -222,6 +365,10 @@ constexpr uint32_t CtxError = CTX_OFFSET(error);
 constexpr uint32_t CtxHalted = CTX_OFFSET(halted);
 constexpr uint32_t CtxMutationScratch = CTX_OFFSET(mutationScratch);
 
+static_assert(sizeof(VM_MICRO_EXECUTION_CONTEXT) <
+        static_cast<size_t>((std::numeric_limits<int32_t>::max)()),
+    "VM context offsets must fit a signed disp32");
+
 constexpr uint8_t JccO = 0x80;
 constexpr uint8_t JccNO = 0x81;
 constexpr uint8_t JccB = 0x82;
@@ -239,10 +386,212 @@ constexpr uint8_t JccGE = 0x8D;
 constexpr uint8_t JccLE = 0x8E;
 constexpr uint8_t JccG = 0x8F;
 
+enum class ContextLoadAddressKind : uint8_t {
+    X64Direct = 1u,
+    X64Indexed = 2u,
+    X86Direct = 3u,
+    X86IndexedEcx = 4u,
+    X86IndexedRegister = 5u
+};
+
+uint64_t MixContextLoadDomain(uint64_t value) {
+    value ^= value >> 30u;
+    value *= 0xBF58476D1CE4E5B9ULL;
+    value ^= value >> 27u;
+    value *= 0x94D049BB133111EBULL;
+    return value ^ (value >> 31u);
+}
+
+bool DeriveControlDispatchKey(
+    CodeBuffer& c,
+    uint64_t helperDomain,
+    uint8_t operand,
+    uint32_t& key)
+{
+    if (c.coreSelector.roundCount == 0u ||
+        c.coreSelector.roundCount > c.coreSelector.rounds.size()) {
+        c.FailEncoding("control dispatch has no valid core selector");
+        return false;
+    }
+
+    // This key is stable for a handler-local control decision.  In particular,
+    // it does not depend on the current code offset or on an emission ordinal,
+    // because business cores are re-emitted in isolation by the validator.
+    uint64_t domain = helperDomain ^
+        (static_cast<uint64_t>(operand) << 48u) ^
+        (static_cast<uint64_t>(c.coreSelector.layout) << 63u);
+    for (uint8_t roundIndex = 0;
+         roundIndex < c.coreSelector.roundCount; ++roundIndex) {
+        const KeyedPermutationRound& round =
+            c.coreSelector.rounds[roundIndex];
+        const uint64_t descriptor =
+            (static_cast<uint64_t>(static_cast<uint8_t>(round.op)) << 56u) ^
+            (static_cast<uint64_t>(round.rotate) << 40u) ^
+            (static_cast<uint64_t>(round.encoding) << 32u) ^
+            static_cast<uint64_t>(roundIndex);
+        domain = MixContextLoadDomain(domain ^ round.key ^ descriptor);
+    }
+
+    // Keep K and K+8 positive signed disp32/immediate values.  Addition is a
+    // bijection modulo the native word size, so all legal widths remain
+    // distinct while every comparison becomes build-seed dependent.
+    constexpr uint32_t kMaximumControlKey = 0x0FFFFFF0u;
+    key = 1u + static_cast<uint32_t>(domain % kMaximumControlKey);
+    return true;
+}
+
+bool DeriveContextLoadDisplacements(
+    CodeBuffer& c,
+    ContextLoadAddressKind kind,
+    uint8_t width,
+    uint8_t destination,
+    uint8_t index,
+    uint32_t displacement,
+    std::array<int32_t, 6>& addressDisplacements,
+    int32_t& loadDisplacement)
+{
+    // Six independently-derived shares form one non-dereferenced effective
+    // address.  Every LEA is flag-neutral and the sole load subtracts their
+    // complete sum, so each share is required to reach the original field.
+    // Derivation depends only on the stable handler-local load identity.
+    if (c.coreSelector.roundCount == 0u ||
+        displacement >= static_cast<uint32_t>(
+            (std::numeric_limits<int32_t>::max)())) {
+        c.FailEncoding("context-load displacement cannot be split safely");
+        return false;
+    }
+
+    uint64_t domain = 0x4354584C4F41444BULL ^
+        (static_cast<uint64_t>(static_cast<uint8_t>(kind)) << 56u) ^
+        (static_cast<uint64_t>(width) << 48u) ^
+        (static_cast<uint64_t>(destination) << 40u) ^
+        (static_cast<uint64_t>(index) << 32u) ^ displacement;
+    domain ^= static_cast<uint64_t>(c.coreSelector.layout) << 63u;
+
+    const uint32_t maximumTotal = static_cast<uint32_t>(
+        (std::numeric_limits<int32_t>::max)()) - displacement;
+    const uint32_t maximumShare = maximumTotal / 6u;
+    if (maximumShare == 0u) {
+        c.FailEncoding("context-load address shares have no signed disp32 range");
+        return false;
+    }
+
+    std::array<uint32_t, 6> shares{};
+    uint64_t shareSum = 0u;
+    for (size_t shareIndex = 0; shareIndex < shares.size(); ++shareIndex) {
+        uint64_t shareDomain = MixContextLoadDomain(domain ^
+            (0x9E3779B97F4A7C15ULL *
+             static_cast<uint64_t>(shareIndex + 1u)));
+        for (uint8_t roundIndex = 0;
+             roundIndex < c.coreSelector.roundCount; ++roundIndex) {
+            const KeyedPermutationRound& round =
+                c.coreSelector.rounds[roundIndex];
+            const uint64_t descriptor =
+                (static_cast<uint64_t>(static_cast<uint8_t>(round.op)) << 56u) ^
+                (static_cast<uint64_t>(round.rotate) << 48u) ^
+                (static_cast<uint64_t>(round.encoding) << 40u) ^
+                (static_cast<uint64_t>(shareIndex) << 32u) ^
+                static_cast<uint64_t>(roundIndex);
+            shareDomain = MixContextLoadDomain(
+                shareDomain ^ round.key ^ descriptor);
+        }
+        shares[shareIndex] = 1u +
+            static_cast<uint32_t>(shareDomain % maximumShare);
+        shareSum += shares[shareIndex];
+    }
+
+    const int64_t first = static_cast<int64_t>(displacement) + shares[0];
+    const int64_t load = -static_cast<int64_t>(shareSum);
+    if (first > (std::numeric_limits<int32_t>::max)() ||
+        load < (std::numeric_limits<int32_t>::min)() ||
+        load > (std::numeric_limits<int32_t>::max)()) {
+        c.FailEncoding("context-load address shares exceeded signed disp32");
+        return false;
+    }
+    addressDisplacements[0] = static_cast<int32_t>(first);
+    for (size_t shareIndex = 1u;
+         shareIndex < shares.size(); ++shareIndex) {
+        if (shares[shareIndex] > static_cast<uint32_t>(
+                (std::numeric_limits<int32_t>::max)())) {
+            c.FailEncoding("context-load share exceeded signed disp32");
+            return false;
+        }
+        addressDisplacements[shareIndex] =
+            static_cast<int32_t>(shares[shareIndex]);
+    }
+    loadDisplacement = static_cast<int32_t>(load);
+    return true;
+}
+
+void EmitX64LoadFromSplitBase(
+    CodeBuffer& c,
+    uint8_t destination,
+    uint8_t width,
+    const std::array<int32_t, 6>& addressDisplacements,
+    int32_t loadDisplacement)
+{
+    const uint8_t leaRex = static_cast<uint8_t>(0x48u |
+        ((destination & 8u) ? 0x04u : 0u) |
+        ((destination & 8u) ? 0x01u : 0u));
+    for (size_t shareIndex = 1u;
+         shareIndex < addressDisplacements.size(); ++shareIndex) {
+        c.Raw({leaRex, 0x8D, static_cast<uint8_t>(0x80u |
+            ((destination & 7u) << 3u) | (destination & 7u))});
+        if ((destination & 7u) == 4u) c.U8(0x24u);
+        c.U32(static_cast<uint32_t>(addressDisplacements[shareIndex]));
+    }
+    const uint8_t rex = static_cast<uint8_t>(
+        (width == 8u ? 0x48u : 0x40u) |
+        ((destination & 8u) ? 0x04u : 0u) |
+        ((destination & 8u) ? 0x01u : 0u));
+    c.U8(rex);
+    if (width == 1u) c.Raw({0x0F, 0xB6});
+    else c.U8(0x8B);
+    c.U8(static_cast<uint8_t>(0x80u |
+        ((destination & 7u) << 3u) | (destination & 7u)));
+    if ((destination & 7u) == 4u) c.U8(0x24u);
+    c.U32(static_cast<uint32_t>(loadDisplacement));
+}
+
+void EmitX86LoadFromSplitBase(
+    CodeBuffer& c,
+    uint8_t destination,
+    uint8_t width,
+    const std::array<int32_t, 6>& addressDisplacements,
+    int32_t loadDisplacement)
+{
+    for (size_t shareIndex = 1u;
+         shareIndex < addressDisplacements.size(); ++shareIndex) {
+        c.Raw({0x8D, static_cast<uint8_t>(0x80u |
+            ((destination & 7u) << 3u) | (destination & 7u))});
+        if ((destination & 7u) == 4u) c.U8(0x24u);
+        c.U32(static_cast<uint32_t>(addressDisplacements[shareIndex]));
+    }
+    if (width == 1u) c.Raw({0x0F, 0xB6});
+    else c.U8(0x8B);
+    c.U8(static_cast<uint8_t>(0x80u |
+        ((destination & 7u) << 3u) | (destination & 7u)));
+    if ((destination & 7u) == 4u) c.U8(0x24u);
+    c.U32(static_cast<uint32_t>(loadDisplacement));
+}
+
 void X64LoadQ(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x49u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            8u, reg, 0xFFu, displacement, addressDisplacements,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX64LoadFromSplitBase(
+        c, reg, 8u, addressDisplacements, loadDisplacement);
 }
 
 void X64StoreQ(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -252,9 +601,22 @@ void X64StoreQ(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X64LoadD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x41u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            4u, reg, 0xFFu, displacement, addressDisplacements,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX64LoadFromSplitBase(
+        c, reg, 4u, addressDisplacements, loadDisplacement);
 }
 
 void X64StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -264,9 +626,22 @@ void X64StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X64LoadByte(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    const uint8_t rex = static_cast<uint8_t>(0x41u | ((reg & 8u) ? 0x04u : 0u));
-    c.Raw({rex, 0x0F, 0xB6, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 15u || reg == 15u || reg == 4u) {
+        c.FailEncoding("x64 context load cannot overwrite the context register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Direct,
+            1u, reg, 0xFFu, displacement, addressDisplacements,
+            loadDisplacement)) return;
+    const uint8_t rex = static_cast<uint8_t>(
+        0x49u | ((reg & 8u) ? 0x04u : 0u));
+    c.Raw({rex, 0x8D,
+        static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX64LoadFromSplitBase(
+        c, reg, 1u, addressDisplacements, loadDisplacement);
 }
 
 void X64StoreByteImmediate(CodeBuffer& c, uint32_t displacement, uint8_t value) {
@@ -287,13 +662,25 @@ void X64LoadIndexedQ(
     uint8_t index,
     uint32_t displacement)
 {
+    if (destination > 15u || destination == 15u || destination == 4u ||
+        index > 15u || index == 15u || index == 4u) {
+        c.FailEncoding("x64 indexed context load uses an invalid register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X64Indexed,
+            8u, destination, index, displacement, addressDisplacements,
+            loadDisplacement)) return;
     const uint8_t rex = static_cast<uint8_t>(0x49u |
         ((destination & 8u) ? 0x04u : 0u) |
         ((index & 8u) ? 0x02u : 0u));
-    c.Raw({rex, 0x8B,
+    c.Raw({rex, 0x8D,
         static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)),
         static_cast<uint8_t>(0xC7u | ((index & 7u) << 3u))});
-    c.U32(displacement);
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX64LoadFromSplitBase(
+        c, destination, 8u, addressDisplacements, loadDisplacement);
 }
 
 void X64StoreIndexedQ(
@@ -312,8 +699,19 @@ void X64StoreIndexedQ(
 }
 
 void X86LoadD(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    c.Raw({0x8B, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 7u || reg == 7u || reg == 4u) {
+        c.FailEncoding("x86 context load cannot overwrite the context register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X86Direct,
+            4u, reg, 0xFFu, displacement, addressDisplacements,
+            loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX86LoadFromSplitBase(
+        c, reg, 4u, addressDisplacements, loadDisplacement);
 }
 
 void X86StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
@@ -322,8 +720,19 @@ void X86StoreD(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X86LoadByte(CodeBuffer& c, uint8_t reg, uint32_t displacement) {
-    c.Raw({0x0F, 0xB6, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
-    c.U32(displacement);
+    if (reg > 7u || reg == 7u || reg == 4u) {
+        c.FailEncoding("x86 context load cannot overwrite the context register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c, ContextLoadAddressKind::X86Direct,
+            1u, reg, 0xFFu, displacement, addressDisplacements,
+            loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x87u | ((reg & 7u) << 3u))});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX86LoadFromSplitBase(
+        c, reg, 1u, addressDisplacements, loadDisplacement);
 }
 
 void X86StoreDImmediate(CodeBuffer& c, uint32_t displacement, uint32_t value) {
@@ -350,8 +759,20 @@ void X86StoreByteRegister(CodeBuffer& c, uint32_t displacement, uint8_t reg) {
 }
 
 void X86LoadIndexedD(CodeBuffer& c, uint8_t destination, uint32_t displacement) {
-    c.Raw({0x8B, static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)), 0xCF});
-    c.U32(displacement);
+    if (destination > 7u || destination == 7u || destination == 4u) {
+        c.FailEncoding("x86 indexed context load uses an invalid register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c,
+            ContextLoadAddressKind::X86IndexedEcx, 4u, destination, 1u,
+            displacement, addressDisplacements, loadDisplacement)) return;
+    c.Raw({0x8D,
+        static_cast<uint8_t>(0x84u | ((destination & 7u) << 3u)), 0xCF});
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX86LoadFromSplitBase(
+        c, destination, 4u, addressDisplacements, loadDisplacement);
 }
 
 void X86StoreIndexedD(CodeBuffer& c, uint32_t displacement, uint8_t source) {
@@ -414,6 +835,9 @@ struct SemanticPathSpec {
 struct SemanticMutationPlan {
     uint8_t strategy = 0;
     uint64_t key = 0;
+    uint8_t roundCount = 0;
+    std::array<uint8_t, 48> roundStrategies{};
+    std::array<uint64_t, 48> roundKeys{};
 };
 
 SemanticMutationPlan DeriveSemanticMutationPlan(
@@ -425,10 +849,15 @@ SemanticMutationPlan DeriveSemanticMutationPlan(
         (static_cast<uint64_t>(config.variant) << 43u) ^
         static_cast<uint64_t>(config.architecture));
     SemanticMutationPlan plan{};
-    plan.strategy = static_cast<uint8_t>(
-        (random.Next32() + config.variant +
-         static_cast<uint8_t>(config.semantic)) % 3u);
-    plan.key = random.Next64() | 1u;
+    plan.roundCount = static_cast<uint8_t>(24u + random.Next32() % 25u);
+    for (uint8_t round = 0; round < plan.roundCount; ++round) {
+        plan.roundStrategies[round] = static_cast<uint8_t>(
+            (random.Next32() + config.variant +
+             static_cast<uint8_t>(config.semantic) + round) % 8u);
+        plan.roundKeys[round] = random.Next64() | 1u;
+    }
+    plan.strategy = plan.roundStrategies[0];
+    plan.key = plan.roundKeys[0];
     return plan;
 }
 
@@ -609,6 +1038,249 @@ void X86BinaryRegister(
         ((source & 7u) << 3u) | (destination & 7u))});
 }
 
+void X64UnaryGroup(CodeBuffer& c, uint8_t group, uint8_t reg) {
+    c.Raw({static_cast<uint8_t>(0x48u | ((reg & 8u) ? 1u : 0u)),
+        0xF7, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+            (reg & 7u))});
+}
+
+void X86UnaryGroup(CodeBuffer& c, uint8_t group, uint8_t reg) {
+    c.Raw({0xF7, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+        (reg & 7u))});
+}
+
+void X64RotateImmediate(
+    CodeBuffer& c, uint8_t group, uint8_t reg, uint8_t count)
+{
+    c.Raw({static_cast<uint8_t>(0x48u | ((reg & 8u) ? 1u : 0u)),
+        0xC1, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+            (reg & 7u)), count});
+}
+
+void X86RotateImmediate(
+    CodeBuffer& c, uint8_t group, uint8_t reg, uint8_t count)
+{
+    c.Raw({0xC1, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+        (reg & 7u)), count});
+}
+
+void X64MultiplyRegister(CodeBuffer& c, uint8_t value, uint8_t factor) {
+    const uint8_t rex = static_cast<uint8_t>(0x48u |
+        ((value & 8u) ? 4u : 0u) | ((factor & 8u) ? 1u : 0u));
+    c.Raw({rex, 0x0F, 0xAF, static_cast<uint8_t>(0xC0u |
+        ((value & 7u) << 3u) | (factor & 7u))});
+}
+
+void X86MultiplyImmediate(CodeBuffer& c, uint8_t value, uint32_t factor) {
+    c.Raw({0x69, static_cast<uint8_t>(0xC0u |
+        ((value & 7u) << 3u) | (value & 7u))});
+    c.U32(factor);
+}
+
+uint32_t CoreKey32(const CodeBuffer& c, size_t index) {
+    uint32_t key = static_cast<uint32_t>(
+        c.coreSelector.rounds[index % c.coreSelector.roundCount].key) &
+        0x7FFFFFFFu;
+    return key != 0u ? key : 0x6D2B79F5u;
+}
+
+uint32_t CoreAddressKey(const CodeBuffer& c, size_t index) {
+    const uint32_t key = CoreKey32(c, index) & 0x0FFFFFFFu;
+    return key != 0u ? key : 0x06D2B795u;
+}
+
+void X64BinaryImmediate32(
+    CodeBuffer& c, uint8_t group, uint8_t reg, uint32_t value)
+{
+    c.Raw({static_cast<uint8_t>(0x48u | ((reg & 8u) ? 1u : 0u)),
+        0x81, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+            (reg & 7u))});
+    c.U32(value);
+}
+
+void X86BinaryImmediate32(
+    CodeBuffer& c, uint8_t group, uint8_t reg, uint32_t value)
+{
+    c.Raw({0x81, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
+        (reg & 7u))});
+    c.U32(value);
+}
+
+void EmitX64PermutationRound(
+    CodeBuffer& c,
+    uint8_t value,
+    const KeyedPermutationRound& round,
+    bool inverse)
+{
+    switch (round.op) {
+        case KeyedPermutationOp::Xor: {
+            const uint64_t key = round.key;
+            if (round.encoding != 0u) X64UnaryGroup(c, 2u, value);
+            X64MovImmediate(c, 11u,
+                round.encoding != 0u ? ~key : key);
+            X64BinaryRegister(c, 0x31, value, 11u);
+            break;
+        }
+        case KeyedPermutationOp::Add: {
+            uint64_t key = round.key;
+            uint8_t opcode = inverse ? 0x29u : 0x01u;
+            if (round.encoding != 0u) {
+                key = 0u - key;
+                opcode = opcode == 0x01u ? 0x29u : 0x01u;
+            }
+            X64MovImmediate(c, 11u, key);
+            X64BinaryRegister(c, opcode, value, 11u);
+            break;
+        }
+        case KeyedPermutationOp::Rotate: {
+            const uint8_t count = inverse
+                ? static_cast<uint8_t>(64u - round.rotate)
+                : round.rotate;
+            if (round.encoding == 0u)
+                X64RotateImmediate(c, 0u, value, count);
+            else
+                X64RotateImmediate(c, 1u, value,
+                    static_cast<uint8_t>(64u - count));
+            break;
+        }
+        case KeyedPermutationOp::Multiply: {
+            uint64_t factor = inverse ? round.inverse : round.key;
+            if (round.encoding != 0u) {
+                X64UnaryGroup(c, 3u, value);
+                factor = 0u - factor;
+            }
+            X64MovImmediate(c, 11u, factor);
+            X64MultiplyRegister(c, value, 11u);
+            break;
+        }
+        case KeyedPermutationOp::Not:
+            if (round.encoding == 0u) X64UnaryGroup(c, 2u, value);
+            else {
+                X64MovImmediate(c, 11u, ~uint64_t{0});
+                X64BinaryRegister(c, 0x31, value, 11u);
+            }
+            break;
+        case KeyedPermutationOp::Negate:
+            if (round.encoding == 0u) X64UnaryGroup(c, 3u, value);
+            else {
+                X64UnaryGroup(c, 2u, value);
+                c.Raw({static_cast<uint8_t>(0x48u | ((value & 8u) ? 1u : 0u)),
+                    0xFF, static_cast<uint8_t>(0xC0u | (value & 7u))});
+            }
+            break;
+        case KeyedPermutationOp::ByteSwap:
+            c.Raw({static_cast<uint8_t>(0x48u | ((value & 8u) ? 1u : 0u)),
+                0x0F, static_cast<uint8_t>(0xC8u | (value & 7u))});
+            break;
+        case KeyedPermutationOp::XorShift:
+            X64MovRegister(c, 11u, value);
+            X64RotateImmediate(c, round.encoding == 0u ? 4u : 5u,
+                11u, round.rotate);
+            X64BinaryRegister(c, 0x31, value, 11u);
+            break;
+    }
+}
+
+void EmitX86PermutationRound(
+    CodeBuffer& c,
+    uint8_t value,
+    const KeyedPermutationRound& round,
+    bool inverse)
+{
+    switch (round.op) {
+        case KeyedPermutationOp::Xor: {
+            uint32_t key = static_cast<uint32_t>(round.key);
+            if (round.encoding != 0u) {
+                X86UnaryGroup(c, 2u, value);
+                key = ~key;
+            }
+            c.Raw({0x81, static_cast<uint8_t>(0xF0u | (value & 7u))});
+            c.U32(key);
+            break;
+        }
+        case KeyedPermutationOp::Add: {
+            uint32_t key = static_cast<uint32_t>(round.key);
+            uint8_t group = inverse ? 5u : 0u;
+            if (round.encoding != 0u) {
+                key = 0u - key;
+                group = group == 0u ? 5u : 0u;
+            }
+            c.Raw({0x81, static_cast<uint8_t>(0xC0u | (group << 3u) |
+                (value & 7u))});
+            c.U32(key);
+            break;
+        }
+        case KeyedPermutationOp::Rotate: {
+            const uint8_t count = inverse
+                ? static_cast<uint8_t>(32u - round.rotate)
+                : round.rotate;
+            if (round.encoding == 0u)
+                X86RotateImmediate(c, 0u, value, count);
+            else
+                X86RotateImmediate(c, 1u, value,
+                    static_cast<uint8_t>(32u - count));
+            break;
+        }
+        case KeyedPermutationOp::Multiply: {
+            uint32_t factor = static_cast<uint32_t>(
+                inverse ? round.inverse : round.key);
+            if (round.encoding != 0u) {
+                X86UnaryGroup(c, 3u, value);
+                factor = 0u - factor;
+            }
+            X86MultiplyImmediate(c, value, factor);
+            break;
+        }
+        case KeyedPermutationOp::Not:
+            if (round.encoding == 0u) X86UnaryGroup(c, 2u, value);
+            else {
+                c.Raw({0x81, static_cast<uint8_t>(0xF0u | (value & 7u))});
+                c.U32(0xFFFFFFFFu);
+            }
+            break;
+        case KeyedPermutationOp::Negate:
+            if (round.encoding == 0u) X86UnaryGroup(c, 3u, value);
+            else {
+                X86UnaryGroup(c, 2u, value);
+                c.U8(static_cast<uint8_t>(0x40u + (value & 7u)));
+            }
+            break;
+        case KeyedPermutationOp::ByteSwap:
+            c.Raw({0x0F, static_cast<uint8_t>(0xC8u | (value & 7u))});
+            break;
+        case KeyedPermutationOp::XorShift:
+            X86MovRegister(c, 1u, value);
+            X86RotateImmediate(c, round.encoding == 0u ? 4u : 5u,
+                1u, round.rotate);
+            X86BinaryRegister(c, 0x31, value, 1u);
+            break;
+    }
+}
+
+void EmitValuePermutation(
+    CodeBuffer& c, bool x64, uint8_t value, bool inverse)
+{
+    const uint32_t begin = static_cast<uint32_t>(c.bytes.size());
+    const auto& plan = c.valueCodec;
+    if (inverse) {
+        for (uint8_t index = plan.roundCount; index != 0u; --index) {
+            if (x64) EmitX64PermutationRound(
+                c, value, plan.rounds[index - 1u], true);
+            else EmitX86PermutationRound(
+                c, value, plan.rounds[index - 1u], true);
+        }
+    } else {
+        for (uint8_t index = 0; index < plan.roundCount; ++index) {
+            if (x64) EmitX64PermutationRound(
+                c, value, plan.rounds[index], false);
+            else EmitX86PermutationRound(
+                c, value, plan.rounds[index], false);
+        }
+    }
+    c.valueCodecRanges.push_back({begin,
+        static_cast<uint32_t>(c.bytes.size()) - begin});
+}
+
 void X64CompareDImmediate(CodeBuffer& c, uint8_t reg, uint8_t value) {
     if (reg & 8u) c.U8(0x41);
     c.Raw({0x83, static_cast<uint8_t>(0xF8u | (reg & 7u)), value});
@@ -668,10 +1340,22 @@ void X86LoadIndexedDVariant(
     uint8_t index,
     uint32_t displacement)
 {
-    c.Raw({0x8B, static_cast<uint8_t>(0x84u |
+    if (destination > 7u || destination == 7u || destination == 4u ||
+        index > 7u || index == 7u || index == 4u) {
+        c.FailEncoding("x86 indexed context load uses an invalid register");
+        return;
+    }
+    std::array<int32_t, 6> addressDisplacements{};
+    int32_t loadDisplacement = 0;
+    if (!DeriveContextLoadDisplacements(c,
+            ContextLoadAddressKind::X86IndexedRegister, 4u, destination, index,
+            displacement, addressDisplacements, loadDisplacement)) return;
+    c.Raw({0x8D, static_cast<uint8_t>(0x84u |
         ((destination & 7u) << 3u)),
         static_cast<uint8_t>(0xC7u | ((index & 7u) << 3u))});
-    c.U32(displacement);
+    c.U32(static_cast<uint32_t>(addressDisplacements[0]));
+    EmitX86LoadFromSplitBase(
+        c, destination, 4u, addressDisplacements, loadDisplacement);
 }
 
 void X86StoreIndexedDVariant(
@@ -693,21 +1377,50 @@ void EmitIdentityMBA(
     uint8_t keyRegister,
     const SemanticMutationPlan& plan)
 {
-    if (x64)
-        X64MovImmediate(c, keyRegister, plan.key);
-    else
-        X86MovImmediate(c, keyRegister, static_cast<uint32_t>(plan.key));
-
-    const uint8_t first = plan.strategy == 0u ? 0x31u :
-        (plan.strategy == 1u ? 0x01u : 0x29u);
-    const uint8_t second = plan.strategy == 0u ? 0x31u :
-        (plan.strategy == 1u ? 0x29u : 0x01u);
-    if (x64) {
-        X64BinaryRegister(c, first, valueRegister, keyRegister);
-        X64BinaryRegister(c, second, valueRegister, keyRegister);
-    } else {
-        X86BinaryRegister(c, first, valueRegister, keyRegister);
-        X86BinaryRegister(c, second, valueRegister, keyRegister);
+    const auto emitX86Key = [&](uint64_t key, uint8_t encoding) {
+        const uint32_t key32 = static_cast<uint32_t>(key);
+        switch (encoding % 3u) {
+            case 0:
+                X86MovImmediate(c, keyRegister, key32);
+                break;
+            case 1:
+                c.U8(0x68); c.U32(key32);
+                c.U8(static_cast<uint8_t>(0x58u + (keyRegister & 7u)));
+                break;
+            default:
+                c.Raw({0xC7, static_cast<uint8_t>(0xC0u |
+                    (keyRegister & 7u))});
+                c.U32(key32);
+                break;
+        }
+    };
+    const auto emitPair = [&](uint8_t pair, uint64_t key, uint8_t encoding) {
+        const uint8_t first = pair == 0u ? 0x31u :
+            (pair == 1u ? 0x01u : 0x29u);
+        const uint8_t second = pair == 0u ? 0x31u :
+            (pair == 1u ? 0x29u : 0x01u);
+        if (x64) {
+            X64MovImmediate(c, keyRegister, key);
+            X64BinaryRegister(c, first, valueRegister, keyRegister);
+            X64MovImmediate(c, keyRegister, key);
+            X64BinaryRegister(c, second, valueRegister, keyRegister);
+        } else {
+            emitX86Key(key, encoding);
+            X86BinaryRegister(c, first, valueRegister, keyRegister);
+            emitX86Key(key, static_cast<uint8_t>(encoding + 1u));
+            X86BinaryRegister(c, second, valueRegister, keyRegister);
+        }
+    };
+    for (uint8_t round = 0; round < plan.roundCount; ++round) {
+        const uint8_t strategy = plan.roundStrategies[round];
+        const uint8_t pairCount = strategy < 3u ? 1u :
+            (strategy < 6u ? 2u : (strategy == 6u ? 3u : 4u));
+        for (uint8_t pair = 0; pair < pairCount; ++pair) {
+            const uint64_t pairKey = plan.roundKeys[round] ^
+                (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(pair + 1u));
+            emitPair(static_cast<uint8_t>((strategy + pair) % 3u), pairKey,
+                static_cast<uint8_t>(strategy + round + pair));
+        }
     }
 }
 
@@ -844,12 +1557,41 @@ void X64DispatchWidth(
     uint8_t operand,
     const WidthLabels& labels)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x5749445448445350ULL, operand, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreWidth1 = c.NewLabel();
+    const auto restoreWidth2 = c.NewLabel();
+    const auto restoreWidth4 = c.NewLabel();
+    const auto restoreWidth8 = c.NewLabel();
+
     X64LoadByte(c, 11, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x41,0x83,0xFB,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x41,0x83,0xFB,0x04}); c.Jcc(JccE, labels.width4);
-    c.Raw({0x41,0x83,0xFB,0x08}); c.Jcc(JccE, labels.width8);
+    // lea r11,[r11+K] is flag-neutral; the matching CMP therefore publishes
+    // the same equality flags as the original raw-width dispatch.
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(key);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 1u); c.Jcc(JccE, restoreWidth1);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 2u); c.Jcc(JccE, restoreWidth2);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 4u); c.Jcc(JccE, restoreWidth4);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 8u); c.Jcc(JccE, restoreWidth8);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
+    // Recreate the exact flags of the original final raw-width comparison
+    // before entering the shared failure path.
+    c.Raw({0x49,0x83,0xFB,0x08});
     c.Jmp(labels.invalid);
+
+    const auto restore = [&](CodeBuffer::Label local,
+                             CodeBuffer::Label destination) {
+        c.Bind(local);
+        c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
+        c.Jmp(destination);
+    };
+    restore(restoreWidth1, labels.width1);
+    restore(restoreWidth2, labels.width2);
+    restore(restoreWidth4, labels.width4);
+    restore(restoreWidth8, labels.width8);
 }
 
 void X86DispatchWidth(
@@ -857,11 +1599,34 @@ void X86DispatchWidth(
     uint8_t operand,
     const WidthLabels& labels)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x5749445448445350ULL, operand, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreWidth1 = c.NewLabel();
+    const auto restoreWidth2 = c.NewLabel();
+    const auto restoreWidth4 = c.NewLabel();
+
     X86LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x83,0xF9,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x83,0xF9,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x83,0xF9,0x04}); c.Jcc(JccE, labels.width4);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key + 1u); c.Jcc(JccE, restoreWidth1);
+    c.Raw({0x81,0xF9}); c.U32(key + 2u); c.Jcc(JccE, restoreWidth2);
+    c.Raw({0x81,0xF9}); c.U32(key + 4u); c.Jcc(JccE, restoreWidth4);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,0x04});
     c.Jmp(labels.invalid);
+
+    const auto restore = [&](CodeBuffer::Label local,
+                             CodeBuffer::Label destination) {
+        c.Bind(local);
+        c.Raw({0x8D,0x89}); c.U32(0u - key);
+        c.Jmp(destination);
+    };
+    restore(restoreWidth1, labels.width1);
+    restore(restoreWidth2, labels.width2);
+    restore(restoreWidth4, labels.width4);
 }
 
 // Defined with the remaining sized-register helpers below.  The K-variant
@@ -871,78 +1636,216 @@ void X64ShiftImmediate(CodeBuffer& c, uint8_t group, uint8_t reg, uint8_t count)
 void X64ShiftCl(CodeBuffer& c, uint8_t group, uint8_t reg);
 
 void EmitX64ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
+    const auto mix = [](uint64_t value) {
+        value ^= value >> 30u;
+        value *= 0xBF58476D1CE4E5B9ULL;
+        value ^= value >> 27u;
+        value *= 0x94D049BB133111EBULL;
+        return value ^ (value >> 31u);
+    };
+    const uint64_t seedWord =
+        (static_cast<uint64_t>(CoreKey32(c, strategy + 1u)) << 32u) |
+        CoreKey32(c, strategy + 5u);
+    const uint64_t key = mix(seedWord ^ 0x42535741505F5836ULL ^ strategy) | 1u;
+    const auto reverseKey = [](uint64_t value, uint8_t bytes) {
+        uint64_t reversed = 0;
+        for (uint8_t index = 0; index < bytes; ++index) {
+            reversed |= ((value >> (index * 8u)) & 0xFFu) <<
+                ((bytes - 1u - index) * 8u);
+        }
+        return reversed;
+    };
+    const auto xorKey = [&](uint8_t bytes, uint64_t value) {
+        if (bytes == 1u) {
+            c.Raw({0x34, static_cast<uint8_t>(value)});
+        } else if (bytes == 2u) {
+            c.Raw({0x66,0x35}); c.U16(static_cast<uint16_t>(value));
+        } else if (bytes == 4u) {
+            c.U8(0x35); c.U32(static_cast<uint32_t>(value));
+        } else {
+            constexpr std::array<uint8_t, 4> keyRegisters = {1u, 2u, 10u, 11u};
+            const uint8_t keyRegister = keyRegisters[
+                static_cast<size_t>((value ^ (value >> 29u) ^ strategy) & 3u)];
+            X64MovImmediate(c, keyRegister, value);
+            X64BinaryRegister(c, 0x31u, 0u, keyRegister);
+        }
+    };
+    const auto conjugate = [&](uint8_t bytes, const auto& transform) {
+        const uint64_t widthKey = bytes == 8u
+            ? key : key & ((uint64_t{1} << (bytes * 8u)) - 1u);
+        xorKey(bytes, widthKey);
+        transform();
+        xorKey(bytes, reverseKey(widthKey, bytes));
+    };
+
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X64DispatchWidth(c, 0, width);
     c.Bind(width.width1);
-    if (strategy == 0u) c.Raw({0x90});
-    else c.Raw({0x25,0xFF,0x00,0x00,0x00});
+    conjugate(1u, [&] {
+        // A byte-wide byte reversal is a rotate by one full byte.  The
+        // effective count is zero, so the rotate itself preserves flags.
+        c.Raw({0xC0, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8), 0x08});
+    });
     c.Jmp(done);
     c.Bind(width.width2);
-    if (strategy == 0u) {
-        c.Raw({0x66,0xC1,0xC0,0x08});
-    } else {
-        c.Raw({0x48,0x89,0xC2,0x48,0xC1,0xE0,0x08,
-               0x48,0xC1,0xEA,0x08,0x48,0x09,0xD0});
-    }
+    conjugate(2u, [&] {
+        c.Raw({0x66,0xC1,
+            static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),0x08});
+    });
     c.Jmp(done);
     c.Bind(width.width4);
-    if (strategy == 0u) {
-        c.Raw({0x0F,0xC8});
-    } else {
-        c.Raw({0x48,0x89,0xC2,0x25,0xFF,0x00,0xFF,0x00,
-               0x48,0xC1,0xE0,0x08,0x48,0xC1,0xEA,0x08,
-               0x81,0xE2,0xFF,0x00,0xFF,0x00,0x48,0x09,0xD0,
-               0xC1,0xC0,0x10});
-    }
+    conjugate(4u, [&] {
+        if (strategy == 0u) c.Raw({0x0F,0xC8});
+        else {
+            constexpr std::array<uint8_t, 4> scratchRegisters = {1u, 2u, 10u, 11u};
+            const uint8_t scratch = scratchRegisters[
+                static_cast<size_t>((key >> 17u) & 3u)];
+            const uint8_t moveInRex = static_cast<uint8_t>(
+                0x40u | ((scratch & 8u) ? 1u : 0u));
+            if (moveInRex != 0x40u) c.U8(moveInRex);
+            c.Raw({0x89, static_cast<uint8_t>(0xC0u | (scratch & 7u))});
+            if (scratch & 8u) c.U8(0x41);
+            c.Raw({0x0F, static_cast<uint8_t>(0xC8u + (scratch & 7u))});
+            const uint8_t moveOutRex = static_cast<uint8_t>(
+                0x40u | ((scratch & 8u) ? 4u : 0u));
+            if (moveOutRex != 0x40u) c.U8(moveOutRex);
+            c.Raw({0x89, static_cast<uint8_t>(
+                0xC0u | ((scratch & 7u) << 3u))});
+        }
+    });
     c.Jmp(done);
     c.Bind(width.width8);
-    if (strategy == 0u) {
-        c.Raw({0x48,0x0F,0xC8});
-    } else {
-        X64MovRegister(c, 10, 0);
-        X64MovImmediate(c, 11, 0x00FF00FF00FF00FFULL);
-        X64BinaryRegister(c, 0x21, 0, 11); X64ShiftImmediate(c, 4, 0, 8);
-        X64ShiftImmediate(c, 5, 10, 8); X64BinaryRegister(c, 0x21, 10, 11);
-        X64BinaryRegister(c, 0x09, 0, 10);
-        X64MovRegister(c, 10, 0);
-        X64MovImmediate(c, 11, 0x0000FFFF0000FFFFULL);
-        X64BinaryRegister(c, 0x21, 0, 11); X64ShiftImmediate(c, 4, 0, 16);
-        X64ShiftImmediate(c, 5, 10, 16); X64BinaryRegister(c, 0x21, 10, 11);
-        X64BinaryRegister(c, 0x09, 0, 10);
-        c.Raw({0x48,0xC1,0xC0,0x20});
-    }
+    conjugate(8u, [&] {
+        if (strategy == 0u) c.Raw({0x48,0x0F,0xC8});
+        else {
+            constexpr std::array<uint8_t, 4> scratchRegisters = {1u, 2u, 10u, 11u};
+            const uint8_t scratch = scratchRegisters[
+                static_cast<size_t>((key >> 41u) & 3u)];
+            X64MovRegister(c, scratch, 0u);
+            c.Raw({static_cast<uint8_t>(0x48u | ((scratch & 8u) ? 1u : 0u)),
+                0x0F, static_cast<uint8_t>(0xC8u + (scratch & 7u))});
+            X64MovRegister(c, 0u, scratch);
+        }
+    });
     c.Jmp(done);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
 }
 
 void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
+    const auto mix = [](uint64_t value) {
+        value ^= value >> 30u;
+        value *= 0xBF58476D1CE4E5B9ULL;
+        value ^= value >> 27u;
+        value *= 0x94D049BB133111EBULL;
+        return value ^ (value >> 31u);
+    };
+    const uint64_t seedWord =
+        (static_cast<uint64_t>(CoreKey32(c, strategy + 2u)) << 32u) |
+        CoreKey32(c, strategy + 6u);
+    const uint32_t key = static_cast<uint32_t>(
+        mix(seedWord ^ 0x42535741505F5833ULL ^ strategy)) | 1u;
+    const auto reverseKey = [](uint32_t value, uint8_t bytes) {
+        uint32_t reversed = 0;
+        for (uint8_t index = 0; index < bytes; ++index) {
+            reversed |= ((value >> (index * 8u)) & 0xFFu) <<
+                ((bytes - 1u - index) * 8u);
+        }
+        return reversed;
+    };
+    const auto xorKey = [&](uint8_t bytes, uint32_t value) {
+        if (bytes == 1u) {
+            c.Raw({0x34, static_cast<uint8_t>(value)});
+        } else if (bytes == 2u) {
+            c.Raw({0x66,0x35}); c.U16(static_cast<uint16_t>(value));
+        } else {
+            c.U8(0x35); c.U32(value);
+        }
+    };
+    const auto conjugate = [&](uint8_t bytes, const auto& transform) {
+        const uint32_t widthKey = bytes == 4u
+            ? key : key & ((uint32_t{1} << (bytes * 8u)) - 1u);
+        xorKey(bytes, widthKey);
+        transform();
+        xorKey(bytes, reverseKey(widthKey, bytes));
+    };
+
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X86DispatchWidth(c, 0, width);
     c.Bind(width.width1);
-    if (strategy == 0u) c.Raw({0x90});
-    else c.Raw({0x25,0xFF,0x00,0x00,0x00});
+    conjugate(1u, [&] {
+        c.Raw({0xC0, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8), 0x08});
+    });
     c.Jmp(done);
     c.Bind(width.width2);
-    if (strategy == 0u) {
-        c.Raw({0x66,0xC1,0xC0,0x08});
-    } else {
-        c.Raw({0x89,0xC2,0xC1,0xE0,0x08,0xC1,0xEA,0x08,0x09,0xD0});
-    }
+    conjugate(2u, [&] {
+        c.Raw({0x66,0xC1,
+            static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),0x08});
+    });
     c.Jmp(done);
     c.Bind(width.width4);
-    if (strategy == 0u) {
-        c.Raw({0x0F,0xC8});
-    } else {
-        c.Raw({0x89,0xC2,0x25,0xFF,0x00,0xFF,0x00,0xC1,0xE0,0x08,
-               0xC1,0xEA,0x08,0x81,0xE2,0xFF,0x00,0xFF,0x00,
-               0x09,0xD0,0xC1,0xC0,0x10});
-    }
+    conjugate(4u, [&] {
+        if (strategy == 0u) c.Raw({0x0F,0xC8});
+        else c.Raw({0x89,0xC2,0x0F,0xCA,0x89,0xD0});
+    });
     c.Jmp(done);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
+}
+
+// Two distinct x64 GPR indices from the safe local-scratch pool
+// {8,11,12,13}, seed-derived per (semantic,strategy). Excludes 0 (the
+// live shift operand), 1/2 (RCX/RDX -- the count is moved through
+// `mov rcx,rdx` and every count-consuming instruction below implicitly
+// reads CL, so RCX must stay the count register end to end), 4 (RSP), 9
+// (the width mask X64MaskForWidthInR11 computed and re-applies to the
+// result after this core returns, so it must survive the whole core body
+// unclobbered), 10 (EmitX64BinaryAlu zeroes it as "auxiliary" *before*
+// calling into this core and reads it back via X64FinishPrelatched right
+// after), and 15 (the runtime's context-pointer register -- see
+// X64LoadQ/X64LoadD's own "cannot overwrite the context register" guard;
+// every Ctx*-prefixed load/store in this file is `[r15+share...]`, not
+// `[rdi+...]`, despite what an earlier draft of this comment claimed).
+//
+// 14 is ALSO excluded, empirically: every register in the pool was
+// individually verified against the real native-differential suite
+// (test_vm_native_differential) one at a time, not just reasoned about
+// from reading the surrounding code, because the 10-exclusion above was
+// itself found that way after a first pass missed it (every corpus case
+// that exercised FLAGS_LAZY after a SHL/SHR/SAR/ROL/ROR access-violated,
+// because the core's own key scratch had clobbered what EmitX64BinaryAlu
+// still expected to be a clean zero). 8/11/12/13 each pass in isolation;
+// 14 alone reproduces the same class of FLAGS_LAZY access violation, for
+// a reason not yet root-caused (most likely some other handler or the
+// direct-threaded dispatch stub itself also treats r14 as reserved) --
+// it is excluded on that empirical evidence, not a traced justification
+// like the others. Do not add it back without either root-causing why or
+// re-running the full isolated single-register verification above.
+//
+// This is what actually changes the per-build 4-gram content of the
+// ModRM/REX bytes this core emits -- the round-keyed immediates alone
+// (already seed-derived) are exactly what the codec-similarity stage
+// strips out before measuring business_core, so on their own they cannot
+// move that number; only the *structural* bytes (which physical register
+// a given instruction touches) can.
+std::pair<uint8_t, uint8_t> DeriveShiftCoreScratchRegisters(
+    const CodeBuffer& c, VM_MICRO_OPCODE semantic, uint8_t strategy)
+{
+    static constexpr std::array<uint8_t, 4> kPool = {8u,11u,12u,13u};
+    const uint64_t domain = 0x5348495254524547ULL ^
+        (static_cast<uint64_t>(semantic) << 16u) ^
+        (static_cast<uint64_t>(strategy) << 8u);
+    const auto& round = c.coreSelector.rounds[domain % c.coreSelector.roundCount];
+    const uint64_t mixed = round.key ^ domain ^
+        (static_cast<uint64_t>(round.rotate) << 32u) ^
+        (static_cast<uint64_t>(round.encoding) << 40u);
+    const size_t first = static_cast<size_t>(mixed % kPool.size());
+    const size_t secondOffset = 1u + static_cast<size_t>(
+        (mixed >> 16u) % (kPool.size() - 1u));
+    const size_t second = (first + secondOffset) % kPool.size();
+    return {kPool[first], kPool[second]};
 }
 
 void EmitX64ShiftRotateVariant(
@@ -953,51 +1856,83 @@ void EmitX64ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X64DispatchWidth(c, 0, width);
+    const auto scratch = DeriveShiftCoreScratchRegisters(c, semantic, strategy);
+    const uint8_t scratchA = scratch.first;
+    const uint8_t scratchB = scratch.second;
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
-        c.Raw({0x48,0x89,0xD1});
-        if (strategy == 0u) {
-            uint8_t modrm = semantic == VM_UOP_SAR ? 0xF8 :
-                (semantic == VM_UOP_ROL ? 0xC0 : 0xC8);
-            if (bytes == 1u) c.Raw({0xD2,modrm});
-            else {
-                if (bytes == 2u) c.U8(0x66);
-                if (bytes == 8u) c.U8(0x48);
-                c.Raw({0xD3,modrm});
+        const auto deriveKey = [&](size_t share) {
+            const auto& round = c.coreSelector.rounds[
+                (static_cast<size_t>(bytes) + share * 3u + strategy * 5u +
+                 static_cast<size_t>(semantic)) % c.coreSelector.roundCount];
+            uint64_t key = round.key ^
+                (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(
+                    static_cast<uint8_t>(semantic) + share + 1u)) ^
+                (static_cast<uint64_t>(round.rotate) << 56u);
+            if (semantic == VM_UOP_SAR) {
+                key &= ~(uint64_t{1} << (bytes * 8u - 1u));
             }
-            if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-            else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
-            else if (bytes == 4u) c.Raw({0x89,0xC0});
-        } else if (semantic == VM_UOP_SAR) {
-            const uint8_t left = static_cast<uint8_t>((8u - bytes) * 8u);
-            if (left != 0u) {
-                X64ShiftImmediate(c, 4, 0, left);
-                X64ShiftImmediate(c, 7, 0, left);
-            }
-            c.Raw({0x80,0xE1,static_cast<uint8_t>(bytes == 8u ? 0x3Fu : 0x1Fu)});
-            X64ShiftCl(c, 7, 0);
-        } else {
-            const uint8_t countMask = static_cast<uint8_t>(bytes * 8u - 1u);
-            c.Raw({0x80,0xE1,countMask,0x89,0xCA,0xF7,0xDA,
-                   0x83,0xE2,countMask});
-            X64MovRegister(c, 10, 0);
-            if (semantic == VM_UOP_ROL) {
-                if ((strategy & 1u) != 0u) {
-                    X64ShiftCl(c, 4, 0); c.Raw({0x89,0xD1});
-                    X64ShiftCl(c, 5, 10);
-                }
+            return key != 0u ? key :
+                (0x6D2B79F5A5C3E17BULL &
+                 ~(semantic == VM_UOP_SAR
+                    ? (uint64_t{1} << (bytes * 8u - 1u)) : 0u));
+        };
+        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
+            const uint8_t modrm = static_cast<uint8_t>(
+                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
+            if (bytes == 1u) {
+                if (reg >= 8u) c.U8(0x41);
+                c.Raw({0xD2, modrm});
             } else {
-                if ((strategy & 1u) != 0u) {
-                    X64ShiftCl(c, 5, 0); c.Raw({0x89,0xD1});
-                    X64ShiftCl(c, 4, 10);
-                }
+                if (bytes == 2u) c.U8(0x66);
+                if (bytes == 8u) c.U8(static_cast<uint8_t>(
+                    0x48u | (reg >= 8u ? 1u : 0u)));
+                else if (reg >= 8u) c.U8(0x41);
+                c.Raw({0xD3, modrm});
             }
-            X64BinaryRegister(c, 0x09, 0, 10);
+        };
+
+        std::array<uint64_t, 4> keys{};
+        for (size_t share = 0u; share < keys.size(); ++share) {
+            keys[share] = deriveKey(share);
         }
+        std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
+        if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
+
+        c.Raw({0x48,0x89,0xD1});
+        for (const size_t share : shareOrder) {
+            X64MovImmediate(c, scratchB, keys[share]);
+            X64BinaryRegister(c, 0x31u, 0u, scratchB);
+        }
+        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
+            (semantic == VM_UOP_ROL ? 0u : 1u);
+        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
+        emitClOperation(0u, valueGroup);
+
+        X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
+        emitClOperation(scratchA, keyGroup);
+        for (size_t position = 1u; position < shareOrder.size(); ++position) {
+            X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
+            emitClOperation(scratchB, keyGroup);
+            X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+        }
+        X64BinaryRegister(c, 0x31u, 0u, scratchA);
+        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
+        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
+        else if (bytes == 4u) c.Raw({0x89,0xC0});
         c.Jmp(done);
     };
-    emit(width.width1, 1u); emit(width.width2, 2u);
-    emit(width.width4, 4u); emit(width.width8, 8u);
+    std::array<std::pair<CodeBuffer::Label, uint8_t>, 4> blocks = {{
+        {width.width1,uint8_t{1}}, {width.width2,uint8_t{2}},
+        {width.width4,uint8_t{4}}, {width.width8,uint8_t{8}}}};
+    for (uint8_t index = 3u; index != 0u; --index) {
+        const auto& round = c.coreSelector.rounds[
+            (index + strategy * 5u) % c.coreSelector.roundCount];
+        const uint8_t selected = static_cast<uint8_t>(
+            (round.key ^ round.rotate) % (static_cast<uint32_t>(index) + 1u));
+        std::swap(blocks[index], blocks[selected]);
+    }
+    for (const auto& block : blocks) emit(block.first, block.second);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
 }
@@ -1012,35 +1947,73 @@ void EmitX86ShiftRotateVariant(
     X86DispatchWidth(c, 0, width);
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
-        c.Raw({0x89,0xD1});
-        if (strategy == 0u) {
-            uint8_t modrm = semantic == VM_UOP_SAR ? 0xF8 :
-                (semantic == VM_UOP_ROL ? 0xC0 : 0xC8);
-            if (bytes == 1u) c.Raw({0xD2,modrm});
+        const auto deriveKey = [&](size_t share) {
+            const auto& round = c.coreSelector.rounds[
+                (static_cast<size_t>(bytes) + share * 3u + strategy * 5u +
+                 static_cast<size_t>(semantic)) % c.coreSelector.roundCount];
+            uint64_t mixed = round.key ^
+                (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(
+                    static_cast<uint8_t>(semantic) + share + 1u)) ^
+                (static_cast<uint64_t>(round.rotate) << 56u);
+            uint32_t key = static_cast<uint32_t>(mixed ^ (mixed >> 32u));
+            if (semantic == VM_UOP_SAR) {
+                key &= ~(uint32_t{1} << (bytes * 8u - 1u));
+            }
+            return key != 0u ? key :
+                (0x6D2B79F5u &
+                 ~(semantic == VM_UOP_SAR
+                    ? (uint32_t{1} << (bytes * 8u - 1u)) : 0u));
+        };
+        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
+            const uint8_t modrm = static_cast<uint8_t>(
+                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
+            if (bytes == 1u) c.Raw({0xD2, modrm});
             else {
                 if (bytes == 2u) c.U8(0x66);
-                c.Raw({0xD3,modrm});
+                c.Raw({0xD3, modrm});
             }
-            if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-            else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
-        } else if (semantic == VM_UOP_SAR) {
-            const uint8_t left = static_cast<uint8_t>((4u - bytes) * 8u);
-            if (left != 0u) c.Raw({0xC1,0xE0,left,0xC1,0xF8,left});
-            c.Raw({0x80,0xE1,0x1F,0xD3,0xF8});
-        } else {
-            const uint8_t countMask = static_cast<uint8_t>(bytes * 8u - 1u);
-            c.Raw({0x80,0xE1,countMask,0x89,0xCA,0xF7,0xDA,
-                   0x83,0xE2,countMask,0x89,0xC3});
-            if (semantic == VM_UOP_ROL) {
-                c.Raw({0xD3,0xE0,0x89,0xD1,0xD3,0xEB});
-            } else {
-                c.Raw({0xD3,0xE8,0x89,0xD1,0xD3,0xE3});
-            }
-            c.Raw({0x09,0xD8});
+        };
+
+        std::array<uint32_t, 4> keys{};
+        for (size_t share = 0u; share < keys.size(); ++share) {
+            keys[share] = deriveKey(share);
         }
+        std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
+        if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
+
+        c.Raw({0x89,0xD1});
+        for (const size_t share : shareOrder) {
+            X86MovImmediate(c, 2u, keys[share]);
+            X86BinaryRegister(c, 0x31u, 0u, 2u);
+        }
+        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
+            (semantic == VM_UOP_ROL ? 0u : 1u);
+        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
+        emitClOperation(0u, valueGroup);
+
+        X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
+        emitClOperation(3u, keyGroup);
+        for (size_t position = 1u; position < shareOrder.size(); ++position) {
+            X86MovImmediate(c, 2u, keys[shareOrder[position]]);
+            emitClOperation(2u, keyGroup);
+            X86BinaryRegister(c, 0x31u, 3u, 2u);
+        }
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
+        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
         c.Jmp(done);
     };
-    emit(width.width1, 1u); emit(width.width2, 2u); emit(width.width4, 4u);
+    std::array<std::pair<CodeBuffer::Label, uint8_t>, 3> blocks = {{
+        {width.width1,uint8_t{1}}, {width.width2,uint8_t{2}},
+        {width.width4,uint8_t{4}}}};
+    for (uint8_t index = 2u; index != 0u; --index) {
+        const auto& round = c.coreSelector.rounds[
+            (index + strategy * 5u) % c.coreSelector.roundCount];
+        const uint8_t selected = static_cast<uint8_t>(
+            (round.key ^ round.rotate) % (static_cast<uint32_t>(index) + 1u));
+        std::swap(blocks[index], blocks[selected]);
+    }
+    for (const auto& block : blocks) emit(block.first, block.second);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
 }
@@ -1081,6 +2054,8 @@ void EmitX86ExtendVariant(CodeBuffer& c, bool signExtend, uint8_t strategy) {
 }
 
 void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
     if (strategy == 0u) {
         const auto merge = c.NewLabel();
         const auto done = c.NewLabel();
@@ -1092,7 +2067,9 @@ void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
         X64ShiftCl(c, 4, 0);
         X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
         c.Raw({0x49,0xF7,0xD3});
-        X64LoadIndexedQ(c, 2, 10, CtxVregs);
+        c.Raw({0x4B,0x8D,0x94,0xD7}); c.U32(CtxVregs + address0);
+        X64BinaryImmediate32(c, 0u, 2u, address1);
+        c.Raw({0x48,0x8B,0x92}); c.U32(0u - (address0 + address1));
         X64BinaryRegister(c, 0x21, 2, 11);
         X64BinaryRegister(c, 0x09, 0, 2);
         c.Bind(done);
@@ -1101,7 +2078,9 @@ void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
         X64MovRegister(c, 2, 0); X64ShiftCl(c, 4, 2);
         X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
         c.Raw({0x49,0xF7,0xD3});
-        X64LoadIndexedQ(c, 9, 10, CtxVregs);
+        c.Raw({0x4F,0x8D,0x8C,0xD7}); c.U32(CtxVregs + address0);
+        X64BinaryImmediate32(c, 0u, 9u, address1);
+        c.Raw({0x4D,0x8B,0x89}); c.U32(0u - (address0 + address1));
         X64BinaryRegister(c, 0x21, 9, 11);
         X64BinaryRegister(c, 0x09, 2, 9);
         X64LoadD(c, 8, CtxDecodedOperands + 24u);
@@ -1110,6 +2089,8 @@ void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
 }
 
 void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
     if (strategy == 0u) {
         const auto merge = c.NewLabel();
         const auto done = c.NewLabel();
@@ -1119,14 +2100,18 @@ void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
         X86LoadD(c, 1, CtxDecodedOperands + 16u);
         c.Raw({0xD3,0xE0});
         X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        X86LoadIndexedDVariant(c, 6, 2, CtxVregs);
+        c.Raw({0x8D,0xB4,0xD7}); c.U32(CtxVregs + address0);
+        X86BinaryImmediate32(c, 0u, 6u, address1);
+        c.Raw({0x8B,0xB6}); c.U32(0u - (address0 + address1));
         c.Raw({0x21,0xDE,0x09,0xF0});
         c.Bind(done);
     } else {
         X86LoadD(c, 1, CtxDecodedOperands + 16u);
         c.Raw({0x89,0xC6,0xD3,0xE6});
         X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        X86LoadIndexedDVariant(c, 0, 2, CtxVregs);
+        c.Raw({0x8D,0x84,0xD7}); c.U32(CtxVregs + address0);
+        X86BinaryImmediate32(c, 0u, 0u, address1);
+        c.Raw({0x8B,0x80}); c.U32(0u - (address0 + address1));
         c.Raw({0x21,0xD8,0x09,0xC6});
         X86LoadD(c, 0, CtxMutationScratch + 4u);
         c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
@@ -1138,33 +2123,81 @@ void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
 void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
+    const size_t shareDomain = (store ? 1u : 0u) + strategy * 2u;
+    std::array<uint32_t, 3> shares = {
+        CoreAddressKey(c, shareDomain),
+        CoreAddressKey(c, shareDomain + 3u),
+        CoreAddressKey(c, shareDomain + 6u)};
+    if (strategy != 0u) std::rotate(shares.begin(), shares.begin() + 2u, shares.end());
+    const uint32_t displacement = 0u - (shares[0] + shares[1] + shares[2]);
+    std::array<uint8_t, 3> addressRegisters = {1u, 8u, 10u};
+    uint64_t registerSelector =
+        (static_cast<uint64_t>(shares[0]) << 32u) ^
+        (static_cast<uint64_t>(shares[1]) << 7u) ^ shares[2] ^
+        (static_cast<uint64_t>(strategy) << 61u);
+    registerSelector ^= registerSelector >> 29u;
+    for (size_t index = addressRegisters.size() - 1u; index != 0u; --index) {
+        const size_t selected = static_cast<size_t>(
+            registerSelector % static_cast<uint64_t>(index + 1u));
+        std::swap(addressRegisters[index], addressRegisters[selected]);
+        registerSelector = registerSelector * 0x9E3779B97F4A7C15ULL + index;
+    }
+    const auto emitLea = [&](uint8_t destination, uint8_t base, uint32_t share) {
+        const uint8_t rex = static_cast<uint8_t>(0x48u |
+            ((destination & 8u) ? 4u : 0u) | ((base & 8u) ? 1u : 0u));
+        c.Raw({rex,0x8D,static_cast<uint8_t>(0x80u |
+            ((destination & 7u) << 3u) | (base & 7u))});
+        c.U32(share);
+    };
+    // Three independently-derived shares all participate in the only guest
+    // effective address.  LEA is flag-neutral and the final memory
+    // displacement subtracts the complete share sum, so the sole faulting
+    // load/store still observes exactly the original guest address in RAX.
+    emitLea(addressRegisters[0], 0u, shares[0]);
+    emitLea(addressRegisters[1], addressRegisters[0], shares[1]);
+    emitLea(addressRegisters[2], addressRegisters[1], shares[2]);
+    const uint8_t address = addressRegisters[2];
+    const auto emitLoad = [&](uint8_t destination, uint8_t bytes) {
+        const uint8_t rexBits = static_cast<uint8_t>(
+            ((destination & 8u) ? 4u : 0u) | ((address & 8u) ? 1u : 0u));
+        if (bytes <= 2u) {
+            c.Raw({static_cast<uint8_t>(0x48u | rexBits),0x0F,
+                static_cast<uint8_t>(bytes == 1u ? 0xB6 : 0xB7)});
+        } else {
+            const uint8_t rex = static_cast<uint8_t>(
+                (bytes == 8u ? 0x48u : 0x40u) | rexBits);
+            if (rex != 0x40u) c.U8(rex);
+            c.U8(0x8B);
+        }
+        c.U8(static_cast<uint8_t>(0x80u |
+            ((destination & 7u) << 3u) | (address & 7u)));
+        c.U32(displacement);
+    };
+    const auto emitStore = [&](uint8_t source, uint8_t bytes) {
+        const uint8_t rexBits = static_cast<uint8_t>(
+            ((source & 8u) ? 4u : 0u) | ((address & 8u) ? 1u : 0u));
+        if (bytes == 2u) c.U8(0x66);
+        const uint8_t rex = static_cast<uint8_t>(
+            (bytes == 8u ? 0x48u : 0x40u) | rexBits);
+        if (rex != 0x40u) c.U8(rex);
+        c.U8(bytes == 1u ? 0x88 : 0x89);
+        c.U8(static_cast<uint8_t>(0x80u |
+            ((source & 7u) << 3u) | (address & 7u)));
+        c.U32(displacement);
+    };
     X64DispatchWidth(c, 0, width);
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         if (strategy == 0u) {
-            if (!store) {
-                if (bytes == 1u) c.Raw({0x48,0x0F,0xB6,0x00});
-                else if (bytes == 2u) c.Raw({0x48,0x0F,0xB7,0x00});
-                else if (bytes == 4u) c.Raw({0x8B,0x00});
-                else c.Raw({0x48,0x8B,0x00});
-            } else {
-                if (bytes == 1u) c.Raw({0x88,0x10});
-                else if (bytes == 2u) c.Raw({0x66,0x89,0x10});
-                else if (bytes == 4u) c.Raw({0x89,0x10});
-                else c.Raw({0x48,0x89,0x10});
-            }
+            if (!store) emitLoad(0u, bytes);
+            else emitStore(2u, bytes);
         } else if (!store) {
-            if (bytes == 1u) c.Raw({0x45,0x31,0xD2,0x44,0x8A,0x10});
-            else if (bytes == 2u) c.Raw({0x45,0x31,0xD2,0x66,0x44,0x8B,0x10});
-            else if (bytes == 4u) c.Raw({0x44,0x8B,0x10});
-            else c.Raw({0x4C,0x8B,0x10});
-            X64MovRegister(c, 0, 10);
+            emitLoad(address, bytes);
+            X64MovRegister(c, 0u, address);
         } else {
-            X64MovRegister(c, 10, 2);
-            if (bytes == 1u) c.Raw({0x44,0x88,0x10});
-            else if (bytes == 2u) c.Raw({0x66,0x44,0x89,0x10});
-            else if (bytes == 4u) c.Raw({0x44,0x89,0x10});
-            else c.Raw({0x4C,0x89,0x10});
+            const uint8_t value = addressRegisters[0];
+            X64MovRegister(c, value, 2u);
+            emitStore(value, bytes);
         }
         c.Jmp(done);
     };
@@ -1177,29 +2210,48 @@ void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
 void EmitX86MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
+    const size_t shareDomain = (store ? 1u : 0u) + strategy * 2u;
+    std::array<uint32_t, 3> shares = {
+        CoreAddressKey(c, shareDomain),
+        CoreAddressKey(c, shareDomain + 3u),
+        CoreAddressKey(c, shareDomain + 6u)};
+    if (strategy != 0u) std::rotate(shares.begin(), shares.begin() + 1u, shares.end());
+    const uint32_t displacement = 0u - (shares[0] + shares[1] + shares[2]);
+    const uint8_t address = strategy == 0u ? 3u : 6u;
+    const auto emitLea = [&](uint8_t base, uint32_t share) {
+        c.Raw({0x8D,static_cast<uint8_t>(0x80u |
+            ((address & 7u) << 3u) | (base & 7u))});
+        c.U32(share);
+    };
+    emitLea(0u, shares[0]);
+    emitLea(address, shares[1]);
+    emitLea(address, shares[2]);
     X86DispatchWidth(c, 0, width);
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         if (strategy == 0u) {
             if (!store) {
-                if (bytes == 1u) c.Raw({0x0F,0xB6,0x00});
-                else if (bytes == 2u) c.Raw({0x0F,0xB7,0x00});
-                else c.Raw({0x8B,0x00});
+                if (bytes == 1u) c.Raw({0x0F,0xB6,0x83});
+                else if (bytes == 2u) c.Raw({0x0F,0xB7,0x83});
+                else c.Raw({0x8B,0x83});
             } else {
-                if (bytes == 1u) c.Raw({0x88,0x10});
-                else if (bytes == 2u) c.Raw({0x66,0x89,0x10});
-                else c.Raw({0x89,0x10});
+                if (bytes == 1u) c.Raw({0x88,0x93});
+                else if (bytes == 2u) c.Raw({0x66,0x89,0x93});
+                else c.Raw({0x89,0x93});
             }
+            c.U32(displacement);
         } else if (!store) {
-            if (bytes == 1u) c.Raw({0x31,0xD2,0x8A,0x10});
-            else if (bytes == 2u) c.Raw({0x31,0xD2,0x66,0x8B,0x10});
-            else c.Raw({0x8B,0x10});
+            if (bytes == 1u) c.Raw({0x0F,0xB6,0x96});
+            else if (bytes == 2u) c.Raw({0x0F,0xB7,0x96});
+            else c.Raw({0x8B,0x96});
+            c.U32(displacement);
             c.Raw({0x89,0xD0});
         } else {
             c.Raw({0x89,0xD3});
-            if (bytes == 1u) c.Raw({0x88,0x18});
-            else if (bytes == 2u) c.Raw({0x66,0x89,0x18});
-            else c.Raw({0x89,0x18});
+            if (bytes == 1u) c.Raw({0x88,0x9E});
+            else if (bytes == 2u) c.Raw({0x66,0x89,0x9E});
+            else c.Raw({0x89,0x9E});
+            c.U32(displacement);
         }
         c.Jmp(done);
     };
@@ -1262,6 +2314,487 @@ void EmitX86CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
     c.Bind(done);
 }
 
+void EmitKeyedAddSubCore(
+    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
+{
+    const uint32_t k0 = CoreKey32(c, strategy + 0u);
+    const uint32_t k1 = CoreKey32(c, strategy + 3u);
+    const uint32_t k2 = CoreKey32(c, strategy + 5u);
+    if (x64) {
+        X64BinaryImmediate32(c, 0u, 0u, k0);
+        X64BinaryImmediate32(c, 5u, 0u, k1);
+        X64BinaryImmediate32(c, 0u, 0u, k2);
+        if (!subtract) {
+            if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
+            else c.Raw({0x48,0x8D,0x04,0x10});
+        } else if (strategy == 0u) {
+            X64BinaryRegister(c, 0x29, 0, 2);
+        } else {
+            c.Raw({0x48,0xF7,0xDA});
+            X64BinaryRegister(c, 0x01, 0, 2);
+        }
+        X64BinaryImmediate32(c, 5u, 0u, k2);
+        X64BinaryImmediate32(c, 0u, 0u, k1);
+        X64BinaryImmediate32(c, 5u, 0u, k0);
+    } else {
+        X86BinaryImmediate32(c, 0u, 0u, k0);
+        X86BinaryImmediate32(c, 5u, 0u, k1);
+        X86BinaryImmediate32(c, 0u, 0u, k2);
+        if (!subtract) {
+            if (strategy == 0u) c.Raw({0x01,0xD0});
+            else c.Raw({0x8D,0x04,0x10});
+        } else if (strategy == 0u) {
+            c.Raw({0x29,0xD0});
+        } else {
+            c.Raw({0xF7,0xDA,0x01,0xD0});
+        }
+        X86BinaryImmediate32(c, 5u, 0u, k2);
+        X86BinaryImmediate32(c, 0u, 0u, k1);
+        X86BinaryImmediate32(c, 5u, 0u, k0);
+    }
+}
+
+void EmitKeyedXorCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const std::array<uint32_t, 3> keys = {
+        CoreKey32(c, strategy + 1u), CoreKey32(c, strategy + 4u),
+        CoreKey32(c, strategy + 6u)};
+    if (x64) {
+        for (uint32_t key : keys) X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryRegister(c, 0x31, 0, 2);
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it)
+            X64BinaryImmediate32(c, 6u, 0u, *it);
+    } else {
+        for (uint32_t key : keys) X86BinaryImmediate32(c, 6u, 0u, key);
+        c.Raw({0x31,0xD0});
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it)
+            X86BinaryImmediate32(c, 6u, 0u, *it);
+    }
+}
+
+void EmitKeyedCopyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const std::array<uint32_t, 3> keys = {
+        CoreKey32(c, strategy + 0u), CoreKey32(c, strategy + 2u),
+        CoreKey32(c, strategy + 7u)};
+    if (x64) {
+        for (uint32_t key : keys) X64BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) X64MovRegister(c, 2, 0);
+        else c.Raw({0x48,0x8D,0x10});
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+            X64BinaryImmediate32(c, 6u, 0u, *it);
+            X64BinaryImmediate32(c, 6u, 2u, *it);
+        }
+    } else {
+        for (uint32_t key : keys) X86BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) c.Raw({0x89,0xC2});
+        else c.Raw({0x8D,0x10});
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+            X86BinaryImmediate32(c, 6u, 0u, *it);
+            X86BinaryImmediate32(c, 6u, 2u, *it);
+        }
+    }
+}
+
+void EmitKeyedContextCopy(
+    CodeBuffer& c,
+    bool x64,
+    uint32_t sourceOffset,
+    uint32_t destinationOffset,
+    bool nativeWidth,
+    size_t keyIndex)
+{
+    const uint32_t sourceKey = CoreAddressKey(c, keyIndex);
+    const uint32_t destinationKey = CoreAddressKey(c, keyIndex + 3u);
+    if (x64) {
+        c.Raw({0x4D,0x8D,0x97}); c.U32(sourceOffset + sourceKey);
+        if (nativeWidth) c.Raw({0x49,0x8B,0x82});
+        else c.Raw({0x41,0x8B,0x82});
+        c.U32(0u - sourceKey);
+        c.Raw({0x4D,0x8D,0x97}); c.U32(destinationOffset + destinationKey);
+        if (nativeWidth) c.Raw({0x49,0x89,0x82});
+        else c.Raw({0x41,0x89,0x82});
+        c.U32(0u - destinationKey);
+    } else {
+        c.Raw({0x8D,0x97}); c.U32(sourceOffset + sourceKey);
+        c.Raw({0x8B,0x82}); c.U32(0u - sourceKey);
+        c.Raw({0x8D,0x97}); c.U32(destinationOffset + destinationKey);
+        c.Raw({0x89,0x82}); c.U32(0u - destinationKey);
+    }
+}
+
+void EmitKeyedPushIpCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 2u);
+    if (x64) {
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
+        else {
+            X64UnaryGroup(c, 3u, 2u);
+            X64BinaryRegister(c, 0x01, 0, 2);
+        }
+        X64BinaryImmediate32(c, 5u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) c.Raw({0x29,0xD0});
+        else c.Raw({0xF7,0xDA,0x01,0xD0});
+        X86BinaryImmediate32(c, 5u, 0u, key);
+    }
+}
+
+void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 4u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x48,0x92});
+        else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.U8(0x92);
+        else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+    }
+}
+
+void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 6u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        X64BinaryImmediate32(c, 6u, 8u, key);
+        if (strategy == 0u) {
+            X64MovRegister(c, 10u, 0u); X64MovRegister(c, 0u, 2u);
+            X64MovRegister(c, 2u, 8u); X64MovRegister(c, 8u, 10u);
+        } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        X64BinaryImmediate32(c, 6u, 8u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        X86BinaryImmediate32(c, 6u, 1u, key);
+        if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
+        else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        X86BinaryImmediate32(c, 6u, 3u, key);
+    }
+}
+
+void EmitKeyedCarryCore(
+    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 1u);
+    if (x64) {
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (!subtract) {
+            if (strategy == 0u) {
+                X64BinaryRegister(c, 0x01, 0u, 2u);
+                X64BinaryRegister(c, 0x01, 0u, 8u);
+            } else {
+                X64BinaryRegister(c, 0x01, 0u, 8u);
+                X64BinaryRegister(c, 0x01, 0u, 2u);
+            }
+        } else if (strategy == 0u) {
+            X64BinaryRegister(c, 0x29, 0u, 2u);
+            X64BinaryRegister(c, 0x29, 0u, 8u);
+        } else {
+            X64BinaryRegister(c, 0x01, 2u, 8u);
+            X64BinaryRegister(c, 0x29, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 5u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (!subtract) {
+            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
+            else c.Raw({0x01,0xC8,0x01,0xD0});
+        } else if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
+        else c.Raw({0x01,0xCA,0x29,0xD0});
+        X86BinaryImmediate32(c, 5u, 0u, key);
+    }
+}
+
+void EmitKeyedBitwiseCore(
+    CodeBuffer& c, bool x64, bool bitwiseOr, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 3u);
+    if (x64) {
+        X64MovRegister(c, 8u, 2u);
+        if (bitwiseOr) X64UnaryGroup(c, 2u, 8u);
+        X64BinaryImmediate32(c, 4u, 8u, key);
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) {
+            X64BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
+        } else {
+            X64UnaryGroup(c, 2u, 0u); X64UnaryGroup(c, 2u, 2u);
+            X64BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
+            X64UnaryGroup(c, 2u, 0u);
+        }
+        X64BinaryRegister(c, 0x31u, 0u, 8u);
+    } else {
+        X86MovRegister(c, 3u, 2u);
+        if (bitwiseOr) X86UnaryGroup(c, 2u, 3u);
+        X86BinaryImmediate32(c, 4u, 3u, key);
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        if (strategy == 0u) {
+            X86BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
+        } else {
+            X86UnaryGroup(c, 2u, 0u); X86UnaryGroup(c, 2u, 2u);
+            X86BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
+            X86UnaryGroup(c, 2u, 0u);
+        }
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+    }
+}
+
+void EmitKeyedUnaryCore(
+    CodeBuffer& c, bool x64, bool negate, uint8_t strategy)
+{
+    const uint32_t key = CoreKey32(c, strategy + 5u);
+    if (x64) {
+        X64BinaryImmediate32(c, negate ? 0u : 6u, 0u, key);
+        if (negate) {
+            if (strategy == 0u) X64UnaryGroup(c, 3u, 0u);
+            else { X64UnaryGroup(c, 2u, 0u); c.Raw({0x48,0xFF,0xC0}); }
+            X64BinaryImmediate32(c, 0u, 0u, key);
+        } else {
+            if (strategy == 0u) X64UnaryGroup(c, 2u, 0u);
+            else X64BinaryRegister(c, 0x31u, 0u, 9u);
+            X64BinaryImmediate32(c, 6u, 0u, key);
+        }
+    } else {
+        X86BinaryImmediate32(c, negate ? 0u : 6u, 0u, key);
+        if (negate) {
+            if (strategy == 0u) X86UnaryGroup(c, 3u, 0u);
+            else c.Raw({0xF7,0xD0,0x40});
+            X86BinaryImmediate32(c, 0u, 0u, key);
+        } else {
+            if (strategy == 0u) X86UnaryGroup(c, 2u, 0u);
+            else { c.Raw({0x33,0x87}); c.U32(CtxMutationScratch); }
+            X86BinaryImmediate32(c, 6u, 0u, key);
+        }
+    }
+}
+
+void EmitKeyedMultiplyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 7u);
+    if (x64) {
+        X64MovImmediate(c, 8u, key);
+        X64MultiplyRegister(c, 8u, 2u);
+        X64BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) X64MultiplyRegister(c, 0u, 2u);
+        else c.Raw({0x48,0xF7,0xE2});
+        X64BinaryRegister(c, 0x29u, 0u, 8u);
+    } else {
+        X86MovImmediate(c, 3u, key);
+        c.Raw({0x0F,0xAF,0xDA});
+        X86BinaryImmediate32(c, 0u, 0u, key);
+        if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
+        else c.Raw({0xF7,0xE2});
+        X86BinaryRegister(c, 0x29u, 0u, 3u);
+    }
+}
+
+void EmitKeyedLogicalShiftCore(
+    CodeBuffer& c, bool x64, bool shiftRight, uint8_t strategy)
+{
+    const auto deriveShare = [&](size_t share) {
+        const auto& round = c.coreSelector.rounds[
+            (share * 2u + strategy) % c.coreSelector.roundCount];
+        const uint64_t domain = 0x5348494654534852ULL ^
+            (static_cast<uint64_t>(shiftRight) << 63u) ^
+            (static_cast<uint64_t>(strategy) << 55u) ^
+            (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(share + 1u)) ^
+            (static_cast<uint64_t>(round.rotate) << 48u) ^
+            (static_cast<uint64_t>(round.encoding) << 40u);
+        uint64_t key = MixContextLoadDomain(round.key ^ domain);
+        if (shiftRight) key |= uint64_t{1} << 63u;
+        else key |= uint64_t{1};
+        return key;
+    };
+    std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
+    if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
+
+    if (x64) {
+        // See DeriveShiftCoreScratchRegisters (used by the SAR/ROL/ROR core
+        // right below): same pool, same exclusions (0/1/2/4/7/9 stay live
+        // across the whole EmitX64BinaryAlu-latched core body), same reason
+        // -- register choice, not the already-keyed immediates, is what
+        // moves this core's 4-gram content once value_codec strips the
+        // immediates back out.
+        const auto scratch = DeriveShiftCoreScratchRegisters(
+            c, shiftRight ? VM_UOP_SHR : VM_UOP_SHL, strategy);
+        const uint8_t scratchA = scratch.first;
+        const uint8_t scratchB = scratch.second;
+        std::array<uint64_t, 4> keys{};
+        for (size_t share = 0u; share < keys.size(); ++share) {
+            keys[share] = deriveShare(share);
+        }
+        for (const size_t share : shareOrder) {
+            X64MovImmediate(c, scratchA, keys[share]);
+            X64BinaryRegister(c, 0x31u, 0u, scratchA);
+        }
+        c.Raw({0x48,0x89,0xD1});
+        // scratchB <- r9 (the width mask X64MaskForWidthInR11 already
+        // computed and left live in r9 for this whole core, same as
+        // EmitX64ShiftRotateVariant's sibling core above): all-ones only
+        // for width 8, so (sar 63)&32 is 32 only there, and |31 turns that
+        // into the exact 5-bit/6-bit shift-count mask this build needs.
+        X64MovRegister(c, scratchB, 9u);
+        X64ShiftImmediate(c, 7u, scratchB, 0x3F);
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x48u | ((scratchB & 8u) ? 1u : 0u));
+            c.Raw({rex, 0x83, static_cast<uint8_t>(
+                0xE0u | (scratchB & 7u)), 0x20});
+        }
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x48u | ((scratchB & 8u) ? 1u : 0u));
+            c.Raw({rex, 0x83, static_cast<uint8_t>(
+                0xC8u | (scratchB & 7u)), 0x1F});
+        }
+        {
+            const uint8_t rex = static_cast<uint8_t>(
+                0x40u | ((scratchB & 8u) ? 0x04u : 0u));
+            c.Raw({rex, 0x20, static_cast<uint8_t>(
+                0xC1u | ((scratchB & 7u) << 3u))});
+        }
+
+        const auto shiftShares = [&] {
+            X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
+            X64ShiftCl(c, shiftRight ? 5u : 4u, scratchA);
+            for (size_t position = 1u;
+                 position < shareOrder.size(); ++position) {
+                X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
+                X64ShiftCl(c, shiftRight ? 5u : 4u, scratchB);
+                X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+            }
+        };
+        if (strategy == 0u) {
+            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+            shiftShares();
+        } else {
+            shiftShares();
+            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+        }
+        X64BinaryRegister(c, 0x31u, 0u, scratchA);
+    } else {
+        std::array<uint32_t, 4> keys{};
+        for (size_t share = 0u; share < keys.size(); ++share) {
+            const uint64_t mixed = deriveShare(share);
+            uint32_t key = static_cast<uint32_t>(mixed ^ (mixed >> 32u));
+            if (shiftRight) key |= uint32_t{1} << 31u;
+            else key |= uint32_t{1};
+            keys[share] = key;
+        }
+        for (const size_t share : shareOrder) {
+            X86MovImmediate(c, 3u, keys[share]);
+            X86BinaryRegister(c, 0x31u, 0u, 3u);
+        }
+        c.Raw({0x88,0xD1,0x80,0xE1,0x1F});
+
+        const auto shiftRegister = [&](uint8_t reg) {
+            c.Raw({0xD3, static_cast<uint8_t>(0xC0u |
+                ((shiftRight ? 5u : 4u) << 3u) | (reg & 7u))});
+        };
+        const auto shiftShares = [&] {
+            X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
+            shiftRegister(3u);
+            for (size_t position = 1u;
+                 position < shareOrder.size(); ++position) {
+                X86MovImmediate(c, 2u, keys[shareOrder[position]]);
+                shiftRegister(2u);
+                X86BinaryRegister(c, 0x31u, 3u, 2u);
+            }
+        };
+        if (strategy == 0u) {
+            shiftRegister(0u);
+            shiftShares();
+        } else {
+            shiftShares();
+            shiftRegister(0u);
+        }
+        X86BinaryRegister(c, 0x31u, 0u, 3u);
+    }
+}
+
+void EmitKeyedFlagsWriteCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 2u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) {
+            X64MovRegister(c, 11u, 1u); X64UnaryGroup(c, 2u, 11u);
+            X64BinaryRegister(c, 0x21u, 0u, 11u);
+            X64BinaryRegister(c, 0x21u, 2u, 1u);
+            X64BinaryRegister(c, 0x09u, 0u, 2u);
+        } else {
+            X64BinaryRegister(c, 0x31u, 2u, 0u);
+            X64BinaryRegister(c, 0x21u, 2u, 1u);
+            X64BinaryRegister(c, 0x31u, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 6u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
+                                   0x21,0xCA,0x09,0xD0});
+        else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+    }
+}
+
+void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreKey32(c, strategy + 4u);
+    if (x64) {
+        X64BinaryImmediate32(c, 6u, 0u, key);
+        X64BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
+        else {
+            X64MovRegister(c, 11u, 10u); X64UnaryGroup(c, 3u, 11u);
+            X64BinaryRegister(c, 0x31u, 2u, 0u);
+            X64BinaryRegister(c, 0x21u, 2u, 11u);
+            X64BinaryRegister(c, 0x31u, 0u, 2u);
+        }
+        X64BinaryImmediate32(c, 6u, 0u, key);
+    } else {
+        X86BinaryImmediate32(c, 6u, 0u, key);
+        X86BinaryImmediate32(c, 6u, 2u, key);
+        if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
+        else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
+        X86BinaryImmediate32(c, 6u, 0u, key);
+    }
+}
+
+void EmitX64SeedAddressedWideOperation(
+    CodeBuffer& c,
+    uint8_t group,
+    uint8_t strategy,
+    size_t keyIndex)
+{
+    // The real multiplier/divisor is materialized in the execution-context
+    // scratch slot and consumed directly by the hardware wide operation.  The
+    // build seed splits that slot's effective address between LEA and the
+    // memory operand displacement; neither half can be removed or changed
+    // without changing the value consumed by IMUL/DIV/IDIV.  LEA and MOV do
+    // not alter flags, while the one-operand F7 form retains the full
+    // RDX:RAX result and native #DE behaviour.
+    const uint32_t key = CoreAddressKey(c, keyIndex + strategy);
+    const uint8_t address = strategy == 0u ? 10u : 11u;
+    c.Raw({0x4D, 0x8D, static_cast<uint8_t>(
+        0x80u | ((address & 7u) << 3u) | 7u)});
+    c.U32(CtxMutationScratch + key);              // lea address,[r15+slot+key]
+    c.Raw({0x4D, 0x89, static_cast<uint8_t>(
+        0x80u | (1u << 3u) | (address & 7u))});
+    c.U32(0u - key);                              // mov [address-key],r9
+    c.Raw({0x49, 0xF7, static_cast<uint8_t>(
+        0x80u | ((group & 7u) << 3u) | (address & 7u))});
+    c.U32(0u - key);                              // F7 /group [address-key]
+}
+
 bool EmitBusinessCoreVariant(
     CodeBuffer& c,
     bool x64,
@@ -1269,38 +2802,79 @@ bool EmitBusinessCoreVariant(
     uint8_t strategy)
 {
     strategy &= 1u;
+    const auto coreOrder = [&](uint8_t count) {
+        std::vector<uint8_t> order(count);
+        for (uint8_t index = 0; index < count; ++index) order[index] = index;
+        for (uint8_t index = static_cast<uint8_t>(count - 1u);
+             index != 0u; --index) {
+            const auto& round = c.coreSelector.rounds[
+                (static_cast<size_t>(index) + strategy * 7u) %
+                    c.coreSelector.roundCount];
+            const uint8_t selected = static_cast<uint8_t>(
+                (round.key ^ (static_cast<uint64_t>(round.rotate) << 32u) ^
+                 (static_cast<uint64_t>(strategy) << 17u)) %
+                (static_cast<uint32_t>(index) + 1u));
+            std::swap(order[index], order[selected]);
+        }
+        return order;
+    };
     if (x64) {
         switch (semantic) {
-            case VM_UOP_PUSH_FLAGS:
-                if (strategy == 0u) X64LoadQ(c, 0, CtxVirtualFlags);
-                else {
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags);
-                    c.Raw({0x49,0x8B,0x02});
-                }
+            case VM_UOP_PUSH_FLAGS: {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+                c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
+                if (strategy != 0u) X64BinaryImmediate32(c, 0u, 10u, k1);
+                c.Raw({0x49,0x8B,0x82});
+                c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
                 return true;
+            }
             case VM_UOP_PUSH_IP:
-                if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xDA});
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                }
+                EmitKeyedPushIpCore(c, true, strategy);
                 return true;
             case VM_UOP_PUSH_IMAGE_BASE:
-                if (strategy == 0u) X64LoadQ(c, 0, CtxImageBase);
-                else {
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxImageBase);
-                    c.Raw({0x49,0x8B,0x02});
+                {
+                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                    const uint32_t k1 = CoreAddressKey(c, strategy + 3u);
+                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxImageBase + k0);
+                    X64BinaryImmediate32(c, 0u, 10u, k1);
+                    X64BinaryImmediate32(c, 5u, 10u, k2);
+                    X64BinaryImmediate32(c, 0u, 10u, k3);
+                    c.Raw({0x49,0x8B,0x82});
+                    c.U32(0u - (k0 + k1 - k2 + k3));
                 }
                 return true;
             case VM_UOP_PUSH_VREG:
-                if (strategy == 0u) X64ShiftCl(c, 5, 0);
-                else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAD,0xD0});
+                {
+                    const std::array<uint32_t, 2> keys = {
+                        CoreKey32(c, strategy + 1u),
+                        CoreKey32(c, strategy + 5u)};
+                    for (uint32_t key : keys)
+                        X64BinaryImmediate32(c, 6u, 0u, key);
+                    if (strategy == 0u) X64ShiftCl(c, 5, 0);
+                    else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAD,0xD0});
+                    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+                        X64MovImmediate(c, 10u, *it);
+                        X64ShiftCl(c, 5u, 10u);
+                        X64BinaryRegister(c, 0x31, 0u, 10u);
+                    }
+                }
                 return true;
             case VM_UOP_PUSH_IMM:
-                if (strategy == 0u) X64BinaryRegister(c, 0x21, 0, 9);
-                else {
-                    X64MovRegister(c, 10, 9); c.Raw({0x49,0xF7,0xD2,0x48,0xF7,0xD0});
-                    X64BinaryRegister(c, 0x09, 0, 10); c.Raw({0x48,0xF7,0xD0});
+                {
+                    const std::array<uint32_t, 2> keys = {
+                        CoreKey32(c, strategy + 2u),
+                        CoreKey32(c, strategy + 7u)};
+                    for (uint32_t key : keys)
+                        X64BinaryImmediate32(c, 6u, 0u, key);
+                    X64BinaryRegister(c, 0x21, 0, 9);
+                    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+                        X64MovImmediate(c, 10u, *it);
+                        X64BinaryRegister(c, 0x21, 10u, 9u);
+                        X64BinaryRegister(c, 0x31, 0u, 10u);
+                    }
                 }
                 return true;
             case VM_UOP_POP_VREG:
@@ -1308,40 +2882,58 @@ bool EmitBusinessCoreVariant(
                 else EmitX64PopVregVariant(c, 1u);
                 return true;
             case VM_UOP_LOAD_TEMP:
-                if (strategy == 0u) X64LoadIndexedQ(c, 0, 10, CtxTemps);
-                else {
-                    c.Raw({0x4F,0x8D,
-                        static_cast<uint8_t>(0x80u | (3u << 3u) | 4u),0xD7});
-                    c.U32(CtxTemps);
-                    c.Raw({0x49,0x8B,0x03});
+                {
+                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
+                    X64BinaryImmediate32(c, 0u, 11u, k1);
+                    X64BinaryImmediate32(c, 5u, 11u, k2);
+                    X64BinaryImmediate32(c, 0u, 11u, k3);
+                    c.Raw({0x49,0x8B,0x83});
+                    c.U32(0u - (k0 + k1 - k2 + k3));
                 }
                 return true;
             case VM_UOP_STORE_TEMP:
-                if (strategy == 0u) X64StoreIndexedQ(c, CtxTemps, 10, 0);
-                else {
-                    c.Raw({0x4F,0x8D,
-                        static_cast<uint8_t>(0x80u | (3u << 3u) | 4u),0xD7});
-                    c.U32(CtxTemps);
-                    c.Raw({0x49,0x89,0x03});
+                {
+                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
+                    X64BinaryImmediate32(c, 0u, 11u, k1);
+                    X64BinaryImmediate32(c, 5u, 11u, k2);
+                    X64BinaryImmediate32(c, 0u, 11u, k3);
+                    c.Raw({0x49,0x89,0x83});
+                    c.U32(0u - (k0 + k1 - k2 + k3));
                 }
                 return true;
             case VM_UOP_DUP:
-                if (strategy == 0u) X64MovRegister(c, 2, 0);
-                else c.Raw({0x48,0x8D,0x10});
+                EmitKeyedCopyCore(c, true, strategy);
                 return true;
             case VM_UOP_SWAP:
-                if (strategy == 0u) c.Raw({0x48,0x92});
-                else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
+                EmitKeyedSwapCore(c, true, strategy);
                 return true;
             case VM_UOP_ROT:
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 0); X64MovRegister(c, 0, 2);
-                    X64MovRegister(c, 2, 8); X64MovRegister(c, 8, 10);
-                } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
+                EmitKeyedRotateStackCore(c, true, strategy);
                 return true;
             case VM_UOP_DROP:
-                if (strategy == 0u) c.Raw({0x31,0xC0});
-                else c.Raw({0x29,0xC0});
+                // DROP owns the now-unused value-stack slot. Scrubbing that
+                // physical slot is part of the semantic state transition, so
+                // both K variants are real equivalent memory lowerings.
+                {
+                    const uint32_t key = CoreAddressKey(c, strategy + 3u);
+                    // r10 = &ctx.values[rcx] + key.  The SIB index is RCX,
+                    // so REX.X must remain clear (0x4D, not 0x4F/r9).
+                    c.Raw({0x4D,0x8D,0x94,0xCF}); c.U32(CtxValues + key);
+                    if (strategy == 0u) {
+                        c.Raw({0x31,0xC0,0x49,0x89,0x82});
+                        c.U32(0u - key);
+                    } else {
+                        c.Raw({0x49,0xC7,0x82}); c.U32(0u - key); c.U32(0u);
+                    }
+                }
                 return true;
             case VM_UOP_LOAD:
                 if (strategy == 0u) EmitX64MemoryVariant(c, false, 0u);
@@ -1352,67 +2944,31 @@ bool EmitBusinessCoreVariant(
                 else EmitX64MemoryVariant(c, true, 1u);
                 return true;
             case VM_UOP_ADD:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_ADD_CARRY:
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                    X64BinaryRegister(c, 0x01, 0, 8);
-                } else {
-                    X64BinaryRegister(c, 0x01, 0, 8);
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                }
+                EmitKeyedCarryCore(c, true, false, strategy);
                 return true;
             case VM_UOP_SUB:
-                if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xDA});
-                    X64BinaryRegister(c, 0x01, 0, 2);
-                }
+                EmitKeyedAddSubCore(c, true, true, strategy);
                 return true;
             case VM_UOP_SUB_BORROW:
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x29, 0, 2);
-                    X64BinaryRegister(c, 0x29, 0, 8);
-                } else {
-                    X64BinaryRegister(c, 0x01, 2, 8);
-                    X64BinaryRegister(c, 0x29, 0, 2);
-                }
+                EmitKeyedCarryCore(c, true, true, strategy);
                 return true;
             case VM_UOP_AND:
-                if (strategy == 0u) X64BinaryRegister(c, 0x21, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xD0,0x48,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    c.Raw({0x48,0xF7,0xD0});
-                }
+                EmitKeyedBitwiseCore(c, true, false, strategy);
                 return true;
             case VM_UOP_OR:
-                if (strategy == 0u) X64BinaryRegister(c, 0x09, 0, 2);
-                else {
-                    c.Raw({0x48,0xF7,0xD0,0x48,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x21, 0, 2);
-                    c.Raw({0x48,0xF7,0xD0});
-                }
+                EmitKeyedBitwiseCore(c, true, true, strategy);
                 return true;
             case VM_UOP_XOR:
-                if (strategy == 0u) X64BinaryRegister(c, 0x31, 0, 2);
-                else {
-                    X64MovRegister(c, 10, 0);
-                    X64BinaryRegister(c, 0x21, 10, 2);
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    X64BinaryRegister(c, 0x29, 0, 10);
-                    X64BinaryRegister(c, 0x31, 10, 10);
-                }
+                EmitKeyedXorCore(c, true, strategy);
                 return true;
             case VM_UOP_NOT:
-                if (strategy == 0u) c.Raw({0x48,0xF7,0xD0});
-                else X64BinaryRegister(c, 0x31, 0, 9);
+                EmitKeyedUnaryCore(c, true, false, strategy);
                 return true;
             case VM_UOP_NEG:
-                if (strategy == 0u) c.Raw({0x48,0xF7,0xD8});
-                else c.Raw({0x48,0xF7,0xD0,0x48,0xFF,0xC0});
+                EmitKeyedUnaryCore(c, true, true, strategy);
                 return true;
             case VM_UOP_MUL:
                 // strategy 0: IMUL rax, rdx (two-operand signed multiply).
@@ -1423,8 +2979,7 @@ bool EmitBusinessCoreVariant(
                 // half (discarded here) and flags differ.  This clobbers
                 // rdx, which is safe because a/b were already latched into
                 // r8/r11 before the core runs.
-                if (strategy == 0u) c.Raw({0x48,0x0F,0xAF,0xC2});
-                else c.Raw({0x48,0xF7,0xE2});
+                EmitKeyedMultiplyCore(c, true, strategy);
                 return true;
             case VM_UOP_BIT_TEST:
                 // Common to both strategies: reduce the raw bit-index operand
@@ -1487,6 +3042,8 @@ bool EmitBusinessCoreVariant(
                 }
                 return true;
             case VM_UOP_SHL: {
+                EmitKeyedLogicalShiftCore(c, true, false, strategy);
+                return true;
                 // strategy 0: native SHL rax,cl.
                 // strategy 1: SHLD rax, r10(=0), cl — a zero source makes shld
                 //   pull zeroes into the top, so dst = dst<<cl ≡ SHL.  r10 is
@@ -1502,30 +3059,14 @@ bool EmitBusinessCoreVariant(
                 // `and rax,r9` trims to width).  This is label-free — every byte
                 // is a fixed Raw — so the variant kernel validator's isolated
                 // re-emission matches the inline bytes exactly.
-                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
-                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
-                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
-                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
-                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
-                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
-                if (strategy == 0u) c.Raw({0x48,0xD3,0xE0});      // shl rax, cl
-                else                c.Raw({0x4C,0x0F,0xA5,0xD0}); // shld rax, r10, cl
-                return true;
             }
             case VM_UOP_SHR: {
+                EmitKeyedLogicalShiftCore(c, true, true, strategy);
+                return true;
                 // Same count pre-mask as SHL.
                 // strategy 0: native SHR rax,cl.
                 // strategy 1: SHRD rax, r10(=0), cl pulls zeroes into the bottom
                 //   so dst = dst>>cl ≡ SHR.
-                c.Raw({0x48,0x89,0xD1});            // mov rcx, rdx  (count)
-                c.Raw({0x4D,0x89,0xCB});            // mov r11, r9   (width mask)
-                c.Raw({0x49,0xC1,0xFB,0x3F});       // sar r11, 63
-                c.Raw({0x49,0x83,0xE3,0x20});       // and r11, 32
-                c.Raw({0x49,0x83,0xCB,0x1F});       // or  r11, 31
-                c.Raw({0x44,0x20,0xD9});            // and cl, r11b  (REX.R for r11b source)
-                if (strategy == 0u) c.Raw({0x48,0xD3,0xE8});      // shr rax, cl
-                else                c.Raw({0x4C,0x0F,0xAD,0xD0}); // shrd rax, r10, cl
-                return true;
             }
             case VM_UOP_SAR:
                 if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
@@ -1556,56 +3097,60 @@ bool EmitBusinessCoreVariant(
                 else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xE2});
                 return true;
             case VM_UOP_SMUL_WIDE:
-                if (strategy == 0u) c.Raw({0x49,0xF7,0xE9});
-                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xEA});
+                EmitX64SeedAddressedWideOperation(c, 5u, strategy, 2u);
                 return true;
             case VM_UOP_UDIV_WIDE:
-                if (strategy == 0u) c.Raw({0x49,0xF7,0xF1});
-                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xF2});
+                EmitX64SeedAddressedWideOperation(c, 6u, strategy, 4u);
                 return true;
             case VM_UOP_IDIV_WIDE:
-                if (strategy == 0u) c.Raw({0x49,0xF7,0xF9});
-                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xFA});
+                EmitX64SeedAddressedWideOperation(c, 7u, strategy, 6u);
                 return true;
             case VM_UOP_FLAGS_LAZY:
-                if (strategy == 0u) {
-                    for (uint32_t offset = 0; offset < 40u; offset += 8u) {
-                        X64LoadQ(c, 0, CtxLastAlu + offset);
-                        X64StoreQ(c, CtxPendingFlags + offset, 0);
-                    }
-                    X64LoadD(c, 0, CtxLastAlu + 40u);
-                    X64StoreD(c, CtxPendingFlags + 40u, 0);
-                } else {
-                    X64LoadD(c, 0, CtxLastAlu + 40u);
-                    X64StoreD(c, CtxPendingFlags + 40u, 0);
-                    for (uint32_t offset = 40u; offset != 0u; offset -= 8u) {
-                        X64LoadQ(c, 0, CtxLastAlu + offset - 8u);
-                        X64StoreQ(c, CtxPendingFlags + offset - 8u, 0);
-                    }
+                for (uint8_t field : coreOrder(6u)) {
+                    const uint32_t offset = field < 5u
+                        ? static_cast<uint32_t>(field) * 8u : 40u;
+                    EmitKeyedContextCopy(c, true,
+                        CtxLastAlu + offset, CtxPendingFlags + offset,
+                        field < 5u, static_cast<size_t>(field) + strategy);
                 }
                 return true;
             case VM_UOP_FLAGS_MATERIALIZE:
-                if (strategy == 0u) X64LoadD(c, 2, CtxDecodedOperands);
-                else X64LoadQ(c, 2, CtxDecodedOperands);
-                return true;
-            case VM_UOP_FLAGS_WRITE:
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 1); c.Raw({0x49,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x21, 0, 10);
-                    X64BinaryRegister(c, 0x21, 2, 1);
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                } else {
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                    X64BinaryRegister(c, 0x21, 2, 1);
-                    X64BinaryRegister(c, 0x31, 0, 2);
+                {
+                    const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+                    const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxDecodedOperands + k0);
+                    X64BinaryImmediate32(c, 0u, 10u, k1);
+                    X64BinaryImmediate32(c, 5u, 10u, k2);
+                    X64BinaryImmediate32(c, 0u, 10u, k3);
+                    c.Raw({0x49,0x8B,0x92});
+                    c.U32(0u - (k0 + k1 - k2 + k3));
                 }
                 return true;
+            case VM_UOP_FLAGS_WRITE:
+                EmitKeyedFlagsWriteCore(c, true, strategy);
+                return true;
             case VM_UOP_FLAGS_UPDATE: {
+                const uint32_t modeKey = CoreAddressKey(c, strategy + 1u);
+                const uint32_t dataKey = CoreKey32(c, strategy + 5u);
                 const auto clear = c.NewLabel();
                 const auto set = c.NewLabel();
                 const auto done = c.NewLabel();
-                c.Raw({0x85,0xC9}); c.Jcc(JccE, clear);
-                c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE, set);
+
+                // RCX is dead after the mode decision.  Compare an affine,
+                // seed-keyed representation so the real clear/set/toggle
+                // control edge depends on this build's core selector.
+                c.Raw({0x48,0x8D,0x89}); c.U32(modeKey);
+                c.Raw({0x48,0x81,0xF9});
+                c.U32(modeKey + VM_FLAG_UPDATE_CLEAR); c.Jcc(JccE, clear);
+                c.Raw({0x48,0x81,0xF9});
+                c.U32(modeKey + VM_FLAG_UPDATE_SET); c.Jcc(JccE, set);
+
+                // Toggle in a keyed representation.  Strategy 1 lowers the
+                // actual XOR as (union - intersection), whose operands already
+                // contain the seed key.
+                X64BinaryImmediate32(c, 6u, 0u, dataKey);
                 if (strategy == 0u) {
                     X64BinaryRegister(c, 0x31, 0, 2);
                 } else {
@@ -1614,44 +3159,81 @@ bool EmitBusinessCoreVariant(
                     X64BinaryRegister(c, 0x09, 0, 2);
                     X64BinaryRegister(c, 0x29, 0, 10);
                 }
+                X64BinaryImmediate32(c, 6u, 0u, dataKey);
                 c.Jmp(done);
+
                 c.Bind(clear);
+                // (a & ~mask) = ((a^K) & ~mask) ^ (K & ~mask).
+                X64BinaryImmediate32(c, 6u, 0u, dataKey);
                 if (strategy == 0u) {
-                    X64MovRegister(c, 10, 2); c.Raw({0x49,0xF7,0xD2});
+                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
                     X64BinaryRegister(c, 0x21, 0, 10);
                 } else {
-                    X64MovRegister(c, 10, 0);
-                    X64BinaryRegister(c, 0x21, 10, 2);
-                    X64BinaryRegister(c, 0x29, 0, 10);
+                    X64UnaryGroup(c, 2u, 0u);
+                    X64BinaryRegister(c, 0x09, 0, 2);
+                    X64UnaryGroup(c, 2u, 0u);
+                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
                 }
+                X64MovImmediate(c, 11, dataKey);
+                X64BinaryRegister(c, 0x21, 11, 10);
+                X64BinaryRegister(c, 0x31, 0, 11);
                 c.Jmp(done);
+
                 c.Bind(set);
+                // (a | mask) = ((a^K) | mask) ^ (K & ~mask).
+                X64BinaryImmediate32(c, 6u, 0u, dataKey);
                 if (strategy == 0u) {
                     X64BinaryRegister(c, 0x09, 0, 2);
+                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
                 } else {
-                    X64MovRegister(c, 10, 0); c.Raw({0x49,0xF7,0xD2});
-                    X64BinaryRegister(c, 0x21, 10, 2);
-                    X64BinaryRegister(c, 0x01, 0, 10);
+                    X64UnaryGroup(c, 2u, 0u);
+                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
+                    X64BinaryRegister(c, 0x21, 0, 10);
+                    X64UnaryGroup(c, 2u, 0u);
                 }
+                X64MovImmediate(c, 11, dataKey);
+                X64BinaryRegister(c, 0x21, 11, 10);
+                X64BinaryRegister(c, 0x31, 0, 11);
                 c.Bind(done);
                 return true;
             }
-            case VM_UOP_FLAGS_PACK_AH:
-                if (strategy == 0u) {
-                    c.Raw({0xB8,0x02,0x00,0x00,0x00});
-                    constexpr uint8_t bits[] = {7u, 6u, 4u, 2u, 0u};
-                    for (uint8_t bit : bits) {
-                        X64MovRegister(c, 1, 2); X64ShiftImmediate(c, 5, 1, bit);
-                        c.Raw({0x83,0xE1,0x01});
-                        if (bit != 0u) c.Raw({0xC1,0xE1,bit});
-                        c.Raw({0x09,0xC8});
-                    }
-                } else {
-                    c.Raw({0x89,0xD0,0x25,0xD5,0x00,0x00,0x00,
-                           0x83,0xC8,0x02});
-                }
+            case VM_UOP_FLAGS_PACK_AH: {
+                constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
+                    VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+                const uint32_t rawKey = CoreKey32(c, strategy + 2u);
+                uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
+                if (packedKey == 0u)
+                    packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
+                        (rawKey % 5u == 1u) ? 2u :
+                        (rawKey % 5u == 2u) ? 4u :
+                        (rawKey % 5u == 3u) ? 6u : 7u);
+                const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
+                const uint32_t rotatedMask = strategy == 0u
+                    ? ((packedMask >> rotation) |
+                        (packedMask << (32u - rotation)))
+                    : ((packedMask << rotation) |
+                        (packedMask >> (32u - rotation)));
+
+                // Rotate an encoded flags value and its live mask together,
+                // apply the real selection in that domain, then rotate/decode.
+                c.Raw({0x89,0xD0});
+                X86BinaryImmediate32(c, 6u, 0u, packedKey);
+                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
+                    rotation, 0x25});
+                c.U32(rotatedMask);
+                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
+                    rotation});
+                X86BinaryImmediate32(c, 6u, 0u, packedKey);
+                c.Raw({0x83,0xC8,0x02});
                 return true;
-            case VM_UOP_FLAGS_UNPACK_AH:
+            }
+            case VM_UOP_FLAGS_UNPACK_AH: {
+                const uint32_t key = CoreKey32(c, strategy + 6u);
+                // Both selectable values use the same seed representation;
+                // masked selection therefore produces an encoded result that
+                // is decoded only after the real flags transformation.
+                X64BinaryImmediate32(c, 6u, 0u, key);
+                X64BinaryImmediate32(c, 6u, 2u, key);
                 if (strategy == 0u) {
                     c.Raw({0x48,0x81,0xE2});
                     c.U32(~static_cast<uint32_t>(
@@ -1663,43 +3245,46 @@ bool EmitBusinessCoreVariant(
                     c.Raw({0x25,0xD5,0x00,0x00,0x00});
                     X64BinaryRegister(c, 0x31, 2, 0);
                 }
+                X64BinaryImmediate32(c, 6u, 2u, key);
                 return true;
-            case VM_UOP_PUSH_CONDITION:
-                if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
-                else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
-                return true;
-            case VM_UOP_SELECT:
-                if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
-                else {
-                    X64MovRegister(c, 11, 10); c.Raw({0x49,0xF7,0xDB});
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                    X64BinaryRegister(c, 0x21, 2, 11);
-                    X64BinaryRegister(c, 0x31, 0, 2);
+            }
+            case VM_UOP_PUSH_CONDITION: {
+                // X64EvaluateCondition supplies exactly 0 or 1.  Normalize it
+                // through a seed-shifted predicate rather than decorating an
+                // already-computed result: (condition +/- key) is compared
+                // with the correspondingly shifted representation of true.
+                const uint32_t key = CoreAddressKey(c, strategy + 1u);
+                if (strategy == 0u) {
+                    X64BinaryImmediate32(c, 0u, 0u, key);
+                    X64BinaryImmediate32(c, 7u, 0u, key + 1u);
+                } else {
+                    X64BinaryImmediate32(c, 5u, 0u, key);
+                    X64BinaryImmediate32(c, 7u, 0u, 1u - key);
                 }
+                c.Raw({0x0F,0x94,0xC0,0x0F,0xB6,0xC0});
+                return true;
+            }
+            case VM_UOP_SELECT:
+                EmitKeyedSelectCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_BRANCH_IF:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_CALL_VM:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_CALL_HOST:
                 if (strategy == 0u) EmitX64CallTargetVariant(c, 0u);
                 else EmitX64CallTargetVariant(c, 1u);
                 return true;
             case VM_UOP_RET:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_BRIDGE_EXTENDED:
-                if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-                else c.Raw({0x48,0x8D,0x04,0x10});
+                EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_INT3:
                 if (strategy == 0u) c.U8(0xCC);
@@ -1711,33 +3296,59 @@ bool EmitBusinessCoreVariant(
     }
 
     switch (semantic) {
-        case VM_UOP_PUSH_FLAGS:
-            if (strategy == 0u) X86LoadD(c, 0, CtxVirtualFlags);
-            else {
-                c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags);
-                c.Raw({0x8B,0x02});
-            }
+        case VM_UOP_PUSH_FLAGS: {
+            const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+            const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+            c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
+            if (strategy != 0u) X86BinaryImmediate32(c, 0u, 2u, k1);
+            c.Raw({0x8B,0x82});
+            c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
             return true;
+        }
         case VM_UOP_PUSH_IP:
-            if (strategy == 0u) c.Raw({0x29,0xD0});
-            else c.Raw({0xF7,0xDA,0x01,0xD0});
+            EmitKeyedPushIpCore(c, false, strategy);
             return true;
         case VM_UOP_PUSH_IMAGE_BASE:
-            if (strategy == 0u) X86LoadD(c, 0, CtxImageBase);
-            else {
-                c.Raw({0x8D,0x97}); c.U32(CtxImageBase);
-                c.Raw({0x8B,0x02});
+            {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 3u);
+                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                c.Raw({0x8D,0x97}); c.U32(CtxImageBase + k0);
+                X86BinaryImmediate32(c, 0u, 2u, k1);
+                X86BinaryImmediate32(c, 5u, 2u, k2);
+                X86BinaryImmediate32(c, 0u, 2u, k3);
+                c.Raw({0x8B,0x82});
+                c.U32(0u - (k0 + k1 - k2 + k3));
             }
             return true;
         case VM_UOP_PUSH_VREG:
-            if (strategy == 0u) c.Raw({0xD3,0xE8});
-            else c.Raw({0x31,0xDB,0x0F,0xAD,0xD8});
+            {
+                const std::array<uint32_t, 2> keys = {
+                    CoreKey32(c, strategy + 1u),
+                    CoreKey32(c, strategy + 5u)};
+                for (uint32_t key : keys)
+                    X86BinaryImmediate32(c, 6u, 0u, key);
+                c.Raw({0xD3,0xE8});
+                for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+                    X86MovImmediate(c, 2u, *it);
+                    c.Raw({0xD3,0xEA,0x31,0xD0});
+                }
+            }
             return true;
         case VM_UOP_PUSH_IMM:
-            if (strategy == 0u) { c.Raw({0x23,0x87}); c.U32(CtxMutationScratch); }
-            else {
-                X86LoadD(c, 2, CtxMutationScratch); c.Raw({0xF7,0xD2,0xF7,0xD0,
-                    0x09,0xD0,0xF7,0xD0});
+            {
+                const std::array<uint32_t, 2> keys = {
+                    CoreKey32(c, strategy + 2u),
+                    CoreKey32(c, strategy + 7u)};
+                for (uint32_t key : keys)
+                    X86BinaryImmediate32(c, 6u, 0u, key);
+                c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
+                for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+                    X86MovImmediate(c, 2u, *it);
+                    c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
+                    c.Raw({0x31,0xD0});
+                }
             }
             return true;
         case VM_UOP_POP_VREG:
@@ -1745,32 +3356,60 @@ bool EmitBusinessCoreVariant(
             else EmitX86PopVregVariant(c, 1u);
             return true;
         case VM_UOP_LOAD_TEMP:
-            if (strategy == 0u) X86LoadIndexedD(c, 0, CtxTemps);
-            else {
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps); c.Raw({0x8B,0x02});
+            {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
+                X86BinaryImmediate32(c, 0u, 2u, k1);
+                X86BinaryImmediate32(c, 5u, 2u, k2);
+                X86BinaryImmediate32(c, 0u, 2u, k3);
+                c.Raw({0x8B,0x82});
+                c.U32(0u - (k0 + k1 - k2 + k3));
             }
             return true;
         case VM_UOP_STORE_TEMP:
-            if (strategy == 0u) X86StoreIndexedD(c, CtxTemps, 0);
-            else {
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps); c.Raw({0x89,0x02});
+            {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
+                X86BinaryImmediate32(c, 0u, 2u, k1);
+                X86BinaryImmediate32(c, 5u, 2u, k2);
+                X86BinaryImmediate32(c, 0u, 2u, k3);
+                c.Raw({0x89,0x82});
+                c.U32(0u - (k0 + k1 - k2 + k3));
             }
             return true;
         case VM_UOP_DUP:
-            if (strategy == 0u) c.Raw({0x89,0xC2});
-            else c.Raw({0x8D,0x10});
+            EmitKeyedCopyCore(c, false, strategy);
             return true;
         case VM_UOP_SWAP:
-            if (strategy == 0u) c.Raw({0x92});
-            else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
+            EmitKeyedSwapCore(c, false, strategy);
             return true;
         case VM_UOP_ROT:
-            if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
-            else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
+            EmitKeyedRotateStackCore(c, false, strategy);
             return true;
         case VM_UOP_DROP:
-            if (strategy == 0u) c.Raw({0x31,0xC0});
-            else c.Raw({0x29,0xC0});
+            // ECX is the decremented value depth from X86RequireAndPop. Both
+            // variants scrub the complete eight-byte physical VM stack slot.
+            {
+                const uint32_t key = CoreAddressKey(c, strategy + 3u);
+                // Value decoding may use ECX as a permutation scratch after
+                // X86RequireAndPop stored the decremented depth. Reload the
+                // authoritative depth before using it as the slot index.
+                X86LoadD(c, 1u, CtxValueDepth);
+                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxValues + key);
+                if (strategy == 0u) {
+                    c.Raw({0x31,0xC0,0x89,0x82}); c.U32(0u - key);
+                    c.Raw({0x89,0x82}); c.U32(4u - key);
+                } else {
+                    c.Raw({0xC7,0x82}); c.U32(0u - key); c.U32(0u);
+                    c.Raw({0xC7,0x82}); c.U32(4u - key); c.U32(0u);
+                }
+            }
             return true;
         case VM_UOP_LOAD:
             if (strategy == 0u) EmitX86MemoryVariant(c, false, 0u);
@@ -1781,47 +3420,37 @@ bool EmitBusinessCoreVariant(
             else EmitX86MemoryVariant(c, true, 1u);
             return true;
         case VM_UOP_ADD:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_ADD_CARRY:
-            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
-            else c.Raw({0x01,0xC8,0x01,0xD0});
+            EmitKeyedCarryCore(c, false, false, strategy);
             return true;
         case VM_UOP_SUB:
-            if (strategy == 0u) c.Raw({0x29,0xD0});
-            else c.Raw({0xF7,0xDA,0x01,0xD0});
+            EmitKeyedAddSubCore(c, false, true, strategy);
             return true;
         case VM_UOP_SUB_BORROW:
-            if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
-            else c.Raw({0x01,0xCA,0x29,0xD0});
+            EmitKeyedCarryCore(c, false, true, strategy);
             return true;
         case VM_UOP_AND:
-            if (strategy == 0u) c.Raw({0x21,0xD0});
-            else c.Raw({0xF7,0xD0,0xF7,0xD2,0x09,0xD0,0xF7,0xD0});
+            EmitKeyedBitwiseCore(c, false, false, strategy);
             return true;
         case VM_UOP_OR:
-            if (strategy == 0u) c.Raw({0x09,0xD0});
-            else c.Raw({0xF7,0xD0,0xF7,0xD2,0x21,0xD0,0xF7,0xD0});
+            EmitKeyedBitwiseCore(c, false, true, strategy);
             return true;
         case VM_UOP_XOR:
-            if (strategy == 0u) c.Raw({0x31,0xD0});
-            else c.Raw({0x89,0xC1,0x21,0xD1,0x09,0xD0,0x29,0xC8});
+            EmitKeyedXorCore(c, false, strategy);
             return true;
         case VM_UOP_NOT:
-            if (strategy == 0u) c.Raw({0xF7,0xD0});
-            else { c.Raw({0x33,0x87}); c.U32(CtxMutationScratch); }
+            EmitKeyedUnaryCore(c, false, false, strategy);
             return true;
         case VM_UOP_NEG:
-            if (strategy == 0u) c.Raw({0xF7,0xD8});
-            else c.Raw({0xF7,0xD0,0x40});
+            EmitKeyedUnaryCore(c, false, true, strategy);
             return true;
         case VM_UOP_MUL:
             // Same identity as the x64 case: IMUL EAX,EDX vs. MUL EDX give
             // the same truncated 32-bit product in eax; the clobbered edx
             // is safe for the same reason (a/b already latched earlier).
-            if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
-            else c.Raw({0xF7,0xE2});
+            EmitKeyedMultiplyCore(c, false, strategy);
             return true;
         case VM_UOP_BIT_TEST:
             X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
@@ -1876,6 +3505,8 @@ bool EmitBusinessCoreVariant(
             X86StoreD(c, CtxMutationScratch + 4u, 2);
             return true;
         case VM_UOP_SHL: {
+            EmitKeyedLogicalShiftCore(c, false, false, strategy);
+            return true;
             // strategy 0: native SHL eax,cl.  strategy 1: SHLD eax,ebx(=0),cl ≡
             //   SHL (zero source pulls zeroes into the top).  32-bit mode has no
             //   8-byte operand, so every width (1/2/4) masks the count to 5
@@ -1883,29 +3514,13 @@ bool EmitBusinessCoreVariant(
             //   widths (operand zero-extended, outer `and eax,[scratch]` trims
             //   to width).  Label-free so the validator's isolated re-emission
             //   matches byte-for-byte.  ebx is free across EmitX86BinaryAlu.
-            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
-            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
-            if (strategy == 0u) {
-                c.Raw({0xD3,0xE0});        // shl eax, cl
-            } else {
-                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
-                c.Raw({0x0F,0xA5,0xD8});   // shld eax, ebx, cl
-            }
-            return true;
         }
         case VM_UOP_SHR: {
+            EmitKeyedLogicalShiftCore(c, false, true, strategy);
+            return true;
             // Same count pre-mask as SHL.
             // strategy 0: native SHR eax,cl.  strategy 1: SHRD eax,ebx(=0),cl ≡
             //   SHR (zero source pulls zeroes into the bottom).
-            c.Raw({0x88,0xD1});            // mov cl, dl  (count)
-            c.Raw({0x80,0xE1,0x1F});       // and cl, 31
-            if (strategy == 0u) {
-                c.Raw({0xD3,0xE8});        // shr eax, cl
-            } else {
-                c.Raw({0x31,0xDB});        // xor ebx,ebx (zero src)
-                c.Raw({0x0F,0xAD,0xD8});   // shrd eax, ebx, cl
-            }
-            return true;
         }
         case VM_UOP_SAR:
             if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
@@ -1931,117 +3546,203 @@ bool EmitBusinessCoreVariant(
             if (strategy == 0u) EmitX86ExtendVariant(c, true, 0u);
             else EmitX86ExtendVariant(c, true, 1u);
             return true;
-        case VM_UOP_UMUL_WIDE:
+        case VM_UOP_UMUL_WIDE: {
+            // Multiply by (b + key) and subtract a*key.  The carry from the
+            // 32-bit keyed add contributes a<<32 to the full product, so add
+            // it back to the high half.  The correction is part of the real
+            // 64-bit product rather than an encode/decode identity around MUL.
+            const uint32_t key = CoreKey32(c, strategy + 2u);
+            c.Raw({0x89,0xC3});                    // ebx = a
+            X86BinaryImmediate32(c, 0u, 1u, key); // ecx = b + key
+            c.Raw({0x0F,0x92,0x87});              // keyed-add carry
+            c.U32(CtxMutationScratch);
             if (strategy == 0u) c.Raw({0xF7,0xE1});
-            else c.Raw({0x89,0xCB,0xF7,0xE3});
+            else c.Raw({0x89,0xCE,0xF7,0xE6});
+            c.Raw({0x89,0xC6,0x89,0xD1});          // main low/high
+            c.Raw({0x89,0xD8,0xBA}); c.U32(key);   // eax=a, edx=key
+            c.Raw({0xF7,0xE2});                    // edx:eax = a*key
+            c.Raw({0x29,0xC6,0x19,0xD1});          // subtract correction
+            c.Raw({0x0F,0xB6,0x97}); c.U32(CtxMutationScratch);
+            c.Raw({0x0F,0xAF,0xD3,0x01,0xD1});    // high += carry*a
+            c.Raw({0x89,0xF0,0x89,0xCA});          // edx:eax = result
             return true;
+        }
         case VM_UOP_SMUL_WIDE:
             if (strategy == 0u) c.Raw({0xF7,0xE9});
             else c.Raw({0x89,0xCB,0xF7,0xEB});
             return true;
-        case VM_UOP_UDIV_WIDE:
-            if (strategy == 0u) c.Raw({0xF7,0xF1});
-            else c.Raw({0x89,0xCB,0xF7,0xF3});
+        case VM_UOP_UDIV_WIDE: {
+            // Spill the actual divisor through a seed-split effective address
+            // and make that memory operand the source of DIV.  Zero divisors
+            // and quotient overflow therefore still fault in the hardware DIV
+            // itself with the original EDX:EAX dividend.
+            const uint32_t key = CoreAddressKey(c, strategy + 4u);
+            const uint32_t slot = strategy == 0u ? 0u : 4u;
+            if (strategy == 0u) {
+                c.Raw({0x8D,0x9F}); c.U32(CtxMutationScratch + slot + key);
+                c.Raw({0x89,0x8B}); c.U32(0u - key);
+                c.Raw({0xF7,0xB3}); c.U32(0u - key);
+            } else {
+                c.Raw({0x8D,0xB7}); c.U32(CtxMutationScratch + slot + key);
+                c.Raw({0x89,0x8E}); c.U32(0u - key);
+                c.Raw({0xF7,0xB6}); c.U32(0u - key);
+            }
             return true;
+        }
         case VM_UOP_IDIV_WIDE:
             if (strategy == 0u) c.Raw({0xF7,0xF9});
             else c.Raw({0x89,0xCB,0xF7,0xFB});
             return true;
         case VM_UOP_FLAGS_LAZY:
-            if (strategy == 0u) {
-                for (uint32_t offset = 0; offset < sizeof(VM_LAZY_FLAGS_RECORD);
-                     offset += 4u) {
-                    X86LoadD(c, 0, CtxLastAlu + offset);
-                    X86StoreD(c, CtxPendingFlags + offset, 0);
-                }
-            } else {
-                for (uint32_t offset = sizeof(VM_LAZY_FLAGS_RECORD);
-                     offset != 0u; offset -= 4u) {
-                    X86LoadD(c, 0, CtxLastAlu + offset - 4u);
-                    X86StoreD(c, CtxPendingFlags + offset - 4u, 0);
-                }
+            for (uint8_t field : coreOrder(static_cast<uint8_t>(
+                    sizeof(VM_LAZY_FLAGS_RECORD) / 4u))) {
+                const uint32_t offset = static_cast<uint32_t>(field) * 4u;
+                EmitKeyedContextCopy(c, false,
+                    CtxLastAlu + offset, CtxPendingFlags + offset,
+                    false, static_cast<size_t>(field) + strategy);
             }
             return true;
         case VM_UOP_FLAGS_MATERIALIZE:
-            if (strategy == 0u) X86LoadD(c, 2, CtxDecodedOperands);
-            else { X86LoadD(c, 1, CtxDecodedOperands); c.Raw({0x89,0xCA}); }
+            {
+                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+                c.Raw({0x8D,0x8F}); c.U32(CtxDecodedOperands + k0);
+                X86BinaryImmediate32(c, 0u, 1u, k1);
+                X86BinaryImmediate32(c, 5u, 1u, k2);
+                X86BinaryImmediate32(c, 0u, 1u, k3);
+                c.Raw({0x8B,0x91});
+                c.U32(0u - (k0 + k1 - k2 + k3));
+            }
             return true;
         case VM_UOP_FLAGS_WRITE:
-            if (strategy == 0u) {
-                c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
-                       0x21,0xCA,0x09,0xD0});
-            } else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
+            EmitKeyedFlagsWriteCore(c, false, strategy);
             return true;
         case VM_UOP_FLAGS_UPDATE: {
+            const uint32_t modeKey = CoreAddressKey(c, strategy + 1u);
+            const uint32_t dataKey = CoreKey32(c, strategy + 5u);
             const auto clear = c.NewLabel();
             const auto set = c.NewLabel();
             const auto done = c.NewLabel();
-            c.Raw({0x85,0xC9}); c.Jcc(JccE, clear);
-            c.Raw({0x83,0xF9,VM_FLAG_UPDATE_SET}); c.Jcc(JccE, set);
-            if (strategy == 0u) c.Raw({0x31,0xD0});
-            else c.Raw({0x89,0xC3,0x21,0xD3,0x09,0xD0,0x29,0xD8});
+            c.Raw({0x8D,0x89}); c.U32(modeKey);
+            c.Raw({0x81,0xF9});
+            c.U32(modeKey + VM_FLAG_UPDATE_CLEAR); c.Jcc(JccE, clear);
+            c.Raw({0x81,0xF9});
+            c.U32(modeKey + VM_FLAG_UPDATE_SET); c.Jcc(JccE, set);
+
+            X86BinaryImmediate32(c, 6u, 0u, dataKey);
+            if (strategy == 0u) {
+                c.Raw({0x31,0xD0});
+            } else {
+                X86MovRegister(c, 3u, 0u);
+                X86BinaryRegister(c, 0x21u, 3u, 2u);
+                X86BinaryRegister(c, 0x09u, 0u, 2u);
+                X86BinaryRegister(c, 0x29u, 0u, 3u);
+            }
+            X86BinaryImmediate32(c, 6u, 0u, dataKey);
             c.Jmp(done);
+
             c.Bind(clear);
-            if (strategy == 0u) c.Raw({0x89,0xD3,0xF7,0xD3,0x21,0xD8});
-            else c.Raw({0x89,0xC3,0x21,0xD3,0x29,0xD8});
+            X86BinaryImmediate32(c, 6u, 0u, dataKey);
+            if (strategy == 0u) {
+                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
+                X86BinaryRegister(c, 0x21u, 0u, 3u);
+            } else {
+                X86UnaryGroup(c, 2u, 0u);
+                X86BinaryRegister(c, 0x09u, 0u, 2u);
+                X86UnaryGroup(c, 2u, 0u);
+                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
+            }
+            X86MovImmediate(c, 1u, dataKey);
+            X86BinaryRegister(c, 0x21u, 1u, 3u);
+            X86BinaryRegister(c, 0x31u, 0u, 1u);
             c.Jmp(done);
+
             c.Bind(set);
-            if (strategy == 0u) c.Raw({0x09,0xD0});
-            else c.Raw({0x89,0xC3,0xF7,0xD3,0x21,0xD3,0x01,0xD8});
+            X86BinaryImmediate32(c, 6u, 0u, dataKey);
+            if (strategy == 0u) {
+                X86BinaryRegister(c, 0x09u, 0u, 2u);
+                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
+            } else {
+                X86UnaryGroup(c, 2u, 0u);
+                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
+                X86BinaryRegister(c, 0x21u, 0u, 3u);
+                X86UnaryGroup(c, 2u, 0u);
+            }
+            X86MovImmediate(c, 1u, dataKey);
+            X86BinaryRegister(c, 0x21u, 1u, 3u);
+            X86BinaryRegister(c, 0x31u, 0u, 1u);
             c.Bind(done);
             return true;
         }
-        case VM_UOP_FLAGS_PACK_AH:
-            if (strategy == 0u) {
-                c.Raw({0xB8,0x02,0x00,0x00,0x00});
-                constexpr uint8_t bits[] = {7u, 6u, 4u, 2u, 0u};
-                for (uint8_t bit : bits) {
-                    c.Raw({0x89,0xD1,0xC1,0xE9,bit,0x83,0xE1,0x01});
-                    if (bit != 0u) c.Raw({0xC1,0xE1,bit});
-                    c.Raw({0x09,0xC8});
-                }
-            } else c.Raw({0x89,0xD0,0x25,0xD5,0x00,0x00,0x00,
-                          0x83,0xC8,0x02});
+        case VM_UOP_FLAGS_PACK_AH: {
+            constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
+                VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+            const uint32_t rawKey = CoreKey32(c, strategy + 2u);
+            uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
+            if (packedKey == 0u)
+                packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
+                    (rawKey % 5u == 1u) ? 2u :
+                    (rawKey % 5u == 2u) ? 4u :
+                    (rawKey % 5u == 3u) ? 6u : 7u);
+            const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
+            const uint32_t rotatedMask = strategy == 0u
+                ? ((packedMask >> rotation) |
+                    (packedMask << (32u - rotation)))
+                : ((packedMask << rotation) |
+                    (packedMask >> (32u - rotation)));
+            c.Raw({0x89,0xD0});
+            X86BinaryImmediate32(c, 6u, 0u, packedKey);
+            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
+                rotation, 0x25});
+            c.U32(rotatedMask);
+            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
+                rotation});
+            X86BinaryImmediate32(c, 6u, 0u, packedKey);
+            c.Raw({0x83,0xC8,0x02});
             return true;
-        case VM_UOP_FLAGS_UNPACK_AH:
+        }
+        case VM_UOP_FLAGS_UNPACK_AH: {
+            // Uniform XOR conjugation commutes with the masked bit-select:
+            // status bits come from EAX, every other bit remains from EDX.
+            const uint32_t key = CoreKey32(c, strategy + 6u);
+            X86BinaryImmediate32(c, 6u, 0u, key);
+            X86BinaryImmediate32(c, 6u, 2u, key);
             if (strategy == 0u) {
                 c.Raw({0x81,0xE2});
                 c.U32(~static_cast<uint32_t>(
                     VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
                 c.Raw({0x25,0xD5,0x00,0x00,0x00,0x09,0xC2});
             } else c.Raw({0x31,0xD0,0x25,0xD5,0x00,0x00,0x00,0x31,0xC2});
+            X86BinaryImmediate32(c, 6u, 2u, key);
             return true;
+        }
         case VM_UOP_PUSH_CONDITION:
             if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
             else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
             return true;
         case VM_UOP_SELECT:
-            if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
-            else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
+            EmitKeyedSelectCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_BRANCH_IF:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_CALL_VM:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_CALL_HOST:
             if (strategy == 0u) EmitX86CallTargetVariant(c, 0u);
             else EmitX86CallTargetVariant(c, 1u);
             return true;
         case VM_UOP_RET:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_BRIDGE_EXTENDED:
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
+            EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_INT3:
             if (strategy == 0u) c.U8(0xCC);
@@ -2061,10 +3762,46 @@ bool EmitTrackedBusinessCoreVariant(
     uint32_t& size)
 {
     const uint32_t begin = static_cast<uint32_t>(c.bytes.size());
-    if (!EmitBusinessCoreVariant(c, x64, semantic, strategy)) return false;
+    // DeriveBusinessCoreStrategy already guarantees alternating K choices
+    // while letting the build seed choose which physical strategy starts at
+    // K=0.  Re-XORing a handler-local layout bit here could cancel that
+    // alternation and make all four K entries select one fixed lowering.
+    if (!EmitBusinessCoreVariant(c, x64, semantic,
+            static_cast<uint8_t>(strategy & 1u)))
+        return false;
     if (size == 0u) {
         offset = begin;
         size = static_cast<uint32_t>(c.bytes.size()) - begin;
+    }
+    return true;
+}
+
+bool ValidateBusinessCoreStrategyReemission(
+    const VMHandlerSemanticCodegenConfig& config,
+    bool x64,
+    std::string& error)
+{
+    if (!HasBusinessCoreVariant(config.semantic)) return true;
+
+    std::array<std::vector<uint8_t>, 2> emitted{};
+    for (uint8_t strategy = 0;
+         strategy < static_cast<uint8_t>(emitted.size()); ++strategy) {
+        CodeBuffer code;
+        ConfigurePermutationPlans(code, config);
+        if (!EmitBusinessCoreVariant(code, x64, config.semantic, strategy)) {
+            error = "business core strategy could not be re-emitted";
+            return false;
+        }
+        std::string resolveError;
+        if (!code.Resolve(resolveError) || code.bytes.empty()) {
+            error = "business core strategy re-emission is empty or unresolved";
+            return false;
+        }
+        emitted[strategy] = std::move(code.bytes);
+    }
+    if (emitted[0] == emitted[1]) {
+        error = "business core strategies emitted identical bytes";
+        return false;
     }
     return true;
 }
@@ -2181,14 +3918,44 @@ void X64RequireAndPop(
     uint8_t count,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B504F50ULL, count, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X64LoadD(c, 1, CtxValueDepth);             // ecx = old depth
-    c.Raw({0x83,0xF9,count});                  // cmp ecx,count
-    c.Jcc(JccB, stackFailure);
+    c.Raw({0x48,0x8D,0x89}); c.U32(key);       // rcx = depth + K
+    // depth<count is exactly the encoded half-open interval [K,K+count).
+    // The lower check also rejects no valid depth and keeps the x86 form
+    // below correct when its 32-bit LEA wraps for a corrupt high depth.
+    c.Raw({0x48,0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedSuccess);
+    c.Raw({0x48,0x81,0xF9}); c.U32(key + count);
+    c.Jcc(JccB, encodedFailure);
+    c.Jmp(encodedSuccess);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,count});                  // restore original CMP flags
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,count});
     c.Raw({0x83,0xE9,count});                  // ecx = first popped slot
     X64StoreD(c, CtxValueDepth, 1);
-    if (count >= 1) X64LoadIndexedQ(c, 0, 1, CtxValues);
-    if (count >= 2) X64LoadIndexedQ(c, 2, 1, CtxValues + 8u);
-    if (count >= 3) X64LoadIndexedQ(c, 8, 1, CtxValues + 16u);
+    if (count >= 1) {
+        X64LoadIndexedQ(c, 0, 1, CtxValues);
+        EmitValuePermutation(c, true, 0, true);
+    }
+    if (count >= 2) {
+        X64LoadIndexedQ(c, 2, 1, CtxValues + 8u);
+        EmitValuePermutation(c, true, 2, true);
+    }
+    if (count >= 3) {
+        X64LoadIndexedQ(c, 8, 1, CtxValues + 16u);
+        EmitValuePermutation(c, true, 8, true);
+    }
 }
 
 void X64PushOne(
@@ -2196,9 +3963,29 @@ void X64PushOne(
     uint8_t source,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B505331ULL, source, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X64LoadD(c, 1, CtxValueDepth);
+    c.Raw({0x48,0x8D,0x89}); c.U32(key);
+    c.Raw({0x48,0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedFailure);
+    c.Raw({0x48,0x81,0xF9});
+    c.U32(key + VM_RUNTIME_VALUE_STACK_DEPTH);
+    c.Jcc(JccB, encodedSuccess);
+    c.Jmp(encodedFailure);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
     c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH);
-    c.Jcc(JccAE, stackFailure);
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH);
+    EmitValuePermutation(c, true, source, false);
     X64StoreIndexedQ(c, CtxValues, 1, source);
     c.Raw({0xFF,0xC1});
     X64StoreD(c, CtxValueDepth, 1);
@@ -2210,9 +3997,31 @@ void X64PushTwo(
     uint8_t second,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    const uint8_t operand = static_cast<uint8_t>((first << 4u) ^ second);
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B505332ULL, operand, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X64LoadD(c, 1, CtxValueDepth);
+    c.Raw({0x48,0x8D,0x89}); c.U32(key);
+    c.Raw({0x48,0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedFailure);
+    c.Raw({0x48,0x81,0xF9});
+    c.U32(key + VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
+    c.Jcc(JccB, encodedSuccess);
+    c.Jmp(encodedFailure);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
     c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
-    c.Jcc(JccAE, stackFailure);
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
+    EmitValuePermutation(c, true, first, false);
+    EmitValuePermutation(c, true, second, false);
     X64StoreIndexedQ(c, CtxValues, 1, first);
     X64StoreIndexedQ(c, CtxValues + 8u, 1, second);
     c.Raw({0x83,0xC1,0x02});
@@ -2224,14 +4033,41 @@ void X86RequireAndPop(
     uint8_t count,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B504F50ULL, count, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X86LoadD(c, 1, CtxValueDepth);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedSuccess);
+    c.Raw({0x81,0xF9}); c.U32(key + count);
+    c.Jcc(JccB, encodedFailure);
+    c.Jmp(encodedSuccess);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
     c.Raw({0x83,0xF9,count});
-    c.Jcc(JccB, stackFailure);
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,count});
     c.Raw({0x83,0xE9,count});
     X86StoreD(c, CtxValueDepth, 1);
-    if (count >= 1) X86LoadIndexedD(c, 0, CtxValues);
-    if (count >= 2) X86LoadIndexedD(c, 2, CtxValues + 8u);
-    if (count >= 3) X86LoadIndexedD(c, 1, CtxValues + 16u);
+    if (count >= 1) {
+        X86LoadIndexedD(c, 0, CtxValues);
+        EmitValuePermutation(c, false, 0, true);
+    }
+    if (count >= 2) {
+        X86LoadIndexedD(c, 2, CtxValues + 8u);
+        EmitValuePermutation(c, false, 2, true);
+    }
+    if (count >= 3) {
+        X86LoadIndexedD(c, 1, CtxValues + 16u);
+        EmitValuePermutation(c, false, 1, true);
+    }
 }
 
 void X86PushOne(
@@ -2239,9 +4075,29 @@ void X86PushOne(
     uint8_t source,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B505331ULL, source, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X86LoadD(c, 1, CtxValueDepth);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedFailure);
+    c.Raw({0x81,0xF9});
+    c.U32(key + VM_RUNTIME_VALUE_STACK_DEPTH);
+    c.Jcc(JccB, encodedSuccess);
+    c.Jmp(encodedFailure);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
     c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH);
-    c.Jcc(JccAE, stackFailure);
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH);
+    EmitValuePermutation(c, false, source, false);
     X86StoreIndexedD(c, CtxValues, source);
     c.Raw({0xC7,0x84,0xCF}); c.U32(CtxValues + 4u); c.U32(0);
     c.Raw({0x41});
@@ -2254,9 +4110,31 @@ void X86PushTwo(
     uint8_t second,
     CodeBuffer::Label stackFailure)
 {
+    uint32_t key = 0;
+    const uint8_t operand = static_cast<uint8_t>((first << 4u) ^ second);
+    if (!DeriveControlDispatchKey(
+            c, 0x535441434B505332ULL, operand, key)) return;
+    const auto encodedFailure = c.NewLabel();
+    const auto encodedSuccess = c.NewLabel();
     X86LoadD(c, 1, CtxValueDepth);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key);
+    c.Jcc(JccB, encodedFailure);
+    c.Raw({0x81,0xF9});
+    c.U32(key + VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
+    c.Jcc(JccB, encodedSuccess);
+    c.Jmp(encodedFailure);
+
+    c.Bind(encodedFailure);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
     c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
-    c.Jcc(JccAE, stackFailure);
+    c.Jmp(stackFailure);
+
+    c.Bind(encodedSuccess);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x81,0xF9}); c.U32(VM_RUNTIME_VALUE_STACK_DEPTH - 1u);
+    EmitValuePermutation(c, false, first, false);
+    EmitValuePermutation(c, false, second, false);
     X86StoreIndexedD(c, CtxValues, first);
     c.Raw({0xC7,0x84,0xCF}); c.U32(CtxValues + 4u); c.U32(0);
     X86StoreIndexedD(c, CtxValues + 8u, second);
@@ -2266,20 +4144,68 @@ void X86PushTwo(
 }
 
 void X64DispatchPendingWidth(CodeBuffer& c, const WidthLabels& labels) {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x50454E4457494454ULL, 0u, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreWidth1 = c.NewLabel();
+    const auto restoreWidth2 = c.NewLabel();
+    const auto restoreWidth4 = c.NewLabel();
+    const auto restoreWidth8 = c.NewLabel();
+
     X64LoadByte(c, 11, RECORD_OFFSET(CtxPendingFlags, width));
-    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x41,0x83,0xFB,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x41,0x83,0xFB,0x04}); c.Jcc(JccE, labels.width4);
-    c.Raw({0x41,0x83,0xFB,0x08}); c.Jcc(JccE, labels.width8);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(key);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 1u); c.Jcc(JccE, restoreWidth1);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 2u); c.Jcc(JccE, restoreWidth2);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 4u); c.Jcc(JccE, restoreWidth4);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 8u); c.Jcc(JccE, restoreWidth8);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
+    c.Raw({0x49,0x83,0xFB,0x08});
     c.Jmp(labels.invalid);
+
+    const auto restore = [&](CodeBuffer::Label local,
+                             CodeBuffer::Label destination) {
+        c.Bind(local);
+        c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
+        c.Jmp(destination);
+    };
+    restore(restoreWidth1, labels.width1);
+    restore(restoreWidth2, labels.width2);
+    restore(restoreWidth4, labels.width4);
+    restore(restoreWidth8, labels.width8);
 }
 
 void X86DispatchPendingWidth(CodeBuffer& c, const WidthLabels& labels) {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x50454E4457494454ULL, 0u, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreWidth1 = c.NewLabel();
+    const auto restoreWidth2 = c.NewLabel();
+    const auto restoreWidth4 = c.NewLabel();
+
     X86LoadByte(c, 1, RECORD_OFFSET(CtxPendingFlags, width));
-    c.Raw({0x83,0xF9,0x01}); c.Jcc(JccE, labels.width1);
-    c.Raw({0x83,0xF9,0x02}); c.Jcc(JccE, labels.width2);
-    c.Raw({0x83,0xF9,0x04}); c.Jcc(JccE, labels.width4);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key + 1u); c.Jcc(JccE, restoreWidth1);
+    c.Raw({0x81,0xF9}); c.U32(key + 2u); c.Jcc(JccE, restoreWidth2);
+    c.Raw({0x81,0xF9}); c.U32(key + 4u); c.Jcc(JccE, restoreWidth4);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,0x04});
     c.Jmp(labels.invalid);
+
+    const auto restore = [&](CodeBuffer::Label local,
+                             CodeBuffer::Label destination) {
+        c.Bind(local);
+        c.Raw({0x8D,0x89}); c.U32(0u - key);
+        c.Jmp(destination);
+    };
+    restore(restoreWidth1, labels.width1);
+    restore(restoreWidth2, labels.width2);
+    restore(restoreWidth4, labels.width4);
 }
 
 void X64MaskForWidthInR11(CodeBuffer& c) {
@@ -2482,13 +4408,24 @@ void X64EvaluateCondition(
     uint8_t operand,
     CodeBuffer::Label invalid)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x434F4E4444495350ULL, operand, key)) return;
     std::array<CodeBuffer::Label, VM_CONDITION_G + 1u> cases{};
     for (auto& label : cases) label = c.NewLabel();
     const auto done = c.NewLabel();
     X64LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
+    // Keep dispatch on the live condition value while making every compared
+    // representation handler-seed dependent.  LEA is flag-neutral, and a
+    // successful equality CMP publishes the same flags as the raw comparison.
+    c.Raw({0x48,0x8D,0x89}); c.U32(key);
     for (uint8_t condition = VM_CONDITION_ALWAYS; condition <= VM_CONDITION_G; ++condition) {
-        c.Raw({0x83,0xF9,condition}); c.Jcc(JccE, cases[condition]);
+        c.Raw({0x48,0x81,0xF9}); c.U32(key + condition);
+        c.Jcc(JccE, cases[condition]);
     }
+    // Preserve the original invalid-path register and final-CMP flag state.
+    c.Raw({0x48,0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,VM_CONDITION_G});
     c.Jmp(invalid);
 
     c.Bind(cases[VM_CONDITION_ALWAYS]);
@@ -2540,13 +4477,20 @@ void X86EvaluateCondition(
     uint8_t operand,
     CodeBuffer::Label invalid)
 {
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x434F4E4444495350ULL, operand, key)) return;
     std::array<CodeBuffer::Label, VM_CONDITION_G + 1u> cases{};
     for (auto& label : cases) label = c.NewLabel();
     const auto done = c.NewLabel();
     X86LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
+    c.Raw({0x8D,0x89}); c.U32(key);
     for (uint8_t condition = VM_CONDITION_ALWAYS; condition <= VM_CONDITION_G; ++condition) {
-        c.Raw({0x83,0xF9,condition}); c.Jcc(JccE, cases[condition]);
+        c.Raw({0x81,0xF9}); c.U32(key + condition);
+        c.Jcc(JccE, cases[condition]);
     }
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,VM_CONDITION_G});
     c.Jmp(invalid);
     c.Bind(cases[VM_CONDITION_ALWAYS]);
     c.Raw({0xB8,0x01,0x00,0x00,0x00}); c.Jmp(done);
@@ -2596,13 +4540,26 @@ void X64ValidateWidth(
     uint8_t operand,
     CodeBuffer::Label invalid)
 {
-    const auto valid = c.NewLabel();
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x574944544856414CULL, operand, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreValid = c.NewLabel();
+
     X64LoadByte(c, 11, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, valid);
-    c.Raw({0x41,0x83,0xFB,0x02}); c.Jcc(JccE, valid);
-    c.Raw({0x41,0x83,0xFB,0x04}); c.Jcc(JccE, valid);
-    c.Raw({0x41,0x83,0xFB,0x08}); c.Jcc(JccNE, invalid);
-    c.Bind(valid);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(key);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 1u); c.Jcc(JccE, restoreValid);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 2u); c.Jcc(JccE, restoreValid);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 4u); c.Jcc(JccE, restoreValid);
+    c.Raw({0x49,0x81,0xFB}); c.U32(key + 8u); c.Jcc(JccE, restoreValid);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
+    c.Raw({0x49,0x83,0xFB,0x08});
+    c.Jmp(invalid);
+
+    c.Bind(restoreValid);
+    c.Raw({0x4D,0x8D,0x9B}); c.U32(0u - key);
 }
 
 void X86ValidateWidth(
@@ -2610,12 +4567,25 @@ void X86ValidateWidth(
     uint8_t operand,
     CodeBuffer::Label invalid)
 {
-    const auto valid = c.NewLabel();
+    uint32_t key = 0;
+    if (!DeriveControlDispatchKey(
+            c, 0x574944544856414CULL, operand, key)) return;
+    const auto restoreInvalid = c.NewLabel();
+    const auto restoreValid = c.NewLabel();
+
     X86LoadByte(c, 1, CtxDecodedOperands + static_cast<uint32_t>(operand) * 8u);
-    c.Raw({0x83,0xF9,0x01}); c.Jcc(JccE, valid);
-    c.Raw({0x83,0xF9,0x02}); c.Jcc(JccE, valid);
-    c.Raw({0x83,0xF9,0x04}); c.Jcc(JccNE, invalid);
-    c.Bind(valid);
+    c.Raw({0x8D,0x89}); c.U32(key);
+    c.Raw({0x81,0xF9}); c.U32(key + 1u); c.Jcc(JccE, restoreValid);
+    c.Raw({0x81,0xF9}); c.U32(key + 2u); c.Jcc(JccE, restoreValid);
+    c.Raw({0x81,0xF9}); c.U32(key + 4u); c.Jcc(JccE, restoreValid);
+
+    c.Bind(restoreInvalid);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
+    c.Raw({0x83,0xF9,0x04});
+    c.Jmp(invalid);
+
+    c.Bind(restoreValid);
+    c.Raw({0x8D,0x89}); c.U32(0u - key);
 }
 
 void X64CopyRecord(CodeBuffer& c, uint32_t destination, uint32_t source) {
@@ -2991,7 +4961,8 @@ void EmitX64DataSemantic(
         case VM_UOP_DROP:
             X64RequireAndPop(c, 1, stackFailure);
             EmitTrackedBusinessCoreVariant(c, true, semantic, coreStrategy,
-                coreVariantOffset, coreVariantSize); return;
+                coreVariantOffset, coreVariantSize);
+            return;
         case VM_UOP_LOAD:
             X64RequireAndPop(c, 1, stackFailure); X64ValidateWidth(c, 0, widthFailure);
             c.Raw({0x48,0x85,0xC0}); c.Jcc(JccE, rangeFailure);
@@ -3105,7 +5076,8 @@ void EmitX86DataSemantic(
         case VM_UOP_DROP:
             X86RequireAndPop(c, 1, stackFailure);
             EmitTrackedBusinessCoreVariant(c, false, semantic, coreStrategy,
-                coreVariantOffset, coreVariantSize); return;
+                coreVariantOffset, coreVariantSize);
+            return;
         case VM_UOP_LOAD:
             X86RequireAndPop(c, 1, stackFailure); X86ValidateWidth(c, 0, widthFailure);
             c.Raw({0x85,0xC0}); c.Jcc(JccE, rangeFailure);
@@ -4638,28 +6610,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     }
 
     CodeBuffer code;
-    SeedStream random(config.buildSeed,
-        0x53454D414E544943ULL ^ (static_cast<uint64_t>(config.semantic) << 16u) ^
-        (static_cast<uint64_t>(config.variant) << 40u) ^ config.architecture);
+    ConfigurePermutationPlans(code, config);
     result.registerAssignment = DeriveVariantRegisters(
         x64, config.variant, config.semantic, config.buildSeed);
     result.variantPrefixOffset = static_cast<uint32_t>(code.bytes.size());
-    EmitExecutableSeedJunk(code, x64, result.registerAssignment, random,
-        x64 ? 96u : 192u);
-    EmitLiveIdentityMBA(code, x64, config.variant,
-        result.registerAssignment, random);
-    const auto impossibleOpaqueBranch = code.NewLabel();
-    const auto afterOpaquePredicate = code.NewLabel();
-    result.opaquePredicateOffset = static_cast<uint32_t>(code.bytes.size());
-    EmitOpaqueEvenProductPredicate(code, x64, result.registerAssignment,
-        impossibleOpaqueBranch);
-    code.Jmp(afterOpaquePredicate);
-    code.Bind(impossibleOpaqueBranch);
-    if (x64) EmitX64Failure(code, VM_MICRO_ERR_HANDLER_BUG);
-    else EmitX86Failure(code, VM_MICRO_ERR_HANDLER_BUG);
-    code.Bind(afterOpaquePredicate);
-    result.opaquePredicateSize = static_cast<uint32_t>(code.bytes.size()) -
-        result.opaquePredicateOffset;
     result.variantPrefixSize = static_cast<uint32_t>(code.bytes.size()) -
         result.variantPrefixOffset;
     result.semanticBodyOffset = static_cast<uint32_t>(code.bytes.size());
@@ -4670,10 +6624,6 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const auto divideFailure = code.NewLabel();
     const auto success = code.NewLabel();
 
-    const SemanticPathSpec inputPath = SemanticInputPath(
-        *descriptor, config.semantic);
-    const SemanticPathSpec outputPath = SemanticResultPath(
-        *descriptor, config.semantic);
     const SemanticMutationPlan inputPlan = DeriveSemanticMutationPlan(
         config, 0x494E505554504154ULL);
     const SemanticMutationPlan outputPlan = DeriveSemanticMutationPlan(
@@ -4681,15 +6631,7 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     result.semanticInputStrategy = inputPlan.strategy;
     result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
     result.semanticResultStrategy = outputPlan.strategy;
-    EmitSemanticInputPreparation(code, x64, inputPath,
-        result.registerAssignment,
-        descriptor->stackPops > 0
-            ? static_cast<uint8_t>(descriptor->stackPops)
-            : 0u,
-        stackFailure, rangeFailure);
     result.semanticInputPathOffset = static_cast<uint32_t>(code.bytes.size());
-    EmitSemanticIdentityPath(code, x64, inputPath,
-        result.registerAssignment, inputPlan, true);
     result.semanticInputPathSize = static_cast<uint32_t>(code.bytes.size()) -
         result.semanticInputPathOffset;
     result.semanticCoreOffset = static_cast<uint32_t>(code.bytes.size());
@@ -4888,17 +6830,11 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     result.semanticCoreSize = static_cast<uint32_t>(code.bytes.size()) -
         result.semanticCoreOffset;
     result.semanticResultPathOffset = static_cast<uint32_t>(code.bytes.size());
-    EmitSemanticIdentityPath(code, x64, outputPath,
-        result.registerAssignment, outputPlan, false);
     result.semanticResultPathSize = static_cast<uint32_t>(code.bytes.size()) -
         result.semanticResultPathOffset;
     result.semanticBodySize = static_cast<uint32_t>(code.bytes.size()) -
         result.semanticBodyOffset;
     result.variantSuffixOffset = static_cast<uint32_t>(code.bytes.size());
-    EmitExecutableSeedJunk(code, x64, result.registerAssignment, random,
-        x64 ? 96u : 192u);
-    EmitLiveIdentityMBA(code, x64, static_cast<uint8_t>(config.variant + 1u),
-        result.registerAssignment, random);
     result.variantSuffixSize = static_cast<uint32_t>(code.bytes.size()) -
         result.variantSuffixOffset;
     code.Jmp(success);
@@ -4939,6 +6875,9 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     result.stackPushes = descriptor->stackPushes;
     result.decodedOperandCount = descriptor->operandCount;
     result.stackFunclets = std::move(code.stackFunclets);
+    result.valueCodecRanges.reserve(code.valueCodecRanges.size());
+    for (const auto& range : code.valueCodecRanges)
+        result.valueCodecRanges.push_back({range.first, range.second});
     result.code = std::move(code.bytes);
     result.semanticComplete = !result.code.empty();
     result.success = result.semanticComplete;
@@ -4985,10 +6924,11 @@ bool ValidateVMHandlerSemanticVariantKernel(
             result.semanticBodyOffset ||
         result.semanticBodyOffset + result.semanticBodySize !=
             result.variantSuffixOffset ||
-        result.variantPrefixSize < 1024u || result.variantSuffixSize < 1024u ||
-        result.semanticBodySize == 0 || result.semanticInputPathSize == 0 ||
-        result.semanticCoreSize == 0 || result.semanticResultPathSize == 0 ||
-        result.opaquePredicateSize < 16u) {
+        result.variantPrefixSize != 0u || result.variantSuffixSize != 0u ||
+        result.semanticInputPathSize != 0u ||
+        result.semanticResultPathSize != 0u ||
+        result.opaquePredicateSize != 0u ||
+        result.semanticBodySize == 0 || result.semanticCoreSize == 0) {
         error = "variant executable ranges are missing, overlapping, or too small";
         return false;
     }
@@ -4998,12 +6938,13 @@ bool ValidateVMHandlerSemanticVariantKernel(
             result.semanticCoreOffset, result.semanticCoreSize) ||
         !rangeInside(result.semanticBodyOffset, result.semanticBodySize,
             result.semanticResultPathOffset, result.semanticResultPathSize) ||
-        result.semanticInputPathOffset + result.semanticInputPathSize !=
-            result.semanticCoreOffset ||
+        result.semanticInputPathOffset != result.semanticCoreOffset ||
         result.semanticCoreOffset + result.semanticCoreSize !=
             result.semanticResultPathOffset ||
-        result.semanticResultPathOffset + result.semanticResultPathSize !=
-            result.semanticBodyOffset + result.semanticBodySize) {
+        result.semanticResultPathOffset !=
+            result.semanticBodyOffset + result.semanticBodySize ||
+        result.semanticBodyOffset != result.semanticCoreOffset ||
+        result.semanticBodySize != result.semanticCoreSize) {
         error = "semantic input/core/result evidence is outside semanticBody";
         return false;
     }
@@ -5137,25 +7078,9 @@ bool ValidateVMHandlerSemanticVariantKernel(
             std::equal(expected.begin(), expected.end(),
                 result.code.begin() + offset);
     };
-    CodeBuffer expectedInput;
-    EmitSemanticIdentityPath(expectedInput, x64,
-        SemanticInputPath(*descriptor, config.semantic), expectedRegisters,
-        expectedInputPlan, true);
-    if (!rangeEquals(result.semanticInputPathOffset,
-            result.semanticInputPathSize, expectedInput.bytes)) {
-        error = "semanticBody input path lacks seed-derived live operand evidence";
+    if (!ValidateBusinessCoreStrategyReemission(config, x64, error)) {
         return false;
     }
-    CodeBuffer expectedOutput;
-    EmitSemanticIdentityPath(expectedOutput, x64,
-        SemanticResultPath(*descriptor, config.semantic), expectedRegisters,
-        expectedOutputPlan, false);
-    if (!rangeEquals(result.semanticResultPathOffset,
-            result.semanticResultPathSize, expectedOutput.bytes)) {
-        error = "semanticBody result path lacks seed-derived live result evidence";
-        return false;
-    }
-
     if (HasBusinessCoreVariant(config.semantic)) {
         if (!rangeValid(result.semanticCoreVariantOffset,
                 result.semanticCoreVariantSize) ||
@@ -5166,13 +7091,19 @@ bool ValidateVMHandlerSemanticVariantKernel(
             return false;
         }
         CodeBuffer expectedCoreVariant;
-        if (!EmitBusinessCoreVariant(expectedCoreVariant, x64,
-                config.semantic, expectedCoreStrategy)) {
+        ConfigurePermutationPlans(expectedCoreVariant, config);
+        uint32_t expectedOffset = 0;
+        uint32_t expectedSize = 0;
+        if (!EmitTrackedBusinessCoreVariant(expectedCoreVariant, x64,
+                config.semantic, expectedCoreStrategy,
+                expectedOffset, expectedSize)) {
             error = "business core variant could not be re-emitted";
             return false;
         }
         std::string coreResolveError;
         if (!expectedCoreVariant.Resolve(coreResolveError) ||
+            expectedOffset != 0u ||
+            expectedSize != expectedCoreVariant.bytes.size() ||
             !rangeEquals(result.semanticCoreVariantOffset,
                 result.semanticCoreVariantSize,
                 expectedCoreVariant.bytes)) {
@@ -5192,55 +7123,152 @@ bool ValidateVMHandlerSemanticVariantKernel(
         const auto end = begin + size;
         return std::search(begin, end, needle.begin(), needle.end()) != end;
     };
-    const auto append32 = [](std::vector<uint8_t>& bytes, uint32_t value) {
-        for (unsigned index = 0; index < 4u; ++index)
-            bytes.push_back(static_cast<uint8_t>(value >> (index * 8u)));
+    const KeyedPermutationPlan valuePlan = DerivePermutationPlan(config,
+        0x56414C5545434F44ULL, static_cast<uint8_t>(kValueCodecRoundCount), 4u);
+    const KeyedPermutationPlan corePlan = DerivePermutationPlan(config,
+        0x434F524553454C45ULL ^
+            (static_cast<uint64_t>(config.semantic) << 13u) ^
+            (static_cast<uint64_t>(config.variant) << 41u),
+        static_cast<uint8_t>(kCoreSelectorRoundCount), 8u);
+    const auto validatePlan = [&](const KeyedPermutationPlan& plan,
+                                  uint8_t expectedRounds,
+                                  uint8_t expectedFamilies,
+                                  const char* name) {
+        if (plan.roundCount != expectedRounds) {
+            error = std::string(name) + " has the wrong fixed round budget";
+            return false;
+        }
+        std::array<uint8_t, 8> families{};
+        for (uint8_t index = 0; index < plan.roundCount; ++index) {
+            const auto& round = plan.rounds[index];
+            const uint8_t family = static_cast<uint8_t>(round.op);
+            if (family >= families.size()) {
+                error = std::string(name) + " has an invalid permutation op";
+                return false;
+            }
+            ++families[family];
+            if ((round.op == KeyedPermutationOp::Xor ||
+                 round.op == KeyedPermutationOp::Add) && round.key == 0u) {
+                error = std::string(name) + " contains a zero key";
+                return false;
+            }
+            if (round.op == KeyedPermutationOp::Multiply &&
+                (((round.key & 1u) == 0u) || round.key == 1u ||
+                 round.key * round.inverse != 1u)) {
+                if (!x64 && static_cast<uint32_t>(round.key) *
+                        static_cast<uint32_t>(round.inverse) == 1u) {
+                    continue;
+                }
+                error = std::string(name) +
+                    " contains a degenerate multiplier or wrong inverse";
+                return false;
+            }
+            const uint8_t width = x64 ? 64u : 32u;
+            if (round.op == KeyedPermutationOp::Rotate &&
+                (round.rotate == 0u || round.rotate >= width)) {
+                error = std::string(name) + " has a degenerate rotation";
+                return false;
+            }
+        }
+        if (std::any_of(families.begin(),
+                families.begin() + expectedFamilies,
+                [](uint8_t count) { return count == 0u; }) ||
+            std::any_of(families.begin() + expectedFamilies,
+                families.end(), [](uint8_t count) { return count != 0u; })) {
+            error = std::string(name) + " omits a required permutation family";
+            return false;
+        }
+        return true;
     };
-    std::vector<uint8_t> load;
-    std::vector<uint8_t> store;
-    const uint8_t evidenceRegister = result.registerAssignment[0];
-    if (x64) {
-        const uint8_t rex = static_cast<uint8_t>(0x49u |
-            ((evidenceRegister & 8u) ? 4u : 0u));
-        load = {rex, 0x8B, static_cast<uint8_t>(0x87u |
-            ((evidenceRegister & 7u) << 3u))};
-        store = {rex, 0x89, static_cast<uint8_t>(0x87u |
-            ((evidenceRegister & 7u) << 3u))};
-    } else {
-        load = {0x8B, static_cast<uint8_t>(0x87u |
-            ((evidenceRegister & 7u) << 3u))};
-        store = {0x89, static_cast<uint8_t>(0x87u |
-            ((evidenceRegister & 7u) << 3u))};
-    }
-    append32(load, CtxMutationScratch);
-    append32(store, CtxMutationScratch);
-    if (!contains(result.variantPrefixOffset, result.variantPrefixSize, load) ||
-        !contains(result.variantPrefixOffset, result.variantPrefixSize, store) ||
-        !contains(result.variantSuffixOffset, result.variantSuffixSize, load) ||
-        !contains(result.variantSuffixOffset, result.variantSuffixSize, store)) {
-        error = "published register allocation is absent from live mutation bytes";
+    if (!validatePlan(valuePlan, static_cast<uint8_t>(kValueCodecRoundCount),
+            4u, "value codec") ||
+        !validatePlan(corePlan, static_cast<uint8_t>(kCoreSelectorRoundCount),
+            8u, "core selector")) {
         return false;
     }
-    for (uint8_t reg : result.registerAssignment) {
-        const std::vector<uint8_t> moveImmediate = x64
-            ? std::vector<uint8_t>{static_cast<uint8_t>(0x48u |
-                  ((reg & 8u) ? 1u : 0u)),
-                  static_cast<uint8_t>(0xB8u + (reg & 7u))}
-            : std::vector<uint8_t>{static_cast<uint8_t>(0xB8u + reg)};
-        if (!contains(result.variantPrefixOffset, result.variantPrefixSize,
-                moveImmediate) ||
-            !contains(result.variantSuffixOffset, result.variantSuffixSize,
-                moveImmediate)) {
-            error = "one published register is not encoded in both live variant regions";
+
+    const auto applyRound = [&](uint64_t value,
+                                const KeyedPermutationRound& round,
+                                bool inverse) {
+        const uint8_t width = x64 ? 64u : 32u;
+        const uint64_t mask = x64 ? ~uint64_t{0} : 0xFFFFFFFFu;
+        value &= mask;
+        switch (round.op) {
+            case KeyedPermutationOp::Xor:
+                value ^= round.key;
+                break;
+            case KeyedPermutationOp::Add:
+                value = inverse ? value - round.key : value + round.key;
+                break;
+            case KeyedPermutationOp::Rotate: {
+                const uint8_t rotate = inverse
+                    ? static_cast<uint8_t>(width - round.rotate)
+                    : round.rotate;
+                value = ((value << rotate) |
+                    (value >> (width - rotate))) & mask;
+                break;
+            }
+            case KeyedPermutationOp::Multiply:
+                value *= inverse ? round.inverse : round.key;
+                break;
+        }
+        return value & mask;
+    };
+    constexpr std::array<uint64_t, 6> oracleValues = {
+        0u, 1u, ~uint64_t{0}, 0x8000000000000000ULL,
+        0x0123456789ABCDEFULL, 0xA5A5A5A55A5A5A5AULL
+    };
+    for (uint64_t original : oracleValues) {
+        if (!x64) original = static_cast<uint32_t>(original);
+        uint64_t value = original;
+        for (uint8_t index = 0; index < valuePlan.roundCount; ++index)
+            value = applyRound(value, valuePlan.rounds[index], false);
+        for (uint8_t index = valuePlan.roundCount; index != 0u; --index)
+            value = applyRound(value, valuePlan.rounds[index - 1u], true);
+        if (value != original) {
+            error = "value codec failed the independent inverse oracle";
             return false;
         }
     }
-    if (!contains(result.opaquePredicateOffset, result.opaquePredicateSize,
-            {0x0F, 0xAF}) ||
-        !contains(result.opaquePredicateOffset, result.opaquePredicateSize,
-            {0x0F, JccNE})) {
-        error = "opaque predicate lacks executable IMUL/JNE evidence";
+
+    const size_t expectedCodecRanges =
+        static_cast<size_t>(std::max<int>(0, descriptor->stackPops)) +
+        static_cast<size_t>(std::max<int>(0, descriptor->stackPushes));
+    if (result.valueCodecRanges.size() != expectedCodecRanges) {
+        error = "value codec ranges do not cover every stack pop/push";
         return false;
+    }
+    uint32_t previousCodecEnd = result.semanticCoreOffset;
+    for (const auto& range : result.valueCodecRanges) {
+        if (range.size < 32u || !rangeValid(range.offset, range.size) ||
+            !rangeInside(result.semanticCoreOffset, result.semanticCoreSize,
+                range.offset, range.size) ||
+            range.offset < previousCodecEnd) {
+            error = "value codec range is invalid, reordered, or outside core";
+            return false;
+        }
+        previousCodecEnd = range.offset + range.size;
+        bool matched = false;
+        const std::array<uint8_t, 3> registers = x64
+            ? std::array<uint8_t, 3>{0u, 2u, 8u}
+            : std::array<uint8_t, 3>{0u, 1u, 2u};
+        for (uint8_t reg : registers) {
+            for (bool inverse : {false, true}) {
+                CodeBuffer expectedCodec;
+                ConfigurePermutationPlans(expectedCodec, config);
+                EmitValuePermutation(expectedCodec, x64, reg, inverse);
+                if (rangeEquals(range.offset, range.size,
+                        expectedCodec.bytes)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) break;
+        }
+        if (!matched) {
+            error = "value codec range disagrees with the build-wide plan";
+            return false;
+        }
     }
 
     const uint32_t failureRotation = config.variant % 5u;

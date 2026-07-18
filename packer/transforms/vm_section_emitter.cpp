@@ -34,7 +34,8 @@ constexpr uint32_t kKnownHeaderFlags = VM_METADATA_FLAG_AUTHENTICATED |
     VM_METADATA_FLAG_LAZY_FLAGS |
     VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
     VM_METADATA_FLAG_DIRECT_THREADED |
-    VM_METADATA_FLAG_HANDLER_ENCRYPTED;
+    VM_METADATA_FLAG_HANDLER_ENCRYPTED |
+    VM_METADATA_FLAG_RUNTIME_TRACE;
 constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
     VM_RECORD_FLAG_UNWIND_VERIFIED |
@@ -499,6 +500,60 @@ VMEmitResult VMSectionEmitter::Emit(
     return result;
 }
 
+VMTraceEmitResult VMSectionEmitter::EmitTrace(
+    CS_PE_IMAGE* image,
+    const std::array<uint8_t, 16>& buildId,
+    uint32_t architecture,
+    uint32_t groupId,
+    uint32_t capacity,
+    const char sectionName[8])
+{
+    VMTraceEmitResult result{};
+    if (!image || !image->isValid || !image->rawData ||
+        (architecture != VM_ARCH_X86 && architecture != VM_ARCH_X64) ||
+        groupId >= 64u || capacity == 0 || capacity > VM_TRACE_MAX_CAPACITY) {
+        result.error = "VM_TRACE: invalid image or trace binding";
+        return result;
+    }
+    const uint64_t byteCount = sizeof(VM_TRACE_HEADER) +
+        static_cast<uint64_t>(capacity) * sizeof(VM_TRACE_EVENT);
+    if (byteCount > (std::numeric_limits<uint32_t>::max)()) {
+        result.error = "VM_TRACE: trace section exceeds uint32 range";
+        return result;
+    }
+    std::vector<uint8_t> section(static_cast<size_t>(byteCount), 0);
+    VM_TRACE_HEADER header{};
+    header.magic = VM_TRACE_MAGIC;
+    header.version = VM_TRACE_VERSION;
+    header.headerSize = sizeof(VM_TRACE_HEADER);
+    header.eventSize = sizeof(VM_TRACE_EVENT);
+    header.capacity = capacity;
+    header.architecture = architecture;
+    header.groupId = groupId;
+    std::copy(buildId.begin(), buildId.end(), std::begin(header.buildId));
+    std::memcpy(section.data(), &header, sizeof(header));
+
+    char name[8] = {'.', 'c', 's', 't', 'r', 'c', 0, 0};
+    if (sectionName) std::memcpy(name, sectionName, sizeof(name));
+    PEEmitter emitter(image);
+    auto appended = emitter.AppendSection(name, section,
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+        IMAGE_SCN_MEM_WRITE);
+    if (!appended.success) {
+        result.error = "VM_TRACE: " + appended.error;
+        return result;
+    }
+    result.success = true;
+    result.sectionRVA = appended.rva;
+    result.sectionRawOffset = appended.rawOffset;
+    result.sectionSize = static_cast<uint32_t>(byteCount);
+    result.capacity = capacity;
+    result.groupId = groupId;
+    result.architecture = architecture;
+    result.buildId = buildId;
+    return result;
+}
+
 bool VMSectionEmitter::VerifyMetadata(
     const uint8_t* metadata,
     size_t availableSize,
@@ -559,7 +614,19 @@ bool VMSectionEmitter::VerifyMetadata(
             (header.runtimeBaseRVA >= header.imageSize ||
              header.runtimeSize > header.imageSize - header.runtimeBaseRVA ||
              header.runtimeEntryRVA < header.runtimeBaseRVA ||
-             header.runtimeEntryRVA - header.runtimeBaseRVA >= header.runtimeSize))) {
+             header.runtimeEntryRVA - header.runtimeBaseRVA >= header.runtimeSize)) ||
+        (((header.flags & VM_METADATA_FLAG_RUNTIME_TRACE) == 0) &&
+            (header.traceRVA != 0 || header.traceCapacity != 0 ||
+             header.traceGroup != 0)) ||
+        (((header.flags & VM_METADATA_FLAG_RUNTIME_TRACE) != 0) &&
+            (header.traceRVA == 0 || header.traceRVA >= header.imageSize ||
+             header.traceCapacity == 0 ||
+             header.traceCapacity > VM_TRACE_MAX_CAPACITY ||
+             header.traceGroup >= 64u ||
+             sizeof(VM_TRACE_HEADER) +
+                 static_cast<uint64_t>(header.traceCapacity) *
+                     sizeof(VM_TRACE_EVENT) >
+                 static_cast<uint64_t>(header.imageSize - header.traceRVA)))) {
         error = "metadata range validation failed";
         return false;
     }
@@ -673,7 +740,10 @@ bool VMSectionEmitter::PatchLinkage(
     const std::vector<VMTrampolineRecord>& trampolines,
     const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
     uint32_t verifiedFlags,
-    std::string* error)
+    std::string* error,
+    uint32_t traceRVA,
+    uint32_t traceCapacity,
+    uint32_t traceGroup)
 {
     PEEmitter emitter(image);
     if (!emitter.IsValid()) {
@@ -716,6 +786,78 @@ bool VMSectionEmitter::PatchLinkage(
         ? image->ntHeaders64->OptionalHeader.SizeOfImage
         : image->ntHeaders32->OptionalHeader.SizeOfImage;
     mutableHeader->flags |= verifiedFlags;
+    if (traceRVA != 0 || traceCapacity != 0 || traceGroup != 0) {
+        if (traceRVA == 0 || traceCapacity == 0 ||
+            traceCapacity > VM_TRACE_MAX_CAPACITY || traceGroup >= 64u ||
+            traceRVA >= mutableHeader->imageSize ||
+            sizeof(VM_TRACE_HEADER) +
+                static_cast<uint64_t>(traceCapacity) * sizeof(VM_TRACE_EVENT) >
+                static_cast<uint64_t>(mutableHeader->imageSize - traceRVA)) {
+            if (error) *error = "trace linkage is outside the final image";
+            return false;
+        }
+        const uint64_t traceBytes = sizeof(VM_TRACE_HEADER) +
+            static_cast<uint64_t>(traceCapacity) * sizeof(VM_TRACE_EVENT);
+        const IMAGE_SECTION_HEADER* traceSection = nullptr;
+        for (uint16_t index = 0; index < image->numSections; ++index) {
+            const auto& candidate = image->sections[index];
+            if (candidate.VirtualAddress == traceRVA) {
+                if (traceSection != nullptr) {
+                    if (error) *error = "trace RVA aliases multiple sections";
+                    return false;
+                }
+                traceSection = &candidate;
+            }
+        }
+        constexpr uint32_t forbiddenTraceCharacteristics =
+            IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE |
+            IMAGE_SCN_MEM_DISCARDABLE;
+        if (traceSection == nullptr ||
+            traceSection->Misc.VirtualSize != traceBytes ||
+            traceSection->SizeOfRawData < traceBytes ||
+            traceSection->PointerToRawData == 0 ||
+            traceSection->PointerToRawData > image->rawSize ||
+            traceBytes > image->rawSize - traceSection->PointerToRawData ||
+            (traceSection->Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+            (traceSection->Characteristics & IMAGE_SCN_MEM_WRITE) == 0 ||
+            (traceSection->Characteristics & forbiddenTraceCharacteristics) != 0) {
+            if (error) *error =
+                "trace storage is not one independent file-backed RW/NX section";
+            return false;
+        }
+        const uint32_t traceOffset = emitter.RvaToOffset(traceRVA);
+        if (traceOffset != traceSection->PointerToRawData ||
+            image->rawSize < sizeof(VM_TRACE_HEADER) ||
+            traceOffset > image->rawSize - sizeof(VM_TRACE_HEADER)) {
+            if (error) *error = "trace header RVA/raw mapping is invalid";
+            return false;
+        }
+        VM_TRACE_HEADER trace{};
+        std::memcpy(&trace, image->rawData + traceOffset, sizeof(trace));
+        if (trace.magic != VM_TRACE_MAGIC ||
+            trace.version != VM_TRACE_VERSION ||
+            trace.headerSize != sizeof(VM_TRACE_HEADER) ||
+            trace.eventSize != sizeof(VM_TRACE_EVENT) ||
+            trace.capacity != traceCapacity || trace.nextSequence != 0 ||
+            trace.committedCount != 0 || trace.overflow != 0 ||
+            trace.architecture != mutableHeader->architecture ||
+            trace.groupId != traceGroup || trace.reserved[0] != 0 ||
+            trace.reserved[1] != 0 ||
+            std::memcmp(trace.buildId, mutableHeader->buildId,
+                sizeof(trace.buildId)) != 0) {
+            if (error) *error = "trace header does not match authenticated metadata";
+            return false;
+        }
+        mutableHeader->traceRVA = traceRVA;
+        mutableHeader->traceCapacity = traceCapacity;
+        mutableHeader->traceGroup = traceGroup;
+        mutableHeader->flags |= VM_METADATA_FLAG_RUNTIME_TRACE;
+    } else {
+        mutableHeader->traceRVA = 0;
+        mutableHeader->traceCapacity = 0;
+        mutableHeader->traceGroup = 0;
+        mutableHeader->flags &= ~VM_METADATA_FLAG_RUNTIME_TRACE;
+    }
 
     std::unordered_map<uint32_t, VMTrampolineRecord> byFunction;
     for (const auto& trampoline : trampolines) byFunction[trampoline.functionRVA] = trampoline;

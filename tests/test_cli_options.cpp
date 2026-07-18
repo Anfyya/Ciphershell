@@ -33,6 +33,13 @@ int main() {
             "valid arguments must parse")) return 1;
     if (!Expect(options.inputFile == "input.exe" && options.protectionLevel == 4 && options.verbose,
             "parsed values must match")) return 1;
+    if (!Expect(Parse({"ciphershell", "input.exe", "--vm-handler-evidence",
+                "handlers.bin"}, options, error) &&
+            options.vmHandlerEvidenceFile == "handlers.bin",
+            "VM handler evidence path must parse")) return 1;
+    if (!Expect(!Parse({"ciphershell", "input.exe", "--vm-handler-evidence"},
+                options, error),
+            "missing VM handler evidence path must fail")) return 1;
 
     if (!Expect(!Parse({"ciphershell", "input.exe", "-l", "abc"}, options, error),
             "non-numeric protection level must fail")) return 1;

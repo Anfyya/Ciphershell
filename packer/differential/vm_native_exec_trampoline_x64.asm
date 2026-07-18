@@ -94,7 +94,11 @@ VMNativeExecTrampolineInvoke:
     mov r13, [rcx + 13*8]
     mov r14, [rcx + 14*8]
     mov r15, [rcx + 15*8]
+    ; state.gpr[4] is the architectural RSP observed at function entry.
+    ; CALL itself pushes an 8-byte return address, so invoke from S+8 to make
+    ; the callee enter at exactly S (the same value used by the VM half).
     mov rsp, [rcx + 4*8]
+    lea rsp, [rsp+8]
     mov rcx, [rcx + 1*8]
 
     call qword [g_entry_point]
@@ -115,10 +119,12 @@ VMNativeExecTrampolineInvoke:
     mov [g_out_r14], r14
     mov [g_out_r15], r15
     mov [g_out_rsp], rsp
-    pushfq
     mov [g_out_rax], rax
-    pop rax
-    mov [g_out_rflags], rax
+    ; Capture flags on the harness stack.  This keeps the synthetic CALL
+    ; return slot and any caller stack arguments free of PUSHFQ scratch.
+    mov rsp, [g_harness_rsp]
+    pushfq
+    pop qword [g_out_rflags]
     ; The Win64 ABI requires DF=0 on entry/exit of every function, but the
     ; corpus deliberately randomizes DF for entryPoint's benefit (it must
     ; observe whatever the real function would).  Restore it before falling

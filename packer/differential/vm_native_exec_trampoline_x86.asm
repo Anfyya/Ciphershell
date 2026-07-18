@@ -71,7 +71,11 @@ _VMNativeExecTrampolineInvoke:
     mov ebp, [ecx + 5*8]
     mov esi, [ecx + 6*8]
     mov edi, [ecx + 7*8]
+    ; state.gpr[4] is the architectural ESP observed at function entry.
+    ; CALL itself pushes a 4-byte return address, so invoke from S+4 to make
+    ; the callee enter at exactly S (the same value used by the VM half).
     mov esp, [ecx + 4*8]
+    lea esp, [esp+4]
     mov ecx, [ecx + 1*8]
 
     call dword [g_entry_point]
@@ -83,10 +87,12 @@ _VMNativeExecTrampolineInvoke:
     mov [g_out_esi], esi
     mov [g_out_edi], edi
     mov [g_out_esp], esp
-    pushfd
     mov [g_out_eax], eax
-    pop eax
-    mov [g_out_eflags], eax
+    ; RET imm16 may leave ESP above the argument window.  Capture flags on
+    ; the harness stack so PUSHFD cannot overwrite a callee-clean argument.
+    mov esp, [g_harness_esp]
+    pushfd
+    pop dword [g_out_eflags]
     ; The ABI requires DF=0 on entry/exit of every function, but the corpus
     ; deliberately randomizes DF for entryPoint's benefit (it must observe
     ; whatever the real function would).  Restore it before falling back

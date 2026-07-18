@@ -50,6 +50,11 @@ struct VMHandlerSemanticStackFunclet {
     uint8_t nonvolatileRegister = 0;
 };
 
+struct VMHandlerSemanticCodeRange {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+
 struct VMHandlerSemanticCodegenResult {
     bool success = false;
     bool semanticComplete = false;
@@ -86,6 +91,11 @@ struct VMHandlerSemanticCodegenResult {
     uint8_t semanticInputStrategy = 0;
     uint8_t semanticCoreStrategy = 0;
     uint8_t semanticResultStrategy = 0;
+    // Every range is a mandatory encode/decode stage for the persistent
+    // build-seed-specific VM value-stack representation.  Ranges are kept
+    // separate from the business-core range so the quantitative gate cannot
+    // let one segment dilute or hide reuse in the other.
+    std::vector<VMHandlerSemanticCodeRange> valueCodecRanges;
     uint32_t variantSuffixOffset = 0;
     uint32_t variantSuffixSize = 0;
     uint32_t opaquePredicateOffset = 0;

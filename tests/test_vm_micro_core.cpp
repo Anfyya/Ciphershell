@@ -1,4 +1,5 @@
 #include "packer/analysis/hotspot_analyzer.h"
+#include "packer/analysis/disassembler.h"
 #include "packer/mutation/mutation_engine.h"
 #include "packer/transforms/translator.h"
 #include "packer/vm/micro_semantics.h"
@@ -1818,8 +1819,11 @@ enum class NativeEvidenceFixtureMode : uint8_t {
     IncompleteFlags,
     Unbound,
     NoIsolation,
+    StackMismatch,
     GprMismatch,
     FlagsMismatch,
+    CarryFlagsMismatch,
+    UndefinedFlagsMismatch,
     MemoryMismatch
 };
 
@@ -1852,6 +1856,12 @@ public:
         evidence.handlerInstructionCount = 1;
         evidence.nativeState.gpr = request.initialGpr;
         evidence.vmState.gpr = request.initialGpr;
+        // The real native worker observes SP after RET consumed the synthetic
+        // return address; the VM snapshot intentionally retains logical
+        // function-body SP.
+        evidence.nativeState.gpr[4] +=
+            request.architecture ==
+                CipherShell::VMNativeDifferentialArchitecture::X64 ? 8u : 4u;
         evidence.nativeState.rflags = request.initialRflags;
         evidence.vmState.rflags = request.initialRflags;
         evidence.nativeState.validRflagsMask = VM_FLAG_ARCHITECTURAL_MASK;
@@ -1886,11 +1896,20 @@ public:
             case NativeEvidenceFixtureMode::NoIsolation:
                 evidence.isolatedWorker = false;
                 break;
+            case NativeEvidenceFixtureMode::StackMismatch:
+                evidence.nativeState.gpr[4] -= 8u;
+                break;
             case NativeEvidenceFixtureMode::GprMismatch:
                 evidence.vmState.gpr[15] ^= 1u;
                 break;
             case NativeEvidenceFixtureMode::FlagsMismatch:
                 evidence.vmState.rflags ^= VM_FLAG_OF;
+                break;
+            case NativeEvidenceFixtureMode::CarryFlagsMismatch:
+                evidence.vmState.rflags ^= VM_FLAG_CF;
+                break;
+            case NativeEvidenceFixtureMode::UndefinedFlagsMismatch:
+                evidence.vmState.rflags ^= VM_FLAG_AF;
                 break;
             case NativeEvidenceFixtureMode::MemoryMismatch:
                 evidence.vmState.memory.back() ^= 1u;
@@ -1958,6 +1977,8 @@ void TestNativeDifferentialEvidenceContractFailClosed() {
         "not bound to the requested case");
     requireRejected(NativeEvidenceFixtureMode::NoIsolation,
         "isolation or deadline");
+    requireRejected(NativeEvidenceFixtureMode::StackMismatch,
+        "stack-balance mismatch");
     requireRejected(NativeEvidenceFixtureMode::GprMismatch, "GPR mismatch");
     requireRejected(NativeEvidenceFixtureMode::FlagsMismatch,
         "RFLAGS mismatch");
@@ -1972,6 +1993,345 @@ void TestNativeDifferentialEvidenceContractFailClosed() {
             accepted.nativeCpuEvidenceVerified &&
             accepted.synthesizedHandlerEvidenceVerified,
         "complete evidence contract fixture was rejected: " + accepted.error);
+}
+
+void TestNativeDifferentialUndefinedFlagsMask() {
+    CipherShell::Function function = MakeAddFunction();
+    auto& logic = function.blocks[0].instructions[0];
+    logic.rawBytes[0] = 0x48;
+    logic.rawBytes[1] = 0x31;
+    logic.rawBytes[2] = 0xC0; // xor rax, rax
+    logic.mnemonic = CipherShell::InstructionMnemonic::Xor;
+    logic.mnemonicText = "xor";
+    logic.flagsWritten = VM_FLAG_CF | VM_FLAG_PF | VM_FLAG_ZF |
+        VM_FLAG_SF | VM_FLAG_OF;
+    logic.flagsUndefined = VM_FLAG_AF;
+    logic.operands[1] = RegisterOperand(
+        CipherShell::RegisterId::RAX, CipherShell::OperandAction::Read);
+
+    OpcodeMaps maps = MakeOpcodeMaps(MakeSeed(0xA7));
+    KeepRuntimeSupportedOpcodes(maps, true);
+    const TranslationResult translation = TranslateForGate(
+        function, 0xA7A7D1FFD1FFA7A7ULL, VMMicroDensity::Heavy,
+        VM_MICRO_HEAVY_MIN_RATIO, maps);
+    Require(translation.success,
+        "terminal ISA-undefined flag incorrectly rejected translation");
+    Require((translation.observableRflagsMask & VM_FLAG_AF) == 0u &&
+            (translation.observableRflagsMask & VM_FLAG_OF) != 0u,
+        "terminal observable RFLAGS mask did not exclude only undefined AF");
+
+    const auto registers = IdentityRegisterMap();
+    CipherShell::VMNativeDifferentialConfig config{};
+    config.corpusCount = 2;
+    config.memorySize = 0x1000;
+    config.timeoutMilliseconds = 100;
+    config.expectedHandlerImageDigest = 0xA7D1FFE71D3E57ULL;
+
+    NativeEvidenceFixtureProvider undefinedMismatch(
+        NativeEvidenceFixtureMode::UndefinedFlagsMismatch);
+    config.evidenceProvider = &undefinedMismatch;
+    const auto accepted = CipherShell::VMNativeDifferentialVerifier::Verify(
+        function, translation, maps.forward, registers, config);
+    Require(accepted.success && accepted.casesVerified == config.corpusCount,
+        "native differential compared ISA-undefined AF: " + accepted.error);
+
+    NativeEvidenceFixtureProvider definedMismatch(
+        NativeEvidenceFixtureMode::FlagsMismatch);
+    config.evidenceProvider = &definedMismatch;
+    const auto rejected = CipherShell::VMNativeDifferentialVerifier::Verify(
+        function, translation, maps.forward, registers, config);
+    Require(!rejected.success &&
+            rejected.error.find("RFLAGS mismatch") != std::string::npos,
+        "native differential ignored defined OF mismatch");
+
+    auto makePathDependentFunction = [](bool takeUndefinedPath) {
+        auto makeFlagInstruction = [](uint32_t rva,
+                                      CipherShell::InstructionMnemonic mnemonic,
+                                      uint64_t written,
+                                      uint64_t undefined) {
+            CipherShell::InstructionIR instruction{};
+            instruction.address = instruction.rva = rva;
+            instruction.length = 3;
+            instruction.rawBytes[0] = 0x48;
+            instruction.rawBytes[1] = mnemonic ==
+                CipherShell::InstructionMnemonic::Cmp ? 0x39 : 0x85;
+            instruction.rawBytes[2] = 0xC0;
+            instruction.mnemonic = mnemonic;
+            instruction.mnemonicText = mnemonic ==
+                CipherShell::InstructionMnemonic::Cmp ? "cmp" : "test";
+            instruction.category = mnemonic ==
+                CipherShell::InstructionMnemonic::Cmp
+                ? CipherShell::InstructionCategory::Compare
+                : CipherShell::InstructionCategory::Logical;
+            instruction.machineMode = CipherShell::MachineMode::X64;
+            instruction.encoding = CipherShell::InstructionEncoding::Legacy;
+            instruction.instructionSet =
+                CipherShell::InstructionSetClass::Scalar;
+            instruction.operandWidth = 64;
+            instruction.flagsWritten = written;
+            instruction.flagsUndefined = undefined;
+            instruction.operands.push_back(RegisterOperand(
+                CipherShell::RegisterId::RAX,
+                CipherShell::OperandAction::Read));
+            instruction.operands.push_back(RegisterOperand(
+                CipherShell::RegisterId::RAX,
+                CipherShell::OperandAction::Read));
+            return instruction;
+        };
+
+        auto firstCmp = makeFlagInstruction(0x7000,
+            CipherShell::InstructionMnemonic::Cmp,
+            VM_FLAG_STATUS_MASK, 0);
+        CipherShell::InstructionIR branch{};
+        branch.address = branch.rva = 0x7003;
+        branch.length = 2;
+        branch.rawBytes[0] = takeUndefinedPath ? 0x74 : 0x75;
+        branch.rawBytes[1] = 0x04;
+        branch.mnemonic = takeUndefinedPath
+            ? CipherShell::InstructionMnemonic::Jz
+            : CipherShell::InstructionMnemonic::Jnz;
+        branch.mnemonicText = takeUndefinedPath ? "jz" : "jnz";
+        branch.category = CipherShell::InstructionCategory::ConditionalBranch;
+        branch.branchKind = takeUndefinedPath
+            ? CipherShell::BranchKind::Equal
+            : CipherShell::BranchKind::NotEqual;
+        branch.machineMode = CipherShell::MachineMode::X64;
+        branch.encoding = CipherShell::InstructionEncoding::Legacy;
+        branch.instructionSet = CipherShell::InstructionSetClass::Scalar;
+        branch.flagsRead = VM_FLAG_ZF;
+        branch.hasBranchTarget = true;
+        branch.branchTargetRVA = 0x7009;
+
+        auto definedCmp = makeFlagInstruction(0x7005,
+            CipherShell::InstructionMnemonic::Cmp,
+            VM_FLAG_STATUS_MASK, 0);
+        auto definedRet = MakeAddFunction().blocks[0].instructions[1];
+        definedRet.address = definedRet.rva = 0x7008;
+        auto undefinedTest = makeFlagInstruction(0x7009,
+            CipherShell::InstructionMnemonic::Test,
+            VM_FLAG_CF | VM_FLAG_PF | VM_FLAG_ZF | VM_FLAG_SF | VM_FLAG_OF,
+            VM_FLAG_AF);
+        auto undefinedRet = definedRet;
+        undefinedRet.address = undefinedRet.rva = 0x700C;
+
+        CipherShell::BasicBlock block{};
+        block.startAddress = 0x7000;
+        block.endAddress = 0x700D;
+        block.instructionCount = 6;
+        block.instructions = {firstCmp, branch, definedCmp, definedRet,
+            undefinedTest, undefinedRet};
+        block.isFunctionEntry = true;
+        CipherShell::Function result{};
+        result.entryAddress = 0x7000;
+        result.size = 0x0D;
+        result.decodedBytes = 0x0D;
+        result.boundaryTrusted = true;
+        result.blocks.push_back(std::move(block));
+        return result;
+    };
+
+    for (const bool takeUndefinedPath : {true, false}) {
+        const CipherShell::Function pathFunction =
+            makePathDependentFunction(takeUndefinedPath);
+        const TranslationResult pathTranslation = TranslateForGate(
+            pathFunction, takeUndefinedPath ? 0xA701ULL : 0xA702ULL,
+            VMMicroDensity::Heavy, VM_MICRO_HEAVY_MIN_RATIO, maps);
+        Require(pathTranslation.success &&
+                (pathTranslation.observableRflagsMask & VM_FLAG_AF) == 0u,
+            "path-dependent terminal AF translation did not produce a conservative mask");
+        CipherShell::VMNativeDifferentialConfig pathConfig{};
+        pathConfig.corpusCount = 2;
+        pathConfig.memorySize = 0x1000;
+        pathConfig.timeoutMilliseconds = 100;
+        pathConfig.expectedHandlerImageDigest = 0xA7D1FFE71D3E57ULL;
+        pathConfig.evidenceProvider = &undefinedMismatch;
+        const auto pathResult =
+            CipherShell::VMNativeDifferentialVerifier::Verify(
+                pathFunction, pathTranslation, maps.forward, registers,
+                pathConfig);
+        if (takeUndefinedPath) {
+            Require(pathResult.success,
+                "dynamic path mask compared AF on the ISA-undefined path: " +
+                    pathResult.error);
+        } else {
+            Require(!pathResult.success &&
+                    pathResult.error.find("RFLAGS mismatch") != std::string::npos,
+                "conservative function mask hid AF mismatch on the defined path");
+        }
+    }
+}
+
+CipherShell::Function DecodeShiftRotateFlagFixture(
+    CipherShell::InstructionMnemonic mnemonic,
+    uint8_t width,
+    uint8_t rawCount,
+    bool countFromCl)
+{
+    Require(width == 1u || width == 2u,
+        "shift/rotate flag fixture requires an 8/16-bit destination");
+    uint8_t extension = 0;
+    switch (mnemonic) {
+        case CipherShell::InstructionMnemonic::Rol: extension = 0; break;
+        case CipherShell::InstructionMnemonic::Ror: extension = 1; break;
+        case CipherShell::InstructionMnemonic::Shl: extension = 4; break;
+        case CipherShell::InstructionMnemonic::Shr: extension = 5; break;
+        case CipherShell::InstructionMnemonic::Sar: extension = 7; break;
+        default: throw TestFailure("unsupported shift/rotate flag fixture mnemonic");
+    }
+
+    std::vector<uint8_t> code;
+    if (countFromCl) {
+        code.push_back(0xB1); // mov cl, imm8
+        code.push_back(rawCount);
+    }
+    if (width == 2u) code.push_back(0x66);
+    code.push_back(countFromCl
+        ? static_cast<uint8_t>(width == 1u ? 0xD2u : 0xD3u)
+        : static_cast<uint8_t>(width == 1u ? 0xC0u : 0xC1u));
+    code.push_back(static_cast<uint8_t>(0xC0u | (extension << 3u)));
+    if (!countFromCl) code.push_back(rawCount);
+    code.push_back(0xC3); // ret
+
+    CipherShell::Disassembler disassembler;
+    CipherShell::Function function{};
+    Require(disassembler.AnalyzeFunctionRange(code.data(),
+            static_cast<uint32_t>(code.size()), 0x7800u,
+            static_cast<uint32_t>(code.size()), false, function),
+        "real x86 shift/rotate fixture decode failed: " +
+            disassembler.GetLastError());
+    Require(function.boundaryTrusted &&
+            function.decodedBytes == function.size,
+        "real x86 shift/rotate fixture did not retain an exact boundary");
+    return function;
+}
+
+void TestNativeDifferentialValueDependentShiftFlags() {
+    OpcodeMaps maps = MakeOpcodeMaps(MakeSeed(0x5F));
+    KeepRuntimeSupportedOpcodes(maps, true);
+    const auto registers = IdentityRegisterMap();
+    uint64_t seed = 0x5F1A600000000000ULL;
+
+    auto verifyMismatch = [&](const CipherShell::Function& function,
+                              NativeEvidenceFixtureMode mode,
+                              bool expectedAccepted,
+                              const char* description) {
+        const TranslationResult translation = TranslateForGate(
+            function, ++seed, VMMicroDensity::Heavy,
+            VM_MICRO_HEAVY_MIN_RATIO, maps);
+        Require(translation.success,
+            std::string("shift/rotate flag fixture translation failed: ") +
+                description + (translation.failures.empty() ? std::string{} :
+                    " (" + translation.failures.front().reason + ")"));
+
+        CipherShell::VMIRModelPreflightConfig modelConfig{};
+        modelConfig.corpusSeed = seed ^ 0xD1FFULL;
+        modelConfig.corpusCount = 4;
+        modelConfig.memorySize = 0x1000;
+        const auto model = CipherShell::VMIRModelPreflightVerifier::Verify(
+            function, translation, maps.forward, registers, modelConfig);
+        Require(model.success,
+            std::string("shift/rotate IR-model regression failed: ") +
+                description + " (" + model.error + ")");
+
+        NativeEvidenceFixtureProvider provider(mode);
+        CipherShell::VMNativeDifferentialConfig config{};
+        config.corpusSeed = seed ^ 0xC0DEULL;
+        config.corpusCount = 1;
+        config.memorySize = 0x1000;
+        config.timeoutMilliseconds = 100;
+        config.expectedHandlerImageDigest = 0x5F1A6D1FFULL;
+        config.evidenceProvider = &provider;
+        const auto result = CipherShell::VMNativeDifferentialVerifier::Verify(
+            function, translation, maps.forward, registers, config);
+        Require(result.success == expectedAccepted &&
+                (expectedAccepted ||
+                    result.error.find("RFLAGS mismatch") != std::string::npos),
+            std::string("value-dependent flag mask was wrong for ") +
+                description + " (" + result.error + ")");
+    };
+
+    auto verifyCountClass = [&](CipherShell::InstructionMnemonic mnemonic,
+                                uint8_t width,
+                                uint8_t rawCount,
+                                bool countFromCl,
+                                unsigned maskedCount,
+                                const char* description) {
+        const CipherShell::Function function = DecodeShiftRotateFlagFixture(
+            mnemonic, width, rawCount, countFromCl);
+        const bool rotate = mnemonic == CipherShell::InstructionMnemonic::Rol ||
+            mnemonic == CipherShell::InstructionMnemonic::Ror;
+        verifyMismatch(function, NativeEvidenceFixtureMode::FlagsMismatch,
+            maskedCount > 1u, description);
+        verifyMismatch(function, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            false, description);
+        verifyMismatch(function, NativeEvidenceFixtureMode::UndefinedFlagsMismatch,
+            !rotate && maskedCount != 0u, description);
+    };
+
+    const std::array<CipherShell::InstructionMnemonic, 5> mnemonics = {
+        CipherShell::InstructionMnemonic::Shl,
+        CipherShell::InstructionMnemonic::Shr,
+        CipherShell::InstructionMnemonic::Sar,
+        CipherShell::InstructionMnemonic::Rol,
+        CipherShell::InstructionMnemonic::Ror,
+    };
+    for (const auto mnemonic : mnemonics) {
+        // Immediate counts exercise the architectural five-bit mask: raw
+        // 32/33/34 are concrete count classes 0/1/>1 for r8.
+        verifyCountClass(mnemonic, 1u, 32u, false, 0u,
+            "r8,imm raw32 (masked count=0)");
+        verifyCountClass(mnemonic, 1u, 33u, false, 1u,
+            "r8,imm raw33 (masked count=1)");
+        verifyCountClass(mnemonic, 1u, 34u, false, 2u,
+            "r8,imm raw34 (masked count>1)");
+        // CL-sourced counts cover the same three classes on a 16-bit
+        // destination, through real MSVC/Zydis-compatible instruction bytes.
+        verifyCountClass(mnemonic, 2u, 0u, true, 0u,
+            "r16,cl count=0");
+        verifyCountClass(mnemonic, 2u, 1u, true, 1u,
+            "r16,cl count=1");
+        verifyCountClass(mnemonic, 2u, 2u, true, 2u,
+            "r16,cl count>1");
+    }
+
+    for (const auto mnemonic : {
+            CipherShell::InstructionMnemonic::Shl,
+            CipherShell::InstructionMnemonic::Shr,
+            CipherShell::InstructionMnemonic::Sar}) {
+        const auto exact8 = DecodeShiftRotateFlagFixture(
+            mnemonic, 1u, 8u, false);
+        verifyMismatch(exact8, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            true, "r8 shift count equal to width leaves CF undefined");
+        const auto exact16 = DecodeShiftRotateFlagFixture(
+            mnemonic, 2u, 16u, true);
+        verifyMismatch(exact16, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            true, "r16 shift count equal to width leaves CF undefined");
+        const auto over8 = DecodeShiftRotateFlagFixture(
+            mnemonic, 1u, 9u, false);
+        verifyMismatch(over8, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            true, "r8 shift count greater than width leaves CF undefined");
+        const auto over16 = DecodeShiftRotateFlagFixture(
+            mnemonic, 2u, 17u, true);
+        verifyMismatch(over16, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            true, "r16 shift count greater than width leaves CF undefined");
+    }
+
+    for (const auto mnemonic : {
+            CipherShell::InstructionMnemonic::Rol,
+            CipherShell::InstructionMnemonic::Ror}) {
+        const auto full8 = DecodeShiftRotateFlagFixture(
+            mnemonic, 1u, 8u, false);
+        verifyMismatch(full8, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            false, "r8 full-width rotate still defines CF");
+        verifyMismatch(full8, NativeEvidenceFixtureMode::FlagsMismatch,
+            true, "r8 full-width rotate leaves OF undefined");
+        const auto full16 = DecodeShiftRotateFlagFixture(
+            mnemonic, 2u, 16u, true);
+        verifyMismatch(full16, NativeEvidenceFixtureMode::CarryFlagsMismatch,
+            false, "r16 full-width rotate still defines CF");
+        verifyMismatch(full16, NativeEvidenceFixtureMode::FlagsMismatch,
+            true, "r16 full-width rotate leaves OF undefined");
+    }
 }
 
 void AppendAccumulatorSelfCompare(
@@ -2953,6 +3313,10 @@ int main() {
         &TestTranslatorStackAndImplicitFlagsDifferential, failures);
     Run("native differential evidence contract fail-closed",
         &TestNativeDifferentialEvidenceContractFailClosed, failures);
+    Run("native differential masks only ISA-undefined terminal flags",
+        &TestNativeDifferentialUndefinedFlagsMask, failures);
+    Run("native differential refines shift/rotate flags by concrete count",
+        &TestNativeDifferentialValueDependentShiftFlags, failures);
     Run("controlled native CPU probes (partial non-production evidence)",
         &TestNativeMachineCodeDifferentialGate, failures);
     Run("Translator unsupported/flags bridge fail-closed",

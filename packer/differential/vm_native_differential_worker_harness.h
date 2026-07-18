@@ -25,6 +25,8 @@ struct VMNativeDifferentialWorkerOutcome {
     uint64_t nativeFaultOffset = 0;
     std::array<uint64_t, 16> nativeFinalGpr{};
     uint64_t nativeFinalRflags = 0;
+    std::array<uint64_t, 16> nativeFaultGpr{};
+    uint64_t nativeFaultRflags = 0;
     std::vector<uint8_t> nativeFinalMemory;
 
     bool vmExecuted = false;
@@ -37,12 +39,15 @@ struct VMNativeDifferentialWorkerOutcome {
     uint64_t vmVipOffset = 0;
     std::array<uint64_t, 16> vmFinalGpr{};
     uint64_t vmFinalRflags = 0;
+    std::array<uint64_t, 16> vmFaultGpr{};
+    uint64_t vmFaultRflags = 0;
     std::vector<uint8_t> vmFinalMemory;
 };
 
 bool RunNativeDifferentialWorkerCase(
     const VMNativeDifferentialRequestHeader& header,
     const uint8_t* nativeCode,
+    const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* corpusMemory,
     const uint8_t* vmBytecode,
     const uint8_t* handlerImage,

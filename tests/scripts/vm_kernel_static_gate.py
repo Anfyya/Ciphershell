@@ -9,7 +9,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +94,34 @@ MICRO_EXECUTOR_NATIVE_FLAG_IDENTIFIERS = {
     "__writeeflags",
 }
 
+# 算术标志（CF/PF/AF/ZF/SF/OF）真正的产生/消费点：VM 内部的 pending-flags
+# 记录、lastAlu 快照、materialize 例程本身，以及软件模型执行器里的等价物。
+FLAG_STATE_IDENTIFIERS = {
+    "VM_FLAG_CF", "VM_FLAG_PF", "VM_FLAG_AF", "VM_FLAG_ZF", "VM_FLAG_SF",
+    "VM_FLAG_OF", "VM_FLAG_STATUS_MASK", "VM_FLAG_ARCHITECTURAL_MASK",
+    "CtxPendingFlags", "CtxLastAlu", "CtxVirtualFlags", "CtxFlagMaterializer",
+    "VM_LAZY_FLAGS_RECORD", "MaterializeFlags", "flagMaterializer",
+    "BuildFlagMaterializer",
+}
+
+# ciphershellpro.md §8 点名的 VM_BRIDGE_SIMD/VM_BRIDGE_X87：本仓库里这两个
+# v3 遗留操作码名字已经不存在（LEGACY_COARSE_OPCODES 早已禁止），真正在生产
+# 路径里承担同一职责的是 AVX/x87 原生指令桥接机制——
+# VMInstructionBridgeBuilder 生成的 thunk、VM_INSTRUCTION_BRIDGE_STATE、
+# VM_MICRO_BRIDGE_AVX/X87 掩码位，以及 handler 里触发它的
+# EmitX64/86BridgeExtended。检查必须落在这套真实机制上，而不是继续找一个
+# 已经不存在的旧符号名字。
+BRIDGE_STATE_IDENTIFIERS = {
+    "VM_INSTRUCTION_BRIDGE_STATE", "VMInstructionBridgeBuilder",
+    "VMInstructionBridgeLink", "usesAvx", "usesX87", "VM_MICRO_BRIDGE_AVX",
+    "VM_MICRO_BRIDGE_X87", "VM_MICRO_BRIDGE_KNOWN_MASK",
+    "VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK", "VM_MICRO_BRIDGE_LINKED",
+    "Fxsave", "Fxrstor", "Xsave", "Xrstor", "extendedState",
+    "extendedStateFlags", "EmitX64BridgeExtended", "EmitX86BridgeExtended",
+    "VM_UOP_BRIDGE_EXTENDED", "nativeCallBridge", "CtxNativeCallBridge",
+    "VM_NATIVE_CALL_STATE", "vm_native_call_bridge", "vm_instruction_bridge",
+}
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -104,6 +135,34 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
     return parser.parse_args()
+
+
+def subprocess_environment(
+    source: Iterable[tuple[str, str]] | None = None,
+    *,
+    windows: bool | None = None,
+) -> dict[str, str]:
+    """Build an environment with one key per Windows case-folded name.
+
+    Python dictionaries are case-sensitive even though a Windows environment
+    block is not.  A runner that contributes both ``Path`` and ``PATH`` can
+    therefore hand MSBuild two logically identical variables and trigger
+    MSB6001 while it constructs a child process.  Normalizing Windows names to
+    uppercase before *every* configure/build/probe subprocess makes the block
+    unique without deleting any environment variable.
+    """
+    items = list(os.environ.items() if source is None else source)
+    is_windows = os.name == "nt" if windows is None else windows
+    if not is_windows:
+        return dict(items)
+    result: dict[str, str] = {}
+    for key, value in items:
+        result[key.upper()] = value
+    # Keep this executable invariant next to construction rather than assuming
+    # future refactors preserve it.
+    if len(result) != len({key.casefold() for key in result}):
+        raise RuntimeError("Windows subprocess environment is not case-unique")
+    return result
 
 
 def production_files(root: Path) -> list[Path]:
@@ -165,6 +224,209 @@ def identifier_hits(
     return hits
 
 
+ARITHMETIC_FLAG_TRANSFER_OPCODES = {0x9C, 0x9D, 0x9E, 0x9F}
+
+
+def _modrm_encoded_length(data: list[int], index: int) -> int:
+    """Return ModRM/SIB/displacement length, clamped to a literal Raw block.
+
+    This is deliberately a small source-emission decoder rather than a search
+    for byte values: 0x9c is a perfectly ordinary ModRM byte (for example in
+    ``lea r11,[r15+rdx*8+disp32]``), and must never be treated as PUSHF.
+    """
+    if index >= len(data):
+        return 0
+    start = index
+    modrm = data[index]
+    index += 1
+    mod = modrm >> 6
+    rm = modrm & 7
+    if mod != 3 and rm == 4 and index < len(data):
+        sib = data[index]
+        index += 1
+        if mod == 0 and (sib & 7) == 5:
+            index += 4
+    elif mod == 0 and rm == 5:
+        index += 4
+    if mod == 1:
+        index += 1
+    elif mod == 2:
+        index += 4
+    return min(index, len(data)) - start
+
+
+def _literal_instruction_shape(
+    data: list[int], start: int,
+) -> tuple[int, int]:
+    """Return ``(instruction_length, opcode_index)`` for literal Raw bytes.
+
+    The gate only needs enough decoding to distinguish opcode positions from
+    ModRM/SIB/displacement/immediate positions. Unknown opcodes consume the
+    remainder of that Raw emission (fail-safe against false PUSHF reports),
+    while the instruction forms emitted by this code generator are covered by
+    the tables below. Dynamic immediates emitted by a following U8/U32/U64 are
+    naturally clamped at the end of this Raw block.
+    """
+    index = start
+    legacy_prefixes = {
+        0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65, 0x66, 0x67,
+    }
+    while index < len(data) and data[index] in legacy_prefixes:
+        index += 1
+    while index < len(data) and 0x40 <= data[index] <= 0x4F:
+        index += 1
+    if index >= len(data):
+        return max(1, len(data) - start), index
+
+    opcode_index = index
+    opcode = data[index]
+    index += 1
+    has_modrm = False
+    immediate = 0
+
+    if opcode == 0x0F:
+        if index >= len(data):
+            return len(data) - start, opcode_index
+        second = data[index]
+        index += 1
+        # Two-byte control/system opcodes without ModRM. Everything else used
+        # by the production emitter (CMOVcc/SETcc/BT*/SHLD/SHRD/IMUL/MOVZX...)
+        # has ModRM; near Jcc instead has a rel32 immediate.
+        if 0x80 <= second <= 0x8F:
+            immediate = 4
+        elif second not in {
+            0x05, 0x07, 0x0B, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+            0x77, 0xA0, 0xA1, 0xA2, 0xA8, 0xA9, 0xAA,
+        }:
+            has_modrm = True
+    elif opcode in ARITHMETIC_FLAG_TRANSFER_OPCODES:
+        pass
+    elif opcode in range(0x70, 0x80) or opcode in {
+        0x6A, 0xA8, 0xCD, 0xEB,
+    }:
+        immediate = 1
+    elif opcode in {
+        0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D,
+        0x68, 0xA9, 0xE8, 0xE9,
+    }:
+        immediate = 4
+    elif 0xB0 <= opcode <= 0xB7:
+        immediate = 1
+    elif 0xB8 <= opcode <= 0xBF:
+        immediate = 4
+    elif (
+        opcode <= 0x3B and (opcode & 0x07) <= 3
+    ) or opcode in {
+        0x62, 0x63, 0x69, 0x6B,
+        *range(0x80, 0x90),
+        0xC0, 0xC1, 0xC6, 0xC7,
+        0xD0, 0xD1, 0xD2, 0xD3,
+        0xF6, 0xF7, 0xFE, 0xFF,
+    }:
+        has_modrm = True
+
+    modrm = data[index] if has_modrm and index < len(data) else None
+    if has_modrm:
+        index += _modrm_encoded_length(data, index)
+        if opcode in {0x6B, 0x80, 0x82, 0x83, 0xC0, 0xC1, 0xC6}:
+            immediate = 1
+        elif opcode in {0x69, 0x81, 0xC7}:
+            immediate = 4
+        elif opcode == 0xF6 and modrm is not None and ((modrm >> 3) & 7) <= 1:
+            immediate = 1
+        elif opcode == 0xF7 and modrm is not None and ((modrm >> 3) & 7) <= 1:
+            immediate = 4
+    elif opcode not in ARITHMETIC_FLAG_TRANSFER_OPCODES and opcode not in {
+        *range(0x40, 0x60),
+        *range(0x90, 0xA0),
+        0x60, 0x61, 0x90, 0xC2, 0xC3, 0xC9, 0xCA, 0xCB,
+        0xCC, 0xCE, 0xCF, 0xD7, 0xEC, 0xED, 0xEE, 0xEF,
+        0xF4, 0xF5, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD,
+    } and opcode != 0x0F and immediate == 0:
+        return len(data) - start, opcode_index
+
+    return max(1, min(len(data), index + immediate) - start), opcode_index
+
+
+def _raw_flag_transfer_opcode_indices(data: list[int]) -> list[int]:
+    """Locate 9C..9F only when they decode as an instruction opcode."""
+    hits: list[int] = []
+    index = 0
+    while index < len(data):
+        length, opcode_index = _literal_instruction_shape(data, index)
+        if opcode_index < len(data) and \
+                data[opcode_index] in ARITHMETIC_FLAG_TRANSFER_OPCODES:
+            hits.append(opcode_index)
+        index += max(1, length)
+    return hits
+
+
+def arithmetic_flag_transfer_emissions(code: str) -> list[tuple[int, str]]:
+    """Find structured U8/Raw emission points for PUSHF/POPF/LAHF/SAHF."""
+    hits: list[tuple[int, str]] = []
+    u8_pattern = re.compile(
+        r"\b[A-Za-z_]\w*\.U8\(\s*(0x9[cd-f])\s*\)", re.IGNORECASE)
+    for match in u8_pattern.finditer(code):
+        hits.append((match.start(1), f"U8({match.group(1)})"))
+
+    raw_pattern = re.compile(
+        r"\b[A-Za-z_]\w*\.Raw\s*\(\s*\{(?P<body>.*?)\}\s*\)",
+        re.DOTALL)
+    literal_pattern = re.compile(r"^\s*0x([0-9a-f]{1,2})(?:u)?\s*$", re.IGNORECASE)
+    for match in raw_pattern.finditer(code):
+        values: list[int] = []
+        offsets: list[int] = []
+        cursor = match.start("body")
+        for item in match.group("body").split(","):
+            literal = literal_pattern.fullmatch(item)
+            if literal is None:
+                values = []
+                break
+            values.append(int(literal.group(1), 16))
+            value_match = re.search(r"0x[0-9a-f]{1,2}", item, re.IGNORECASE)
+            offsets.append(cursor + (value_match.start() if value_match else 0))
+            cursor += len(item) + 1
+        for byte_index in _raw_flag_transfer_opcode_indices(values):
+            hits.append((
+                offsets[byte_index],
+                f"Raw opcode 0x{values[byte_index]:02X} at byte {byte_index}",
+            ))
+    return sorted(hits)
+
+
+def static_gate_internal_self_check() -> list[str]:
+    """Exercise the two parsers whose false positives can disable CI itself."""
+    errors: list[str] = []
+    environment = subprocess_environment(
+        [("Path", "first"), ("PATH", "second"), ("ComSpec", "cmd.exe")],
+        windows=True,
+    )
+    if environment != {"PATH": "second", "COMSPEC": "cmd.exe"}:
+        errors.append(
+            "Windows environment folding did not remove the Path/PATH alias")
+
+    # The first two 0x9c bytes are ModRM fields, not PUSHF.  The remaining
+    # U8, leading Raw opcode, and second instruction in a multi-instruction
+    # Raw block are real transfer opcodes and must all be found.
+    sample = """
+        c.Raw({0x4F,0x8D,0x9C,0xD7});
+        c.Raw({0x4C,0x8D,0x9C,0x24});
+        c.U8(0x9D);
+        c.Raw({0x66,0x9E});
+        c.Raw({0x90,0x9C});
+    """
+    details = [detail for _, detail in arithmetic_flag_transfer_emissions(sample)]
+    if details != [
+        "U8(0x9D)",
+        "Raw opcode 0x9E at byte 1",
+        "Raw opcode 0x9C at byte 1",
+    ]:
+        errors.append(
+            "structured flag-transfer emission parser self-check failed: " +
+            repr(details))
+    return errors
+
+
 def arithmetic_bridge_hits(path: Path, code: str) -> list[Violation]:
     """阻止算术 flags 借 native/instruction bridge 计算或回读。"""
     # SIMD/x87 的正式 bridge 可以保存/恢复 rflags，因此不能在全仓库用
@@ -191,14 +453,15 @@ def arithmetic_bridge_hits(path: Path, code: str) -> list[Violation]:
         for function_name in ("void EmitX64CallHost", "void EmitX86CallHost"):
             call_host_body = extract_function_body(code, function_name)
             if call_host_body is not None:
-                arithmetic_code = arithmetic_code.replace(call_host_body, "")
-        for match in re.finditer(
-                r"0x(?:9C|9D|9E|9F)\b", arithmetic_code, re.IGNORECASE):
+                blank = "".join(
+                    "\n" if ch == "\n" else " " for ch in call_host_body)
+                arithmetic_code = arithmetic_code.replace(call_host_body, blank, 1)
+        for offset, detail in arithmetic_flag_transfer_emissions(arithmetic_code):
             hits.append(Violation(
                 path,
-                arithmetic_code.count("\n", 0, match.start()) + 1,
+                arithmetic_code.count("\n", 0, offset) + 1,
                 "arithmetic-flags-native-transfer-opcode",
-                match.group(0),
+                detail,
             ))
     return hits
 
@@ -224,6 +487,167 @@ def extract_function_body(code: str, name: str) -> str | None:
     if depth != 0:
         return None
     return code[match.end():index - 1]
+
+
+TOP_LEVEL_FUNCTION_RE = re.compile(
+    r"^[A-Za-z_][\w:<>,\*&\s]*?\b([A-Za-z_]\w*)\s*\(([^;{]*)\)\s*"
+    r"(?:const\s*)?(?:noexcept\s*)?\{",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def extract_top_level_functions(code: str) -> list[tuple[str, int, str]]:
+    """Enumerate every brace-matched function definition that starts at
+    column 0, in source order, as (name, start_offset, body).  This
+    codebase's actual formatting convention is that top-level function
+    definitions are never indented and their bodies always are, so column-0
+    reliably separates real function boundaries from nested blocks without
+    needing a real C++ parser."""
+    functions: list[tuple[str, int, str]] = []
+    search_from = 0
+    for match in TOP_LEVEL_FUNCTION_RE.finditer(code):
+        if match.start() < search_from:
+            continue
+        line_start = code.rfind("\n", 0, match.start()) + 1
+        if code[line_start:match.start()].strip(" "):
+            continue
+        depth = 1
+        index = match.end()
+        while index < len(code) and depth > 0:
+            if code[index] == "{":
+                depth += 1
+            elif code[index] == "}":
+                depth -= 1
+            index += 1
+        if depth != 0:
+            continue
+        functions.append((match.group(1), match.start(), code[match.end():index - 1]))
+        search_from = index
+    return functions
+
+
+def split_switch_case_segments(body: str) -> list[str]:
+    """Split a function body into one segment per `switch` case/default label
+    (generalized beyond `switch (semantic)` -- this codebase also dispatches
+    on things like `instruction.opcode`), plus whatever code sits outside
+    any switch.  A single VM_UOP dispatcher legitimately touches both flag
+    state (its ALU cases) and bridge state (its VM_UOP_BRIDGE_EXTENDED case)
+    in the same function; checking the whole function body would flag that
+    as a false co-occurrence, so real closure only makes sense evaluated
+    case-by-case."""
+    segments: list[str] = []
+    outside = body
+    for switch_match in re.finditer(r"switch\s*\([^)]*\)\s*\{", body):
+        depth = 1
+        index = switch_match.end()
+        while index < len(body) and depth > 0:
+            if body[index] == "{":
+                depth += 1
+            elif body[index] == "}":
+                depth -= 1
+            index += 1
+        if depth != 0:
+            continue
+        switch_body = body[switch_match.end():index - 1]
+        outside = outside.replace(body[switch_match.start():index], "")
+        case_matches = list(re.finditer(
+            r"(?:case\s+[A-Za-z_][\w:]*\s*:|default\s*:)", switch_body))
+        if not case_matches:
+            segments.append(switch_body)
+            continue
+        for position, case_match in enumerate(case_matches):
+            end = (case_matches[position + 1].start()
+                   if position + 1 < len(case_matches) else len(switch_body))
+            segments.append(switch_body[case_match.end():end])
+    segments.append(outside)
+    return segments
+
+
+def arithmetic_flags_bridge_closure_gate(root: Path) -> list[Violation]:
+    """静态证明:CF/PF/AF/ZF/SF/OF 的产生或消费,在真正承担 handler 生成/
+    差分执行职责的生产文件里,不存在任何直接依赖 AVX/x87 原生指令桥接
+    (ciphershellpro.md §8 所称的 VM_BRIDGE_SIMD/VM_BRIDGE_X87)的代码路径。
+
+    做法:把每个文件拆成顶层函数,再把每个函数按 switch case 拆成更细的
+    代码段(否则像 EmitBusinessCoreVariant / ExecuteOne 这类同时覆盖全部
+    VM_UOP 的大 switch,会在同一个函数体内同时看到 ALU 分支引用的 flag
+    标识符和 VM_UOP_BRIDGE_EXTENDED 分支引用的 bridge 标识符,产生误报)。
+    对每个代码段分别检查 FLAG_STATE_IDENTIFIERS 与 BRIDGE_STATE_IDENTIFIERS
+    是否同时出现;只要同一段代码里两者都命中,就说明标志位的产生/消费和
+    bridge 状态耦合在了一起,直接判违规。
+
+    再叠加一条字节级正向证据:桥接 thunk 写入 VM_INSTRUCTION_BRIDGE_STATE.
+    rflags 的值必须是编译期固定立即数 0x00000202(仅保留 x86 RFLAGS 位 1
+    的架构常量和 IF),而不是从 VM 自己的 pending/lastAlu 标志状态加载——
+    这样即使两边未来改用同一个标识符名字,数值层面的输入隔离依然可查。
+    """
+    semantic_path = root / "packer" / "transforms" / "vm_handler_semantic_codegen.cpp"
+    entry_path = root / "packer" / "transforms" / "vm_handler_entry_codegen.cpp"
+    bridge_builder_path = root / "packer" / "transforms" / "vm_instruction_bridge_builder.cpp"
+    micro_semantics_path = root / "packer" / "vm" / "micro_semantics.cpp"
+    paths = (semantic_path, entry_path, bridge_builder_path, micro_semantics_path)
+    violations: list[Violation] = []
+    for path in paths:
+        if not path.is_file():
+            violations.append(Violation(
+                path, 1, "arithmetic-flags-bridge-closure",
+                "required source file is missing"))
+    if violations:
+        return violations
+
+    found_flag_evidence = False
+    found_bridge_evidence = False
+    for path in paths:
+        code = strip_comments_and_literals(
+            path.read_text(encoding="utf-8", errors="strict"))
+        for name, start, body in extract_top_level_functions(code):
+            for segment in split_switch_case_segments(body):
+                tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", segment))
+                flag_hits = tokens & FLAG_STATE_IDENTIFIERS
+                bridge_hits = tokens & BRIDGE_STATE_IDENTIFIERS
+                if flag_hits:
+                    found_flag_evidence = True
+                if bridge_hits:
+                    found_bridge_evidence = True
+                if flag_hits and bridge_hits:
+                    line = code.count("\n", 0, start) + 1
+                    violations.append(Violation(
+                        path, line, "arithmetic-flags-bridge-closure",
+                        f"{name}: arithmetic-flag state {sorted(flag_hits)} "
+                        f"and AVX/x87 bridge state {sorted(bridge_hits)} "
+                        "co-occur in the same code path"))
+    if violations:
+        return violations
+    if not found_flag_evidence or not found_bridge_evidence:
+        violations.append(Violation(
+            semantic_path, 1, "arithmetic-flags-bridge-closure",
+            f"gate found no evidence to check against (flags={found_flag_evidence}, "
+            f"bridge={found_bridge_evidence}) -- identifiers likely renamed "
+            "out from under this gate"))
+        return violations
+
+    semantic_code = strip_comments_and_literals(
+        semantic_path.read_text(encoding="utf-8", errors="strict"))
+    rflags_seed_pattern = re.compile(
+        r"c\.Raw\(\{0xB8,0x02,0x02,0x00,0x00\}\);"
+        r"[A-Za-z0-9_]*StoreStack[QD]\(c,(?:stateBase\+)?"
+        r"offsetof\(VM_INSTRUCTION_BRIDGE_STATE,rflags\),0\)")
+    for function_name in ("void EmitX64BridgeExtended", "void EmitX86BridgeExtended"):
+        body = extract_function_body(semantic_code, function_name)
+        if body is None:
+            violations.append(Violation(
+                semantic_path, 1, "arithmetic-flags-bridge-closure",
+                f"could not locate {function_name} to verify its rflags seed"))
+            continue
+        normalized = re.sub(r"\s+", "", body)
+        if not rflags_seed_pattern.search(normalized):
+            violations.append(Violation(
+                semantic_path, 1, "arithmetic-flags-bridge-closure",
+                f"{function_name} does not seed VM_INSTRUCTION_BRIDGE_STATE."
+                "rflags with the fixed architectural constant 0x202 -- the "
+                "bridged native instruction may be inheriting VM arithmetic "
+                "flags as input"))
+    return violations
 
 
 def extract_switch_semantic_blocks(body: str) -> list[str]:
@@ -252,78 +676,110 @@ def case_segments(switch_body: str) -> dict[str, str]:
     return segments
 
 
-def consume_statement(text: str, index: int) -> tuple[str, int]:
-    """Consume one ';'-terminated statement or one brace-delimited block
-    starting at (whitespace-skipped) index.  Returns (text, next_index)."""
-    while index < len(text) and text[index].isspace():
-        index += 1
-    if index < len(text) and text[index] == "{":
-        depth = 1
-        start = index
-        index += 1
-        while index < len(text) and depth > 0:
-            if text[index] == "{":
-                depth += 1
-            elif text[index] == "}":
-                depth -= 1
-            index += 1
-        return text[start:index], index
-    start = index
-    depth = 0
-    while index < len(text):
-        ch = text[index]
-        if ch in "({":
-            depth += 1
-        elif ch in ")}":
-            depth -= 1
-        elif ch == ";" and depth == 0:
-            index += 1
-            break
-        index += 1
-    return text[start:index], index
+def business_core_semantics(semantic_code: str) -> set[str]:
+    """Return the exact semantic set declared by HasBusinessCoreVariant.
+
+    Source-level ``if (strategy)`` counting is intentionally absent here.  It
+    misses differences introduced through helpers and seed-derived immediates,
+    and can be gamed by branches that never affect executable bytes.  The
+    production validator below must re-emit both strategies and compare the
+    resulting machine-code vectors; this parser locks the complete 54-semantic
+    allow-list over which that executable check is required.
+    """
+    body = extract_function_body(semantic_code, "bool HasBusinessCoreVariant")
+    if body is None:
+        return set()
+    return set(re.findall(r"case\s+(VM_UOP_[A-Z0-9_]+)\s*:", body))
 
 
-def has_real_strategy_branch(segment: str) -> bool:
-    """A real K-variant core branches on `strategy` with two arms whose
-    emitted code actually differs; forwarding `strategy` unused, or an
-    if/else pair that emits byte-identical code on both arms, does not
-    count."""
-    for match in re.finditer(r"if\s*\(\s*strategy\s*(?:==|!=)\s*[^)]*\)", segment):
-        then_text, next_index = consume_statement(segment, match.end())
-        rest = segment[next_index:]
-        stripped = rest.lstrip()
-        if not stripped.startswith("else"):
-            continue
-        else_index = next_index + (len(rest) - len(stripped)) + len("else")
-        else_text, _ = consume_statement(segment, else_index)
-        if re.sub(r"\s+", "", then_text) != re.sub(r"\s+", "", else_text):
-            return True
-    return False
-
-
-def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
-    """Semantics where EmitBusinessCoreVariant branches on `strategy` with two
-    genuinely different emitted code arms, in *both* the x64 and x86
-    switches.  A case that only forwards `strategy` without an actual
-    strategy-conditioned branch, or whose branches emit identical code,
-    must not count as a real K-variant core."""
+def emitted_business_core_semantics(semantic_code: str) -> set[str]:
+    """Return semantics with EmitBusinessCoreVariant cases on both arches."""
     body = extract_function_body(semantic_code, "bool EmitBusinessCoreVariant")
     if body is None:
         return set()
     switch_blocks = extract_switch_semantic_blocks(body)
     if len(switch_blocks) < 2:
         return set()
-    per_arch_real: list[set[str]] = []
+    per_arch: list[set[str]] = []
     for switch_body in switch_blocks:
-        real: set[str] = set()
-        for semantic, segment in case_segments(switch_body).items():
-            if has_real_strategy_branch(segment):
-                real.add(semantic)
-        per_arch_real.append(real)
-    common = per_arch_real[0]
-    for extra in per_arch_real[1:]:
+        per_arch.append(set(case_segments(switch_body)))
+    common = per_arch[0]
+    for extra in per_arch[1:]:
         common &= extra
     return common
+
+
+def strategy_reemission_evidence_errors(semantic_code: str) -> list[str]:
+    """Check executable evidence for two strategies under one production config.
+
+    The helper is production code, called fail-closed by the main result
+    validator.  It must directly re-emit strategy 0 and 1, resolve both code
+    buffers, reject empty output, and reject byte-identical output.  These are
+    structural call/data-flow markers, not a count of strategy branches.
+    """
+    errors: list[str] = []
+    helper = extract_function_body(
+        semantic_code, "bool ValidateBusinessCoreStrategyReemission")
+    if helper is None:
+        return ["ValidateBusinessCoreStrategyReemission is missing"]
+    normalized = re.sub(r"\s+", "", helper)
+    unrolled_strategies = set(re.findall(
+        r"EmitBusinessCoreVariant\([^;]*?,(0u|1u)\)", normalized))
+    looped_strategies = (
+        "std::array<std::vector<uint8_t>,2>" in normalized and
+        re.search(
+            r"for\(uint8_tstrategy=0;strategy<"
+            r"static_cast<uint8_t>\(\w+\.size\(\)\);\+\+strategy\)",
+            normalized,
+        ) is not None and
+        re.search(
+            r"EmitBusinessCoreVariant\([^;]*?,strategy\)", normalized)
+        is not None
+    )
+    if unrolled_strategies != {"0u", "1u"} and not looped_strategies:
+        errors.append(
+            "helper does not directly re-emit EmitBusinessCoreVariant for "
+            "both strategy 0 and strategy 1")
+    if "ConfigurePermutationPlans(code,config)" not in normalized or \
+            "config.semantic,strategy" not in normalized:
+        errors.append(
+            "both strategy emissions are not bound to the same production config")
+    minimum_per_buffer_checks = 1 if looped_strategies else 2
+    if normalized.count(".Resolve(") < minimum_per_buffer_checks:
+        errors.append("both strategy code buffers are not resolved")
+    if normalized.count(".bytes.empty()") < minimum_per_buffer_checks:
+        errors.append("both strategy byte vectors are not checked for emptiness")
+    if looped_strategies and \
+            "emitted[strategy]=std::move(code.bytes)" not in normalized:
+        errors.append(
+            "resolved strategy bytes are not retained in distinct result slots")
+    if not (
+        re.search(r"\w+\.bytes==\w+\.bytes", normalized) or
+        re.search(r"\w+\[0\]==\w+\[1\]", normalized)
+    ):
+        errors.append(
+            "strategy byte vectors are not compared byte-for-byte for equality")
+
+    validator = extract_function_body(
+        semantic_code, "bool ValidateVMHandlerSemanticVariantKernel")
+    validator_normalized = re.sub(r"\s+", "", validator or "")
+    fail_closed_call = re.search(
+        r"if\(!ValidateBusinessCoreStrategyReemission\(config,[^;{}]*\)\)"
+        r"\{[^{}]*returnfalse;[^{}]*\}",
+        validator_normalized,
+    )
+    if fail_closed_call is None:
+        errors.append(
+            "ValidateVMHandlerSemanticVariantKernel does not call the "
+            "re-emission helper fail-closed")
+    return errors
+
+
+def real_strategy_variant_semantics(semantic_code: str) -> set[str]:
+    """Semantics backed by production two-strategy machine-code evidence."""
+    if strategy_reemission_evidence_errors(semantic_code):
+        return set()
+    return business_core_semantics(semantic_code)
 
 
 # 只有这四项不适用 K 业务核心，不能把“不好做”追加成第五项：
@@ -932,6 +1388,152 @@ def dispatch_table_encoding_gate(root: Path) -> list[Violation]:
     return violations
 
 
+def micro_op_heavy_ratio_statistical_gate(root: Path) -> list[Violation]:
+    """ciphershellpro.md §8"双射抗性":静态度量"x86 指令 : 微操作"平均比
+    ≥ 阈值，抽样确认无 1:1 粗粒度直译残留。
+
+    tests/test_vm_micro_core.cpp 里已有的检查只在一两个手写的 2~5 条指令
+    的玩具函数上验证过这个比例；那不是"有代表性的样本函数集合"，只是单个
+    孤立测试点。这里做两件事：
+
+    1. 结构性证明 Translator::FinalizeProgram 对 Heavy 密度真的 fail-closed
+       ——ratio 不够就拒绝产出，而不是只记录不阻断。
+    2. 实际构建并运行 tests/scripts/vm_micro_op_ratio_probe.cpp：它用真实
+       的生产 Disassembler + Translator，对一批经汇编器验证过的、覆盖
+       ALU/逻辑/移位/位测试/乘除/分支/循环/cmov/setcc/符号扩展/lea/栈/xchg
+       的代表性 x86-64 函数字节做 Heavy 虚拟化，汇总真实的
+       微操作数:原生指令数整体比例。Disassembler/Translator 都不触碰任何
+       Windows API，所以这一步在 Linux 静态门禁 job 里就能真正跑通，不需要
+       等 Windows-only 的 ctest。
+    """
+    translator_path = root / "packer" / "transforms" / "translator.cpp"
+    probe_path = root / "tests" / "scripts" / "vm_micro_op_ratio_probe.cpp"
+    probe_cmake_path = root / "packer" / "CMakeLists.txt"
+    zydis_cmake_path = root / "third_party" / "zydis" / "CMakeLists.txt"
+    for path in (translator_path, probe_path, probe_cmake_path):
+        if not path.is_file():
+            return [Violation(path, 1, "micro-op-heavy-ratio-statistical-gate",
+                              "required source file is missing")]
+
+    violations: list[Violation] = []
+
+    # 第 1 步：结构性确认 fail-closed 逻辑真的在生产路径里，而不是只有
+    # microOpRatio 字段被算出来但从未拦截任何东西。
+    translator_code = strip_comments_and_literals(
+        translator_path.read_text(encoding="utf-8", errors="strict"))
+    finalize_body = extract_function_body(
+        translator_code, "bool Translator::FinalizeProgram")
+    finalize_norm = re.sub(r"\s+", "", finalize_body or "")
+    required_fail_closed = (
+        "if(result.density==VMMicroDensity::Heavy&&"
+        "result.microOpRatio<static_cast<double>(m_config.heavyMinimumRatio)){"
+        "returnfalse;}")
+    if required_fail_closed not in finalize_norm:
+        violations.append(Violation(
+            translator_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "Translator::FinalizeProgram no longer fail-closes a Heavy "
+            "translation whose microOpRatio is below heavyMinimumRatio"))
+    if "result.microOpCount=static_cast<uint32_t>(result.instructions.size())" \
+            not in finalize_norm or \
+       "result.microOpRatio=result.nativeInstructionCount==0" not in finalize_norm:
+        violations.append(Violation(
+            translator_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "Translator::FinalizeProgram no longer computes microOpCount/"
+            "microOpRatio from the real emitted instruction stream"))
+    if violations:
+        return violations
+
+    # 第 2 步：真正构建并运行 probe，而不是只检查它的源码存在。
+    if not zydis_cmake_path.is_file():
+        return [Violation(
+            zydis_cmake_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "third_party/zydis submodule is not checked out -- run "
+            "`git submodule update --init --recursive` before this gate "
+            "can build the real Translator")]
+    process_environment = subprocess_environment()
+    environment_path = next(
+        (value for key, value in process_environment.items()
+         if key.casefold() == "path"),
+        None,
+    )
+    cmake = shutil.which("cmake", path=environment_path)
+    if cmake is None:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "cmake is not available -- cannot build the real Disassembler/"
+            "Translator to measure the ratio on representative samples")]
+
+    build_dir = root / "build_vm_micro_op_ratio_gate"
+    configure = subprocess.run(
+        [cmake, "-S", str(root), "-B", str(build_dir),
+         "-DCMAKE_BUILD_TYPE=Release"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=300, env=process_environment)
+    if configure.returncode != 0:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "cmake configure failed:\n" + configure.stdout[-4000:] +
+            configure.stderr[-4000:])]
+
+    build = subprocess.run(
+        [cmake, "--build", str(build_dir),
+         "--target", "vm_micro_op_ratio_probe", "--config", "Release", "-j"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=900, env=process_environment)
+    if build.returncode != 0:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "building vm_micro_op_ratio_probe against the real Translator "
+            "failed:\n" + build.stdout[-4000:] + build.stderr[-4000:])]
+
+    # Single-config generators (Makefiles/Ninja) put the binary straight in
+    # bin/; multi-config generators (Visual Studio) nest it under bin/<CONFIG>/
+    # regardless of the -DCMAKE_BUILD_TYPE passed at configure time, since
+    # that variable is a single-config-only concept and config is instead
+    # selected by --config at build time.
+    candidates = [
+        build_dir / "bin" / "vm_micro_op_ratio_probe",
+        build_dir / "bin" / "vm_micro_op_ratio_probe.exe",
+        build_dir / "bin" / "Release" / "vm_micro_op_ratio_probe.exe",
+        build_dir / "bin" / "Debug" / "vm_micro_op_ratio_probe.exe",
+    ]
+    exe = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if exe is None:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"build succeeded but the probe executable was not found in any of: "
+            + ", ".join(str(candidate) for candidate in candidates))]
+
+    run = subprocess.run(
+        [str(exe)], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=120,
+        env=process_environment)
+    output = run.stdout + run.stderr
+    aggregate_match = re.search(
+        r"\[aggregate\] samples=(\d+) native=(\d+) micro=(\d+) "
+        r"ratio=([\d.]+) threshold=(\d+)", output)
+    if run.returncode != 0 or "VM_MICRO_RATIO_PROBE_PASS" not in output or \
+            aggregate_match is None:
+        return [Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            "representative-sample ratio probe did not pass:\n" + output[-4000:])]
+
+    samples = int(aggregate_match.group(1))
+    aggregate_ratio = float(aggregate_match.group(4))
+    threshold = int(aggregate_match.group(5))
+    if samples < 10:
+        violations.append(Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"only {samples} representative samples produced statistics -- "
+            "not enough to call this a representative sample set"))
+    if aggregate_ratio < float(threshold):
+        violations.append(Violation(
+            probe_path, 1, "micro-op-heavy-ratio-statistical-gate",
+            f"aggregate ratio {aggregate_ratio} across {samples} "
+            f"representative samples is below the {threshold}:1 threshold"))
+    return violations
+
+
 def decryptor_coverage_gate(root: Path) -> list[Violation]:
     """Verify production choice cardinality, exact-byte self-validation and
     exhaustive native execution coverage.  Digest/result field names alone do
@@ -1154,34 +1756,44 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
             synth_path, 1, "synth-does-not-verify-k-variant-bytes",
             "ValidateVMHandlerSemanticVariantKernel"))
 
-    # Name-existence above only proves the K-variant machinery exists
-    # somewhere in the file; it says nothing about how many semantics it
-    # actually covers.  Count semantics whose EmitBusinessCoreVariant branch
-    # really differs byte-for-byte per strategy in both architectures, and
-    # fail if that count regresses from the historical 13-semantic baseline:
-    # ADD/SUB/AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET/SHL/SHR.
-    real_variant_semantics = real_strategy_variant_semantics(semantic)
+    # Lock the complete 54-business-semantic surface, then require production
+    # code to re-emit strategy 0/1 under the same config and reject identical
+    # machine code.  We deliberately do not count `if (strategy)` source
+    # branches: helper-driven and seed-immediate variants defeat that heuristic,
+    # while dead/byte-identical branches can falsely satisfy it.
     exemption_names = set(K_VARIANT_NOT_APPLICABLE)
     if exemption_names != EXPECTED_K_VARIANT_NOT_APPLICABLE:
         violations.append(Violation(
             semantic_path, 1, "unauthorized-k-variant-exemption",
             "exemptions must be exactly CPUID/RDTSC/TRAP/EXIT; got " +
             ", ".join(sorted(exemption_names))))
-    missing_required = (
-        REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS - real_variant_semantics)
-    if missing_required:
+    implemented_semantics = business_core_semantics(semantic)
+    missing_required = REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS - implemented_semantics
+    unexpected = implemented_semantics - REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS
+    if missing_required or unexpected:
         violations.append(Violation(
-            semantic_path, 1, "missing-required-real-k-variant-semantics",
-            ", ".join(sorted(missing_required))))
-    if len(real_variant_semantics) < MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS:
+            semantic_path, 1, "business-k-variant-semantic-set-mismatch",
+            "missing=[" + ", ".join(sorted(missing_required)) +
+            "]; unexpected=[" + ", ".join(sorted(unexpected)) + "]"))
+    emitted_semantics = emitted_business_core_semantics(semantic)
+    missing_emission = implemented_semantics - emitted_semantics
+    if missing_emission:
         violations.append(Violation(
-            semantic_path, 1, "insufficient-real-k-variant-coverage",
-            f"only {len(real_variant_semantics)} semantic(s) "
-            f"({', '.join(sorted(real_variant_semantics)) or 'none'}) have a "
-            "strategy-conditioned EmitBusinessCoreVariant branch with two "
-            f"distinct emitted byte sequences in both x64 and x86; need >= "
-            f"{MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}, not just the ADD/SUB/"
-            "AND/OR/XOR/NOT/NEG/MUL/BIT_TEST/BIT_SET/BIT_RESET historical baseline"))
+            semantic_path, 1, "business-k-variant-emission-set-mismatch",
+            "HasBusinessCoreVariant semantics missing from one or both "
+            "EmitBusinessCoreVariant architecture switches: " +
+            ", ".join(sorted(missing_emission))))
+    if len(REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS) != \
+            TARGET_REAL_STRATEGY_VARIANT_SEMANTICS:
+        violations.append(Violation(
+            semantic_path, 1, "business-k-variant-target-regressed",
+            f"locked semantic set has "
+            f"{len(REQUIRED_REAL_STRATEGY_VARIANT_SEMANTICS)} entries; expected "
+            f"exactly {TARGET_REAL_STRATEGY_VARIANT_SEMANTICS}"))
+    for detail in strategy_reemission_evidence_errors(semantic):
+        violations.append(Violation(
+            semantic_path, 1,
+            "missing-executable-two-strategy-reemission-evidence", detail))
     if "0x48,0x83,0xEC,0x28,0xFF,0xD0" not in synth or \
        "0x48,0x83,0xC4,0x28" not in synth:
         violations.append(Violation(
@@ -1194,6 +1806,12 @@ def require_markers(root: Path, files: list[Path], code_by_path: dict[Path, str]
 
 
 def main() -> int:
+    self_check_errors = static_gate_internal_self_check()
+    if self_check_errors:
+        print("[FAIL] 静态门禁内部自检失败：", file=sys.stderr)
+        for detail in self_check_errors:
+            print(f"  {detail}", file=sys.stderr)
+        return 2
     args = parse_args()
     root = args.source_root.resolve()
     files = production_files(root)
@@ -1240,17 +1858,19 @@ def main() -> int:
     violations.extend(decryptor_coverage_gate(root))
     violations.extend(vm_group_seed_divergence_gate(root))
     violations.extend(dispatch_table_encoding_gate(root))
+    violations.extend(arithmetic_flags_bridge_closure_gate(root))
+    violations.extend(micro_op_heavy_ratio_statistical_gate(root))
 
-    # 进度可见性：把当前真正达到双策略（两架构各自发出字节不同且非外围包装）
-    # 的语义集合打印到 stdout，CI 摘要里一眼能看到"做到哪了、还差多少"，
-    # 不用再问 AI。即便本次运行 FAIL 也照打，便于定位是覆盖率不足还是别的。
+    # 进度可见性：只有完整语义集合和生产双策略重发射证据同时存在，才把
+    # 语义计入覆盖；源码里出现多少个 if(strategy) 不再参与门禁结论。
     semantic_path = root / "packer" / "transforms" / "vm_handler_semantic_codegen.cpp"
     real_variant_semantics = real_strategy_variant_semantics(
         code_by_path.get(semantic_path, ""))
     achieved = sorted(real_variant_semantics)
     print(
-        f"[progress] 双策略语义覆盖 {len(achieved)}/{TARGET_REAL_STRATEGY_VARIANT_SEMANTICS}"
-        f"（达标阈值 {MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}）："
+        f"[progress] 生产双策略重发射语义覆盖 "
+        f"{len(achieved)}/{TARGET_REAL_STRATEGY_VARIANT_SEMANTICS}"
+        f"（要求完整 {MINIMUM_REAL_STRATEGY_VARIANT_SEMANTICS}）："
         f"{', '.join(achieved) if achieved else 'none'}"
     )
     if violations:

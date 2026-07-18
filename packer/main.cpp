@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <cctype>
 #include <cstdio>
+#include <limits>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -49,6 +50,7 @@
 #include "transforms/vm_instruction_bridge_builder.h"
 #include "transforms/loader_import_builder.h"
 #include "differential/vm_native_differential_provider.h"
+#include "differential/vm_native_differential_protocol.h"
 #include "analysis/capability_checker.h"
 #include "analysis/hotspot_analyzer.h"
 #include "config/protection_build_context.h"
@@ -71,6 +73,8 @@ CipherShell v0.1 - 自研高强度代码保护壳
   -o, --output <文件>      指定输出文件路径
   -l, --level <1-5>        设置保护等级 (默认: 1)
   -c, --config <文件>      指定配置文件路径 (TOML 格式)
+  --vm-handler-evidence <文件>
+                            写出本次真实构建的明文 handler 比较证据
   -v, --verbose            显示详细信息
   -h, --help               显示此帮助信息
 
@@ -413,6 +417,30 @@ static bool ValidateVMStaticLink(
                     reason = "function_patch_reverification_failed: " + patchVerificationError;
                     return false;
                 }
+                for (const auto& relocation : image->relocs.entries) {
+                    const uint64_t relocationWidth = image->is64Bit ? 8u : 4u;
+                    if (relocation.fullRVA >
+                            (std::numeric_limits<uint64_t>::max)() -
+                                relocationWidth) {
+                        reason = "base_relocation_range_overflow";
+                        return false;
+                    }
+                    const uint64_t relocationEnd =
+                        relocation.fullRVA + relocationWidth;
+                    const uint64_t functionEnd =
+                        static_cast<uint64_t>(patch.functionRVA) +
+                            record.functionSize;
+                    if (relocationEnd > patch.functionRVA &&
+                        relocation.fullRVA < functionEnd) {
+                        std::ostringstream detail;
+                        detail << "base_relocation_still_targets_destroyed_native_function"
+                               << " relocation_rva=0x" << std::hex
+                               << relocation.fullRVA
+                               << " function_rva=0x" << patch.functionRVA;
+                        reason = detail.str();
+                        return false;
+                    }
+                }
                 hasVerifiedPatch = true;
                 break;
             }
@@ -654,6 +682,7 @@ struct VMGroupRuntime {
     char unwindSectionName[8] = {0};
     char relocSectionName[8] = {0};
     char runtimeApiSectionName[8] = {0};
+    char traceSectionName[8] = {0};
     CipherShell::MutationEngine mutEngine;
     CipherShell::MutatedISA mutatedISA;
     uint64_t operandCodecSeed = 0;
@@ -675,6 +704,7 @@ struct VMGroupOutcome {
     CipherShell::VMInstructionBridgeBuildResult bridgeResult{};
     CipherShell::VMEmitResult emitResult{};
     CipherShell::VMRuntimeBuildResult runtimeResult{};
+    CipherShell::VMTraceEmitResult traceResult{};
     std::vector<CipherShell::FunctionPatchResult> patchResults;
     std::unordered_map<uint32_t, uint32_t> vmOpcodeCounts;
 };
@@ -712,6 +742,7 @@ int main(int argc, char* argv[]) {
     std::string inputFile = std::move(cli.inputFile);
     std::string outputFile = std::move(cli.outputFile);
     std::string configFile = std::move(cli.configFile);
+    std::string vmHandlerEvidenceFile = std::move(cli.vmHandlerEvidenceFile);
     int protectionLevel = cli.protectionLevel;
     const bool verbose = cli.verbose;
 
@@ -1014,7 +1045,6 @@ int main(int argc, char* argv[]) {
         }
 
         const uint32_t vmRegisterCountConfig = static_cast<uint32_t>(config.vm.registerCount);
-        constexpr uint32_t kVmNativeDifferentialMemorySize = 0x10000u;
 
         CipherShell::Disassembler disasm;
         bool is64 = image->is64Bit != 0;
@@ -1033,6 +1063,15 @@ int main(int argc, char* argv[]) {
         if (!discoveryResult.success) {
             std::cerr << "VM_DISCOVERY_FAIL module=FunctionDiscovery reason="
                       << discoveryResult.error << std::endl;
+            // discoveryResult.error 只是最终的汇总性失败（比如"没有发现任何
+            // 可信函数边界"）；success=false 时上面这一条会直接 return，之前
+            // 每个候选 root 具体为什么被拒绝（issues）从未被打印过，诊断时
+            // 完全看不到中间过程。这里补上，纯诊断，不改变任何判定逻辑。
+            for (const auto& issue : discoveryResult.issues) {
+                std::cerr << "VM_DISCOVERY_REJECT module=FunctionDiscovery rva=0x"
+                          << std::hex << issue.rva << std::dec
+                          << " reason=" << issue.reason << std::endl;
+            }
             PrintFeatureStatus("vm", "failed", discoveryResult.error);
             return 1;
         }
@@ -1145,6 +1184,174 @@ int main(int argc, char* argv[]) {
                 eligibleFunctions.push_back(func);
         }
 
+        // Native bodies are destroyed only after every candidate has passed
+        // differential verification. Scan all discovered native code (not
+        // just selected sources) and reject any selected target whose bytes
+        // are still observed. Function-entry address values remain valid
+        // callable pointers because the entry becomes a trampoline; reads of
+        // entry bytes and every interior address are not preserved.
+        std::unordered_map<uint64_t, std::string> unsafeDestroyedTargets;
+        auto markAddressValue = [&](uint64_t target, const char* reason) {
+            for (const auto& protectedTarget : eligibleFunctions) {
+                const uint64_t begin = protectedTarget.entryAddress;
+                const uint64_t end = begin + protectedTarget.size;
+                if (target > begin && target < end) {
+                    unsafeDestroyedTargets.emplace(begin, reason);
+                }
+            }
+        };
+        auto markMemoryRead = [&](uint64_t target, uint64_t width,
+                                  const char* reason) {
+            width = (std::max)(uint64_t{1}, width);
+            if (target >
+                    (std::numeric_limits<uint64_t>::max)() - width) {
+                return;
+            }
+            const uint64_t targetEnd = target + width;
+            for (const auto& protectedTarget : eligibleFunctions) {
+                const uint64_t begin = protectedTarget.entryAddress;
+                const uint64_t end = begin + protectedTarget.size;
+                if (target < end && targetEnd > begin) {
+                    unsafeDestroyedTargets.emplace(begin, reason);
+                }
+            }
+        };
+        for (const auto& source : discoveryResult.functions) {
+            for (const auto& block : source.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.hasBranchTarget) {
+                        for (const auto& protectedTarget : eligibleFunctions) {
+                            const uint64_t begin = protectedTarget.entryAddress;
+                            const uint64_t end = begin + protectedTarget.size;
+                            if (source.entryAddress != begin &&
+                                instruction.branchTargetRVA > begin &&
+                                instruction.branchTargetRVA < end) {
+                                unsafeDestroyedTargets.emplace(begin,
+                                    "external_control_flow_targets_destroyed_function_interior");
+                            }
+                        }
+                    }
+                    for (const auto& operand : instruction.operands) {
+                        if (operand.type == CipherShell::OperandType::Memory &&
+                            (operand.memory.isImageAddress ||
+                             operand.memory.isRipRelative)) {
+                            if (instruction.mnemonic ==
+                                    CipherShell::InstructionMnemonic::Lea) {
+                                markAddressValue(operand.memory.resolvedRVA,
+                                    "image_address_targets_destroyed_function_interior");
+                            } else {
+                                const uint64_t width =
+                                    (operand.memory.width + 7u) / 8u;
+                                markMemoryRead(operand.memory.resolvedRVA, width,
+                                    "image_memory_read_overlaps_destroyed_function_bytes");
+                            }
+                        } else if (operand.type ==
+                                       CipherShell::OperandType::Immediate &&
+                                   operand.immediateIsImageAddress) {
+                            markAddressValue(operand.immediateResolvedRVA,
+                                "image_address_targets_destroyed_function_interior");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Relocated pointers in data can legally point at a function entry,
+        // but an interior pointer would outlive the native bytes it names.
+        const uint64_t preferredImageBase = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.ImageBase
+            : image->ntHeaders32->OptionalHeader.ImageBase;
+        const uint64_t preferredImageEnd = preferredImageBase +
+            (image->is64Bit ? image->ntHeaders64->OptionalHeader.SizeOfImage
+                            : image->ntHeaders32->OptionalHeader.SizeOfImage);
+        const uint16_t expectedRelocationType = image->is64Bit
+            ? IMAGE_REL_BASED_DIR64 : IMAGE_REL_BASED_HIGHLOW;
+        const uint32_t relocationWidth = image->is64Bit ? 8u : 4u;
+        for (const auto& relocation : image->relocs.entries) {
+            if (relocation.type != expectedRelocationType ||
+                relocation.fullRVA > (std::numeric_limits<uint32_t>::max)()) {
+                continue;
+            }
+            const uint32_t offset = CipherShell::PEUtils::RvaToOffset(
+                image.get(), static_cast<uint32_t>(relocation.fullRVA));
+            if (offset == 0 || offset > image->rawSize ||
+                relocationWidth > image->rawSize - offset) continue;
+            uint64_t value = 0;
+            std::memcpy(&value, image->rawData + offset, relocationWidth);
+            if (value >= preferredImageBase && value < preferredImageEnd) {
+                markAddressValue(value - preferredImageBase,
+                    "relocated_data_pointer_targets_destroyed_function_interior");
+            }
+        }
+
+        std::vector<CipherShell::Function> relocationSafeFunctions;
+        relocationSafeFunctions.reserve(eligibleFunctions.size());
+        for (const auto& function : eligibleFunctions) {
+            const auto unsafe = unsafeDestroyedTargets.find(function.entryAddress);
+            if (unsafe != unsafeDestroyedTargets.end()) {
+                ++rejectedCount;
+                std::cerr << "VM_REJECT module=CapabilityChecker rva=0x"
+                          << std::hex << function.entryAddress << std::dec
+                          << " reason=" << unsafe->second << std::endl;
+                continue;
+            }
+            relocationSafeFunctions.push_back(function);
+        }
+        eligibleFunctions.swap(relocationSafeFunctions);
+
+        // Size the corpus only from candidates that passed explicit selection
+        // and capability checks. Keep a separate 64 KiB stack/scratch tail so
+        // image globals cannot alias the synthetic call stack.
+        constexpr uint64_t kDifferentialStackAndScratch = 0x10000u;
+        const uint64_t parsedImageSize = image->is64Bit
+            ? image->ntHeaders64->OptionalHeader.SizeOfImage
+            : image->ntHeaders32->OptionalHeader.SizeOfImage;
+        // Address values can be formed as imageBase + arithmetic and later
+        // dereferenced through an ordinary base register, so direct operand
+        // annotations alone are not a complete upper bound. Reserving at least
+        // the parsed PE image keeps every legal module RVA disjoint from the
+        // synthetic scratch/stack tail; oversized images fail closed below.
+        uint64_t differentialImageSpan =
+            (std::max)(uint64_t{0x10000u}, parsedImageSize);
+        for (const auto& function : eligibleFunctions) {
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    for (const auto& operand : instruction.operands) {
+                        uint64_t required = 0;
+                        if (operand.type == CipherShell::OperandType::Memory &&
+                            (operand.memory.isImageAddress ||
+                             operand.memory.isRipRelative)) {
+                            const uint64_t width = (std::max)(1u,
+                                static_cast<uint32_t>(
+                                    (operand.memory.width + 7u) / 8u));
+                            required = static_cast<uint64_t>(
+                                operand.memory.resolvedRVA) + width;
+                        } else if (operand.type == CipherShell::OperandType::Immediate &&
+                                   operand.immediateIsImageAddress) {
+                            required = static_cast<uint64_t>(
+                                operand.immediateResolvedRVA) + sizeof(uint64_t);
+                        }
+                        differentialImageSpan = (std::max)(
+                            differentialImageSpan, required);
+                    }
+                }
+            }
+        }
+        differentialImageSpan =
+            (differentialImageSpan + 0xFFFu) & ~0xFFFULL;
+        const uint64_t differentialMemoryRequired =
+            differentialImageSpan + kDifferentialStackAndScratch;
+        if (differentialMemoryRequired < differentialImageSpan ||
+            differentialMemoryRequired >
+                CipherShell::VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE) {
+            std::cerr << "VM_INIT_FAIL module=VMNativeDifferentialVerifier"
+                      << " reason=image_relative_corpus_range_overflow" << std::endl;
+            PrintFeatureStatus("vm", "failed", "image_relative_corpus_range_overflow");
+            return 1;
+        }
+        const uint32_t vmNativeDifferentialMemorySize =
+            static_cast<uint32_t>(differentialMemoryRequired);
+
         // Group 数量：variant_group_count==0 表示自适应——按候选函数数量
         // ceil(eligible / variant_group_functions_per_group)，夹在
         // [1, variant_group_max] 之间；否则使用显式配置的固定组数。两种
@@ -1201,6 +1408,8 @@ int main(int argc, char* argv[]) {
                 grp.unwindSectionName, buildCtx, buildCtx.vmUnwindSectionName, 0xDA7Au, g);
             CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
                 grp.relocSectionName, buildCtx, buildCtx.vmRelocSectionName, 0x2E10u, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.traceSectionName, buildCtx, buildCtx.vmSectionName, 0x7ACEu, g);
 
             CipherShell::MutationConfig mutConfig;
             mutConfig.randomizeOpcodeMap = true;
@@ -1264,7 +1473,7 @@ int main(int argc, char* argv[]) {
                 grp.mutatedISA.handlerSlotToSemantic,
                 grp.mutatedISA.handlerVariants,
                 nativeDifferentialOperandCodec,
-                kVmNativeDifferentialMemorySize,
+                vmNativeDifferentialMemorySize,
                 nativeDifferentialInitError);
             if (!grp.nativeDifferentialProviderReady) {
                 std::cerr << "VM_NATIVE_DIFFERENTIAL_PROVIDER_INIT_FAIL vm_group=" << g
@@ -1364,9 +1573,11 @@ int main(int argc, char* argv[]) {
                 modelConfig.corpusSeed =
                     grp.operandCodecSeed ^ func.entryAddress;
                 modelConfig.corpusCount = 256;
-                // Must match kVmNativeDifferentialMemorySize: the native
+                // Must match vmNativeDifferentialMemorySize: the native
                 // differential gate below reuses this corpus's memory size.
-                modelConfig.memorySize = kVmNativeDifferentialMemorySize;
+                modelConfig.memorySize = vmNativeDifferentialMemorySize;
+                modelConfig.imageSize = static_cast<uint32_t>(
+                    differentialImageSpan);
                 // 纯标注，不影响校验逻辑：让 result.vmGroupId 能回答"这份
                 // 证据是哪个 VM Variant Group 产出的"，为后续多 Group 交叉
                 // 校验（确认互不干扰）打基础。
@@ -1412,6 +1623,7 @@ int main(int argc, char* argv[]) {
                 nativeConfig.corpusSeed = modelConfig.corpusSeed;
                 nativeConfig.corpusCount = modelConfig.corpusCount;
                 nativeConfig.memorySize = modelConfig.memorySize;
+                nativeConfig.imageSize = modelConfig.imageSize;
                 nativeConfig.timeoutMilliseconds = 1000;
                 // A missing/failed-to-initialize provider (worker binary absent,
                 // wrong architecture, synthesis failure) must fail closed here,
@@ -1518,6 +1730,34 @@ int main(int argc, char* argv[]) {
         for (const auto& outcome : vmGroupOutcomes) totalVmRecords += static_cast<uint32_t>(outcome.vmRecords.size());
 
         if (totalVmRecords > 0) {
+            std::unordered_set<uint64_t> consumedNativeRelocations;
+            for (const auto& function : allProtectedFunctions) {
+                for (const auto& block : function.blocks) {
+                    for (const auto& instruction : block.instructions) {
+                        if (!instruction.hasImageRelocation ||
+                            !instruction.imageRelocationSupported) continue;
+                        consumedNativeRelocations.insert(
+                            static_cast<uint64_t>(instruction.rva) +
+                            instruction.imageRelocationOffset);
+                    }
+                }
+            }
+            const size_t relocationsBefore = image->relocs.entries.size();
+            image->relocs.entries.erase(std::remove_if(
+                image->relocs.entries.begin(), image->relocs.entries.end(),
+                [&](const CipherShell::CS_RELOC_ENTRY& relocation) {
+                    return consumedNativeRelocations.count(relocation.fullRVA) != 0u;
+                }), image->relocs.entries.end());
+            if (relocationsBefore - image->relocs.entries.size() !=
+                    consumedNativeRelocations.size()) {
+                std::cerr << "VM_INIT_FAIL module=RelocFixer"
+                          << " reason=protected_image_relocation_consumption_mismatch"
+                          << std::endl;
+                PrintFeatureStatus("vm", "failed",
+                    "protected_image_relocation_consumption_mismatch");
+                return 1;
+            }
+
             CipherShell::LoaderImportBuilder runtimeImportBuilder;
             vmRuntimeImports = runtimeImportBuilder.Build(
                 image.get(), buildCtx.vmRuntimeApiSectionName);
@@ -1554,6 +1794,28 @@ int main(int argc, char* argv[]) {
                 outcome.opcodeMap = grp.mutatedISA.opcodeMap;
                 outcome.registerMap = grp.mutatedISA.registerMap;
 
+                CipherShell::VMRuntimeTraceBinding traceBinding{};
+                const CipherShell::VMRuntimeTraceBinding* traceBindingPtr = nullptr;
+                if (!vmHandlerEvidenceFile.empty()) {
+                    outcome.traceResult = vmEmitter.EmitTrace(
+                        image.get(), outcome.emitResult.buildId,
+                        outcome.emitResult.architecture, g,
+                        VM_TRACE_DEFAULT_CAPACITY, grp.traceSectionName);
+                    if (!outcome.traceResult.success) {
+                        std::cerr << "VM_TRACE_FAIL module=VMSectionEmitter vm_group="
+                                  << g << " reason=" << outcome.traceResult.error
+                                  << std::endl;
+                        PrintFeatureStatus("vm", "failed", outcome.traceResult.error);
+                        return 1;
+                    }
+                    traceBinding.traceRVA = outcome.traceResult.sectionRVA;
+                    traceBinding.capacity = outcome.traceResult.capacity;
+                    traceBinding.groupId = g;
+                    traceBinding.architecture = outcome.emitResult.architecture;
+                    traceBinding.buildId = outcome.emitResult.buildId;
+                    traceBindingPtr = &traceBinding;
+                }
+
                 CipherShell::VMRuntimeBuilder runtimeBuilder;
                 CipherShell::VMHandlerSynthesisConfig synthesisConfig{};
                 synthesisConfig.architecture = is64
@@ -1576,12 +1838,15 @@ int main(int argc, char* argv[]) {
                     vmRuntimeImports.virtualProtectIatRVA;
                 synthesisConfig.flushInstructionCacheIatRVA =
                     vmRuntimeImports.flushInstructionCacheIatRVA;
+                synthesisConfig.runtimeTraceEnabled = traceBindingPtr != nullptr;
                 outcome.runtimeResult = runtimeBuilder.Build(image.get(), outcome.vmRecords,
+                    outcome.vmBytecodeBlob, outcome.opcodeMap,
                     outcome.emitResult.metadataRVA, outcome.emitResult.runtimeKeyShare,
                     synthesisConfig,
                     grp.runtimeSectionName,
                     grp.unwindSectionName,
-                    grp.relocSectionName);
+                    grp.relocSectionName,
+                    traceBindingPtr);
                 if (!outcome.runtimeResult.success ||
                     !outcome.runtimeResult.handlerSynthesisVerified ||
                     !outcome.runtimeResult.directThreadedVerified ||
@@ -1607,7 +1872,10 @@ int main(int argc, char* argv[]) {
                         outcome.runtimeResult.sectionRVA, outcome.runtimeResult.runtimeEntryRVA,
                         outcome.runtimeResult.runtimeImageSize,
                         outcome.runtimeResult.trampolines, outcome.emitResult.runtimeKeyShare,
-                        linkageVerifiedFlags, &patchError)) {
+                        linkageVerifiedFlags, &patchError,
+                        outcome.traceResult.sectionRVA,
+                        outcome.traceResult.capacity,
+                        outcome.traceResult.groupId)) {
                     std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver vm_group=" << g
                               << " reason=" << patchError << std::endl;
                     PrintFeatureStatus("vm", "failed", patchError);
@@ -1641,7 +1909,11 @@ int main(int argc, char* argv[]) {
                         outcome.runtimeResult.runtimeImageSize,
                         outcome.runtimeResult.trampolines,
                         outcome.emitResult.runtimeKeyShare,
-                        VM_METADATA_FLAG_NATIVE_BODY_DESTROYED | linkageVerifiedFlags, &patchError)) {
+                        VM_METADATA_FLAG_NATIVE_BODY_DESTROYED | linkageVerifiedFlags,
+                        &patchError,
+                        outcome.traceResult.sectionRVA,
+                        outcome.traceResult.capacity,
+                        outcome.traceResult.groupId)) {
                     std::cerr << "VM_METADATA_FAIL module=VMMetadataResolver vm_group=" << g
                               << " reason=" << patchError << std::endl;
                     PrintFeatureStatus("vm", "failed", patchError);
@@ -1666,6 +1938,30 @@ int main(int argc, char* argv[]) {
                           << " raw=0x" << outcome.runtimeResult.sectionRawOffset
                           << " size=0x" << outcome.runtimeResult.sectionSize
                           << " entry=0x" << outcome.runtimeResult.runtimeEntryRVA << std::dec << std::endl;
+                // ciphershellpro.md §8 per-build diagnostics. Runtime digests
+                // bind the physical synthesized/encrypted image. The separate
+                // opt-in evidence sidecar below contains only the synthesizer-
+                // published semantic-body ranges. Storage-envelope opaque
+                // islands, encryption and junk handlers cannot manufacture a
+                // low similarity score.
+                std::cout << "VM_RUNTIME_DIGESTS vm_group=" << g << std::hex
+                          << " opcode_map=0x" << outcome.runtimeResult.opcodeMapDigest
+                          << " handler_body=0x" << outcome.runtimeResult.handlerBodyDigest
+                          << " dispatch_key=0x" << outcome.runtimeResult.dispatchKeyDigest
+                          << " variant_selector=0x" << outcome.runtimeResult.variantSelectorDigest
+                          << " encrypted_handlers_offset=0x"
+                          << outcome.runtimeResult.integrityExpectation.encryptedHandlers.offset
+                          << " encrypted_handlers_size=0x"
+                          << outcome.runtimeResult.integrityExpectation.encryptedHandlers.size
+                          << std::dec << std::endl;
+                std::cout << "VM_HANDLER_PLAINTEXT_DIGEST vm_group=" << g
+                          << " digest=0x" << std::hex
+                          << outcome.runtimeResult.semanticPlaintextEvidenceDigest
+                          << std::dec << " handlers="
+                          << outcome.runtimeResult.plaintextHandlers.size()
+                          << " records="
+                          << outcome.runtimeResult.handlerReferences.size()
+                          << std::endl;
                 std::cout << "VM_METADATA_SECTION vm_group=" << g << " rva=0x" << std::hex
                           << outcome.emitResult.sectionRVA
                           << " raw=0x" << outcome.emitResult.sectionRawOffset
@@ -1678,6 +1974,15 @@ int main(int argc, char* argv[]) {
                           << " scalar_memory=true memory_arithmetic=true"
                           << " native_call_bridge=false intra_vm_direct_call=true simd_x87_bridge=true"
                           << " fail_policy=error_code_in_eax_then_int3_ud2" << std::endl;
+                if (outcome.traceResult.success) {
+                    std::cout << "VM_RUNTIME_TRACE_SECTION vm_group=" << g
+                              << " rva=0x" << std::hex
+                              << outcome.traceResult.sectionRVA << std::dec
+                              << " capacity=" << outcome.traceResult.capacity
+                              << " architecture="
+                              << (outcome.traceResult.architecture == VM_ARCH_X64 ? 64 : 32)
+                              << std::endl;
+                }
 
                 for (const auto& record : outcome.vmRecords) {
                     const CipherShell::VMTrampolineRecord* trampoline = nullptr;
@@ -1989,6 +2294,172 @@ int main(int argc, char* argv[]) {
     }
     parser.FreeImage(verifyImage);
     std::cout << "  输出文件静态复验成功" << std::endl;
+    if (!vmHandlerEvidenceFile.empty()) {
+        const fs::path evidencePath =
+            fs::absolute(fs::path(vmHandlerEvidenceFile)).lexically_normal();
+        const fs::path protectedPath =
+            fs::absolute(fs::path(outputFile)).lexically_normal();
+        std::string evidenceName = evidencePath.generic_string();
+        std::string protectedName = protectedPath.generic_string();
+        std::transform(evidenceName.begin(), evidenceName.end(),
+            evidenceName.begin(), [](unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+        std::transform(protectedName.begin(), protectedName.end(),
+            protectedName.begin(), [](unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+        std::error_code pathError;
+        const bool evidenceExists = fs::exists(evidencePath, pathError);
+        pathError.clear();
+        const bool sameExistingFile = evidenceExists &&
+            fs::equivalent(evidencePath, protectedPath, pathError) && !pathError;
+        if (evidenceName == protectedName || sameExistingFile) {
+            std::remove(outputFile.c_str());
+            std::cerr << "VM_HANDLER_EVIDENCE_FAIL reason=evidence_path_is_output_path"
+                      << std::endl;
+            return 1;
+        }
+        uint32_t activeGroups = 0;
+        uint32_t architecture = 0;
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            const uint32_t outcomeArchitecture =
+                outcome.runtimeResult.architecture == VM_ARCH_X64 ? 64u :
+                outcome.runtimeResult.architecture == VM_ARCH_X86 ? 32u : 0u;
+            if (outcome.runtimeResult.plaintextHandlers.empty() ||
+                outcome.runtimeResult.handlerReferences.empty() ||
+                outcome.runtimeResult.traceBinding.traceRVA == 0 ||
+                outcome.runtimeResult.traceBinding.capacity == 0 ||
+                outcome.runtimeResult.traceBinding.groupId != outcome.groupId ||
+                outcome.runtimeResult.traceBinding.architecture !=
+                    outcome.emitResult.architecture ||
+                outcome.runtimeResult.traceBinding.buildId !=
+                    outcome.emitResult.buildId ||
+                (architecture != 0 &&
+                 architecture != outcomeArchitecture) ||
+                outcomeArchitecture == 0) {
+                std::remove(outputFile.c_str());
+                std::cerr << "VM_HANDLER_EVIDENCE_FAIL reason=incomplete_runtime_evidence"
+                          << std::endl;
+                return 1;
+            }
+            architecture = outcomeArchitecture;
+            ++activeGroups;
+        }
+        if (!vmApplied || activeGroups == 0 ||
+            (architecture != 32 && architecture != 64)) {
+            std::remove(outputFile.c_str());
+            std::cerr << "VM_HANDLER_EVIDENCE_FAIL reason=no_verified_vm_runtime"
+                      << std::endl;
+            return 1;
+        }
+
+        fs::path temporaryEvidence = evidencePath;
+        temporaryEvidence += ".tmp." + std::to_string(GetCurrentProcessId());
+        pathError.clear();
+        fs::remove(temporaryEvidence, pathError);
+        FILE* evidence = fopen(temporaryEvidence.string().c_str(), "wb");
+        bool evidenceOk = evidence != nullptr;
+        auto writeEvidence = [&](const void* data, size_t size) {
+            if (!evidenceOk || size == 0) return;
+            evidenceOk = fwrite(data, 1, size, evidence) == size;
+        };
+        const char magic[8] = {'C','S','V','M','P','L','N','3'};
+        writeEvidence(magic, sizeof(magic));
+        writeEvidence(&architecture, sizeof(architecture));
+        writeEvidence(&activeGroups, sizeof(activeGroups));
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            const uint32_t groupId = outcome.groupId;
+            const uint64_t digest =
+                outcome.runtimeResult.semanticPlaintextEvidenceDigest;
+            const uint32_t handlerCount = static_cast<uint32_t>(
+                outcome.runtimeResult.plaintextHandlers.size());
+            const uint32_t recordCount = static_cast<uint32_t>(
+                outcome.runtimeResult.handlerReferences.size());
+            writeEvidence(&groupId, sizeof(groupId));
+            writeEvidence(&digest, sizeof(digest));
+            writeEvidence(&handlerCount, sizeof(handlerCount));
+            writeEvidence(&recordCount, sizeof(recordCount));
+            writeEvidence(&outcome.runtimeResult.traceBinding.traceRVA,
+                sizeof(outcome.runtimeResult.traceBinding.traceRVA));
+            writeEvidence(&outcome.runtimeResult.traceBinding.capacity,
+                sizeof(outcome.runtimeResult.traceBinding.capacity));
+            writeEvidence(outcome.runtimeResult.traceBinding.buildId.data(),
+                outcome.runtimeResult.traceBinding.buildId.size());
+            for (const auto& handler :
+                    outcome.runtimeResult.plaintextHandlers) {
+                const uint8_t header[4] = {
+                    handler.semantic, handler.slot, handler.variant, 0};
+                const uint32_t semanticCoreSize =
+                    static_cast<uint32_t>(handler.core.size());
+                const uint32_t codecRangeCount = static_cast<uint32_t>(
+                    handler.valueCodecRanges.size());
+                writeEvidence(header, sizeof(header));
+                writeEvidence(&handler.handlerBodySize,
+                    sizeof(handler.handlerBodySize));
+                writeEvidence(&handler.semanticCoreOffset,
+                    sizeof(handler.semanticCoreOffset));
+                writeEvidence(&semanticCoreSize,
+                    sizeof(semanticCoreSize));
+                writeEvidence(&handler.semanticCoreVariantOffset,
+                    sizeof(handler.semanticCoreVariantOffset));
+                writeEvidence(&handler.semanticCoreVariantSize,
+                    sizeof(handler.semanticCoreVariantSize));
+                writeEvidence(&codecRangeCount, sizeof(codecRangeCount));
+                writeEvidence(handler.core.data(), handler.core.size());
+                for (const auto& range : handler.valueCodecRanges) {
+                    writeEvidence(&range.offset, sizeof(range.offset));
+                    writeEvidence(&range.size, sizeof(range.size));
+                }
+            }
+            for (const auto& record :
+                    outcome.runtimeResult.handlerReferences) {
+                const uint32_t referenceCount = static_cast<uint32_t>(
+                    record.references.size());
+                writeEvidence(&record.functionRVA,
+                    sizeof(record.functionRVA));
+                writeEvidence(&record.bytecodeOffset,
+                    sizeof(record.bytecodeOffset));
+                writeEvidence(&record.bytecodeSize,
+                    sizeof(record.bytecodeSize));
+                writeEvidence(&record.bytecodeDigest,
+                    sizeof(record.bytecodeDigest));
+                writeEvidence(&referenceCount, sizeof(referenceCount));
+                writeEvidence(record.bytecode.data(), record.bytecode.size());
+                for (const auto& reference : record.references) {
+                    const uint8_t referenceHeader[4] = {
+                        reference.semantic, reference.variant, 0, 0};
+                    writeEvidence(&reference.bytecodeOffset,
+                        sizeof(reference.bytecodeOffset));
+                    writeEvidence(&reference.encodedSize,
+                        sizeof(reference.encodedSize));
+                    writeEvidence(referenceHeader, sizeof(referenceHeader));
+                }
+            }
+        }
+        if (evidence && fclose(evidence) != 0) evidenceOk = false;
+        if (evidenceOk) {
+            pathError.clear();
+            fs::remove(evidencePath, pathError);
+            pathError.clear();
+            fs::rename(temporaryEvidence, evidencePath, pathError);
+            if (pathError) evidenceOk = false;
+        }
+        if (!evidenceOk) {
+            pathError.clear();
+            fs::remove(temporaryEvidence, pathError);
+            pathError.clear();
+            fs::remove(evidencePath, pathError);
+            std::remove(outputFile.c_str());
+            std::cerr << "VM_HANDLER_EVIDENCE_FAIL reason=short_or_failed_write"
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "VM_HANDLER_EVIDENCE_PASS architecture=" << architecture
+                  << " groups=" << activeGroups << std::endl;
+    }
     if (vmApplied) {
         uint32_t vmAppliedFunctionCount = 0;
         uint32_t vmActiveGroupCount = 0;
@@ -2003,17 +2474,12 @@ int main(int argc, char* argv[]) {
         // means every emitted function passed real native-CPU-vs-synthesized-
         // handler differential evidence (VM_NATIVE_DIFFERENTIAL_PASS) for its
         // corpus -- semantic correctness is verified for those functions.
-        // It does NOT mean VM protection as a whole is production-ready or
-        // hardened against generic unpacking/deobfuscation tooling: K-variant
-        // instruction-sequence diversity beyond ADD/SUB/AND/OR/XOR/NOT/NEG is
-        // still incomplete (see vm_kernel_static_gate's insufficient-real-k-
-        // variant-coverage check), so most emitted micro-op semantics still
-        // share one fixed core instruction sequence across builds/variants.
-        // Never report or log this as "ready to enable in production" until
-        // that gap is closed.
+        // A single pack run cannot prove the cross-build <15% requirement;
+        // vm_per_build_similarity_gate consumes the opt-in plaintext evidence
+        // from two independent seeds and owns that separate assertion.
         std::cout << "VM_PROTECTION_SCOPE_NOTE correctness=verified "
-                     "anti_cracking_hardening=incomplete "
-                     "reason=k_variant_coverage_below_target" << std::endl;
+                     "per_build_diversity=requires_two_build_gate "
+                     "native_fallback=false" << std::endl;
     }
     if (cfgApplied) {
         PrintFeatureStatus("control_flow.flattening", "applied",

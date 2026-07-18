@@ -70,6 +70,7 @@ struct VMHandlerEntryCodegenConfig {
     uint32_t flushInstructionCacheIatRVA = 0;
     uint32_t functionPlanCount = 0;
     bool emitCetLandingPads = true;
+    bool runtimeTraceEnabled = false;
 };
 
 struct VMHandlerEntryRelocation {

@@ -43,6 +43,18 @@ struct VMEmitResult {
     std::string error;
 };
 
+struct VMTraceEmitResult {
+    bool success = false;
+    uint32_t sectionRVA = 0;
+    uint32_t sectionRawOffset = 0;
+    uint32_t sectionSize = 0;
+    uint32_t capacity = 0;
+    uint32_t groupId = 0;
+    uint32_t architecture = 0;
+    std::array<uint8_t, 16> buildId{};
+    std::string error;
+};
+
 class VMSectionEmitter {
 public:
     VMEmitResult Emit(
@@ -70,7 +82,18 @@ public:
         const std::vector<VMTrampolineRecord>& trampolines,
         const std::array<uint8_t, VM_RUNTIME_KEY_SHARE_SIZE>& runtimeKeyShare,
         uint32_t verifiedFlags,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        uint32_t traceRVA = 0,
+        uint32_t traceCapacity = 0,
+        uint32_t traceGroup = 0);
+
+    VMTraceEmitResult EmitTrace(
+        CS_PE_IMAGE* image,
+        const std::array<uint8_t, 16>& buildId,
+        uint32_t architecture,
+        uint32_t groupId,
+        uint32_t capacity,
+        const char sectionName[8] = nullptr);
 
     static bool VerifyMetadata(
         const uint8_t* metadata,

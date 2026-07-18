@@ -1,0 +1,99 @@
+# Config for tests/scripts/vm_per_build_similarity_gate.py, packing
+# the companion real MSVC DLL and EXE fixtures.
+#
+# Same as config/default.toml except the vm section below turns protection
+# on, names the samples' eight exported functions explicitly, and pins a
+# single variant group. Naming the exports explicitly makes selection
+# deterministic and independent of hotspot-level auto-selection (which
+# would otherwise skip functions the analyzer classifies as "hot"). Pinning
+# a single group makes both of the gate's independently seeded builds land
+# their handler bodies at the same group id so they are directly
+# comparable, instead of the default adaptive group count scattering the
+# same candidate function across a different group id on each build.
+
+[global]
+protection_level = 4
+strip_debug_info = true
+strip_rich_header = true
+strip_timestamps = true
+randomize_section_names = true
+
+[vm]
+enabled = true
+strength = 80
+target_functions = ["add", "sub2", "max2", "is_zero", "local1", "relocated_ptr", "relocated_read", "relocated_write"]
+target_rvas = []
+register_count = 24
+stack_size = 0x20000
+opcode_randomization = true
+handler_mutation = true
+bytecode_encryption = true
+native_body_policy = "destroy"
+x86_call_abi = "auto"
+embed_junk_handlers = true
+simd_bridge = true
+x87_bridge = true
+variant_group_count = 1
+variant_group_max = 4
+variant_group_functions_per_group = 4
+
+[string_encryption]
+enabled = false
+strength = 60
+mode = "startup"
+ascii = true
+utf16 = true
+resources = false
+clear_after_use = false
+
+[import_protection]
+enabled = false
+strength = 50
+
+[section_encryption]
+enabled = false
+strength = 58
+mode = "startup"
+
+[control_flow]
+enabled = false
+strength = 55
+
+[control_flow.flattening]
+enabled = false
+strength = 55
+target_functions = []
+
+[control_flow.bogus]
+enabled = false
+strength = 50
+
+[anti_debug]
+timing_checks = true
+hardware_bp_detection = true
+software_bp_detection = true
+memory_integrity = true
+debugger_window_scan = false
+parent_process_check = true
+thread_hiding = true
+kernel_debugger_check = true
+
+[anti_dump]
+erase_pe_header = true
+section_permission_guard = true
+nanomite_patches = true
+
+[performance]
+auto_hotspot_analysis = true
+max_vm_overhead_ratio = 15.0
+
+# Diagnostic note for anyone editing this file: ConfigParser::ExtractSection
+# (packer/config/config_parser.cpp) locates a section with a plain
+# substring search for a section header written literally, with no
+# awareness of comments or line boundaries. A previous revision of a
+# sibling config file explained that fact by quoting a section's own
+# header inside a comment placed above the real header, and that quote was
+# itself matched as the section start, silently truncating every real
+# field below out of what got fed into that section's parser. Keep any
+# section-header-shaped text out of comments that precede the real header
+# it is naming.
