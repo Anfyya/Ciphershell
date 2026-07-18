@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--business-core-similarity-threshold", type=float, required=True,
         help="max business-lowering 4-gram Dice similarity after removing "
-             "codec ranges (hard ceiling: 0.30). This is an anti-regression "
+             "codec ranges (hard ceiling: 0.32). This is an anti-regression "
              "baseline measured separately per target architecture (see "
              "codex_change.log v2.7.2), not a validated attacker-difficulty "
              "bound, so it has no single shared default: the caller "
@@ -1148,15 +1148,21 @@ def resolve_thresholds(args: argparse.Namespace) -> dict[str, float]:
         "encrypted_handlers": encrypted,
     }
     hard_ceilings = {
-        # 0.30 is the looser of the two real per-architecture business_core
-        # baselines measured for v2.7.2 (x64 0.30, Win32 0.28; see
-        # codex_change.log). It replaces the old 0.35, which was never
-        # validated against any attacker-difficulty bound and had drifted
-        # well above what real builds actually produce. This ceiling only
-        # bounds how loose --business-core-similarity-threshold may be
-        # set (a per-architecture anti-regression baseline supplied by the
-        # caller); it is not itself a claim about analysis difficulty.
-        "business_core": 0.30,
+        # 0.32 replaces the old 0.35, which was never validated against any
+        # attacker-difficulty bound. It is NOT a single fresh sample rounded
+        # up: an initial v2.7.2 attempt used 0.30/0.28 from 4 local samples
+        # per architecture, and real CSPRNG-seeded CI runs immediately
+        # exceeded 0.28 twice in a row on Win32 (0.2856, 0.2863) -- real
+        # per-build seeds vary enough that a 1-2 sample margin is not
+        # reliable. v2.7.3 recalibrated from 16 x64 + 9 Win32 independent
+        # real-seed samples (see codex_change.log): both architectures'
+        # business_core lands at mean~0.28/0.275, stdev~0.006/0.007, so
+        # 0.32 sits about 6 stdev above the mean on both -- comfortably
+        # past the measured spread without being an arbitrary number. This
+        # ceiling only bounds how loose --business-core-similarity-threshold
+        # may be set (a per-architecture anti-regression baseline supplied
+        # by the caller); it is not itself a claim about analysis difficulty.
+        "business_core": 0.32,
         "core_variant": 0.35,
         "codec": 0.15,
         "encrypted_handlers": 0.15,

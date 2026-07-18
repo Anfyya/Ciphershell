@@ -111,3 +111,15 @@
 待验证与未完成：意外发现 vm_per_build_similarity_gate.py 的 codec 聚合阶段（阈值 0.15，本轮完全未改动其逻辑或数值）在真随机种子采样中出现过跨阈值的情况（DLL codec dice 0.1784–0.1870），5 次独立 x64 采样里出现 2 次，且在本轮任何代码改动之前就已复现，确认是该阶段本身对真随机种子波动的敏感度问题、不是本轮引入的回归，但尚未定位根本原因，留待后续会话单独调查，本轮未处理、未掩盖。CALL_HOST、宽乘除法、BRIDGE_EXTENDED 等高风险语义的寄存器重分配（含刚确认的 x86 UMUL_WIDE 0.714286 单 pair）本轮按要求未做。尚未 push，尚未触发新的 GitHub Actions 运行，CI 是否变绿仍待远端验证，不作宣称。
 
 如何部署更改：无需新增依赖；tests/CMakeLists.txt 现在会向 vm_per_build_similarity_gate.py 显式传 --business-core-similarity-threshold（按 CMAKE_SIZEOF_VOID_P 取 0.30 或 0.28），该参数现在是必填项，手工调用此脚本的人需要自己指定架构对应的值，不再有隐式共享默认值。
+[2026-07-18 21:50] v2.7.3
+变更摘要：v2.7.2 push 后真实 GitHub Actions 立刻证伪了其 business_core 阈值的校准方法——x64 (b0f2070→7e1cb96) 一次通过，但 Win32 连续两次真实 CI 运行都在 DLL business_core 上超阈（0.2856、0.2863，均高于当时定的 0.28），说明"4 个本地样本 + 向上取整到 0.01"这个最小步进余量，在真实 CSPRNG 种子的波动面前不够稳。本条目用扩大后的真实样本重新校准，x64/Win32 business_core 阈值与硬上限统一改为 0.32（原 v2.7.2 是 x64 0.30/Win32 0.28）。max_pair 独立上限、C++ 侧固定种子代理测试的阈值（这些不受真随机种子影响）未改动。
+
+涉及文件：tests/scripts/vm_per_build_similarity_gate.py；tests/CMakeLists.txt；ciphershellpro.md；codex_change.log。
+
+原因：v2.7.2 用 x64/Win32 各 4 次真随机种子采样定阈值，余量只有 0.005–0.01，属于对"最小步进"这句字面指示的机械套用，没有充分考虑真实 per-build 门禁（区别于 C++ 固定种子代理测试）每次都用 ciphershell.exe 内部 BCryptGenRandom 生成全新真随机种子、数值本身有天然波动这一事实。push 后的真实 GitHub Actions 结果（而不是本地猜测）直接证明了这一点，必须用更大样本重新定余量，而不是简单把数字调大到刚好盖过这一次的失败值。
+
+已验证：额外在本机对已built的 build_resume_x64/build_resume_win32 二进制运行 vm_per_build_similarity_gate.py（用当时允许的最大值 0.30 采样，因为脚本自身的硬上限会拒绝更松的值），x64 累计 16 个、Win32 累计 9 个独立真随机种子 business_core 样本：x64 均值≈0.280、标准差≈0.006、观测区间 0.272–0.291；Win32 均值≈0.276、标准差≈0.007、观测区间 0.257–0.286。改用"均值+6倍标准差"重新定阈值，两个架构各自独立算出的数字巧合落在同一个 0.32（分别测量、分别声明，不是合并成一个共用常量）。改完后通过真实 tests/CMakeLists.txt 接线（非手工传参）重新配置并跑 ctest，x64、Win32 各追加 3 轮真实 vm_per_build_similarity_gate：business_core 在全部轮次里都稳定低于 0.32（最接近的一次 0.2905，距阈值仍有 0.03 余量）；其中 x64 有 2 轮在 codec 阶段失败（0.1609、0.1725），与 v2.7.2 已记录的既有 codec flaky 属同一问题，business_core 本身未受影响。累计到目前为止，codec 聚合阶段跨阈值在约 25 次独立真随机种子采样（本机+CI 合计）里出现了 6 次，进一步坐实这是一个独立、既有、值得后续专门处理的问题，不是本轮 business_core 改动引入的。
+
+待验证与未完成：codec 阶段（阈值 0.15，本轮仍未改动）的高 flaky 率本身没有被修复，其 0.15 阈值是否也和旧 business_core 0.35 一样缺乏校准依据，需要单独一轮工作核实；已推送，需等这次真实 GitHub Actions 运行确认 0.32 在远端也稳定通过 business_core（而不仅是本机 22 轮真实采样）。
+
+如何部署更改：无需新增依赖；tests/CMakeLists.txt 的 CS_BUSINESS_CORE_SIMILARITY_THRESHOLD 两个分支现在都是 0.32（保留 if/else 两个分支分别赋值，不是合并成一行共用常量，方便未来两个架构的实测结果分道扬镳时独立调整）。
