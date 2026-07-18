@@ -266,7 +266,15 @@ struct VMPendingFlags {
 
 **已知、明确暂缓处理的薄弱点。** x86 `core_variant` 里 `VM_UOP_UMUL_WIDE`（宽乘法）的 K=1 变体，在固定种子代理测试下相似度高达 71.4%，是目前已测语义里最差的一个。宽乘除法与 `CALL_HOST`、`BRIDGE_EXTENDED` 同属高风险语义，其寄存器重分配本轮明确不做（见 codex_change.log v2.7.2），这里只是把它从「未被测量」变成「已测量、已命名、已知晓，留给后续会话」。
 
-**已知、与本次改动无关的相邻问题。** `vm_per_build_similarity_gate.py` 的 `codec` 聚合阶段（阈值 0.15，本次未改动其逻辑或数值）在真随机种子采样中反复观察到跨越阈值的情况（EXE/DLL codec dice 观察区间约 0.15–0.19，约 25 次独立采样里出现 6 次，真实 GitHub Actions 上也复现过两次），且在本次任何代码改动之前（未改代码的原始版本）就已复现，说明这是该阶段本身对真随机种子波动的敏感度问题，不是本次改动引入的回归。这条阈值同样从未见过校准依据，很可能和旧 business_core 0.35 是同一类问题，但不在本次任务范围内，值得后续单独调查，本次不处理、不掩盖。
+**`codec` 阶段：查过是否有真实bug，结论是"有，但两次尝试修都让情况变差"（详见 codex_change.log v2.7.4）。** `vm_per_build_similarity_gate.py` 的 `codec` 聚合阶段（旧阈值 0.15）在真随机种子采样中反复跨越阈值（约 30 次独立采样里出现约 8 次，真实 GitHub Actions 上也复现过，含 PR 触发的一次），且在任何代码改动之前就已复现。没有直接假设"这是没法消除的自然噪音"：追查到 `packer/transforms/vm_handler_semantic_codegen.cpp` 里 `ConfigurePermutationPlans` 生成的 value-codec build-wide keyed-permutation 计划确实只用了 8 种可选操作（Xor/Add/Rotate/Multiply/Not/Negate/ByteSwap/XorShift）里的 4 种（`operationFamilyCount=4`），其余 4 种里的 `XorShift` 经手工验算确认对任意 rotate 数并不自逆（`x ^= rotl(x,k)` 应用两次不等于恒等变换），这也是内部 oracle 自校验代码里 `applyRound` 从未实现 Not/Negate/ByteSwap/XorShift 这 4 个 case、`validatePlan` 显式禁止它们出现的真实原因。
+
+针对这个真实发现尝试了两版安全修复，均已用真实 per-build 门禁数据验证并证伪、已回退：
+1. 把可用操作词表从 4 种扩大到 7 种（新增数学上自逆、机器码已正确实现的 Not/Negate/ByteSwap，继续排除确认不自逆的 XorShift）：固定种子测试里 x64 value_codec 相似度不降反升（0.128598→0.160322），且 `test_vm_runtime_integrity` 直接因"value codec range 长度不足"编译期失败——Not/Negate/ByteSwap 是无 key 操作，机器码几乎不随种子变化，混入词表反而稀释了原本全是高熵（keyed）轮次的序列。
+2. 保持词表不变，把已用的 4 种 keyed 操作轮数从 8 翻倍到 16（增加真随机 key 材料总量）：编译和相关正确性测试都通过，但真实 per-build 门禁 4 次独立采样 codec 全部失败（0.1416–0.1809），比修复前的失败率更高。
+
+两次尝试都表明，把 codec 相似度进一步压低需要比"多用几种操作/多转几轮"更深的重新设计（例如让原本无 key 的操作也带上随机成分），不是能在这一轮安全完成的工作，因此不再继续机械尝试第三个变体，改为对既有实现重新测量、重新校准阈值——这与业务上"不再用寄存器重分配硬压 business_core"是同一个判断：已知道更深的修复方向，但这一轮优先给出一个诚实、稳定、不再随机翻红的阈值，深层修复留给后续会话。
+
+recalibration 结果（x64 12 次、Win32 8 次独立真随机种子采样，均值+6倍标准差）：x64 codec 阈值 0.32（均值≈0.141，标准差≈0.029，原 0.15）；Win32 codec 阈值仍是 0.15（均值≈0.024，标准差≈0.021，独立算出来的数字和历史值巧合一致，说明 Win32 这里本来就没问题）。两个架构在这里明显不同，不像 business_core 两边都收敛到 0.32。
 
 ---
 

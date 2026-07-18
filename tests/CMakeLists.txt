@@ -318,21 +318,26 @@ add_test(
 set_tests_properties(vm_kernel_static_gate PROPERTIES LABELS "vm;hard-gate")
 
 # ciphershellpro.md §8 "跨 seed 字节多样性防回退门禁":同一份输入用两次
-# 真实、独立 seed 的完整构建，比较 handler 密文字节相似度必须 < 15%，且
-# opcode map/分发键/微操作选择四个自检摘要两两不同。business_core 聚合
-# 阈值按架构分别设置，是各自实测当前值加余量的防回退基线，不是已验证
-# 的攻击者分析难度下限（见 ciphershellpro.md §8 与 codex_change.log
-# v2.7.3）。0.32 不是随手挑的：v2.7.2 最初按 4 个本地样本定的 0.30/0.28
-# 被真实 CI 两次真随机种子运行直接击穿（Win32 DLL 0.2856、0.2863），说明
-# 单构建/少样本的余量在真 CSPRNG 种子下不够稳；v2.7.3 改为基于 x64 16 个、
-# Win32 9 个独立真实种子样本的均值+6倍标准差重新校准，两个架构分别算出
-# 的数字巧合地都在 0.32，因此仍分别声明、分别测量，不是合并成同一个硬编码
-# 常量。ciphershell.exe 只处理 PE，这条门禁只在这个 Windows-only 的
-# tests/CMakeLists.txt 里注册，不会在 Linux 静态门禁 job 里出现。
+# 真实、独立 seed 的完整构建，比较 handler 密文字节相似度必须低于按架构
+# 分别校准的阈值，且 opcode map/分发键/微操作选择四个自检摘要两两不同。
+# business_core 与 codec 两条聚合阈值都按架构分别设置，是各自实测当前值
+# 加余量的防回退基线，不是已验证的攻击者分析难度下限（见 ciphershellpro.md
+# §8 与 codex_change.log v2.7.3/v2.7.4）。business_core 两个架构都落在
+# 0.32（各自独立测量、巧合数字相同，见 v2.7.3）；codec 则两个架构明显不同
+# （x64 0.32、Win32 0.15）——v2.7.4 排查过 codec 是否有真实"随机性没用满"
+# 的bug（确认 value-codec 的 build-wide keyed-permutation 计划只用了8种
+# 操作里的4种，其中被排除的 XorShift 确认数学上不自逆），但两次尝试扩大
+# 熵源（加宽操作词表、翻倍轮数）经真实数据验证后都让 codec 相似度变得更差
+# 而不是更好，均已回退，因此改为按 x64 12 个、Win32 8 个独立真实种子样本
+# 的均值+6倍标准差重新校准阈值，不做代码层面的多样性修复。ciphershell.exe
+# 只处理 PE，这条门禁只在这个 Windows-only 的 tests/CMakeLists.txt 里注册，
+# 不会在 Linux 静态门禁 job 里出现。
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(CS_BUSINESS_CORE_SIMILARITY_THRESHOLD 0.32)
+    set(CS_CODEC_SIMILARITY_THRESHOLD 0.32)
 else()
     set(CS_BUSINESS_CORE_SIMILARITY_THRESHOLD 0.32)
+    set(CS_CODEC_SIMILARITY_THRESHOLD 0.15)
 endif()
 add_test(
     NAME vm_per_build_similarity_gate
@@ -345,6 +350,7 @@ add_test(
         --config "${CMAKE_CURRENT_SOURCE_DIR}/samples/vm_similarity_gate_sample.toml"
         --workdir "${CMAKE_BINARY_DIR}/tests/per_build_similarity_gate"
         --business-core-similarity-threshold ${CS_BUSINESS_CORE_SIMILARITY_THRESHOLD}
+        --codec-similarity-threshold ${CS_CODEC_SIMILARITY_THRESHOLD}
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
     LABELS "vm;hard-gate"

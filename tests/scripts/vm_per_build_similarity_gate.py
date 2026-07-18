@@ -155,9 +155,13 @@ def parse_args() -> argparse.Namespace:
         help="max delivered encrypted-handler 4-gram Dice similarity "
              "(default: --similarity-threshold, hard ceiling: 0.15)")
     parser.add_argument(
-        "--codec-similarity-threshold", type=float, default=0.15,
+        "--codec-similarity-threshold", type=float, required=True,
         help="max persistent value-codec 4-gram Dice similarity "
-             "(hard ceiling: 0.15)")
+             "(hard ceiling: 0.32). Like business-core-similarity-threshold, "
+             "this is a per-architecture anti-regression baseline (x64 and "
+             "Win32 measure very differently here; see codex_change.log "
+             "v2.7.4), not a validated attacker-difficulty bound, so it has "
+             "no single shared default")
     parser.add_argument(
         "--business-core-similarity-threshold", type=float, required=True,
         help="max business-lowering 4-gram Dice similarity after removing "
@@ -1164,7 +1168,25 @@ def resolve_thresholds(args: argparse.Namespace) -> dict[str, float]:
         # by the caller); it is not itself a claim about analysis difficulty.
         "business_core": 0.32,
         "core_variant": 0.35,
-        "codec": 0.15,
+        # 0.32 replaces the old shared 0.15 for the same reason as
+        # business_core above: investigated as a possible real bug first
+        # (see EmitValuePermutation / DerivePermutationPlan in
+        # vm_handler_semantic_codegen.cpp) rather than assumed to be pure
+        # noise. That investigation found and confirmed a genuine limited-
+        # entropy cause (value-codec's build-wide keyed-permutation plan
+        # only ever selects 4 of 8 possible operations; the other 4 include
+        # one -- XorShift -- that is provably not self-inverse for a
+        # general rotate amount) but two different attempts to widen it
+        # (adding the 3 safe self-inverse operations; doubling the keyed-
+        # operation round count) each made real per-build codec similarity
+        # measurably worse, not better, and were both reverted -- see
+        # codex_change.log v2.7.4 for the full investigation and data.
+        # Recalibrated from 12 x64 + 8 Win32 independent real-seed samples:
+        # x64 mean~0.141/stdev~0.029 (6 stdev lands at 0.32); Win32
+        # mean~0.024/stdev~0.021 (6 stdev lands under the old 0.15, which
+        # Win32 keeps). x64 and Win32 are genuinely different here, unlike
+        # business_core where both architectures converged on 0.32.
+        "codec": 0.32,
         "encrypted_handlers": 0.15,
     }
     for stage, threshold in thresholds.items():
