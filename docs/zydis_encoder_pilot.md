@@ -748,3 +748,11 @@ Encoder 猜测活跃性。
 结论：该路线适合继续按 3–6 个普通显式操作数语义的小批次推进，并继续要求每批局部
 活跃性契约、每 K 多 seed 差分和正式 gate。`CALL_HOST` 与 `BRIDGE_EXTENDED` 仍不应
 混入普通 ALU 批次；其 ABI、unwind 和故障边界需要独立设计。
+
+### 最终 CI 闭环
+
+代码提交 `9bbfe54` 对应 GitHub Actions run `29697464581` 最终为 `success`：
+`static-gate`、`build-and-test (x64)`、`build-and-test (Win32)` 三个 job 全部通过。
+两个架构 job 均完成完整 Release 构建和全部 CTest，因此本批的全矩阵重编码、两架构
+handler 合成、扩展后的多 seed 隔离差分和正式独立 EXE/DLL per-build similarity gate
+均已由最终代码提交的 CI 核实通过。
