@@ -172,7 +172,7 @@ ZydisEncoderOperand ZydisMemoryOperand(
     return operand;
 }
 
-ZydisEncoderOperand ZydisImmediateOperand(uint32_t value) {
+ZydisEncoderOperand ZydisImmediateOperand(uint64_t value) {
     ZydisEncoderOperand operand{};
     operand.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
     operand.imm.u = value;
@@ -216,6 +216,14 @@ void EmitZydisMove(
 {
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
         {ZydisGprOperand(x64, destination), ZydisGprOperand(x64, source)});
+}
+
+void EmitZydisMoveImmediate(
+    CodeBuffer& c, bool x64, uint8_t destination, uint64_t immediate)
+{
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+        {ZydisGprOperand(x64, destination),
+         ZydisImmediateOperand(immediate)});
 }
 
 void EmitZydisExchange(
@@ -991,7 +999,8 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
     bool x64,
     uint8_t variant,
     VM_MICRO_OPCODE semantic,
-    const std::array<uint8_t, 32>& buildSeed)
+    const std::array<uint8_t, 32>& buildSeed,
+    uint8_t coreStrategy)
 {
     const size_t seedOffset = static_cast<size_t>(
         buildSeed[static_cast<uint8_t>(semantic) & 31u]);
@@ -1040,6 +1049,46 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         if (((seedOffset + static_cast<size_t>(variant)) & 1u) == 0u)
             return {3u, 1u, 6u, 3u};
         return {6u, 3u, 1u, 6u};
+    }
+    if (semantic == VM_UOP_MUL) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if ((coreStrategy & 1u) == 0u) {
+            if (x64) {
+                // Two-operand IMUL has no implicit GPR result pair.  RAX/RDX
+                // enter as a/b, while R8/R11 are dead after their lazy-flags
+                // copies were written to context.  Roles are value, source,
+                // correction scratch, spare.
+                constexpr std::array<uint8_t, 4> pool = {0u, 2u, 8u, 11u};
+                return RotateRegisterContract(
+                    pool, seedOffset, variant);
+            }
+            // X86BeginLatch made ECX dead, and the legacy MUL core already
+            // used EBX for its correction product.  ESI/EDI remain excluded.
+            constexpr std::array<uint8_t, 4> pool = {0u, 2u, 3u, 1u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        if (x64) {
+            // One-operand MUL fixes the implicit multiplicand/result in
+            // RDX:RAX.  Roles are explicit multiplier, correction scratch,
+            // spare, implicit-pair marker.  Scratch never aliases RAX/RDX,
+            // so it survives the hardware multiply.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {2u, 8u, 11u, 0u},
+                {8u, 11u, 1u, 0u},
+                {11u, 1u, 8u, 0u},
+                {1u, 8u, 11u, 0u}}};
+            return plans[plan];
+        }
+        // EDX is the legacy explicit source.  ECX and the already-proven EBX
+        // correction register are the only scratch/source alternatives that
+        // remain live-safe across MUL; ESI/EDI stay excluded.
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {2u, 3u, 1u, 0u},
+            {2u, 1u, 3u, 0u},
+            {1u, 3u, 2u, 0u},
+            {3u, 1u, 2u, 0u}}};
+        return plans[plan];
     }
     if (!x64 && semantic == VM_UOP_UMUL_WIDE) {
         // K=1 keeps EAX as the implicit multiplicand and EBX as the saved
@@ -2865,21 +2914,52 @@ void EmitKeyedUnaryCore(
 
 void EmitKeyedMultiplyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 7u);
-    if (x64) {
-        X64MovImmediate(c, 8u, key);
-        X64MultiplyRegister(c, 8u, 2u);
-        X64BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) X64MultiplyRegister(c, 0u, 2u);
-        else c.Raw({0x48,0xF7,0xE2});
-        X64BinaryRegister(c, 0x29u, 0u, 8u);
-    } else {
-        X86MovImmediate(c, 3u, key);
-        c.Raw({0x0F,0xAF,0xDA});
-        X86BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
-        else c.Raw({0xF7,0xE2});
-        X86BinaryRegister(c, 0x29u, 0u, 3u);
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+    if (strategy == 0u) {
+        const uint8_t value = c.registerAssignment[0];
+        const uint8_t source = c.registerAssignment[1];
+        const uint8_t correction = c.registerAssignment[2];
+        // The original operands were persisted before entering this core.
+        // Reload only when a seed-selected role is not already in its legacy
+        // boundary register; this preserves the fixed RAX/RDX byte baseline.
+        if (value != 0u) {
+            EmitZydisLoad(c, x64, value, context,
+                static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, a)),
+                nativeBytes);
+        }
+        if (source != 2u) {
+            EmitZydisLoad(c, x64, source, context,
+                static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, b)),
+                nativeBytes);
+        }
+        EmitZydisMoveImmediate(c, x64, correction, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL,
+            correction, source);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL, value, source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            value, correction);
+        if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+        return;
     }
+
+    // One-operand MUL retains its architectural RDX:RAX/EDX:EAX pair.  Only
+    // the visible multiplier and a correction register that survives MUL are
+    // seed-selected.  The contract guarantees neither aliases the other and
+    // the correction register never aliases the implicit pair.
+    const uint8_t source = c.registerAssignment[0];
+    const uint8_t correction = c.registerAssignment[1];
+    if (source != 2u) {
+        EmitZydisLoad(c, x64, source, context,
+            static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, b)), nativeBytes);
+    }
+    EmitZydisMoveImmediate(c, x64, correction, key);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL, correction, source);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, 0u, key);
+    EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_MUL, source);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, 0u, correction);
 }
 
 void EmitKeyedLogicalShiftCore(
@@ -4096,7 +4176,8 @@ bool ValidateBusinessCoreStrategyReemission(
         CodeBuffer code;
         ConfigurePermutationPlans(code, config);
         code.registerAssignment = DeriveVariantRegisters(
-            x64, config.variant, config.semantic, config.buildSeed);
+            x64, config.variant, config.semantic, config.buildSeed,
+            strategy);
         if (!EmitBusinessCoreVariant(code, x64, config.semantic, strategy)) {
             error = "business core strategy could not be re-emitted";
             return false;
@@ -6920,8 +7001,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
 
     CodeBuffer code;
     ConfigurePermutationPlans(code, config);
+    result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
     result.registerAssignment = DeriveVariantRegisters(
-        x64, config.variant, config.semantic, config.buildSeed);
+        x64, config.variant, config.semantic, config.buildSeed,
+        result.semanticCoreStrategy);
     code.registerAssignment = result.registerAssignment;
     result.variantPrefixOffset = static_cast<uint32_t>(code.bytes.size());
     result.variantPrefixSize = static_cast<uint32_t>(code.bytes.size()) -
@@ -6939,7 +7022,6 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const SemanticMutationPlan outputPlan = DeriveSemanticMutationPlan(
         config, 0x4F55545055545041ULL);
     result.semanticInputStrategy = inputPlan.strategy;
-    result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
     result.semanticResultStrategy = outputPlan.strategy;
     result.semanticInputPathOffset = static_cast<uint32_t>(code.bytes.size());
     result.semanticInputPathSize = static_cast<uint32_t>(code.bytes.size()) -
@@ -7258,8 +7340,10 @@ bool ValidateVMHandlerSemanticVariantKernel(
         error = "semantic input/core/result evidence is outside semanticBody";
         return false;
     }
+    const uint8_t expectedCoreStrategy = DeriveBusinessCoreStrategy(config);
     const std::array<uint8_t, 4> expectedRegisters = DeriveVariantRegisters(
-        x64, config.variant, config.semantic, config.buildSeed);
+        x64, config.variant, config.semantic, config.buildSeed,
+        expectedCoreStrategy);
     if (result.registerAssignment != expectedRegisters) {
         error = "published register allocation does not match variant/seed";
         return false;
@@ -7276,11 +7360,14 @@ bool ValidateVMHandlerSemanticVariantKernel(
              config.semantic == VM_UOP_STORE);
         const bool x86UmulWideContract = !x64 &&
             config.semantic == VM_UOP_UMUL_WIDE;
+        const bool x86MultiplyContract = !x64 &&
+            config.semantic == VM_UOP_MUL;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
                reg == 8 || reg == 9 || reg == 10 || reg == 11)
-            : (reg <= 2 || (x86MemoryContract &&
+             : (reg <= 2 || (x86MemoryContract &&
                 (reg == 3 || reg == 6)) ||
+                (x86MultiplyContract && reg == 3) ||
                 (x86UmulWideContract && (reg == 3 || reg == 6)));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
@@ -7381,7 +7468,6 @@ bool ValidateVMHandlerSemanticVariantKernel(
         config, 0x494E505554504154ULL);
     const SemanticMutationPlan expectedOutputPlan = DeriveSemanticMutationPlan(
         config, 0x4F55545055545041ULL);
-    const uint8_t expectedCoreStrategy = DeriveBusinessCoreStrategy(config);
     if (result.semanticInputStrategy != expectedInputPlan.strategy ||
         result.semanticCoreStrategy != expectedCoreStrategy ||
         result.semanticResultStrategy != expectedOutputPlan.strategy) {

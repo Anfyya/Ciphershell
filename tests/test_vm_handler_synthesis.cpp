@@ -3314,21 +3314,22 @@ PilotRegisterSignature DecodePilotRegisterSignature(
 }
 
 void TestZydisMigratedRegistersVaryByBuildSeed() {
-    constexpr std::array<VM_MICRO_OPCODE, 9> semantics = {
+    constexpr std::array<VM_MICRO_OPCODE, 10> semantics = {
         VM_UOP_LOAD, VM_UOP_STORE,
         VM_UOP_ADD, VM_UOP_SUB,
         VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
-        VM_UOP_NOT, VM_UOP_NEG};
+        VM_UOP_NOT, VM_UOP_NEG, VM_UOP_MUL};
     for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
         for (VM_MICRO_OPCODE semantic : semantics) {
             const bool memory = semantic == VM_UOP_LOAD ||
                 semantic == VM_UOP_STORE;
             const bool unary = semantic == VM_UOP_NOT ||
                 semantic == VM_UOP_NEG;
-            const size_t minimumAssignments = memory
+            const bool multiply = semantic == VM_UOP_MUL;
+            const size_t minimumAssignments = multiply ? 4u : (memory
                 ? (architecture == VM_ARCH_X64 ? 4u : 2u)
                 : (unary && architecture == VM_ARCH_X64 ? 5u
-                    : (architecture == VM_ARCH_X64 ? 4u : 3u));
+                    : (architecture == VM_ARCH_X64 ? 4u : 3u)));
             std::set<std::array<uint8_t, 4>> assignments;
             std::array<std::set<std::array<uint8_t, 4>>, 2>
                 assignmentsByStrategy{};
@@ -3364,7 +3365,9 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                         "published Zydis source/value register is not in emitted code");
                 }
                 if (memory || semantic == VM_UOP_AND ||
-                        semantic == VM_UOP_OR) {
+                        semantic == VM_UOP_OR ||
+                        (multiply &&
+                            generated.semanticCoreStrategy == 0u)) {
                     Require(signature.registerIds.count(
                                 generated.registerAssignment[2]) != 0u,
                         "published Zydis temporary register is not in emitted code");

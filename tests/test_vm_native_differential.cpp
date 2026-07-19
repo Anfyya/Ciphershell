@@ -418,10 +418,17 @@ void TestMulNativeDifferentialMatchesRealCpu() {
     Translator translator;
     const TranslationResult mulTranslation =
         TranslateStandaloneFunction(mulFunction, build, translator);
+    const auto mulInstruction = std::find_if(
+        mulTranslation.instructions.begin(), mulTranslation.instructions.end(),
+        [](const MicroInstruction& instruction) {
+            return instruction.opcode == VM_UOP_MUL;
+        });
+    Require(mulInstruction != mulTranslation.instructions.end(),
+        "IMUL fixture emitted no VM_UOP_MUL instruction");
 
     VMIRModelPreflightConfig preflightConfig{};
     preflightConfig.corpusSeed = 0x5678;
-    preflightConfig.corpusCount = 8;
+    preflightConfig.corpusCount = 32;
     const auto preflight = VMIRModelPreflightVerifier::Verify(
         mulFunction, mulTranslation, build.isa.opcodeMap, build.isa.registerMap, preflightConfig);
     std::cout << "[preflight] success=" << preflight.success << " cases=" << preflight.casesExecuted
@@ -429,8 +436,42 @@ void TestMulNativeDifferentialMatchesRealCpu() {
     Require(preflight.success, "software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
         preflight.error);
 
-    RunDifferentialCase(mulFunction, mulTranslation, build, 8, true,
-        "native-vs-VM MUL(IMUL two-operand) 语义一致");
+    std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+    std::array<std::set<std::array<uint8_t, 4>>, 2>
+        assignmentsByStrategy{};
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+        config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+        config.semantic = VM_UOP_MUL;
+        config.variant = mulInstruction->handlerVariant;
+        const auto generated = GenerateVMHandlerSemanticKernel(config);
+        Require(generated.success,
+            "MUL provider-seed selection generation failed: " +
+                generated.error);
+        const uint8_t strategy = generated.semanticCoreStrategy;
+        if (assignmentsByStrategy[strategy].insert(
+                generated.registerAssignment).second &&
+                providerSeedsByStrategy[strategy].size() < 2u) {
+            providerSeedsByStrategy[strategy].push_back(
+                static_cast<uint8_t>(domain));
+        }
+        if (providerSeedsByStrategy[0].size() == 2u &&
+                providerSeedsByStrategy[1].size() == 2u) break;
+    }
+    Require(providerSeedsByStrategy[0].size() == 2u &&
+            providerSeedsByStrategy[1].size() == 2u,
+        "MUL native differential did not select two register plans per K");
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+            const std::string label =
+                "native-vs-VM Zydis MUL K=" +
+                std::to_string(strategy) + " seed " +
+                std::to_string(providerSeed);
+            RunDifferentialCase(mulFunction, mulTranslation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
+    }
     RunDifferentialCase(addFunction, mulTranslation, build, 8, false,
         "native=ADD vs VM-bytecode=MUL 必须被判定语义分歧");
 }
