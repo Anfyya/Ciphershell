@@ -288,6 +288,54 @@ void TestZydisAluPilotNativeDifferential() {
     }
 }
 
+void TestZydisExplicitAluMemoryBatchNativeDifferential() {
+    const auto seed = MakeSeed(0xB5u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis explicit-ALU/memory batch disassembler initialization failed");
+
+    // mov eax,[rcx/ecx] ; add/sub eax,edx ; not/neg eax ;
+    // mov [rcx/ecx+4],eax ; mov eax,[rcx/ecx+4] ; ret.
+    // These address forms are valid in the verifier's prepared corpus arena
+    // on both hosts and force all six newly migrated kernels into one chain.
+    const std::vector<uint8_t> bytes = {
+        0x8B,0x01,
+        0x01,0xD0,
+        0x29,0xD0,
+        0xF7,0xD0,
+        0xF7,0xD8,
+        0x89,0x41,0x04,
+        0x8B,0x41,0x04,
+        0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A12ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis ADD/SUB/NOT/NEG/LOAD/STORE software IR preflight failed: " +
+            preflight.error);
+
+    constexpr std::array<uint8_t, 4> providerSeeds = {
+        0xB6u, 0xB7u, 0xB8u, 0xB9u};
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis ADD/SUB/NOT/NEG/LOAD/STORE seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestFunctionEntryStackAndRetCleanupDifferential() {
     const auto seed = MakeSeed(0xD2);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -937,6 +985,8 @@ int main() {
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
     Run("Zydis AND/OR/XOR build-seed register native differential",
         &TestZydisAluPilotNativeDifferential, failures);
+    Run("Zydis ADD/SUB/NOT/NEG/LOAD/STORE build-seed native differential",
+        &TestZydisExplicitAluMemoryBatchNativeDifferential, failures);
     Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
         &TestFunctionEntryStackAndRetCleanupDifferential, failures);
     Run("branch-to-RET flags materialization",

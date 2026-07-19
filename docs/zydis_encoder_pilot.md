@@ -233,3 +233,137 @@ EDX:EAX、lazy-flags latch 和 #DE/高半结果没有隐藏依赖。至少应增
 prolog/epilog 且不影响 unwind offset 的叶子指令片段；整体推广前应让“指令序列
 + stack effect + unwind record”来自同一份 typed IR，并继续运行真实 ABI/unwind
 runner。仅用 Zydis Encoder 不能承担这部分正确性责任。
+
+## 推广批次 1：显式 ALU 与简单内存（2026-07-19）
+
+### 范围与结论
+
+第一批推广迁移了 6 个语义：`ADD`、`SUB`、`NOT`、`NEG`、`LOAD`、
+`STORE`。`MUL` 留给后续普通批次；x86 `UMUL_WIDE K=1` 仍按独立批次处理。
+`CALL_HOST`、`BRIDGE_EXTENDED`、CFG 分发和 unwind 代码没有迁移。
+
+这批验证通过。生产路径中的显式寄存器、立即数、`LEA` 和简单
+`MOV/MOVZX [base+disp32]` 均由 `ZydisEncoderRequest` 生成；任意请求失败都写入
+`CodeBuffer` 的编码错误并使 kernel 生成失败，没有手写字节回退。
+
+### 按语义导出的活跃性契约
+
+这批没有扩大或复用全局寄存器池。`registerAssignment[0..2]` 分别按各语义
+实际的数据流解释，候选来自该语义进入 core 时的活跃性状态：
+
+| 语义 | x64 安全池/计划 | x86 安全池/计划 | 排除依据 |
+|---|---|---|---|
+| ADD/SUB | RAX, RDX, R8, R11 轮转 | EAX, EDX, ECX 轮转 | R9 保留 width mask，R10 保留 lazy-flags auxiliary；x86 EBX/ESI/EDI 保留 direct-threaded ABI 状态 |
+| NOT/NEG | RAX, RCX, RDX, R10, R11 轮转 | EAX, ECX, EDX 轮转 | x64 R8 保留原操作数、R9 保留 mask；x86 原操作数已写入 latch，只有 caller-volatile GPR 可用 |
+| LOAD/STORE | RAX, RCX, R8, R10 轮转为 address/value/temp | `(EBX,ECX,ESI)` 与 `(ESI,EBX,ECX)` 两个角色计划 | x64 RDX 是 STORE 源、R11 被 width dispatch 使用；x86 只在这个原本已使用 EBX/ESI 的内存 core 内采用两套已证明安全的地址计划，EDX 始终保留 STORE 源 |
+
+16 个语义专属 seed-byte 样本在固定 business strategy 下得到的真实结果为：
+
+| 语义 | x86 assignment 数 | x64 assignment 数 |
+|---|---:|---:|
+| ADD/SUB | 3 | 4 |
+| NOT/NEG | 3 | 5 |
+| LOAD/STORE | 2 | 4 |
+
+测试从 Zydis 反汇编后的显式寄存器和内存 base/index 构造签名，因而这些变化确实
+进入 ModRM/REX，而不是仅由 seed-keyed 立即数造成。
+
+### 迁移中发现的两个边界
+
+1. 原 `EmitKeyedAddSubCore` 不是 ADD/SUB 私有函数，还被 `BRANCH`、
+   `BRANCH_IF`、`CALL_VM`、`RET` 和 `BRIDGE_EXTENDED` 共用。直接替换该函数会
+   越界改变 CFG/桥接路径，并在组合执行中形成 direct-threaded 循环，虽然孤立
+   ADD/SUB 冒烟仍能通过。最终保留原函数给 CFG/桥接语义，新建
+   `EmitZydisKeyedAddSubCore` 只由 ADD/SUB 调用。这也是后续迁移必须先审计
+   helper 调用图、不能只按函数名判断归属的实证。
+2. `ZydisRegisterEncode(ZYDIS_REGCLASS_GPR8, id)` 的 id 不是通用物理 GPR 编号：
+   GPR8 类在 AL..BL 后还排列 AH..BH，随后才是 SPL..DIL 与 R8B..R15B。
+   未转换时物理 R10 的 byte operand 会被编码成 SIL。辅助层现在仅在 x64
+   byte operand 上把物理编号 4..15 映射到 GPR8 id 8..19；x86 的 byte value
+   契约只允许 EAX/ECX/EDX/EBX。全宽度内存执行矩阵捕获并验证了这个修复。
+
+这两个问题都不是 REX/ModRM 位运算错误：Encoder 正确编码了收到的请求，错误在
+请求的语义所有权和寄存器编号域。结论是 Encoder 显著缩小了正确性风险面，但不能
+代替活跃性契约、调用图审计和真实执行验证。
+
+### 固定寄存器的迁移前后字节
+
+以下使用相同寄存器及相同 `disp32=0x11223344`。寄存器/寄存器、unary 和简单
+地址形式逐字节一致；立即数形式由 Encoder 规范化为 accumulator 短 opcode：
+
+| 指令 | 旧手写/helper | Zydis Encoder |
+|---|---|---|
+| `add rax,rdx` | `48 01 D0` | `48 01 D0` |
+| `sub rax,rdx` | `48 29 D0` | `48 29 D0` |
+| `not rax` | `48 F7 D0` | `48 F7 D0` |
+| `neg rax` | `48 F7 D8` | `48 F7 D8` |
+| `lea rcx,[rax+11223344h]` | `48 8D 88 44 33 22 11` | `48 8D 88 44 33 22 11` |
+| `movzx rax,byte ptr [rcx+11223344h]` | `48 0F B6 81 44 33 22 11` | `48 0F B6 81 44 33 22 11` |
+| `mov byte ptr [rcx+11223344h],dl` | `88 91 44 33 22 11` | `88 91 44 33 22 11` |
+| `add rax,11223344h` | `48 81 C0 44 33 22 11` | `48 05 44 33 22 11` |
+| `sub rax,11223344h` | `48 81 E8 44 33 22 11` | `48 2D 44 33 22 11` |
+
+因此迁移判据与试点一致：固定寄存器的基本指令语义和字节先对齐；完整 core 允许
+存在已解释的等价规范化，并继续由重编码、handler 执行和隔离差分闭环验证。
+
+### 验证结果
+
+- 全矩阵 Decoder→Request→Encoder→Decoder：x86 456 个 kernel、78,065 条指令；
+  x64 456 个 kernel、79,010 条指令。CFG、CALL_HOST、BRIDGE_EXTENDED 和 x64
+  funclet 覆盖仍在，所有重编码操作数语义一致。
+- Release handler 合成与真实执行：x64 和 Win32 均通过全宽度双策略数据/内存、
+  算术、flags、控制流、CALL_HOST、BRIDGE_EXTENDED 与故障矩阵。
+- 隔离原生 CPU 差分：构造
+  `LOAD→ADD→SUB→NOT→NEG→STORE→LOAD` 链；x64 与 x86 各 4 个独立 provider
+  seed、每 seed 32 个 corpus，共 256 个新增真实 CPU 样本，全部通过。
+- 静态门禁：真实双策略覆盖保持 `54/54`。
+- 正式 per-build similarity gate（真实 DLL 与 EXE、独立 seed）全部通过：
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers |
+|---|---:|---:|---:|---:|
+| x64 EXE | 0.2779 | 0.1853 | 0.1319 | 0.0001 |
+| x64 DLL | 0.2859 | 0.1992 | 0.1202 | 0.0001 |
+| x86 EXE | 0.2579 | 0.1008 | 0.0000 | 0.0001 |
+| x86 DLL | 0.2661 | 0.0761 | 0.0051 | 0.0001 |
+
+所有 `business_core` 均低于 0.32，并输出
+`VM_PER_BUILD_SIMILARITY_GATE_PASS`。本机完整门禁实测耗时 x64 375.4 秒、
+Win32 458.6 秒，超过原 CTest 外层 300 秒限制；测试属性已提高到 900 秒，避免
+外层先于脚本自身的逐 case deadline 终止并遗留占用输出 PE 的 runner。
+
+### 实际评估与后续顺序
+
+- 开发效率：对显式寄存器和简单 `[base+disp32]` 明显优于手算字节；新增候选
+  寄存器只改 operand/契约。必须额外花时间审计 helper 调用图和编号域。
+- 正确性风险：REX/ModRM/opcode direction 风险转移给 Zydis；剩余主要风险是
+  活跃性、隐式操作数、FLAGS、ABI、故障边界及 shared helper 所有权。本批两处
+  问题都由全矩阵和组合执行捕获，没有以静默回退掩盖。
+- per-build 多样性：6 个语义在固定策略下得到 2–5 套真实寄存器签名，正式聚合
+  门禁没有退化。范围仍小，不能据此线性外推全量收益。
+
+建议继续推广普通显式操作数语义，但保持每批 3–6 个并执行同一闭环。下一步把
+x86 `UMUL_WIDE K=1` 单独处理：只随机化显式 multiplier 的寄存器/地址形式，明确
+保留硬件隐式 EDX:EAX。`CALL_HOST` 与 `BRIDGE_EXTENDED` 继续不迁移。
+
+## 同批 Linux PE 兼容常量修复
+
+`pe_emitter.cpp` 使用标准值为 `0x0040` 的
+`IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`，而非 Windows 构建使用的
+`compat/windows_compat.h` 原先只定义了 `GUARD_CF`。审计后补齐同一标准常量族：
+
+| 常量 | 值 |
+|---|---:|
+| `HIGH_ENTROPY_VA` | `0x0020` |
+| `DYNAMIC_BASE` | `0x0040` |
+| `FORCE_INTEGRITY` | `0x0080` |
+| `NX_COMPAT` | `0x0100` |
+| `NO_ISOLATION` | `0x0200` |
+| `NO_SEH` | `0x0400` |
+| `NO_BIND` | `0x0800` |
+| `APPCONTAINER` | `0x1000` |
+| `WDM_DRIVER` | `0x2000` |
+| `GUARD_CF` | `0x4000` |
+| `TERMINAL_SERVER_AWARE` | `0x8000` |
+
+这样 Linux 兼容头不再只为当前单个引用打补丁，后续 PE emitter 使用同族标志也
+不会再次因缺失宏而失败。

@@ -355,5 +355,8 @@ add_test(
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
     LABELS "vm;hard-gate"
-    TIMEOUT 300
+    # Four full pack-and-run builds take 6-8 minutes on the slower Win32
+    # builders.  Keep the CTest wrapper above the script's own per-case
+    # deadlines so it cannot strand a runner that still owns an output PE.
+    TIMEOUT 900
 )

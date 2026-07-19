@@ -3274,10 +3274,20 @@ PilotRegisterSignature DecodePilotRegisterSignature(
         text << static_cast<unsigned>(instruction.mnemonic) << ':';
         for (uint8_t index = 0;
              index < instruction.operand_count_visible; ++index) {
-            if (operands[index].type != ZYDIS_OPERAND_TYPE_REGISTER) continue;
-            const int id = ZydisRegisterGetId(operands[index].reg.value);
-            text << id << ',';
-            signature.registerIds.insert(id);
+            if (operands[index].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                const int id = ZydisRegisterGetId(operands[index].reg.value);
+                text << 'r' << id << ',';
+                signature.registerIds.insert(id);
+            } else if (operands[index].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                for (ZydisRegister reg : {
+                        operands[index].mem.base,
+                        operands[index].mem.index}) {
+                    if (reg == ZYDIS_REGISTER_NONE) continue;
+                    const int id = ZydisRegisterGetId(reg);
+                    text << 'm' << id << ',';
+                    signature.registerIds.insert(id);
+                }
+            }
         }
         text << ';';
         relative += instruction.length;
@@ -3288,13 +3298,22 @@ PilotRegisterSignature DecodePilotRegisterSignature(
     return signature;
 }
 
-void TestZydisPilotRegistersVaryByBuildSeed() {
-    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {
-        VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR};
+void TestZydisMigratedRegistersVaryByBuildSeed() {
+    constexpr std::array<VM_MICRO_OPCODE, 9> semantics = {
+        VM_UOP_LOAD, VM_UOP_STORE,
+        VM_UOP_ADD, VM_UOP_SUB,
+        VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
+        VM_UOP_NOT, VM_UOP_NEG};
     for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
-        const size_t minimumAssignments =
-            architecture == VM_ARCH_X64 ? 4u : 3u;
         for (VM_MICRO_OPCODE semantic : semantics) {
+            const bool memory = semantic == VM_UOP_LOAD ||
+                semantic == VM_UOP_STORE;
+            const bool unary = semantic == VM_UOP_NOT ||
+                semantic == VM_UOP_NEG;
+            const size_t minimumAssignments = memory
+                ? (architecture == VM_ARCH_X64 ? 4u : 2u)
+                : (unary && architecture == VM_ARCH_X64 ? 5u
+                    : (architecture == VM_ARCH_X64 ? 4u : 3u));
             std::set<std::array<uint8_t, 4>> assignments;
             std::array<std::set<std::array<uint8_t, 4>>, 2>
                 assignmentsByStrategy{};
@@ -3321,14 +3340,19 @@ void TestZydisPilotRegistersVaryByBuildSeed() {
                 const auto signature = DecodePilotRegisterSignature(
                     architecture, generated);
                 Require(signature.registerIds.count(
-                            generated.registerAssignment[0]) != 0u &&
-                        signature.registerIds.count(
-                            generated.registerAssignment[1]) != 0u,
-                    "published Zydis value/source registers are not in emitted code");
-                if (semantic != VM_UOP_XOR) {
+                            generated.registerAssignment[0]) != 0u,
+                    "published Zydis primary register is not in emitted code");
+                if (!unary && (!memory ||
+                        generated.semanticCoreStrategy == 1u)) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[1]) != 0u,
+                        "published Zydis source/value register is not in emitted code");
+                }
+                if (memory || semantic == VM_UOP_AND ||
+                        semantic == VM_UOP_OR) {
                     Require(signature.registerIds.count(
                                 generated.registerAssignment[2]) != 0u,
-                        "published Zydis scratch register is not in emitted code");
+                        "published Zydis temporary register is not in emitted code");
                 }
                 Require(generated.semanticCoreStrategy < 2u,
                     "Zydis pilot selected an invalid core strategy");
@@ -3339,7 +3363,7 @@ void TestZydisPilotRegistersVaryByBuildSeed() {
                     signature.text);
             }
             Require(assignments.size() >= minimumAssignments,
-                "build seed did not cover the Zydis pilot register pool");
+                "build seed did not cover the semantic liveness register pool");
             bool sameStrategyVaries = false;
             for (size_t strategy = 0; strategy < 2u; ++strategy) {
                 if (assignmentsByStrategy[strategy].size() >= 2u &&
@@ -3387,7 +3411,7 @@ int main() {
         &TestSemanticSeedConsumesEveryLane, failures);
     Run("Zydis Encoder generated-instruction coverage",
         &TestZydisEncoderCoversGeneratedInstructionForms, failures);
-    Run("Zydis ALU pilot build-seed register allocation",
-        &TestZydisPilotRegistersVaryByBuildSeed, failures);
+    Run("Zydis migrated build-seed register allocation",
+        &TestZydisMigratedRegistersVaryByBuildSeed, failures);
     return failures == 0 ? 0 : 1;
 }
