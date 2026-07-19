@@ -340,6 +340,114 @@ void TestZydisExplicitAluMemoryBatchNativeDifferential() {
     }
 }
 
+void TestZydisTempStackBatchNativeDifferential() {
+    const auto seed = MakeSeed(0xBAu);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis temp/stack batch disassembler initialization failed");
+
+    // NOP's production Light lowering emits STORE_TEMP, LOAD_TEMP and DROP.
+    // A scaled LEA emits DUP+ADD when its deterministic address choice takes
+    // the repeated-doubling arm. Search a bounded RVA range so the fixture
+    // proves it reached that production arm instead of synthesizing VM IR.
+    std::vector<uint8_t> bytes = {0x90};
+    if (kIs64) bytes.push_back(0x48);
+    bytes.insert(bytes.end(), {0x8D,0x04,0x48,0xC3});
+    constexpr std::array<VM_MICRO_OPCODE, 4> semantics = {
+        VM_UOP_LOAD_TEMP, VM_UOP_STORE_TEMP, VM_UOP_DUP, VM_UOP_DROP};
+    Function function{};
+    TranslationResult translation{};
+    for (uint64_t entry = 0x1000u; entry < 0x1200u; entry += 0x10u) {
+        Function candidate =
+            DecodeStandaloneFunction(disassembler, bytes, entry);
+        Translator translator;
+        TranslationResult candidateTranslation =
+            TranslateStandaloneFunction(candidate, build, translator);
+        const bool complete = std::all_of(
+            semantics.begin(), semantics.end(), [&](VM_MICRO_OPCODE semantic) {
+                return std::any_of(candidateTranslation.instructions.begin(),
+                    candidateTranslation.instructions.end(),
+                    [&](const MicroInstruction& instruction) {
+                        return instruction.opcode == semantic;
+                    });
+            });
+        if (!complete) continue;
+        function = std::move(candidate);
+        translation = std::move(candidateTranslation);
+        break;
+    }
+    Require(!translation.instructions.empty(),
+        "NOP+scaled-LEA fixture did not reach all temp/stack semantics");
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A13ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis temp/stack software IR preflight failed: " + preflight.error);
+
+    struct Coverage {
+        VM_MICRO_OPCODE semantic = VM_UOP_TRAP;
+        uint8_t variant = 0u;
+        std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+    };
+    std::vector<Coverage> coverage;
+    for (VM_MICRO_OPCODE semantic : semantics) {
+        const auto instruction = std::find_if(
+            translation.instructions.begin(), translation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == semantic;
+            });
+        Require(instruction != translation.instructions.end(),
+            "temp/stack fixture omitted a migrated semantic");
+        coverage.push_back({semantic, instruction->handlerVariant, {}});
+    }
+    const auto complete = [&] {
+        for (const Coverage& item : coverage) {
+            for (const auto& plans : item.assignments) {
+                if (plans.size() < 2u) return false;
+            }
+        }
+        return true;
+    };
+    std::vector<uint8_t> providerSeeds;
+    for (uint16_t domain = 1u;
+         domain <= 0xFFu && !complete(); ++domain) {
+        bool addsCoverage = false;
+        for (Coverage& item : coverage) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = item.semantic;
+            config.variant = item.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "temp/stack provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            if (item.assignments[strategy].size() < 2u &&
+                    item.assignments[strategy].insert(
+                        generated.registerAssignment).second) {
+                addsCoverage = true;
+            }
+        }
+        if (addsCoverage)
+            providerSeeds.push_back(static_cast<uint8_t>(domain));
+    }
+    Require(complete(),
+        "temp/stack differential lacks two register plans per K");
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis LOAD_TEMP/STORE_TEMP/DUP/DROP seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestFunctionEntryStackAndRetCleanupDifferential() {
     const auto seed = MakeSeed(0xD2);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -1319,6 +1427,8 @@ int main() {
         &TestZydisAluPilotNativeDifferential, failures);
     Run("Zydis ADD/SUB/NOT/NEG/LOAD/STORE build-seed native differential",
         &TestZydisExplicitAluMemoryBatchNativeDifferential, failures);
+    Run("Zydis LOAD_TEMP/STORE_TEMP/DUP/DROP build-seed native differential",
+        &TestZydisTempStackBatchNativeDifferential, failures);
     Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
         &TestFunctionEntryStackAndRetCleanupDifferential, failures);
     Run("branch-to-RET flags materialization",

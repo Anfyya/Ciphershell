@@ -852,3 +852,93 @@ byte-equality 失败。
 合成、扩展后的多 seed 隔离原生差分和正式独立 EXE/DLL per-build similarity gate
 均已由最终代码提交的 CI 核实通过。该 run 从 `18:22:50Z` 到 `18:28:55Z`，实际耗时
 365 秒；后续代码 push 将以此作为首次查询前的等待时长。
+
+## 推广批次 6：`LOAD_TEMP`、`STORE_TEMP`、`DUP`、`DROP`（2026-07-20）
+
+### 范围与局部活跃性契约
+
+本批迁移四个简单数据/值栈语义。临时槽的 scaled-index LEA、地址 key 修正和
+load/store，DUP 的 keyed copy，以及 DROP 的已释放物理槽清零都改由
+`ZydisEncoderRequest` 生成。值栈深度检查、push/pop、value codec、range/stack
+failure 跳转保持原结构；没有触碰 CFG 分发、unwind、native bridge 或故障语义。
+`CALL_HOST` 与 `BRIDGE_EXTENDED` 继续不迁移。
+
+`SWAP` 没有混入本批：它虽然也是简单值栈操作，但当前 translator 没有一条生产原生
+指令会一对一发出该语义，隔离差分证据会弱于本批四个都有的生产入口。它应和其他
+缺少 translator 入口的值栈语义单独评估，而不是为了凑批量降低验证标准。
+
+本批继续按 core 导出安全寄存器计划，不复用全局共享池：
+
+| 语义/架构 | seed 选择的角色与安全池 | 保留/边界约束 |
+|---|---|---|
+| LOAD/STORE_TEMP x64 | result/value、address、index、spare 按四套计划使用 RAX/RDX/RCX/R8/R10/R11 的已审计子集 | R10 是入口 slot index，RAX 是 LOAD 结果/STORE 输入边界，R15 是 context；非易失寄存器不参与 |
+| LOAD/STORE_TEMP x86 | result/value、address、index 只在 EAX/ECX/EDX 中按三套计划轮转 | EDI 是 context；STORE 的既有 post-core 高 dword 清零仍要求 ECX 为原 slot index，搬到 EDX 的计划必须在返回前恢复 ECX |
+| DUP x64 | source/destination 在 RAX/RDX/R8/R10 中轮转，共四套计划 | RAX 是弹出输入，RAX/RDX 是 PushTwo 输出边界；RCX 由 PushTwo 重载，R15 是 context |
+| DUP x86 | source/destination 在 EAX/EDX/ECX 中轮转，共三套计划 | EAX 是输入，EAX/EDX 是输出；EBX/ESI/EDI 不参与 |
+| DROP x64 | address 在 R10/R11/R8/RDX 中选择，zero 使用与 address 不冲突的死亡寄存器，共四套计划 | RCX 保持递减后的 slot index，R15 是 context，弹出的 RAX 值已死亡 |
+| DROP x86 | address/index/zero 只在 EAX/ECX/EDX 中按三套计划选择 | value codec 可能复用 ECX，因此 core 先从 `CtxValueDepth` 重载权威 index；EDI 是 context |
+
+为表达临时槽和值栈槽的八字节步长，通用 `ZydisMemoryOperand`/`EmitZydisLea`
+增加显式 scale 参数；未传 scale 的既有调用仍保持默认 1。所有新指令继续沿统一
+fail-closed 路径：Encoder 拒绝请求即使 kernel 生成失败，不回退到 `c.Raw(...)`。
+
+### 固定寄存器场景的迁移前后字节
+
+固定为旧实现角色时，代表性 scaled-index、复制和清零形式逐字节一致：
+
+| 指令/序列 | 迁移前 | Zydis Encoder |
+|---|---|---|
+| `lea r11,[r15+r10*8+disp32]` | `4F 8D 9C D7 <disp32>` | 相同 |
+| `mov rax,[r11+disp32]` | `49 8B 83 <disp32>` | 相同 |
+| `mov [r11+disp32],rax` | `49 89 83 <disp32>` | 相同 |
+| `lea edx,[edi+ecx*8+disp32]` | `8D 94 CF <disp32>` | 相同 |
+| `mov eax,[edx+disp32]` | `8B 82 <disp32>` | 相同 |
+| `mov [edx+disp32],eax` | `89 82 <disp32>` | 相同 |
+| DUP MOV：`mov rdx,rax` / `mov edx,eax` | `48 89 C2` / `89 C2` | 相同 |
+| DUP LEA：`lea rdx,[rax]` / `lea edx,[eax]` | `48 8D 10` / `8D 10` | 相同 |
+| DROP x64 address + zero/store | `4D 8D 94 CF <disp32> 31 C0 49 89 82 <disp32>` | 相同 |
+| DROP x86 address + zero/store | `8D 94 CF <disp32> 31 C0 89 82 <disp32> 89 82 <disp32>` | 相同 |
+
+x86 temp slot 仍按 8-byte VM 槽寻址，但本架构 core 只 load/store 低 4 字节；
+`STORE_TEMP` 随后的高 4 字节清零保持原位置和原语义，没有被错误合并为单次 8-byte
+访问。非固定计划由 Encoder 自动改变 REX、ModRM、SIB 和必要的边界 MOV。
+
+### 本地验证结果与限制
+
+- 完整静态门禁（含比例探针）通过，真实双策略覆盖保持 `54/54`。
+- Release x64 与 Win32 的 `test_vm_handler_synthesis`、
+  `test_vm_native_differential` 均编译并定点执行通过。
+- 全矩阵 Decoder→Request→Encoder→Decoder 覆盖通过：x86 456 个 kernel、78,327
+  条指令；x64 456 个 kernel、79,287 条指令。迁移语义 register-signature 总数从
+  24 个扩展到 28 个；本批每个语义均实测 x86 3 套、x64 4 套 assignment，并要求
+  同一 K 下至少两套真实解码 signature。
+- 隔离差分使用生产 NOP + scaled-LEA fixture：Light NOP lowering 发出
+  STORE_TEMP/LOAD_TEMP/DROP，scaled LEA 的确定性地址 lowering 发出 DUP。测试在有界
+  RVA 范围内寻找确实包含四个语义的生产 TranslationResult，不手工伪造 VM IR。
+  provider seed 再动态覆盖每个语义、每个 K 至少两套 assignment：x64 5 个 seed、
+  x86 8 个 seed，每 seed 32 个 corpus，全部通过。
+- data/stack 全宽度双策略 host-arch handler 矩阵继续覆盖 temp round-trip、DUP、DROP
+  和其后续 stack depth/slot 状态。x86 的替代 index 计划同时由该矩阵和隔离差分证明
+  ECX 恢复正确。
+- 最终本地定点 `core_variant` 从上一批的 x86 `0.258477`、x64 `0.342660`
+  进一步降到 x86 `0.255818`、x64 `0.341153`。正式完整 CTest 与独立 EXE/DLL
+  per-build similarity gate 仍以最终代码提交后的 CI 为准。
+
+### 评估与后续边界
+
+- 开发效率：新增 scale 参数后，base+index*8+disp 的 REX/SIB/ModRM 组合只由一个
+  Encoder request 表达；x64/x86 temp 和 DROP 不再分别维护四套地址位域公式。
+- 正确性风险：Encoder 接管了 SIB scale、扩展寄存器和内存操作数编码，但无法推断
+  x86 STORE_TEMP 的 ECX post-core 依赖。本批通过局部契约显式恢复 ECX，并由两架构
+  真实执行闭环验证，说明地址编码安全和生命周期安全仍需分别证明。
+- per-build 多样性：四个语义均把 seed 变化直接放进业务 core 的 register/SIB 字节；
+  x86 获得三套、x64 获得四套真实 assignment，聚合定点指标小幅继续下降。
+
+结论：Zydis 路线同样适合简单值栈与 context 地址形式，但应优先选择存在生产
+translator 入口、能构造隔离原生差分证据的语义。`SWAP` 等无直接入口语义需要明确
+记录证据限制；`CALL_HOST`、`BRIDGE_EXTENDED` 仍不能混入普通批次。
+
+### 最终 CI 闭环
+
+待最终代码提交后的 GitHub Actions 核实。代码 push 后按同一 `CI` 上一次实际耗时
+365 秒等待，再首次查询；后续纯文档 `[skip ci]` push 不等待也不查询 CI。

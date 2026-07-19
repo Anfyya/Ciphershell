@@ -157,7 +157,8 @@ ZydisEncoderOperand ZydisMemoryOperand(
     uint8_t base,
     int32_t displacement,
     uint16_t bytes,
-    uint8_t index = 0xFFu)
+    uint8_t index = 0xFFu,
+    uint8_t scale = 1u)
 {
     ZydisEncoderOperand operand{};
     operand.type = ZYDIS_OPERAND_TYPE_MEMORY;
@@ -166,7 +167,7 @@ ZydisEncoderOperand ZydisMemoryOperand(
     operand.mem.index = index == 0xFFu ? ZYDIS_REGISTER_NONE :
         ZydisRegisterEncode(
             x64 ? ZYDIS_REGCLASS_GPR64 : ZYDIS_REGCLASS_GPR32, index);
-    operand.mem.scale = index == 0xFFu ? 0u : 1u;
+    operand.mem.scale = index == 0xFFu ? 0u : scale;
     operand.mem.displacement = displacement;
     operand.mem.size = bytes;
     return operand;
@@ -378,12 +379,13 @@ void EmitZydisLea(
     uint8_t destination,
     uint8_t base,
     int32_t displacement,
-    uint8_t index = 0xFFu)
+    uint8_t index = 0xFFu,
+    uint8_t scale = 1u)
 {
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_LEA,
         {ZydisGprOperand(x64, destination),
          ZydisMemoryOperand(x64, base, displacement,
-             static_cast<uint16_t>(x64 ? 8u : 4u), index)});
+             static_cast<uint16_t>(x64 ? 8u : 4u), index, scale)});
 }
 
 void EmitZydisLoad(
@@ -1262,6 +1264,72 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             {3u, 1u, 2u, 6u},
             {0u, 6u, 2u, 3u},
             {3u, 6u, 2u, 0u}
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_LOAD_TEMP || semantic == VM_UOP_STORE_TEMP) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) & 3u;
+            // R10 is the decoded temporary-slot index and R15 is context.
+            // Roles are result/value, address, index and spare. RAX is the
+            // LOAD result/STORE input boundary; the remaining registers are
+            // dead after the preceding stack operation or operand decode.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {0u, 11u, 10u, 8u}, // fixed-register baseline
+                {8u, 11u, 10u, 0u},
+                {0u, 8u, 10u, 11u},
+                {2u, 1u, 10u, 8u}
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // ECX is the decoded slot index and EDI is context. Restrict the
+        // complete plan to caller-volatile EAX/ECX/EDX. STORE_TEMP restores
+        // ECX before its post-core high-dword clear when a plan moves index.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 2u, 1u, 0u}, // fixed-register baseline
+            {2u, 0u, 1u, 2u},
+            {0u, 1u, 2u, 0u}
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_DUP) {
+        if (x64) {
+            // RAX is the popped input and RAX/RDX are the two output
+            // boundaries. RCX is reloaded by PushTwo and R15 is context.
+            // R8/R10 are dead across this core and safely carry a copy.
+            constexpr std::array<uint8_t, 4> pool = {0u, 2u, 8u, 10u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // EAX is the input, EAX/EDX are output boundaries and ECX is reloaded
+        // by PushTwo. EBX/ESI/EDI remain outside the local contract.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_DROP) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) & 3u;
+            // RCX is the decremented slot index, R15 is context and the
+            // popped value is dead. Roles are address, index, zero, spare.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {10u, 1u, 0u, 2u}, // fixed-register baseline
+                {11u, 1u, 2u, 0u},
+                {8u, 1u, 0u, 10u},
+                {2u, 1u, 8u, 10u}
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // The authoritative depth is reloaded before the core because value
+        // decoding may have reused ECX. Only EAX/ECX/EDX participate.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {2u, 1u, 0u, 2u}, // fixed-register baseline
+            {0u, 1u, 2u, 0u},
+            {0u, 2u, 1u, 0u}
         }};
         return plans[plan];
     }
@@ -2977,21 +3045,104 @@ void EmitKeyedCopyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const std::array<uint32_t, 3> keys = {
         CoreKey32(c, strategy + 0u), CoreKey32(c, strategy + 2u),
         CoreKey32(c, strategy + 7u)};
-    if (x64) {
-        for (uint32_t key : keys) X64BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) X64MovRegister(c, 2, 0);
-        else c.Raw({0x48,0x8D,0x10});
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-            X64BinaryImmediate32(c, 6u, 0u, *it);
-            X64BinaryImmediate32(c, 6u, 2u, *it);
+    const uint8_t source = c.registerAssignment[0];
+    const uint8_t destination = c.registerAssignment[1];
+    if (source != 0u) EmitZydisMove(c, x64, source, 0u);
+    for (uint32_t key : keys) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, source, key);
+    }
+    if (strategy == 0u) {
+        EmitZydisMove(c, x64, destination, source);
+    } else {
+        EmitZydisLea(c, x64, destination, source, 0);
+    }
+    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, source, *it);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, destination, *it);
+    }
+    if (source != 0u) EmitZydisMove(c, x64, 0u, source);
+    if (destination != 2u) EmitZydisMove(c, x64, 2u, destination);
+}
+
+void EmitZydisTempCore(
+    CodeBuffer& c, bool x64, bool store, uint8_t strategy)
+{
+    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t address = c.registerAssignment[1];
+    const uint8_t index = c.registerAssignment[2];
+    const uint8_t boundaryIndex = x64 ? 10u : 1u;
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+
+    if (index != boundaryIndex)
+        EmitZydisMove(c, x64, index, boundaryIndex);
+    if (store && value != 0u)
+        EmitZydisMove(c, x64, value, 0u);
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxTemps + k0), index, 8u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, address, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k3);
+    const int32_t displacement = static_cast<int32_t>(
+        0u - (k0 + k1 - k2 + k3));
+    if (store) {
+        EmitZydisStore(c, x64, address, displacement,
+            value, nativeBytes);
+        // The x86 post-core path clears the high dword using ECX as its
+        // original slot index, so restore that boundary when it was moved.
+        if (!x64 && index != 1u)
+            EmitZydisMove(c, false, 1u, index);
+    } else {
+        EmitZydisLoad(c, x64, value, address,
+            displacement, nativeBytes);
+        if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+    }
+}
+
+void EmitZydisDropCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreAddressKey(c, strategy + 3u);
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t index = c.registerAssignment[1];
+    const uint8_t zero = c.registerAssignment[2];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t boundaryIndex = 1u;
+    if (!x64) X86LoadD(c, boundaryIndex, CtxValueDepth);
+    if (index != boundaryIndex)
+        EmitZydisMove(c, x64, index, boundaryIndex);
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxValues + key), index, 8u);
+    const int32_t displacement = static_cast<int32_t>(0u - key);
+    if (strategy == 0u) {
+        // A 32-bit self-XOR zero-extends on x64 and preserves the legacy
+        // no-REX.W fixed byte baseline while still clearing the full source.
+        EmitZydisSizedBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, zero, zero, 4u);
+        EmitZydisStore(c, x64, address, displacement,
+            zero, static_cast<uint8_t>(x64 ? 8u : 4u));
+        if (!x64) {
+            EmitZydisStore(c, false, address,
+                displacement + 4, zero, 4u);
         }
     } else {
-        for (uint32_t key : keys) X86BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) c.Raw({0x89,0xC2});
-        else c.Raw({0x8D,0x10});
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-            X86BinaryImmediate32(c, 6u, 0u, *it);
-            X86BinaryImmediate32(c, 6u, 2u, *it);
+        EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(x64, address, displacement,
+                 static_cast<uint16_t>(x64 ? 8u : 4u)),
+             ZydisImmediateOperand(0u)});
+        if (!x64) {
+            EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+                {ZydisMemoryOperand(false, address,
+                     displacement + 4, 4u),
+                 ZydisImmediateOperand(0u)});
         }
     }
 }
@@ -3676,32 +3827,10 @@ bool EmitBusinessCoreVariant(
                 else EmitX64PopVregVariant(c, 1u);
                 return true;
             case VM_UOP_LOAD_TEMP:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
-                    X64BinaryImmediate32(c, 0u, 11u, k1);
-                    X64BinaryImmediate32(c, 5u, 11u, k2);
-                    X64BinaryImmediate32(c, 0u, 11u, k3);
-                    c.Raw({0x49,0x8B,0x83});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisTempCore(c, true, false, strategy);
                 return true;
             case VM_UOP_STORE_TEMP:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
-                    X64BinaryImmediate32(c, 0u, 11u, k1);
-                    X64BinaryImmediate32(c, 5u, 11u, k2);
-                    X64BinaryImmediate32(c, 0u, 11u, k3);
-                    c.Raw({0x49,0x89,0x83});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisTempCore(c, true, true, strategy);
                 return true;
             case VM_UOP_DUP:
                 EmitKeyedCopyCore(c, true, strategy);
@@ -3716,18 +3845,7 @@ bool EmitBusinessCoreVariant(
                 // DROP owns the now-unused value-stack slot. Scrubbing that
                 // physical slot is part of the semantic state transition, so
                 // both K variants are real equivalent memory lowerings.
-                {
-                    const uint32_t key = CoreAddressKey(c, strategy + 3u);
-                    // r10 = &ctx.values[rcx] + key.  The SIB index is RCX,
-                    // so REX.X must remain clear (0x4D, not 0x4F/r9).
-                    c.Raw({0x4D,0x8D,0x94,0xCF}); c.U32(CtxValues + key);
-                    if (strategy == 0u) {
-                        c.Raw({0x31,0xC0,0x49,0x89,0x82});
-                        c.U32(0u - key);
-                    } else {
-                        c.Raw({0x49,0xC7,0x82}); c.U32(0u - key); c.U32(0u);
-                    }
-                }
+                EmitZydisDropCore(c, true, strategy);
                 return true;
             case VM_UOP_LOAD:
                 if (strategy == 0u) EmitX64MemoryVariant(c, false, 0u);
@@ -4082,32 +4200,10 @@ bool EmitBusinessCoreVariant(
             else EmitX86PopVregVariant(c, 1u);
             return true;
         case VM_UOP_LOAD_TEMP:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
-                X86BinaryImmediate32(c, 0u, 2u, k1);
-                X86BinaryImmediate32(c, 5u, 2u, k2);
-                X86BinaryImmediate32(c, 0u, 2u, k3);
-                c.Raw({0x8B,0x82});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisTempCore(c, false, false, strategy);
             return true;
         case VM_UOP_STORE_TEMP:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
-                X86BinaryImmediate32(c, 0u, 2u, k1);
-                X86BinaryImmediate32(c, 5u, 2u, k2);
-                X86BinaryImmediate32(c, 0u, 2u, k3);
-                c.Raw({0x89,0x82});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisTempCore(c, false, true, strategy);
             return true;
         case VM_UOP_DUP:
             EmitKeyedCopyCore(c, false, strategy);
@@ -4121,21 +4217,7 @@ bool EmitBusinessCoreVariant(
         case VM_UOP_DROP:
             // ECX is the decremented value depth from X86RequireAndPop. Both
             // variants scrub the complete eight-byte physical VM stack slot.
-            {
-                const uint32_t key = CoreAddressKey(c, strategy + 3u);
-                // Value decoding may use ECX as a permutation scratch after
-                // X86RequireAndPop stored the decremented depth. Reload the
-                // authoritative depth before using it as the slot index.
-                X86LoadD(c, 1u, CtxValueDepth);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxValues + key);
-                if (strategy == 0u) {
-                    c.Raw({0x31,0xC0,0x89,0x82}); c.U32(0u - key);
-                    c.Raw({0x89,0x82}); c.U32(4u - key);
-                } else {
-                    c.Raw({0xC7,0x82}); c.U32(0u - key); c.U32(0u);
-                    c.Raw({0xC7,0x82}); c.U32(4u - key); c.U32(0u);
-                }
-            }
+            EmitZydisDropCore(c, false, strategy);
             return true;
         case VM_UOP_LOAD:
             if (strategy == 0u) EmitX86MemoryVariant(c, false, 0u);
