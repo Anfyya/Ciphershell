@@ -2,11 +2,14 @@
 #include "packer/differential/vm_native_differential_provider.h"
 #include "packer/mutation/mutation_engine.h"
 #include "packer/transforms/translator.h"
+#include "packer/transforms/vm_handler_semantic_codegen.h"
 #include "packer/vm/vm_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -244,6 +247,96 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
         "native-vs-VM ADD 语义一致");
     RunDifferentialCase(subFunction, addTranslation, build, 8, false,
         "native=SUB vs VM-bytecode=ADD 必须被判定语义分歧");
+}
+
+void TestZydisAluPilotNativeDifferential() {
+    const auto seed = MakeSeed(0xB0u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis ALU pilot disassembler initialization failed");
+
+    // and eax,ecx ; or eax,edx ; xor eax,ecx ; ret. The same 32-bit bytes
+    // execute on both hosts and force all three migrated semantic kernels to
+    // contribute to the final value. Four provider seeds independently
+    // synthesize the handler chain, exercising build-seed register plans in
+    // the isolated native worker rather than only inspecting emitted bytes.
+    const std::vector<uint8_t> bytes = {
+        0x21,0xC8, 0x09,0xD0, 0x31,0xC8, 0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A11ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis AND/OR/XOR pilot software IR preflight failed: " +
+            preflight.error);
+
+    constexpr std::array<uint8_t, 4> providerSeeds = {
+        0xB1u, 0xB2u, 0xB3u, 0xB4u};
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis AND/OR/XOR seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
+void TestZydisExplicitAluMemoryBatchNativeDifferential() {
+    const auto seed = MakeSeed(0xB5u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis explicit-ALU/memory batch disassembler initialization failed");
+
+    // mov eax,[rcx/ecx] ; add/sub eax,edx ; not/neg eax ;
+    // mov [rcx/ecx+4],eax ; mov eax,[rcx/ecx+4] ; ret.
+    // These address forms are valid in the verifier's prepared corpus arena
+    // on both hosts and force all six newly migrated kernels into one chain.
+    const std::vector<uint8_t> bytes = {
+        0x8B,0x01,
+        0x01,0xD0,
+        0x29,0xD0,
+        0xF7,0xD0,
+        0xF7,0xD8,
+        0x89,0x41,0x04,
+        0x8B,0x41,0x04,
+        0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A12ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis ADD/SUB/NOT/NEG/LOAD/STORE software IR preflight failed: " +
+            preflight.error);
+
+    constexpr std::array<uint8_t, 4> providerSeeds = {
+        0xB6u, 0xB7u, 0xB8u, 0xB9u};
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis ADD/SUB/NOT/NEG/LOAD/STORE seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
 }
 
 void TestFunctionEntryStackAndRetCleanupDifferential() {
@@ -597,6 +690,84 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
     }
 }
 
+#if defined(_M_IX86)
+void TestX86ZydisUmulWidePerKNativeDifferential() {
+    const auto seed = MakeSeed(0xAAu);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(false),
+        "x86 UMUL_WIDE per-K disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+    const std::vector<uint8_t> bytes = {
+        0xF7,0xE1,
+        0x81,0xC0,0x00,0x00,0x00,0x00,
+        0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    const auto umul = std::find_if(
+        translation.instructions.begin(), translation.instructions.end(),
+        [](const MicroInstruction& instruction) {
+            return instruction.opcode == VM_UOP_UMUL_WIDE;
+        });
+    Require(umul != translation.instructions.end(),
+        "x86 MUL fixture emitted no UMUL_WIDE instruction");
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0x554D554C4B31ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "x86 UMUL_WIDE per-K software IR preflight failed: " +
+            preflight.error);
+
+    std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+    std::set<std::array<uint8_t, 4>> k1Plans;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = VM_ARCH_X86;
+        config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+        config.semantic = VM_UOP_UMUL_WIDE;
+        config.variant = umul->handlerVariant;
+        const auto generated = GenerateVMHandlerSemanticKernel(config);
+        Require(generated.success,
+            "x86 UMUL_WIDE seed selection generation failed: " +
+                generated.error);
+        const uint8_t strategy = generated.semanticCoreStrategy;
+        if (strategy == 0u) {
+            if (providerSeedsByStrategy[0].size() < 2u) {
+                providerSeedsByStrategy[0].push_back(
+                    static_cast<uint8_t>(domain));
+            }
+        } else if (k1Plans.insert(generated.registerAssignment).second) {
+            providerSeedsByStrategy[1].push_back(
+                static_cast<uint8_t>(domain));
+        }
+        if (providerSeedsByStrategy[0].size() == 2u &&
+                k1Plans.size() == 4u) break;
+    }
+    Require(providerSeedsByStrategy[0].size() == 2u &&
+            providerSeedsByStrategy[1].size() == 4u,
+        "x86 UMUL_WIDE differential seeds did not cover both K values and all K=1 plans");
+
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+            const std::string label =
+                "native-vs-VM x86 Zydis UMUL_WIDE K=" +
+                std::to_string(strategy) + " seed " +
+                std::to_string(providerSeed);
+            RunDifferentialCase(function, translation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
+    }
+}
+#endif
+
 void TestWideDivideNativeDifferentialAndDivideFault() {
     // 生产级 DIV/IDIV(UDIV_WIDE/IDIV_WIDE)差分证据：直接复用 packer/differential/
     // 的隔离原生 worker，而不是另起一套验证机制。dividend 是完整的
@@ -893,6 +1064,10 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
+    Run("Zydis AND/OR/XOR build-seed register native differential",
+        &TestZydisAluPilotNativeDifferential, failures);
+    Run("Zydis ADD/SUB/NOT/NEG/LOAD/STORE build-seed native differential",
+        &TestZydisExplicitAluMemoryBatchNativeDifferential, failures);
     Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
         &TestFunctionEntryStackAndRetCleanupDifferential, failures);
     Run("branch-to-RET flags materialization",
@@ -913,6 +1088,10 @@ int main() {
         &TestShiftOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("剩余算术家族真 K 变体: 真实 CPU 与合成 handler 链一致性检测",
         &TestRemainingArithmeticFamiliesNativeDifferential, failures);
+#if defined(_M_IX86)
+    Run("x86 Zydis UMUL_WIDE per-K/multi-seed native differential",
+        &TestX86ZydisUmulWidePerKNativeDifferential, failures);
+#endif
     Run("DIV/IDIV 128-bit 被除数与 #DE: 真实 CPU 与合成 handler 链一致性检测",
         &TestWideDivideNativeDifferentialAndDivideFault, failures);
     Run("INT3 两种编码与 #BP: 真实 CPU 与合成 handler 链故障 EIP/寄存器上下文一致性检测",

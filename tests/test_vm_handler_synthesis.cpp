@@ -4,6 +4,8 @@
 #include "packer/vm/micro_semantics.h"
 #include "packer/vm/vm_schema.h"
 
+#include <Zydis/Zydis.h>
+
 #include <Windows.h>
 #include <intrin.h>
 
@@ -16,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -2543,15 +2546,13 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     // intentionally narrow and already exempted below) with real headroom
     // above it, not from the aggregate ceilings above.
     //
-    // core_variant's worst pair today is x86 semantic=20 (VM_UOP_UMUL_WIDE)
-    // K=1 at 0.714286 -- wide-multiply is one of the high-risk semantics
-    // (alongside CALL_HOST/BRIDGE_EXTENDED) whose register reallocation is
-    // explicitly deferred, not attempted this round. The ceiling is set
-    // above that named, already-tracked case so this check has real teeth
-    // against a *new* degenerate pair without demanding that deferred work
-    // land first.
+    // After the isolated x86 UMUL_WIDE K=1 migration, the unchanged K=0
+    // control arm is the x86 worst pair at 0.702128.  K=1 has its own tighter
+    // ceiling below, so a regression there cannot hide behind this global
+    // limit or another semantic.
     constexpr double kMaxPairCeilingBusinessCore = 0.55;
     constexpr double kMaxPairCeilingCoreVariant = 0.75;
+    constexpr double kX86UmulWideK1PairCeiling = 0.55;
     const auto seedA = MakeSeed(static_cast<uint8_t>(
         architecture == VMHandlerArchitecture::X64 ? 0x64 : 0x32));
     const auto seedB = MakeSeed(static_cast<uint8_t>(
@@ -2675,6 +2676,7 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     std::string maxCoreVariantPairLabel;
     double maxBusinessCorePairSimilarity = -1.0;
     std::string maxBusinessCorePairLabel;
+    double x86UmulWideK1PairSimilarity = -1.0;
     const auto orderedA = SortedHandlers(buildA);
     const auto orderedB = SortedHandlers(buildB);
     std::map<uint8_t, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
@@ -2748,6 +2750,11 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
             }
             const double corePairSimilarity =
                 FourGramDiceSimilarity(leftCore, rightCore);
+            if (architecture == VMHandlerArchitecture::X86 &&
+                    left->semantic == VM_UOP_UMUL_WIDE &&
+                    left->variant == 1u) {
+                x86UmulWideK1PairSimilarity = corePairSimilarity;
+            }
             if (corePairSimilarity > maxCoreVariantPairSimilarity) {
                 maxCoreVariantPairSimilarity = corePairSimilarity;
                 maxCoreVariantPairLabel = pairKey;
@@ -2795,6 +2802,17 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
         " core_variant_key=" << maxCoreVariantPairLabel <<
         " business_core=" << maxBusinessCorePairSimilarity <<
         " business_core_key=" << maxBusinessCorePairLabel << '\n';
+    if (architecture == VMHandlerArchitecture::X86) {
+        Require(x86UmulWideK1PairSimilarity >= 0.0,
+            "x86 UMUL_WIDE K=1 pair metric was not sampled");
+        std::cout << "[x86-umul-wide-k1-similarity] dice=" <<
+            x86UmulWideK1PairSimilarity << '\n';
+        Require(x86UmulWideK1PairSimilarity <
+                kX86UmulWideK1PairCeiling,
+            "x86 UMUL_WIDE K=1 core pair similarity regressed above " +
+                std::to_string(kX86UmulWideK1PairCeiling) + ": " +
+                std::to_string(x86UmulWideK1PairSimilarity));
+    }
     Require(identicalCoreVariants.empty(),
         "两次构建仍含逐字节相同的必经业务核心 (semantic,K)");
     Require(valueCodecSimilarity < 0.15,
@@ -3061,6 +3079,402 @@ void TestSemanticSeedConsumesEveryLane() {
     }
 }
 
+struct ZydisCoverageStats {
+    size_t kernels = 0;
+    size_t instructions = 0;
+    size_t controlFlowInstructions = 0;
+    size_t stackFuncletInstructions = 0;
+    size_t callHostInstructions = 0;
+    size_t bridgeExtendedInstructions = 0;
+};
+
+ZydisDecoder MakeSemanticDecoder(uint32_t architecture) {
+    ZydisDecoder decoder{};
+    const bool x64 = architecture == VM_ARCH_X64;
+    Require(ZYAN_SUCCESS(ZydisDecoderInit(&decoder,
+            x64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32,
+            x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32)),
+        "unable to initialize Zydis semantic coverage decoder");
+    return decoder;
+}
+
+void RequireReencodedOperandIdentity(
+    const ZydisDecodedInstruction& original,
+    const ZydisDecodedOperand* originalOperands,
+    const ZydisDecodedInstruction& reencoded,
+    const ZydisDecodedOperand* reencodedOperands)
+{
+    Require(original.mnemonic == reencoded.mnemonic &&
+            original.operand_count_visible == reencoded.operand_count_visible,
+        "Zydis re-encoding changed instruction mnemonic/operand count");
+    for (uint8_t index = 0; index < original.operand_count_visible; ++index) {
+        const auto& left = originalOperands[index];
+        const auto& right = reencodedOperands[index];
+        Require(left.type == right.type,
+            "Zydis re-encoding changed visible operand type");
+        switch (left.type) {
+            case ZYDIS_OPERAND_TYPE_REGISTER:
+                Require(left.reg.value == right.reg.value,
+                    "Zydis re-encoding changed a register operand");
+                break;
+            case ZYDIS_OPERAND_TYPE_MEMORY: {
+                const int64_t leftDisplacement =
+                    left.mem.disp.has_displacement
+                    ? left.mem.disp.value : 0;
+                const int64_t rightDisplacement =
+                    right.mem.disp.has_displacement
+                    ? right.mem.disp.value : 0;
+                Require(left.mem.base == right.mem.base &&
+                        left.mem.index == right.mem.index &&
+                        left.mem.scale == right.mem.scale &&
+                        leftDisplacement == rightDisplacement &&
+                        (left.size == right.size ||
+                         original.mnemonic == ZYDIS_MNEMONIC_LEA ||
+                         original.mnemonic == ZYDIS_MNEMONIC_NOP),
+                    "Zydis re-encoding changed a memory operand");
+                break;
+            }
+            case ZYDIS_OPERAND_TYPE_POINTER:
+                Require(left.ptr.segment == right.ptr.segment &&
+                        left.ptr.offset == right.ptr.offset,
+                    "Zydis re-encoding changed a pointer operand");
+                break;
+            case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+                Require(left.imm.is_relative == right.imm.is_relative &&
+                        left.imm.value.u == right.imm.value.u,
+                    "Zydis re-encoding changed an immediate operand");
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+void AuditKernelWithZydis(
+    uint32_t architecture,
+    VM_MICRO_OPCODE semantic,
+    const VMHandlerSemanticCodegenResult& generated,
+    ZydisCoverageStats& stats)
+{
+    ZydisDecoder decoder = MakeSemanticDecoder(architecture);
+    size_t offset = 0;
+    while (offset < generated.code.size()) {
+        ZydisDecodedInstruction instruction{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, generated.code.data() + offset,
+                generated.code.size() - offset, &instruction, operands)),
+            "Zydis could not decode a generated semantic instruction at " +
+                std::to_string(offset));
+
+        ZydisEncoderRequest request{};
+        Require(ZYAN_SUCCESS(
+                ZydisEncoderDecodedInstructionToEncoderRequest(
+                    &instruction, operands,
+                    instruction.operand_count_visible, &request)),
+            "Zydis could not convert a generated instruction to an encoder request");
+        std::array<uint8_t, ZYDIS_MAX_INSTRUCTION_LENGTH> encoded{};
+        ZyanUSize encodedSize = encoded.size();
+        Require(ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(
+                &request, encoded.data(), &encodedSize)),
+            "Zydis Encoder rejected a generated semantic instruction");
+
+        ZydisDecodedInstruction reencoded{};
+        ZydisDecodedOperand reencodedOperands[ZYDIS_MAX_OPERAND_COUNT]{};
+        Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, encoded.data(), encodedSize,
+                &reencoded, reencodedOperands)),
+            "Zydis could not decode its re-encoded semantic instruction");
+        RequireReencodedOperandIdentity(
+            instruction, operands, reencoded, reencodedOperands);
+
+        ++stats.instructions;
+        if (instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+            instruction.meta.category == ZYDIS_CATEGORY_COND_BR ||
+            instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+            ++stats.controlFlowInstructions;
+        }
+        for (const auto& funclet : generated.stackFunclets) {
+            if (offset >= funclet.offset &&
+                offset < static_cast<size_t>(funclet.offset) + funclet.size) {
+                ++stats.stackFuncletInstructions;
+                break;
+            }
+        }
+        if (semantic == VM_UOP_CALL_HOST) ++stats.callHostInstructions;
+        if (semantic == VM_UOP_BRIDGE_EXTENDED)
+            ++stats.bridgeExtendedInstructions;
+        offset += instruction.length;
+    }
+    Require(offset == generated.code.size(),
+        "Zydis coverage walk ended between instruction boundaries");
+    ++stats.kernels;
+}
+
+void TestZydisEncoderCoversGeneratedInstructionForms() {
+    const std::array<std::array<uint8_t, 32>, 2> seeds = {
+        MakeSeed(0x35u), MakeSeed(0xC9u)};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        ZydisCoverageStats stats{};
+        for (const auto& seed : seeds) {
+            for (uint32_t rawSemantic = VM_UOP_TRAP + 1u;
+                 rawSemantic < VM_UOP_COUNT; ++rawSemantic) {
+                const auto semantic =
+                    static_cast<VM_MICRO_OPCODE>(rawSemantic);
+                for (uint8_t variant = 0;
+                     variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                    VMHandlerSemanticCodegenConfig config{};
+                    config.architecture = architecture;
+                    config.buildSeed = seed;
+                    config.semantic = semantic;
+                    config.variant = variant;
+                    const auto generated =
+                        GenerateVMHandlerSemanticKernel(config);
+                    if (!generated.success) continue;
+                    AuditKernelWithZydis(
+                        architecture, semantic, generated, stats);
+                }
+            }
+        }
+        Require(stats.kernels > 400u && stats.instructions > 70000u,
+            "Zydis coverage audit did not exercise the full semantic matrix");
+        Require(stats.controlFlowInstructions > 0u &&
+                stats.callHostInstructions > 0u &&
+                stats.bridgeExtendedInstructions > 0u,
+            "Zydis coverage audit missed CFG/CALL_HOST/BRIDGE_EXTENDED code");
+        if (architecture == VM_ARCH_X64) {
+            Require(stats.stackFuncletInstructions > 0u,
+                "Zydis coverage audit missed x64 unwind funclet instructions");
+        } else {
+            Require(stats.stackFuncletInstructions == 0u,
+                "x86 semantic unexpectedly published an unwind funclet");
+        }
+        std::cout << "[zydis-coverage] arch=" << architecture
+                  << " kernels=" << stats.kernels
+                  << " instructions=" << stats.instructions
+                  << " cfg=" << stats.controlFlowInstructions
+                  << " funclet=" << stats.stackFuncletInstructions
+                  << " call_host=" << stats.callHostInstructions
+                  << " bridge=" << stats.bridgeExtendedInstructions << '\n';
+    }
+}
+
+struct PilotRegisterSignature {
+    std::string text;
+    std::set<int> registerIds;
+};
+
+PilotRegisterSignature DecodePilotRegisterSignature(
+    uint32_t architecture,
+    const VMHandlerSemanticCodegenResult& generated)
+{
+    Require(RangeInside(generated.code.size(),
+            generated.semanticCoreVariantOffset,
+            generated.semanticCoreVariantSize),
+        "Zydis pilot core range is invalid");
+    ZydisDecoder decoder = MakeSemanticDecoder(architecture);
+    PilotRegisterSignature signature{};
+    std::ostringstream text;
+    size_t relative = 0;
+    const uint8_t* core = generated.code.data() +
+        generated.semanticCoreVariantOffset;
+    while (relative < generated.semanticCoreVariantSize) {
+        ZydisDecodedInstruction instruction{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, core + relative,
+                generated.semanticCoreVariantSize - relative,
+                &instruction, operands)),
+            "Zydis could not decode a pilot core instruction");
+        text << static_cast<unsigned>(instruction.mnemonic) << ':';
+        for (uint8_t index = 0;
+             index < instruction.operand_count_visible; ++index) {
+            if (operands[index].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                const int id = ZydisRegisterGetId(operands[index].reg.value);
+                text << 'r' << id << ',';
+                signature.registerIds.insert(id);
+            } else if (operands[index].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                for (ZydisRegister reg : {
+                        operands[index].mem.base,
+                        operands[index].mem.index}) {
+                    if (reg == ZYDIS_REGISTER_NONE) continue;
+                    const int id = ZydisRegisterGetId(reg);
+                    text << 'm' << id << ',';
+                    signature.registerIds.insert(id);
+                }
+            }
+        }
+        text << ';';
+        relative += instruction.length;
+    }
+    Require(relative == generated.semanticCoreVariantSize,
+        "Zydis pilot core ended between instruction boundaries");
+    signature.text = text.str();
+    return signature;
+}
+
+void TestZydisMigratedRegistersVaryByBuildSeed() {
+    constexpr std::array<VM_MICRO_OPCODE, 9> semantics = {
+        VM_UOP_LOAD, VM_UOP_STORE,
+        VM_UOP_ADD, VM_UOP_SUB,
+        VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
+        VM_UOP_NOT, VM_UOP_NEG};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            const bool memory = semantic == VM_UOP_LOAD ||
+                semantic == VM_UOP_STORE;
+            const bool unary = semantic == VM_UOP_NOT ||
+                semantic == VM_UOP_NEG;
+            const size_t minimumAssignments = memory
+                ? (architecture == VM_ARCH_X64 ? 4u : 2u)
+                : (unary && architecture == VM_ARCH_X64 ? 5u
+                    : (architecture == VM_ARCH_X64 ? 4u : 3u));
+            std::set<std::array<uint8_t, 4>> assignments;
+            std::array<std::set<std::array<uint8_t, 4>>, 2>
+                assignmentsByStrategy{};
+            std::array<std::set<std::string>, 2> signaturesByStrategy{};
+            for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                    0x40u + static_cast<uint8_t>(semantic)));
+                config.buildSeed[static_cast<uint8_t>(semantic) & 31u] =
+                    seedByte;
+                config.semantic = semantic;
+                config.variant = 0u;
+                const auto generated =
+                    GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "Zydis pilot semantic generation failed: " +
+                        generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "Zydis pilot semantic validation failed: " +
+                        validationError);
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                Require(signature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u,
+                    "published Zydis primary register is not in emitted code");
+                if (!unary && (!memory ||
+                        generated.semanticCoreStrategy == 1u)) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[1]) != 0u,
+                        "published Zydis source/value register is not in emitted code");
+                }
+                if (memory || semantic == VM_UOP_AND ||
+                        semantic == VM_UOP_OR) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[2]) != 0u,
+                        "published Zydis temporary register is not in emitted code");
+                }
+                Require(generated.semanticCoreStrategy < 2u,
+                    "Zydis pilot selected an invalid core strategy");
+                assignments.insert(generated.registerAssignment);
+                assignmentsByStrategy[generated.semanticCoreStrategy].insert(
+                    generated.registerAssignment);
+                signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                    signature.text);
+            }
+            Require(assignments.size() >= minimumAssignments,
+                "build seed did not cover the semantic liveness register pool");
+            bool sameStrategyVaries = false;
+            for (size_t strategy = 0; strategy < 2u; ++strategy) {
+                if (assignmentsByStrategy[strategy].size() >= 2u &&
+                    signaturesByStrategy[strategy].size() >= 2u) {
+                    sameStrategyVaries = true;
+                }
+            }
+            Require(sameStrategyVaries,
+                "register operands did not vary at a fixed business strategy");
+            std::cout << "[zydis-registers] arch=" << architecture
+                      << " semantic=" << static_cast<unsigned>(semantic)
+                      << " assignments=" << assignments.size() << '\n';
+        }
+    }
+}
+
+void TestX86ZydisUmulWideK1SourcePlans() {
+    const std::set<std::array<uint8_t, 4>> expectedPlans = {
+        {6u, 1u, 3u, 2u},
+        {2u, 1u, 3u, 6u},
+        {6u, 1u, 3u, 0u},
+        {2u, 1u, 3u, 0u}};
+    std::set<std::array<uint8_t, 4>> observedPlans;
+    std::set<std::string> operandSignatures;
+    for (uint8_t seedByte = 0u; seedByte < 16u; ++seedByte) {
+        for (uint8_t variant = 0u;
+             variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = VM_ARCH_X86;
+            config.buildSeed = MakeSeed(0xA6u);
+            config.buildSeed[static_cast<uint8_t>(VM_UOP_UMUL_WIDE) & 31u] =
+                seedByte;
+            config.semantic = VM_UOP_UMUL_WIDE;
+            config.variant = variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "x86 Zydis UMUL_WIDE generation failed: " + generated.error);
+            std::string validationError;
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    config, generated, validationError),
+                "x86 Zydis UMUL_WIDE validation failed: " + validationError);
+            if (generated.semanticCoreStrategy != 1u) continue;
+            Require(expectedPlans.count(generated.registerAssignment) != 0u,
+                "x86 UMUL_WIDE K=1 published an unknown liveness plan");
+
+            ZydisDecoder decoder = MakeSemanticDecoder(VM_ARCH_X86);
+            const uint8_t* core = generated.code.data() +
+                generated.semanticCoreVariantOffset;
+            size_t relative = 0u;
+            bool foundMainMultiply = false;
+            while (relative < generated.semanticCoreVariantSize) {
+                ZydisDecodedInstruction instruction{};
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+                Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        &decoder, core + relative,
+                        generated.semanticCoreVariantSize - relative,
+                        &instruction, operands)),
+                    "Zydis could not decode x86 UMUL_WIDE K=1 core");
+                relative += instruction.length;
+                if (instruction.mnemonic != ZYDIS_MNEMONIC_MUL) continue;
+                Require(instruction.operand_count_visible == 1u,
+                    "x86 UMUL_WIDE main MUL lacks one explicit source");
+                const uint8_t expectedRegister =
+                    generated.registerAssignment[0];
+                const bool memorySource =
+                    generated.registerAssignment[3] == 0u;
+                if (memorySource) {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                            ZydisRegisterGetId(operands[0].mem.base) ==
+                                expectedRegister,
+                        "x86 UMUL_WIDE memory MUL does not use its liveness base");
+                    operandSignatures.insert(
+                        "memory:" + std::to_string(expectedRegister));
+                } else {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            ZydisRegisterGetId(operands[0].reg.value) ==
+                                expectedRegister,
+                        "x86 UMUL_WIDE register MUL does not use its liveness source");
+                    operandSignatures.insert(
+                        "register:" + std::to_string(expectedRegister));
+                }
+                foundMainMultiply = true;
+                break;
+            }
+            Require(foundMainMultiply,
+                "x86 UMUL_WIDE K=1 emitted no hardware MUL source");
+            observedPlans.insert(generated.registerAssignment);
+        }
+    }
+    Require(observedPlans == expectedPlans && operandSignatures.size() == 4u,
+        "x86 UMUL_WIDE K=1 did not cover four register/address plans");
+    std::cout << "[x86-umul-wide-k1-plans] assignments=" <<
+        observedPlans.size() << " operand_signatures=" <<
+        operandSignatures.size() << '\n';
+}
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -3090,5 +3504,11 @@ int main() {
         &TestSemanticBodyRejectsFixedCoreEnvelope, failures);
     Run("semantic seed 256-bit lane coverage",
         &TestSemanticSeedConsumesEveryLane, failures);
+    Run("Zydis Encoder generated-instruction coverage",
+        &TestZydisEncoderCoversGeneratedInstructionForms, failures);
+    Run("Zydis migrated build-seed register allocation",
+        &TestZydisMigratedRegistersVaryByBuildSeed, failures);
+    Run("x86 Zydis UMUL_WIDE K=1 source plans",
+        &TestX86ZydisUmulWideK1SourcePlans, failures);
     return failures == 0 ? 0 : 1;
 }

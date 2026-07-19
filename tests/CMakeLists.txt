@@ -23,6 +23,7 @@ add_executable(test_vm_handler_synthesis
 
 target_link_libraries(test_vm_handler_synthesis PRIVATE
     ciphershell_packer
+    Zydis
 )
 
 target_include_directories(test_vm_handler_synthesis PRIVATE ${CMAKE_SOURCE_DIR})
@@ -354,5 +355,8 @@ add_test(
 )
 set_tests_properties(vm_per_build_similarity_gate PROPERTIES
     LABELS "vm;hard-gate"
-    TIMEOUT 300
+    # Four full pack-and-run builds take 6-8 minutes on the slower Win32
+    # builders.  Keep the CTest wrapper above the script's own per-case
+    # deadlines so it cannot strand a runner that still owns an output PE.
+    TIMEOUT 900
 )
