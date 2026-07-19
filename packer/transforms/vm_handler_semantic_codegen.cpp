@@ -1041,6 +1041,18 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             return {3u, 1u, 6u, 3u};
         return {6u, 3u, 1u, 6u};
     }
+    if (!x64 && semantic == VM_UOP_UMUL_WIDE) {
+        // K=1 keeps EAX as the implicit multiplicand and EBX as the saved
+        // correction operand.  Its explicit main-product source may be ESI
+        // or EDX, either directly or as a seed-split scratch-memory base.
+        // ECX holds (b + key); EDI remains the context throughout.
+        switch ((seedOffset + static_cast<size_t>(variant)) & 3u) {
+            case 0u: return {6u, 1u, 3u, 2u}; // MUL ESI
+            case 1u: return {2u, 1u, 3u, 6u}; // MUL EDX
+            case 2u: return {6u, 1u, 3u, 0u}; // MUL [ESI + disp32]
+            default: return {2u, 1u, 3u, 0u}; // MUL [EDX + disp32]
+        }
+    }
     std::array<uint8_t, 4> output{};
     if (x64) {
         constexpr std::array<uint8_t, 7> pool = {0, 1, 2, 8, 9, 10, 11};
@@ -3829,8 +3841,30 @@ bool EmitBusinessCoreVariant(
             X86BinaryImmediate32(c, 0u, 1u, key); // ecx = b + key
             c.Raw({0x0F,0x92,0x87});              // keyed-add carry
             c.U32(CtxMutationScratch);
-            if (strategy == 0u) c.Raw({0xF7,0xE1});
-            else c.Raw({0x89,0xCE,0xF7,0xE6});
+            if (strategy == 0u) {
+                // Keep K=0 byte-for-byte unchanged.  This is the control arm
+                // for the K=1 explicit-source diversification below.
+                c.Raw({0xF7,0xE1});
+            } else {
+                const uint8_t multiplier = c.registerAssignment[0];
+                const bool memorySource = c.registerAssignment[3] == 0u;
+                if (!memorySource) {
+                    EmitZydisMove(c, false, multiplier, 1u);
+                    EmitZydisUnary(
+                        c, false, ZYDIS_MNEMONIC_MUL, multiplier);
+                } else {
+                    const uint32_t addressKey =
+                        CoreAddressKey(c, strategy + 9u);
+                    EmitZydisLea(c, false, multiplier, 7u,
+                        static_cast<int32_t>(
+                            CtxMutationScratch + 4u + addressKey));
+                    EmitZydisStore(c, false, multiplier,
+                        static_cast<int32_t>(0u - addressKey), 1u, 4u);
+                    EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MUL,
+                        {ZydisMemoryOperand(false, multiplier,
+                            static_cast<int32_t>(0u - addressKey), 4u)});
+                }
+            }
             c.Raw({0x89,0xC6,0x89,0xD1});          // main low/high
             c.Raw({0x89,0xD8,0xBA}); c.U32(key);   // eax=a, edx=key
             c.Raw({0xF7,0xE2});                    // edx:eax = a*key
@@ -7240,11 +7274,14 @@ bool ValidateVMHandlerSemanticVariantKernel(
         const bool x86MemoryContract = !x64 &&
             (config.semantic == VM_UOP_LOAD ||
              config.semantic == VM_UOP_STORE);
+        const bool x86UmulWideContract = !x64 &&
+            config.semantic == VM_UOP_UMUL_WIDE;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
                reg == 8 || reg == 9 || reg == 10 || reg == 11)
             : (reg <= 2 || (x86MemoryContract &&
-                (reg == 3 || reg == 6)));
+                (reg == 3 || reg == 6)) ||
+                (x86UmulWideContract && (reg == 3 || reg == 6)));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
             return false;

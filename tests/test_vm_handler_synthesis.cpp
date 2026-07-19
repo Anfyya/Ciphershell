@@ -2546,15 +2546,13 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     // intentionally narrow and already exempted below) with real headroom
     // above it, not from the aggregate ceilings above.
     //
-    // core_variant's worst pair today is x86 semantic=20 (VM_UOP_UMUL_WIDE)
-    // K=1 at 0.714286 -- wide-multiply is one of the high-risk semantics
-    // (alongside CALL_HOST/BRIDGE_EXTENDED) whose register reallocation is
-    // explicitly deferred, not attempted this round. The ceiling is set
-    // above that named, already-tracked case so this check has real teeth
-    // against a *new* degenerate pair without demanding that deferred work
-    // land first.
+    // After the isolated x86 UMUL_WIDE K=1 migration, the unchanged K=0
+    // control arm is the x86 worst pair at 0.702128.  K=1 has its own tighter
+    // ceiling below, so a regression there cannot hide behind this global
+    // limit or another semantic.
     constexpr double kMaxPairCeilingBusinessCore = 0.55;
     constexpr double kMaxPairCeilingCoreVariant = 0.75;
+    constexpr double kX86UmulWideK1PairCeiling = 0.55;
     const auto seedA = MakeSeed(static_cast<uint8_t>(
         architecture == VMHandlerArchitecture::X64 ? 0x64 : 0x32));
     const auto seedB = MakeSeed(static_cast<uint8_t>(
@@ -2678,6 +2676,7 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     std::string maxCoreVariantPairLabel;
     double maxBusinessCorePairSimilarity = -1.0;
     std::string maxBusinessCorePairLabel;
+    double x86UmulWideK1PairSimilarity = -1.0;
     const auto orderedA = SortedHandlers(buildA);
     const auto orderedB = SortedHandlers(buildB);
     std::map<uint8_t, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
@@ -2751,6 +2750,11 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
             }
             const double corePairSimilarity =
                 FourGramDiceSimilarity(leftCore, rightCore);
+            if (architecture == VMHandlerArchitecture::X86 &&
+                    left->semantic == VM_UOP_UMUL_WIDE &&
+                    left->variant == 1u) {
+                x86UmulWideK1PairSimilarity = corePairSimilarity;
+            }
             if (corePairSimilarity > maxCoreVariantPairSimilarity) {
                 maxCoreVariantPairSimilarity = corePairSimilarity;
                 maxCoreVariantPairLabel = pairKey;
@@ -2798,6 +2802,17 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
         " core_variant_key=" << maxCoreVariantPairLabel <<
         " business_core=" << maxBusinessCorePairSimilarity <<
         " business_core_key=" << maxBusinessCorePairLabel << '\n';
+    if (architecture == VMHandlerArchitecture::X86) {
+        Require(x86UmulWideK1PairSimilarity >= 0.0,
+            "x86 UMUL_WIDE K=1 pair metric was not sampled");
+        std::cout << "[x86-umul-wide-k1-similarity] dice=" <<
+            x86UmulWideK1PairSimilarity << '\n';
+        Require(x86UmulWideK1PairSimilarity <
+                kX86UmulWideK1PairCeiling,
+            "x86 UMUL_WIDE K=1 core pair similarity regressed above " +
+                std::to_string(kX86UmulWideK1PairCeiling) + ": " +
+                std::to_string(x86UmulWideK1PairSimilarity));
+    }
     Require(identicalCoreVariants.empty(),
         "两次构建仍含逐字节相同的必经业务核心 (semantic,K)");
     Require(valueCodecSimilarity < 0.15,
@@ -3380,6 +3395,86 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
     }
 }
 
+void TestX86ZydisUmulWideK1SourcePlans() {
+    const std::set<std::array<uint8_t, 4>> expectedPlans = {
+        {6u, 1u, 3u, 2u},
+        {2u, 1u, 3u, 6u},
+        {6u, 1u, 3u, 0u},
+        {2u, 1u, 3u, 0u}};
+    std::set<std::array<uint8_t, 4>> observedPlans;
+    std::set<std::string> operandSignatures;
+    for (uint8_t seedByte = 0u; seedByte < 16u; ++seedByte) {
+        for (uint8_t variant = 0u;
+             variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = VM_ARCH_X86;
+            config.buildSeed = MakeSeed(0xA6u);
+            config.buildSeed[static_cast<uint8_t>(VM_UOP_UMUL_WIDE) & 31u] =
+                seedByte;
+            config.semantic = VM_UOP_UMUL_WIDE;
+            config.variant = variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "x86 Zydis UMUL_WIDE generation failed: " + generated.error);
+            std::string validationError;
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    config, generated, validationError),
+                "x86 Zydis UMUL_WIDE validation failed: " + validationError);
+            if (generated.semanticCoreStrategy != 1u) continue;
+            Require(expectedPlans.count(generated.registerAssignment) != 0u,
+                "x86 UMUL_WIDE K=1 published an unknown liveness plan");
+
+            ZydisDecoder decoder = MakeSemanticDecoder(VM_ARCH_X86);
+            const uint8_t* core = generated.code.data() +
+                generated.semanticCoreVariantOffset;
+            size_t relative = 0u;
+            bool foundMainMultiply = false;
+            while (relative < generated.semanticCoreVariantSize) {
+                ZydisDecodedInstruction instruction{};
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+                Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        &decoder, core + relative,
+                        generated.semanticCoreVariantSize - relative,
+                        &instruction, operands)),
+                    "Zydis could not decode x86 UMUL_WIDE K=1 core");
+                relative += instruction.length;
+                if (instruction.mnemonic != ZYDIS_MNEMONIC_MUL) continue;
+                Require(instruction.operand_count_visible == 1u,
+                    "x86 UMUL_WIDE main MUL lacks one explicit source");
+                const uint8_t expectedRegister =
+                    generated.registerAssignment[0];
+                const bool memorySource =
+                    generated.registerAssignment[3] == 0u;
+                if (memorySource) {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                            ZydisRegisterGetId(operands[0].mem.base) ==
+                                expectedRegister,
+                        "x86 UMUL_WIDE memory MUL does not use its liveness base");
+                    operandSignatures.insert(
+                        "memory:" + std::to_string(expectedRegister));
+                } else {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            ZydisRegisterGetId(operands[0].reg.value) ==
+                                expectedRegister,
+                        "x86 UMUL_WIDE register MUL does not use its liveness source");
+                    operandSignatures.insert(
+                        "register:" + std::to_string(expectedRegister));
+                }
+                foundMainMultiply = true;
+                break;
+            }
+            Require(foundMainMultiply,
+                "x86 UMUL_WIDE K=1 emitted no hardware MUL source");
+            observedPlans.insert(generated.registerAssignment);
+        }
+    }
+    Require(observedPlans == expectedPlans && operandSignatures.size() == 4u,
+        "x86 UMUL_WIDE K=1 did not cover four register/address plans");
+    std::cout << "[x86-umul-wide-k1-plans] assignments=" <<
+        observedPlans.size() << " operand_signatures=" <<
+        operandSignatures.size() << '\n';
+}
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -3413,5 +3508,7 @@ int main() {
         &TestZydisEncoderCoversGeneratedInstructionForms, failures);
     Run("Zydis migrated build-seed register allocation",
         &TestZydisMigratedRegistersVaryByBuildSeed, failures);
+    Run("x86 Zydis UMUL_WIDE K=1 source plans",
+        &TestX86ZydisUmulWideK1SourcePlans, failures);
     return failures == 0 ? 0 : 1;
 }
