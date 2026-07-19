@@ -12,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -392,39 +393,60 @@ void TestMulNativeDifferentialMatchesRealCpu() {
     // 覆盖新加入的 VM_UOP_MUL 双策略业务核心(EmitBusinessCoreVariant 的
     // IMUL reg,reg 与 MUL reg 两条真实不同字节序列)：证明无论 build 的
     // seed/variant 选中哪一支策略，合成 handler 链的乘法结果都必须与
-    // 真实 CPU IMUL 逐字节一致，而不仅仅是结构层面的字节模式检查。
+    // 真实 CPU LEA 的 scaled-index arithmetic 一致，而不仅仅是结构层面的
+    // 字节模式检查。显式 two/three-operand IMUL 在 translator 中有意降低为
+    // SMUL_WIDE；VM_UOP_MUL 的真实生产入口是地址 scale 计算。
     const auto seed = MakeSeed(0xD3);
     const HarnessBuild build = SetUpMutatedIsa(seed);
 
     Disassembler disassembler;
     Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
 
-    // imul eax, ecx ; add eax, 0 ; ret  (two-operand signed multiply).
-    // IMUL only defines CF/OF and leaves SF/ZF/AF/PF architecturally
-    // undefined, so the translator's flags-flow analysis correctly refuses
-    // to translate a terminal RET immediately after it (it cannot know
-    // what a real CPU would leave in those bits). The trailing `add eax, 0`
-    // is a value no-op that fully redefines all six status flags, closing
-    // that undefined-flags window without touching the product in eax.
-    const std::vector<uint8_t> mulBytes = {
-        0x0F, 0xAF, 0xC1, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
-    // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
-    const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
-    constexpr uint64_t kEntry = 0x1000;
+    // lea rax/eax,[rax/eax+rcx/ecx*4] ; ret. EmitAddress chooses either a
+    // real VM_UOP_MUL or repeated ADDs from translator seed and instruction
+    // address. Search a small deterministic address range for the MUL arm so
+    // this fixture cannot silently stop covering the migrated semantic.
+    std::vector<uint8_t> mulBytes;
+    if (kIs64) mulBytes.push_back(0x48);
+    mulBytes.insert(mulBytes.end(), {0x8D,0x04,0x88,0xC3});
+    std::vector<uint8_t> addBytes;
+    if (kIs64) addBytes.push_back(0x48);
+    addBytes.insert(addBytes.end(), {0x01,0xC8,0xC3});
 
-    const Function mulFunction = DecodeStandaloneFunction(disassembler, mulBytes, kEntry);
-    const Function addFunction = DecodeStandaloneFunction(disassembler, addBytes, kEntry);
-
-    Translator translator;
-    const TranslationResult mulTranslation =
-        TranslateStandaloneFunction(mulFunction, build, translator);
+    Function mulFunction{};
+    TranslationResult mulTranslation{};
+    uint64_t selectedEntry = 0u;
+    for (uint64_t candidateEntry = 0x1000u;
+         candidateEntry < 0x1100u; candidateEntry += 0x10u) {
+        Function candidateFunction = DecodeStandaloneFunction(
+            disassembler, mulBytes, candidateEntry);
+        Translator candidateTranslator;
+        TranslationResult candidateTranslation =
+            TranslateStandaloneFunction(
+                candidateFunction, build, candidateTranslator);
+        const auto candidateMul = std::find_if(
+            candidateTranslation.instructions.begin(),
+            candidateTranslation.instructions.end(),
+            [](const MicroInstruction& instruction) {
+                return instruction.opcode == VM_UOP_MUL;
+            });
+        if (candidateMul == candidateTranslation.instructions.end()) continue;
+        selectedEntry = candidateEntry;
+        mulFunction = std::move(candidateFunction);
+        mulTranslation = std::move(candidateTranslation);
+        break;
+    }
+    Require(selectedEntry != 0u,
+        "scaled LEA fixture could not select the VM_UOP_MUL lowering arm");
+    const Function addFunction = DecodeStandaloneFunction(
+        disassembler, addBytes, selectedEntry);
     const auto mulInstruction = std::find_if(
         mulTranslation.instructions.begin(), mulTranslation.instructions.end(),
         [](const MicroInstruction& instruction) {
             return instruction.opcode == VM_UOP_MUL;
         });
     Require(mulInstruction != mulTranslation.instructions.end(),
-        "IMUL fixture emitted no VM_UOP_MUL instruction");
+        "scaled LEA fixture emitted no VM_UOP_MUL instruction");
 
     VMIRModelPreflightConfig preflightConfig{};
     preflightConfig.corpusSeed = 0x5678;
@@ -473,7 +495,7 @@ void TestMulNativeDifferentialMatchesRealCpu() {
         }
     }
     RunDifferentialCase(addFunction, mulTranslation, build, 8, false,
-        "native=ADD vs VM-bytecode=MUL 必须被判定语义分歧");
+        "native=ADD vs VM scaled-LEA MUL 必须被判定语义分歧");
 }
 
 void TestBitOperationsNativeDifferentialMatchesRealCpu() {
@@ -1188,7 +1210,7 @@ int main() {
 #endif
     Run("分发表编码分化: 两套加密查表路径均由隔离原生 CPU 执行",
         &TestDispatchTableEncodingSchemesExecuteNatively, failures);
-    Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",
+    Run("MUL 真 K 变体: 真实 CPU scaled LEA 与合成 handler 链一致性/分歧检测",
         &TestMulNativeDifferentialMatchesRealCpu, failures);
     Run("BIT_TEST/BIT_SET/BIT_RESET 真 K 变体: 真实 CPU BT/BTS/BTR 与合成 handler 链一致性/分歧检测",
         &TestBitOperationsNativeDifferentialMatchesRealCpu, failures);

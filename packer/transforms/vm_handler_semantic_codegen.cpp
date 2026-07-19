@@ -204,7 +204,26 @@ void EmitZydisInstruction(
     const ZyanStatus status = ZydisEncoderEncodeInstruction(
         &request, encoded.data(), &encodedSize);
     if (!ZYAN_SUCCESS(status)) {
-        c.FailEncoding("Zydis Encoder rejected a semantic instruction");
+        std::string error = "Zydis Encoder rejected semantic instruction " +
+            std::to_string(static_cast<uint32_t>(mnemonic)) +
+            " status=" + std::to_string(static_cast<uint32_t>(status)) +
+            " operands=";
+        for (size_t operandIndex = 0u;
+             operandIndex < request.operand_count; ++operandIndex) {
+            if (operandIndex != 0u) error += ',';
+            const auto& operand = request.operands[operandIndex];
+            error += std::to_string(static_cast<uint32_t>(operand.type));
+            if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                error += ":r" + std::to_string(
+                    static_cast<uint32_t>(operand.reg.value));
+            } else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                error += ":m" + std::to_string(
+                    static_cast<uint32_t>(operand.mem.base));
+            } else if (operand.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                error += ":i" + std::to_string(operand.imm.u);
+            }
+        }
+        c.FailEncoding(error);
         return;
     }
     c.bytes.insert(c.bytes.end(), encoded.begin(),
@@ -230,9 +249,20 @@ void EmitZydisSizedMove(
          ZydisSizedGprOperand(x64, source, bytes)});
 }
 
+uint64_t ZydisSignExtendImmediateBits(uint64_t immediate, uint8_t bytes) {
+    if (bytes != 1u && bytes != 2u && bytes != 4u) return immediate;
+    const uint8_t bits = static_cast<uint8_t>(bytes * 8u);
+    const uint64_t mask = (uint64_t{1} << bits) - 1u;
+    immediate &= mask;
+    if ((immediate & (uint64_t{1} << (bits - 1u))) != 0u)
+        immediate |= ~mask;
+    return immediate;
+}
+
 void EmitZydisMoveImmediate(
     CodeBuffer& c, bool x64, uint8_t destination, uint64_t immediate)
 {
+    if (!x64) immediate = ZydisSignExtendImmediateBits(immediate, 4u);
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
         {ZydisGprOperand(x64, destination),
          ZydisImmediateOperand(immediate)});
@@ -245,6 +275,7 @@ void EmitZydisSizedMoveImmediate(
     uint8_t bytes,
     uint64_t immediate)
 {
+    immediate = ZydisSignExtendImmediateBits(immediate, bytes);
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
         {ZydisSizedGprOperand(x64, destination, bytes),
          ZydisImmediateOperand(immediate)});
@@ -301,6 +332,12 @@ void EmitZydisSizedBinaryImmediate(
     uint8_t bytes,
     uint64_t immediate)
 {
+    // Zydis models the legacy ALU immediate encodings as signed fields even
+    // when the instruction consumes their raw bits at the destination width.
+    // Sign-extend the requested bit pattern so values with bit 7/15/31 set
+    // remain representable at that exact width instead of being rejected as
+    // requiring a wider immediate.
+    immediate = ZydisSignExtendImmediateBits(immediate, bytes);
     EmitZydisInstruction(c, x64, mnemonic,
         {ZydisSizedGprOperand(x64, destination, bytes),
          ZydisImmediateOperand(immediate)});
