@@ -846,5 +846,9 @@ byte-equality 失败。
 
 ### 最终 CI 闭环
 
-待最终代码提交后的 GitHub Actions 核实；本节将在同一文档中补记 run、三个 job 与
-正式 per-build similarity gate 结果。
+代码提交 `e5692f0` 对应 GitHub Actions run `29698611515` 最终为 `success`：
+`static-gate`、`build-and-test (x64)`、`build-and-test (Win32)` 三个 job 全部通过。
+两个架构 job 均完成完整 Release 构建与全部 CTest，因此全矩阵重编码、两架构 handler
+合成、扩展后的多 seed 隔离原生差分和正式独立 EXE/DLL per-build similarity gate
+均已由最终代码提交的 CI 核实通过。该 run 从 `18:22:50Z` 到 `18:28:55Z`，实际耗时
+365 秒；后续代码 push 将以此作为首次查询前的等待时长。
