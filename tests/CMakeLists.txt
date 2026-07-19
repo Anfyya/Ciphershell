@@ -23,6 +23,7 @@ add_executable(test_vm_handler_synthesis
 
 target_link_libraries(test_vm_handler_synthesis PRIVATE
     ciphershell_packer
+    Zydis
 )
 
 target_include_directories(test_vm_handler_synthesis PRIVATE ${CMAKE_SOURCE_DIR})

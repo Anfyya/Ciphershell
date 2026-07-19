@@ -2,11 +2,14 @@
 
 #include "../vm/vm_schema.h"
 
+#include <Zydis/Encoder.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <utility>
 
@@ -101,9 +104,10 @@ public:
     std::vector<uint8_t> bytes;
     KeyedPermutationPlan valueCodec{};
     KeyedPermutationPlan coreSelector{};
+    std::array<uint8_t, 4> registerAssignment{};
     std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
 
-    void FailEncoding(const char* error) {
+    void FailEncoding(const std::string& error) {
         if (encodingError.empty()) encodingError = error;
     }
 
@@ -117,6 +121,96 @@ private:
     std::vector<size_t> labels;
     std::vector<Fixup> fixups;
 };
+
+ZydisEncoderOperand ZydisGprOperand(bool x64, uint8_t reg) {
+    ZydisEncoderOperand operand{};
+    operand.type = ZYDIS_OPERAND_TYPE_REGISTER;
+    operand.reg.value = ZydisRegisterEncode(
+        x64 ? ZYDIS_REGCLASS_GPR64 : ZYDIS_REGCLASS_GPR32, reg);
+    return operand;
+}
+
+ZydisEncoderOperand ZydisImmediateOperand(uint32_t value) {
+    ZydisEncoderOperand operand{};
+    operand.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+    operand.imm.u = value;
+    return operand;
+}
+
+void EmitZydisInstruction(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    std::initializer_list<ZydisEncoderOperand> operands)
+{
+    if (operands.size() > ZYDIS_ENCODER_MAX_OPERANDS) {
+        c.FailEncoding("Zydis Encoder pilot instruction has too many operands");
+        return;
+    }
+    ZydisEncoderRequest request{};
+    request.machine_mode = x64
+        ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
+    request.allowed_encodings = ZYDIS_ENCODABLE_ENCODING_LEGACY;
+    request.mnemonic = mnemonic;
+    request.operand_count = static_cast<ZyanU8>(operands.size());
+    size_t index = 0;
+    for (const ZydisEncoderOperand& operand : operands)
+        request.operands[index++] = operand;
+
+    std::array<uint8_t, ZYDIS_MAX_INSTRUCTION_LENGTH> encoded{};
+    ZyanUSize encodedSize = encoded.size();
+    const ZyanStatus status = ZydisEncoderEncodeInstruction(
+        &request, encoded.data(), &encodedSize);
+    if (!ZYAN_SUCCESS(status)) {
+        c.FailEncoding("Zydis Encoder rejected an ALU pilot instruction");
+        return;
+    }
+    c.bytes.insert(c.bytes.end(), encoded.begin(),
+        encoded.begin() + encodedSize);
+}
+
+void EmitZydisMove(
+    CodeBuffer& c, bool x64, uint8_t destination, uint8_t source)
+{
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+        {ZydisGprOperand(x64, destination), ZydisGprOperand(x64, source)});
+}
+
+void EmitZydisExchange(
+    CodeBuffer& c, bool x64, uint8_t left, uint8_t right)
+{
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_XCHG,
+        {ZydisGprOperand(x64, left), ZydisGprOperand(x64, right)});
+}
+
+void EmitZydisBinary(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t destination,
+    uint8_t source)
+{
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisGprOperand(x64, destination), ZydisGprOperand(x64, source)});
+}
+
+void EmitZydisBinaryImmediate(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t destination,
+    uint32_t immediate)
+{
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisGprOperand(x64, destination),
+         ZydisImmediateOperand(immediate)});
+}
+
+void EmitZydisUnary(
+    CodeBuffer& c, bool x64, ZydisMnemonic mnemonic, uint8_t reg)
+{
+    EmitZydisInstruction(c, x64, mnemonic, {ZydisGprOperand(x64, reg)});
+}
 
 constexpr uint32_t kX64FlagCallStackBytes = 0x28u;
 constexpr uint8_t kX64FlagCallPrologSize = 4u;
@@ -801,6 +895,30 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
     std::array<uint8_t, 4> output{};
     const size_t seedOffset = static_cast<size_t>(
         buildSeed[static_cast<uint8_t>(semantic) & 31u]);
+    const bool zydisAluPilot = semantic == VM_UOP_AND ||
+        semantic == VM_UOP_OR || semantic == VM_UOP_XOR;
+    if (zydisAluPilot) {
+        if (x64) {
+            // RAX/RDX hold the incoming operands. R8/R11 are free after the
+            // pre-latched record is stored; R9 (width mask), R10 (auxiliary),
+            // R15 (context), RSP and every nonvolatile register stay excluded.
+            constexpr std::array<uint8_t, 4> pool = {0, 2, 8, 11};
+            const size_t start =
+                (seedOffset + static_cast<size_t>(variant)) % pool.size();
+            for (size_t index = 0; index < output.size(); ++index)
+                output[index] = pool[(start + index) % pool.size()];
+        } else {
+            // EAX/EDX hold the incoming operands and ECX is dead at this
+            // point. Keep EBX/ESI/EDI out of the allocation because they are
+            // direct-threaded ABI state on x86.
+            constexpr std::array<uint8_t, 3> pool = {0, 2, 1};
+            const size_t start =
+                (seedOffset + static_cast<size_t>(variant)) % pool.size();
+            for (size_t index = 0; index < output.size(); ++index)
+                output[index] = pool[(start + index) % pool.size()];
+        }
+        return output;
+    }
     if (x64) {
         constexpr std::array<uint8_t, 7> pool = {0, 1, 2, 8, 9, 10, 11};
         const size_t start = (seedOffset + static_cast<size_t>(variant)) %
@@ -2354,21 +2472,60 @@ void EmitKeyedAddSubCore(
     }
 }
 
+struct ZydisAluRegisterPlan {
+    uint8_t value = 0;
+    uint8_t source = 2;
+    uint8_t scratch = 8;
+};
+
+ZydisAluRegisterPlan PrepareZydisAluRegisters(
+    CodeBuffer& c, bool x64, bool needsScratch)
+{
+    const ZydisAluRegisterPlan plan = {
+        c.registerAssignment[0],
+        c.registerAssignment[1],
+        c.registerAssignment[2]};
+    if (plan.value == 0u && plan.source == 2u) {
+        if (needsScratch) EmitZydisMove(c, x64, plan.scratch, 2u);
+        return plan;
+    }
+
+    if (x64) {
+        // First duplicate the original RDX input into both otherwise-free
+        // registers. Exchanging RAX with the selected value register then
+        // leaves every non-value register holding the original source.
+        EmitZydisMove(c, true, 8u, 2u);
+        EmitZydisMove(c, true, 11u, 2u);
+    } else {
+        EmitZydisMove(c, false, 1u, 2u);
+    }
+    EmitZydisExchange(c, x64, 0u, plan.value);
+    return plan;
+}
+
+void FinishZydisAluRegisters(
+    CodeBuffer& c, bool x64, const ZydisAluRegisterPlan& plan)
+{
+    if (plan.value != 0u) EmitZydisMove(c, x64, 0u, plan.value);
+}
+
 void EmitKeyedXorCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const std::array<uint32_t, 3> keys = {
         CoreKey32(c, strategy + 1u), CoreKey32(c, strategy + 4u),
         CoreKey32(c, strategy + 6u)};
-    if (x64) {
-        for (uint32_t key : keys) X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryRegister(c, 0x31, 0, 2);
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it)
-            X64BinaryImmediate32(c, 6u, 0u, *it);
-    } else {
-        for (uint32_t key : keys) X86BinaryImmediate32(c, 6u, 0u, key);
-        c.Raw({0x31,0xD0});
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it)
-            X86BinaryImmediate32(c, 6u, 0u, *it);
+    const ZydisAluRegisterPlan registers =
+        PrepareZydisAluRegisters(c, x64, false);
+    for (uint32_t key : keys) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, registers.value, key);
     }
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR,
+        registers.value, registers.source);
+    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, registers.value, *it);
+    }
+    FinishZydisAluRegisters(c, x64, registers);
 }
 
 void EmitKeyedCopyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
@@ -2520,33 +2677,31 @@ void EmitKeyedBitwiseCore(
     CodeBuffer& c, bool x64, bool bitwiseOr, uint8_t strategy)
 {
     const uint32_t key = CoreKey32(c, strategy + 3u);
-    if (x64) {
-        X64MovRegister(c, 8u, 2u);
-        if (bitwiseOr) X64UnaryGroup(c, 2u, 8u);
-        X64BinaryImmediate32(c, 4u, 8u, key);
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) {
-            X64BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
-        } else {
-            X64UnaryGroup(c, 2u, 0u); X64UnaryGroup(c, 2u, 2u);
-            X64BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
-            X64UnaryGroup(c, 2u, 0u);
-        }
-        X64BinaryRegister(c, 0x31u, 0u, 8u);
-    } else {
-        X86MovRegister(c, 3u, 2u);
-        if (bitwiseOr) X86UnaryGroup(c, 2u, 3u);
-        X86BinaryImmediate32(c, 4u, 3u, key);
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) {
-            X86BinaryRegister(c, bitwiseOr ? 0x09u : 0x21u, 0u, 2u);
-        } else {
-            X86UnaryGroup(c, 2u, 0u); X86UnaryGroup(c, 2u, 2u);
-            X86BinaryRegister(c, bitwiseOr ? 0x21u : 0x09u, 0u, 2u);
-            X86UnaryGroup(c, 2u, 0u);
-        }
-        X86BinaryRegister(c, 0x31u, 0u, 3u);
+    const ZydisAluRegisterPlan registers =
+        PrepareZydisAluRegisters(c, x64, true);
+    if (bitwiseOr) {
+        EmitZydisUnary(
+            c, x64, ZYDIS_MNEMONIC_NOT, registers.scratch);
     }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+        registers.scratch, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+        registers.value, key);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64,
+            bitwiseOr ? ZYDIS_MNEMONIC_OR : ZYDIS_MNEMONIC_AND,
+            registers.value, registers.source);
+    } else {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.value);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.source);
+        EmitZydisBinary(c, x64,
+            bitwiseOr ? ZYDIS_MNEMONIC_AND : ZYDIS_MNEMONIC_OR,
+            registers.value, registers.source);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.value);
+    }
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR,
+        registers.value, registers.scratch);
+    FinishZydisAluRegisters(c, x64, registers);
 }
 
 void EmitKeyedUnaryCore(
@@ -3788,6 +3943,8 @@ bool ValidateBusinessCoreStrategyReemission(
          strategy < static_cast<uint8_t>(emitted.size()); ++strategy) {
         CodeBuffer code;
         ConfigurePermutationPlans(code, config);
+        code.registerAssignment = DeriveVariantRegisters(
+            x64, config.variant, config.semantic, config.buildSeed);
         if (!EmitBusinessCoreVariant(code, x64, config.semantic, strategy)) {
             error = "business core strategy could not be re-emitted";
             return false;
@@ -6613,6 +6770,7 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     ConfigurePermutationPlans(code, config);
     result.registerAssignment = DeriveVariantRegisters(
         x64, config.variant, config.semantic, config.buildSeed);
+    code.registerAssignment = result.registerAssignment;
     result.variantPrefixOffset = static_cast<uint32_t>(code.bytes.size());
     result.variantPrefixSize = static_cast<uint32_t>(code.bytes.size()) -
         result.variantPrefixOffset;
@@ -7092,6 +7250,7 @@ bool ValidateVMHandlerSemanticVariantKernel(
         }
         CodeBuffer expectedCoreVariant;
         ConfigurePermutationPlans(expectedCoreVariant, config);
+        expectedCoreVariant.registerAssignment = expectedRegisters;
         uint32_t expectedOffset = 0;
         uint32_t expectedSize = 0;
         if (!EmitTrackedBusinessCoreVariant(expectedCoreVariant, x64,

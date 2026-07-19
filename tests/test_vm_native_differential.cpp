@@ -246,6 +246,48 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
         "native=SUB vs VM-bytecode=ADD 必须被判定语义分歧");
 }
 
+void TestZydisAluPilotNativeDifferential() {
+    const auto seed = MakeSeed(0xB0u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis ALU pilot disassembler initialization failed");
+
+    // and eax,ecx ; or eax,edx ; xor eax,ecx ; ret. The same 32-bit bytes
+    // execute on both hosts and force all three migrated semantic kernels to
+    // contribute to the final value. Four provider seeds independently
+    // synthesize the handler chain, exercising build-seed register plans in
+    // the isolated native worker rather than only inspecting emitted bytes.
+    const std::vector<uint8_t> bytes = {
+        0x21,0xC8, 0x09,0xD0, 0x31,0xC8, 0xC3};
+    constexpr uint64_t kEntry = 0x1000;
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A11ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis AND/OR/XOR pilot software IR preflight failed: " +
+            preflight.error);
+
+    constexpr std::array<uint8_t, 4> providerSeeds = {
+        0xB1u, 0xB2u, 0xB3u, 0xB4u};
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis AND/OR/XOR seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestFunctionEntryStackAndRetCleanupDifferential() {
     const auto seed = MakeSeed(0xD2);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -893,6 +935,8 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
+    Run("Zydis AND/OR/XOR build-seed register native differential",
+        &TestZydisAluPilotNativeDifferential, failures);
     Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
         &TestFunctionEntryStackAndRetCleanupDifferential, failures);
     Run("branch-to-RET flags materialization",
