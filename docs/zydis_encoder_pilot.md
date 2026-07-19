@@ -562,3 +562,58 @@ ESI/EDX 寄存器源与 seed-split 地址源实现、计划表和专项上限均
   单点的无专项约束状态；实际值、Win32/x64 全矩阵重编码、两架构 handler 合成、
   隔离差分和正式 per-build similarity gate 均由本批提交后的 CI 核实，本地不把
   Windows-only 测试标记为已运行。
+
+## 推广批次 3C：`BSWAP`、`ZERO_EXTEND`、`SIGN_EXTEND`（2026-07-19）
+
+### 范围与活跃性契约
+
+本批只迁移三个算术语义的显式寄存器指令。`BSWAP` 的本地 width 分支和 invalid
+路径保持原控制结构；扩展语义仍固定使用 CL 作为硬件 shift count。没有触碰 VM
+CFG 分发、unwind funclet、native 调用桥接或故障语义，`CALL_HOST` 与
+`BRIDGE_EXTENDED` 继续排除。
+
+| 语义/架构 | seed 选择的角色与安全池 | 明确保留/排除 |
+|---|---|---|
+| BSWAP x64 | value/transform/key/spare 在 RAX、RCX、RDX、R10 中轮转 | R8 保留原值，R9 保留 width mask，R11 专用于 width dispatch，R15 为 context |
+| BSWAP x86 | value/transform/spare 在 EAX、EDX、EBX 中轮转 | ECX 专用于 width dispatch，EDI 为 context，ESI 不参与 |
+| ZERO/SIGN_EXTEND x64 | value/mask/count/sign 在 RAX、R10、RDX、R11 中轮转 | RCX 固定提供 CL，R8 保留原值，R9 保留 destination mask，R15 为 context |
+| ZERO/SIGN_EXTEND x86 | value/mask/count-or-sign 在 EAX、EBX、EDX 中轮转 | ECX 固定提供 CL，EDI 为 context；count 写入 CL 后同一角色才可复用为 sign scratch |
+
+扩展语义在任何可能把 RAX/EAX 分配为 count scratch 的计划中，都会先把输入复制到
+seed 选中的 value 寄存器，再生成 count；因此不会用 count 计算覆盖尚未搬走的输入。
+每条 MOV、XOR、ROL/ROR、BSWAP、SUB、SHL/SHR/SAR、AND 指令都通过
+`ZydisEncoderRequest` 构造。请求失败沿统一 `CodeBuffer::FailEncoding` 路径让
+kernel fail-closed，不回退手写 ModRM/REX。
+
+### 固定寄存器字节对比
+
+将角色固定为迁移前使用的寄存器时，下列代表性显式指令逐字节一致：
+
+| 指令 | 迁移前 | Zydis Encoder |
+|---|---|---|
+| `xor al,imm8` | `34 <imm8>` | `34 <imm8>` |
+| `rol ax,8` | `66 C1 C0 08` | `66 C1 C0 08` |
+| `bswap eax` | `0F C8` | `0F C8` |
+| `bswap rax` | `48 0F C8` | `48 0F C8` |
+| `mov edx,eax; bswap edx; mov eax,edx` | `89 C2 0F CA 89 D0` | `89 C2 0F CA 89 D0` |
+| `mov edx,8; sub edx,ecx; shl edx,3; mov ecx,edx` | `BA 08 00 00 00 29 CA C1 E2 03 89 D1` | 相同 |
+| `shl rax,cl; mov rcx,rdx; shr rax,cl` | `48 D3 E0 48 89 D1 48 D3 E8` | 相同 |
+| `mov ebx,-1; shr ebx,cl; and eax,ebx` | `BB FF FF FF FF D3 EB 21 D8` | 相同 |
+
+非固定计划由 Encoder 自动改变 REX/ModRM，例如 value 轮转到 R10/R11 或 EBX/EDX；
+代码不再自己拼位域。x64 的 64-bit key/sign immediate 仍允许 Encoder 在合法的
+sign-extended imm32 与 imm64 形式间选择，语义等价性由重编码和执行测试闭环约束。
+
+### 当前验证状态
+
+- 本地 Win32/x64 均已完成 `test_vm_handler_synthesis` 与
+  `test_vm_native_differential` 两个目标的编译检查；没有把“编译成功”写成 ctest
+  或真实执行已通过。
+- 本地完整静态门禁（含比例探针）：`54/54`，通过。
+- register-signature 枚举从 10 个迁移语义扩展为 13 个；每个新语义要求同一业务
+  K 下至少两个不同 assignment 和两个不同真实解码 signature，并校验实际发布的
+  value/mask/count/sign 角色出现在 core 字节中。
+- 隔离原生差分会按 fixture 中的实际 handler variant 自动选择 provider seed，
+  对 BSWAP 以及 ZERO/SIGN_EXTEND 的每个 K 各覆盖至少两个不同 assignment，每
+  seed 32 个 corpus。全矩阵重编码、两架构 handler 合成、实际隔离差分、ctest 与
+  正式 per-build similarity gate 由提交后的 CI 核实。

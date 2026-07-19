@@ -701,13 +701,18 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         const std::vector<uint8_t>* bytes;
         uint64_t preflightSeed;
         const char* label;
+        std::array<VM_MICRO_OPCODE, 2> migratedSemantics;
+        size_t migratedSemanticCount;
     } cases[] = {
         {&carryShiftBytes, 0xA701ULL,
-            "ADC/SBB/BSWAP/SAR/ROL/ROR"},
+            "ADC/SBB/BSWAP/SAR/ROL/ROR",
+            {VM_UOP_BSWAP, VM_UOP_TRAP}, 1u},
         {&extendBytes, 0xA702ULL,
-            "ZERO_EXTEND/SIGN_EXTEND"},
+            "ZERO_EXTEND/SIGN_EXTEND",
+            {VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND}, 2u},
         {&wideMultiplyBytes, 0xA703ULL,
-            "UMUL_WIDE/SMUL_WIDE"},
+            "UMUL_WIDE/SMUL_WIDE",
+            {VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
     };
 
     for (const auto& testCase : cases) {
@@ -725,9 +730,73 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         Require(preflight.success,
             std::string(testCase.label) + " software IR 预检失败: " +
                 preflight.error);
-        RunDifferentialCase(function, translation, build, 32, true,
-            (std::string("native-vs-VM ") + testCase.label +
-                " 语义一致").c_str());
+        std::vector<uint8_t> providerSeeds;
+        if (testCase.migratedSemanticCount != 0u) {
+            struct Coverage {
+                VM_MICRO_OPCODE semantic = VM_UOP_TRAP;
+                uint8_t variant = 0u;
+                std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+            };
+            std::vector<Coverage> coverage;
+            for (size_t index = 0u;
+                 index < testCase.migratedSemanticCount; ++index) {
+                const VM_MICRO_OPCODE semantic =
+                    testCase.migratedSemantics[index];
+                const auto instruction = std::find_if(
+                    translation.instructions.begin(),
+                    translation.instructions.end(),
+                    [&](const MicroInstruction& candidate) {
+                        return candidate.opcode == semantic;
+                    });
+                Require(instruction != translation.instructions.end(),
+                    "migrated arithmetic fixture omitted its target semantic");
+                coverage.push_back({semantic, instruction->handlerVariant, {}});
+            }
+            const auto complete = [&] {
+                for (const Coverage& item : coverage) {
+                    for (const auto& plans : item.assignments) {
+                        if (plans.size() < 2u) return false;
+                    }
+                }
+                return true;
+            };
+            for (uint16_t domain = 1u;
+                 domain <= 0xFFu && !complete(); ++domain) {
+                bool addsCoverage = false;
+                for (Coverage& item : coverage) {
+                    VMHandlerSemanticCodegenConfig config{};
+                    config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+                    config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+                    config.semantic = item.semantic;
+                    config.variant = item.variant;
+                    const auto generated =
+                        GenerateVMHandlerSemanticKernel(config);
+                    Require(generated.success,
+                        "migrated arithmetic provider-seed selection failed: " +
+                            generated.error);
+                    const uint8_t strategy = generated.semanticCoreStrategy;
+                    Require(strategy < item.assignments.size(),
+                        "migrated arithmetic selected an unknown K strategy");
+                    if (item.assignments[strategy].size() < 2u &&
+                            item.assignments[strategy].insert(
+                                generated.registerAssignment).second) {
+                        addsCoverage = true;
+                    }
+                }
+                if (addsCoverage)
+                    providerSeeds.push_back(static_cast<uint8_t>(domain));
+            }
+            Require(complete(),
+                "migrated arithmetic differential lacks two plans per K");
+        } else {
+            providerSeeds.push_back(0xC7u);
+        }
+        for (uint8_t providerSeed : providerSeeds) {
+            const std::string label = std::string("native-vs-VM ") +
+                testCase.label + " seed " + std::to_string(providerSeed);
+            RunDifferentialCase(function, translation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
     }
 }
 

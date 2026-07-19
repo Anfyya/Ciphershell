@@ -3322,22 +3322,29 @@ PilotRegisterSignature DecodePilotRegisterSignature(
 }
 
 void TestZydisMigratedRegistersVaryByBuildSeed() {
-    constexpr std::array<VM_MICRO_OPCODE, 10> semantics = {
+    constexpr std::array<VM_MICRO_OPCODE, 13> semantics = {
         VM_UOP_LOAD, VM_UOP_STORE,
         VM_UOP_ADD, VM_UOP_SUB,
         VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
-        VM_UOP_NOT, VM_UOP_NEG, VM_UOP_MUL};
+        VM_UOP_NOT, VM_UOP_NEG, VM_UOP_MUL,
+        VM_UOP_BSWAP, VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND};
     for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
         for (VM_MICRO_OPCODE semantic : semantics) {
             const bool memory = semantic == VM_UOP_LOAD ||
                 semantic == VM_UOP_STORE;
             const bool unary = semantic == VM_UOP_NOT ||
-                semantic == VM_UOP_NEG;
+                semantic == VM_UOP_NEG || semantic == VM_UOP_BSWAP;
+            const bool extend = semantic == VM_UOP_ZERO_EXTEND ||
+                semantic == VM_UOP_SIGN_EXTEND;
             const bool multiply = semantic == VM_UOP_MUL;
-            const size_t minimumAssignments = multiply ? 4u : (memory
-                ? (architecture == VM_ARCH_X64 ? 4u : 2u)
-                : (unary && architecture == VM_ARCH_X64 ? 5u
-                    : (architecture == VM_ARCH_X64 ? 4u : 3u)));
+            const bool sizedAlu = semantic == VM_UOP_BSWAP || extend;
+            size_t minimumAssignments =
+                architecture == VM_ARCH_X64 ? 4u : 3u;
+            if (memory)
+                minimumAssignments = architecture == VM_ARCH_X64 ? 4u : 2u;
+            else if (!sizedAlu && unary && architecture == VM_ARCH_X64)
+                minimumAssignments = 5u;
+            if (multiply) minimumAssignments = 4u;
             std::set<std::array<uint8_t, 4>> assignments;
             std::array<std::set<std::array<uint8_t, 4>>, 2>
                 assignmentsByStrategy{};
@@ -3366,19 +3373,31 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                 Require(signature.registerIds.count(
                             generated.registerAssignment[0]) != 0u,
                     "published Zydis primary register is not in emitted code");
-                if (!unary && (!memory ||
-                        generated.semanticCoreStrategy == 1u)) {
+                if ((!unary && !extend && (!memory ||
+                         generated.semanticCoreStrategy == 1u)) ||
+                        ((semantic == VM_UOP_BSWAP || extend) &&
+                         generated.semanticCoreStrategy == 1u)) {
                     Require(signature.registerIds.count(
                                 generated.registerAssignment[1]) != 0u,
                         "published Zydis source/value register is not in emitted code");
                 }
                 if (memory || semantic == VM_UOP_AND ||
                         semantic == VM_UOP_OR ||
+                        extend ||
+                        (semantic == VM_UOP_BSWAP &&
+                            architecture == VM_ARCH_X64) ||
                         (multiply &&
                             generated.semanticCoreStrategy == 0u)) {
                     Require(signature.registerIds.count(
                                 generated.registerAssignment[2]) != 0u,
                         "published Zydis temporary register is not in emitted code");
+                }
+                if (semantic == VM_UOP_SIGN_EXTEND &&
+                        architecture == VM_ARCH_X64 &&
+                        generated.semanticCoreStrategy == 1u) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[3]) != 0u,
+                        "published Zydis sign register is not in emitted code");
                 }
                 Require(generated.semanticCoreStrategy < 2u,
                     "Zydis pilot selected an invalid core strategy");
