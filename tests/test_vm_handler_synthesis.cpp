@@ -3464,6 +3464,87 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
     }
 }
 
+// Batch 7 (PUSH_FLAGS/PUSH_IMAGE_BASE/PUSH_IP/PUSH_VREG/PUSH_IMM) activity
+// contracts are heterogeneous per architecture -- x86 PUSH_VREG has exactly
+// one safe register plan (see docs/zydis_encoder_pilot.md) -- so this uses
+// an explicit per-semantic expectation table instead of forcing them through
+// the generic TestZydisMigratedRegistersVaryByBuildSeed loop. POP_VREG was
+// evaluated but left on its pre-existing hand-written implementation (no
+// safe register pool on either architecture, and the register-free Zydis
+// re-encoding alone regressed the formal per-build similarity gate), so it
+// is intentionally absent here.
+void TestZydisPushPopFamilyRegisterDiversity() {
+    struct Expectation {
+        VM_MICRO_OPCODE semantic;
+        size_t minimumX64;
+        size_t minimumX86;
+    };
+    constexpr std::array<Expectation, 5> expectations = {{
+        {VM_UOP_PUSH_FLAGS, 4u, 2u},
+        {VM_UOP_PUSH_IMAGE_BASE, 4u, 2u},
+        {VM_UOP_PUSH_IP, 7u, 3u},
+        {VM_UOP_PUSH_VREG, 4u, 1u},
+        {VM_UOP_PUSH_IMM, 3u, 2u},
+    }};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (const Expectation& expectation : expectations) {
+            const size_t minimum = architecture == VM_ARCH_X64
+                ? expectation.minimumX64 : expectation.minimumX86;
+            std::set<std::array<uint8_t, 4>> assignments;
+            std::array<std::set<std::string>, 2> signaturesByStrategy{};
+            for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                    0x70u + static_cast<uint8_t>(expectation.semantic)));
+                config.buildSeed[
+                        static_cast<uint8_t>(expectation.semantic) & 31u] =
+                    seedByte;
+                config.semantic = expectation.semantic;
+                config.variant = 0u;
+                const auto generated = GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "push/pop family semantic generation failed: " +
+                        generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "push/pop family semantic validation failed: " +
+                        validationError);
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                Require(signature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u,
+                    "published Zydis primary register is not in "
+                    "emitted code");
+                Require(generated.semanticCoreStrategy < 2u,
+                    "push/pop family semantic selected an invalid core "
+                    "strategy");
+                assignments.insert(generated.registerAssignment);
+                signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                    signature.text);
+            }
+            Require(assignments.size() >= minimum,
+                "build seed did not cover the push/pop family liveness "
+                "register pool");
+            if (minimum >= 2u) {
+                bool sameStrategyVaries = false;
+                for (size_t strategy = 0; strategy < 2u; ++strategy) {
+                    if (signaturesByStrategy[strategy].size() >= 2u)
+                        sameStrategyVaries = true;
+                }
+                Require(sameStrategyVaries,
+                    "register operands did not vary at a fixed business "
+                    "strategy");
+            }
+            std::cout << "[zydis-registers-pushpop] arch=" << architecture
+                      << " semantic="
+                      << static_cast<unsigned>(expectation.semantic)
+                      << " assignments=" << assignments.size() << '\n';
+        }
+    }
+}
+
 void TestX86ZydisUmulWidePerKSourcePlans() {
     const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
         {{1u, 2u, 3u, 6u},
@@ -3590,6 +3671,8 @@ int main() {
         &TestZydisEncoderCoversGeneratedInstructionForms, failures);
     Run("Zydis migrated build-seed register allocation",
         &TestZydisMigratedRegistersVaryByBuildSeed, failures);
+    Run("Zydis push/pop family register allocation",
+        &TestZydisPushPopFamilyRegisterDiversity, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;
