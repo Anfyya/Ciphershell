@@ -664,6 +664,81 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
             (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
     }
 
+    // Re-run a compact SHL+SHR chain under provider seeds selected from the
+    // published local liveness contracts. Each K must execute at least two
+    // distinct physical assignments in the isolated native worker.
+    const std::vector<uint8_t> migratedShiftBytes = {
+        0xC1,0xE0,0x05, 0xC1,0xE8,0x03,
+        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+    const Function migratedShiftFunction = DecodeStandaloneFunction(
+        disassembler, migratedShiftBytes, kEntry);
+    Translator migratedShiftTranslator;
+    const TranslationResult migratedShiftTranslation =
+        TranslateStandaloneFunction(
+            migratedShiftFunction, build, migratedShiftTranslator);
+    struct ShiftCoverage {
+        VM_MICRO_OPCODE semantic;
+        uint8_t variant;
+        std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+    };
+    std::array<ShiftCoverage, 2> shiftCoverage = {{
+        {VM_UOP_SHL, 0u, {}}, {VM_UOP_SHR, 0u, {}}}};
+    for (ShiftCoverage& coverage : shiftCoverage) {
+        const auto instruction = std::find_if(
+            migratedShiftTranslation.instructions.begin(),
+            migratedShiftTranslation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == coverage.semantic;
+            });
+        Require(instruction != migratedShiftTranslation.instructions.end(),
+            "migrated SHL/SHR fixture omitted its target semantic");
+        coverage.variant = instruction->handlerVariant;
+    }
+    const auto completeShiftCoverage = [&] {
+        for (const ShiftCoverage& coverage : shiftCoverage) {
+            for (const auto& plans : coverage.assignments) {
+                if (plans.size() < 2u) return false;
+            }
+        }
+        return true;
+    };
+    std::vector<uint8_t> migratedShiftProviderSeeds;
+    for (uint16_t domain = 1u;
+         domain <= 0xFFu && !completeShiftCoverage(); ++domain) {
+        bool addsCoverage = false;
+        for (ShiftCoverage& coverage : shiftCoverage) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = coverage.semantic;
+            config.variant = coverage.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "migrated SHL/SHR provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < coverage.assignments.size(),
+                "migrated SHL/SHR selected an unknown K strategy");
+            if (coverage.assignments[strategy].size() < 2u &&
+                    coverage.assignments[strategy].insert(
+                        generated.registerAssignment).second) {
+                addsCoverage = true;
+            }
+        }
+        if (addsCoverage)
+            migratedShiftProviderSeeds.push_back(
+                static_cast<uint8_t>(domain));
+    }
+    Require(completeShiftCoverage(),
+        "migrated SHL/SHR differential lacks two plans per K");
+    for (uint8_t providerSeed : migratedShiftProviderSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis SHL/SHR seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(migratedShiftFunction, migratedShiftTranslation,
+            build, 32, true, label.c_str(), false, providerSeed);
+    }
+
     // 跨语义负控制:native=SHL 的求值结果绝不能被误判为与 VM-bytecode=SHR 一致,
     // 证明差分验证器确实在比较真实移位语义而非结构存在性。
     const Function shl4Function = DecodeStandaloneFunction(disassembler, shl4, kEntry);
@@ -723,18 +798,19 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         const std::vector<uint8_t>* bytes;
         uint64_t preflightSeed;
         const char* label;
-        std::array<VM_MICRO_OPCODE, 2> migratedSemantics;
+        std::array<VM_MICRO_OPCODE, 4> migratedSemantics;
         size_t migratedSemanticCount;
     } cases[] = {
         {&carryShiftBytes, 0xA701ULL,
             "ADC/SBB/BSWAP/SAR/ROL/ROR",
-            {VM_UOP_BSWAP, VM_UOP_TRAP}, 1u},
+            {VM_UOP_BSWAP, VM_UOP_SAR, VM_UOP_ROL, VM_UOP_ROR}, 4u},
         {&extendBytes, 0xA702ULL,
             "ZERO_EXTEND/SIGN_EXTEND",
-            {VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND}, 2u},
+            {VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND,
+             VM_UOP_TRAP, VM_UOP_TRAP}, 2u},
         {&wideMultiplyBytes, 0xA703ULL,
             "UMUL_WIDE/SMUL_WIDE",
-            {VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
+            {VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
     };
 
     for (const auto& testCase : cases) {

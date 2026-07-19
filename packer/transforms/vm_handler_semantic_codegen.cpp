@@ -1175,6 +1175,44 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         constexpr std::array<uint8_t, 3> pool = {0u, 3u, 2u};
         return RotateRegisterContract(pool, seedOffset, variant);
     }
+    if (semantic == VM_UOP_SHL || semantic == VM_UOP_SHR ||
+            semantic == VM_UOP_SAR || semantic == VM_UOP_ROL ||
+            semantic == VM_UOP_ROR) {
+        if (x64) {
+            // The pre-latched operands are already persisted in context.
+            // RCX/RDX remain the count path, R9 remains the width mask, R10
+            // remains the lazy-flags auxiliary and R15 remains context.
+            // RAX plus the complete isolated-differential-tested
+            // R8/R11/R12/R13 set form this core's value/scratch contract.
+            constexpr std::array<uint8_t, 5> pool = {
+                0u, 8u, 11u, 12u, 13u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // CL is the fixed hardware count. EAX is the boundary result while
+        // EDX is available after publishing CL and EBX is the proven legacy
+        // scratch. Rotate value/accumulator/share roles only inside that set;
+        // ESI/EDI stay excluded.
+        constexpr std::array<uint8_t, 3> pool = {0u, 3u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_ROT) {
+        const bool alternate =
+            ((seedOffset + static_cast<size_t>(variant)) & 1u) != 0u;
+        if (x64) {
+            // RAX/RDX/R8 are the three popped values and R10 is the existing
+            // proven temporary. The two plans choose equivalent cycle
+            // choreographies while preserving those fixed boundary roles.
+            return alternate
+                ? std::array<uint8_t, 4>{0u, 8u, 2u, 10u}
+                : std::array<uint8_t, 4>{0u, 2u, 8u, 10u};
+        }
+        // EAX/EDX/ECX are the popped values and EBX is the third pushed
+        // result. As on x64, only the choreography changes; ESI/EDI remain
+        // outside this semantic's live register contract.
+        return alternate
+            ? std::array<uint8_t, 4>{0u, 1u, 2u, 3u}
+            : std::array<uint8_t, 4>{0u, 2u, 1u, 3u};
+    }
     if (semantic == VM_UOP_LOAD || semantic == VM_UOP_STORE) {
         if (x64) {
             // RAX is the guest address and RDX is the STORE value. R11 is
@@ -2268,59 +2306,6 @@ void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
         EmitZydisMove(c, false, 0u, valueRegister);
 }
 
-// Two distinct x64 GPR indices from the safe local-scratch pool
-// {8,11,12,13}, seed-derived per (semantic,strategy). Excludes 0 (the
-// live shift operand), 1/2 (RCX/RDX -- the count is moved through
-// `mov rcx,rdx` and every count-consuming instruction below implicitly
-// reads CL, so RCX must stay the count register end to end), 4 (RSP), 9
-// (the width mask X64MaskForWidthInR11 computed and re-applies to the
-// result after this core returns, so it must survive the whole core body
-// unclobbered), 10 (EmitX64BinaryAlu zeroes it as "auxiliary" *before*
-// calling into this core and reads it back via X64FinishPrelatched right
-// after), and 15 (the runtime's context-pointer register -- see
-// X64LoadQ/X64LoadD's own "cannot overwrite the context register" guard;
-// every Ctx*-prefixed load/store in this file is `[r15+share...]`, not
-// `[rdi+...]`, despite what an earlier draft of this comment claimed).
-//
-// 14 is ALSO excluded, empirically: every register in the pool was
-// individually verified against the real native-differential suite
-// (test_vm_native_differential) one at a time, not just reasoned about
-// from reading the surrounding code, because the 10-exclusion above was
-// itself found that way after a first pass missed it (every corpus case
-// that exercised FLAGS_LAZY after a SHL/SHR/SAR/ROL/ROR access-violated,
-// because the core's own key scratch had clobbered what EmitX64BinaryAlu
-// still expected to be a clean zero). 8/11/12/13 each pass in isolation;
-// 14 alone reproduces the same class of FLAGS_LAZY access violation, for
-// a reason not yet root-caused (most likely some other handler or the
-// direct-threaded dispatch stub itself also treats r14 as reserved) --
-// it is excluded on that empirical evidence, not a traced justification
-// like the others. Do not add it back without either root-causing why or
-// re-running the full isolated single-register verification above.
-//
-// This is what actually changes the per-build 4-gram content of the
-// ModRM/REX bytes this core emits -- the round-keyed immediates alone
-// (already seed-derived) are exactly what the codec-similarity stage
-// strips out before measuring business_core, so on their own they cannot
-// move that number; only the *structural* bytes (which physical register
-// a given instruction touches) can.
-std::pair<uint8_t, uint8_t> DeriveShiftCoreScratchRegisters(
-    const CodeBuffer& c, VM_MICRO_OPCODE semantic, uint8_t strategy)
-{
-    static constexpr std::array<uint8_t, 4> kPool = {8u,11u,12u,13u};
-    const uint64_t domain = 0x5348495254524547ULL ^
-        (static_cast<uint64_t>(semantic) << 16u) ^
-        (static_cast<uint64_t>(strategy) << 8u);
-    const auto& round = c.coreSelector.rounds[domain % c.coreSelector.roundCount];
-    const uint64_t mixed = round.key ^ domain ^
-        (static_cast<uint64_t>(round.rotate) << 32u) ^
-        (static_cast<uint64_t>(round.encoding) << 40u);
-    const size_t first = static_cast<size_t>(mixed % kPool.size());
-    const size_t secondOffset = 1u + static_cast<size_t>(
-        (mixed >> 16u) % (kPool.size() - 1u));
-    const size_t second = (first + secondOffset) % kPool.size();
-    return {kPool[first], kPool[second]};
-}
-
 void EmitX64ShiftRotateVariant(
     CodeBuffer& c,
     VM_MICRO_OPCODE semantic,
@@ -2329,9 +2314,9 @@ void EmitX64ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X64DispatchWidth(c, 0, width);
-    const auto scratch = DeriveShiftCoreScratchRegisters(c, semantic, strategy);
-    const uint8_t scratchA = scratch.first;
-    const uint8_t scratchB = scratch.second;
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t scratchA = c.registerAssignment[1];
+    const uint8_t scratchB = c.registerAssignment[2];
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         const auto deriveKey = [&](size_t share) {
@@ -2350,21 +2335,6 @@ void EmitX64ShiftRotateVariant(
                  ~(semantic == VM_UOP_SAR
                     ? (uint64_t{1} << (bytes * 8u - 1u)) : 0u));
         };
-        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
-            const uint8_t modrm = static_cast<uint8_t>(
-                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
-            if (bytes == 1u) {
-                if (reg >= 8u) c.U8(0x41);
-                c.Raw({0xD2, modrm});
-            } else {
-                if (bytes == 2u) c.U8(0x66);
-                if (bytes == 8u) c.U8(static_cast<uint8_t>(
-                    0x48u | (reg >= 8u ? 1u : 0u)));
-                else if (reg >= 8u) c.U8(0x41);
-                c.Raw({0xD3, modrm});
-            }
-        };
-
         std::array<uint64_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveKey(share);
@@ -2372,27 +2342,42 @@ void EmitX64ShiftRotateVariant(
         std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
         if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
-        c.Raw({0x48,0x89,0xD1});
+        EmitZydisMove(c, true, 1u, 2u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, scratchB, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, scratchB);
+            EmitZydisMoveImmediate(c, true, scratchB, keys[share]);
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchB);
         }
-        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
-            (semantic == VM_UOP_ROL ? 0u : 1u);
-        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
-        emitClOperation(0u, valueGroup);
+        const ZydisMnemonic valueMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SAR : (semantic == VM_UOP_ROL
+                ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR);
+        const ZydisMnemonic keyMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SHR : valueMnemonic;
+        EmitZydisShiftCl(c, true, valueMnemonic, valueRegister, bytes);
 
-        X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
-        emitClOperation(scratchA, keyGroup);
+        EmitZydisMoveImmediate(c, true, scratchA, keys[shareOrder[0u]]);
+        EmitZydisShiftCl(c, true, keyMnemonic, scratchA, bytes);
         for (size_t position = 1u; position < shareOrder.size(); ++position) {
-            X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
-            emitClOperation(scratchB, keyGroup);
-            X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+            EmitZydisMoveImmediate(
+                c, true, scratchB, keys[shareOrder[position]]);
+            EmitZydisShiftCl(c, true, keyMnemonic, scratchB, bytes);
+            EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                scratchA, scratchB, bytes);
         }
-        X64BinaryRegister(c, 0x31u, 0u, scratchA);
-        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
-        else if (bytes == 4u) c.Raw({0x89,0xC0});
+        EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA, bytes);
+        if (bytes <= 2u) {
+            EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOVZX,
+                {ZydisSizedGprOperand(true, valueRegister, 4u),
+                 ZydisSizedGprOperand(true, valueRegister, bytes)});
+        } else if (bytes == 4u) {
+            EmitZydisSizedMove(
+                c, true, valueRegister, valueRegister, 4u);
+        }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, 0u, valueRegister);
         c.Jmp(done);
     };
     std::array<std::pair<CodeBuffer::Label, uint8_t>, 4> blocks = {{
@@ -2418,6 +2403,9 @@ void EmitX86ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X86DispatchWidth(c, 0, width);
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t scratchA = c.registerAssignment[1];
+    const uint8_t scratchB = c.registerAssignment[2];
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         const auto deriveKey = [&](size_t share) {
@@ -2437,16 +2425,6 @@ void EmitX86ShiftRotateVariant(
                  ~(semantic == VM_UOP_SAR
                     ? (uint32_t{1} << (bytes * 8u - 1u)) : 0u));
         };
-        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
-            const uint8_t modrm = static_cast<uint8_t>(
-                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
-            if (bytes == 1u) c.Raw({0xD2, modrm});
-            else {
-                if (bytes == 2u) c.U8(0x66);
-                c.Raw({0xD3, modrm});
-            }
-        };
-
         std::array<uint32_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveKey(share);
@@ -2454,26 +2432,39 @@ void EmitX86ShiftRotateVariant(
         std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
         if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
-        c.Raw({0x89,0xD1});
+        EmitZydisMove(c, false, 1u, 2u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X86MovImmediate(c, 2u, keys[share]);
-            X86BinaryRegister(c, 0x31u, 0u, 2u);
+            EmitZydisMoveImmediate(c, false, scratchB, keys[share]);
+            EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchB);
         }
-        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
-            (semantic == VM_UOP_ROL ? 0u : 1u);
-        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
-        emitClOperation(0u, valueGroup);
+        const ZydisMnemonic valueMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SAR : (semantic == VM_UOP_ROL
+                ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR);
+        const ZydisMnemonic keyMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SHR : valueMnemonic;
+        EmitZydisShiftCl(c, false, valueMnemonic, valueRegister, bytes);
 
-        X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
-        emitClOperation(3u, keyGroup);
+        EmitZydisMoveImmediate(c, false, scratchA, keys[shareOrder[0u]]);
+        EmitZydisShiftCl(c, false, keyMnemonic, scratchA, bytes);
         for (size_t position = 1u; position < shareOrder.size(); ++position) {
-            X86MovImmediate(c, 2u, keys[shareOrder[position]]);
-            emitClOperation(2u, keyGroup);
-            X86BinaryRegister(c, 0x31u, 3u, 2u);
+            EmitZydisMoveImmediate(
+                c, false, scratchB, keys[shareOrder[position]]);
+            EmitZydisShiftCl(c, false, keyMnemonic, scratchB, bytes);
+            EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                scratchA, scratchB, bytes);
         }
-        X86BinaryRegister(c, 0x31u, 0u, 3u);
-        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
+        EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA, bytes);
+        if (bytes <= 2u) {
+            EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOVZX,
+                {ZydisSizedGprOperand(false, valueRegister, 4u),
+                 ZydisSizedGprOperand(false, valueRegister, bytes)});
+        }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, 0u, valueRegister);
         c.Jmp(done);
     };
     std::array<std::pair<CodeBuffer::Label, uint8_t>, 3> blocks = {{
@@ -3019,26 +3010,58 @@ void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
 
 void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 6u);
+    const bool alternate = c.registerAssignment[1] != 2u;
     if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        X64BinaryImmediate32(c, 6u, 8u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 8u, key);
         if (strategy == 0u) {
-            X64MovRegister(c, 10u, 0u); X64MovRegister(c, 0u, 2u);
-            X64MovRegister(c, 2u, 8u); X64MovRegister(c, 8u, 10u);
-        } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        X64BinaryImmediate32(c, 6u, 8u, key);
+            const uint8_t temporary = c.registerAssignment[3];
+            if (!alternate) {
+                EmitZydisMove(c, true, temporary, 0u);
+                EmitZydisMove(c, true, 0u, 2u);
+                EmitZydisMove(c, true, 2u, 8u);
+                EmitZydisMove(c, true, 8u, temporary);
+            } else {
+                EmitZydisMove(c, true, temporary, 8u);
+                EmitZydisMove(c, true, 8u, 0u);
+                EmitZydisMove(c, true, 0u, 2u);
+                EmitZydisMove(c, true, 2u, temporary);
+            }
+        } else if (!alternate) {
+            EmitZydisExchange(c, true, 0u, 2u);
+            EmitZydisExchange(c, true, 2u, 8u);
+        } else {
+            EmitZydisExchange(c, true, 0u, 8u);
+            EmitZydisExchange(c, true, 0u, 2u);
+        }
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 8u, key);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        X86BinaryImmediate32(c, 6u, 1u, key);
-        if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
-        else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        X86BinaryImmediate32(c, 6u, 3u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 1u, key);
+        if (strategy == 0u && !alternate) {
+            EmitZydisMove(c, false, 3u, 0u);
+            EmitZydisMove(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 2u, 1u);
+        } else if (strategy == 0u) {
+            EmitZydisMove(c, false, 3u, 0u);
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 2u, 1u);
+        } else if (!alternate) {
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisExchange(c, false, 2u, 1u);
+            EmitZydisMove(c, false, 3u, 1u);
+        } else {
+            EmitZydisExchange(c, false, 0u, 1u);
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 3u, 1u);
+        }
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 3u, key);
     }
 }
 
@@ -3211,70 +3234,74 @@ void EmitKeyedLogicalShiftCore(
     if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
     if (x64) {
-        // See DeriveShiftCoreScratchRegisters (used by the SAR/ROL/ROR core
-        // right below): same pool, same exclusions (0/1/2/4/7/9 stay live
-        // across the whole EmitX64BinaryAlu-latched core body), same reason
-        // -- register choice, not the already-keyed immediates, is what
-        // moves this core's 4-gram content once value_codec strips the
-        // immediates back out.
-        const auto scratch = DeriveShiftCoreScratchRegisters(
-            c, shiftRight ? VM_UOP_SHR : VM_UOP_SHL, strategy);
-        const uint8_t scratchA = scratch.first;
-        const uint8_t scratchB = scratch.second;
+        const uint8_t valueRegister = c.registerAssignment[0];
+        const uint8_t scratchA = c.registerAssignment[1];
+        const uint8_t scratchB = c.registerAssignment[2];
         std::array<uint64_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveShare(share);
         }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, scratchA, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, scratchA);
+            EmitZydisMoveImmediate(c, true, scratchA, keys[share]);
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchA);
         }
-        c.Raw({0x48,0x89,0xD1});
+        EmitZydisMove(c, true, 1u, 2u);
         // scratchB <- r9 (the width mask X64MaskForWidthInR11 already
         // computed and left live in r9 for this whole core, same as
         // EmitX64ShiftRotateVariant's sibling core above): all-ones only
         // for width 8, so (sar 63)&32 is 32 only there, and |31 turns that
         // into the exact 5-bit/6-bit shift-count mask this build needs.
-        X64MovRegister(c, scratchB, 9u);
-        X64ShiftImmediate(c, 7u, scratchB, 0x3F);
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x48u | ((scratchB & 8u) ? 1u : 0u));
-            c.Raw({rex, 0x83, static_cast<uint8_t>(
-                0xE0u | (scratchB & 7u)), 0x20});
-        }
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x48u | ((scratchB & 8u) ? 1u : 0u));
-            c.Raw({rex, 0x83, static_cast<uint8_t>(
-                0xC8u | (scratchB & 7u)), 0x1F});
-        }
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x40u | ((scratchB & 8u) ? 0x04u : 0u));
-            c.Raw({rex, 0x20, static_cast<uint8_t>(
-                0xC1u | ((scratchB & 7u) << 3u))});
-        }
+        EmitZydisMove(c, true, scratchB, 9u);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_SAR,
+            scratchB, 8u, 0x3Fu);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_AND,
+            scratchB, 8u, 0x20u);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_OR,
+            scratchB, 8u, 0x1Fu);
+        EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_AND,
+            1u, scratchB, 1u);
 
         const auto shiftShares = [&] {
-            X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
-            X64ShiftCl(c, shiftRight ? 5u : 4u, scratchA);
+            EmitZydisMoveImmediate(
+                c, true, scratchA, keys[shareOrder[0u]]);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                scratchA, 8u);
             for (size_t position = 1u;
                  position < shareOrder.size(); ++position) {
-                X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
-                X64ShiftCl(c, shiftRight ? 5u : 4u, scratchB);
-                X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+                EmitZydisMoveImmediate(
+                    c, true, scratchB, keys[shareOrder[position]]);
+                EmitZydisShiftCl(c, true,
+                    shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                    scratchB, 8u);
+                EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                    scratchA, scratchB);
             }
         };
         if (strategy == 0u) {
-            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 8u);
             shiftShares();
         } else {
             shiftShares();
-            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 8u);
         }
-        X64BinaryRegister(c, 0x31u, 0u, scratchA);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, 0u, valueRegister);
     } else {
+        const uint8_t valueRegister = c.registerAssignment[0];
+        const uint8_t scratchA = c.registerAssignment[1];
+        const uint8_t scratchB = c.registerAssignment[2];
+        const bool publishCountEarly =
+            valueRegister == 2u || scratchA == 2u;
         std::array<uint32_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             const uint64_t mixed = deriveShare(share);
@@ -3283,34 +3310,52 @@ void EmitKeyedLogicalShiftCore(
             else key |= uint32_t{1};
             keys[share] = key;
         }
+        if (publishCountEarly)
+            EmitZydisSizedMove(c, false, 1u, 2u, 1u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X86MovImmediate(c, 3u, keys[share]);
-            X86BinaryRegister(c, 0x31u, 0u, 3u);
+            EmitZydisMoveImmediate(c, false, scratchA, keys[share]);
+            EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchA);
         }
-        c.Raw({0x88,0xD1,0x80,0xE1,0x1F});
+        if (!publishCountEarly)
+            EmitZydisSizedMove(c, false, 1u, 2u, 1u);
+        EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_AND,
+            1u, 1u, 0x1Fu);
 
-        const auto shiftRegister = [&](uint8_t reg) {
-            c.Raw({0xD3, static_cast<uint8_t>(0xC0u |
-                ((shiftRight ? 5u : 4u) << 3u) | (reg & 7u))});
-        };
         const auto shiftShares = [&] {
-            X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
-            shiftRegister(3u);
+            EmitZydisMoveImmediate(
+                c, false, scratchA, keys[shareOrder[0u]]);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                scratchA, 4u);
             for (size_t position = 1u;
                  position < shareOrder.size(); ++position) {
-                X86MovImmediate(c, 2u, keys[shareOrder[position]]);
-                shiftRegister(2u);
-                X86BinaryRegister(c, 0x31u, 3u, 2u);
+                EmitZydisMoveImmediate(
+                    c, false, scratchB, keys[shareOrder[position]]);
+                EmitZydisShiftCl(c, false,
+                    shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                    scratchB, 4u);
+                EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                    scratchA, scratchB);
             }
         };
         if (strategy == 0u) {
-            shiftRegister(0u);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 4u);
             shiftShares();
         } else {
             shiftShares();
-            shiftRegister(0u);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 4u);
         }
-        X86BinaryRegister(c, 0x31u, 0u, 3u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, 0u, valueRegister);
     }
 }
 
@@ -3635,31 +3680,14 @@ bool EmitBusinessCoreVariant(
                 }
                 return true;
             case VM_UOP_SHL: {
+                // Key-share linearization uses the local value/scratch
+                // assignment; strategy chooses which equivalent order runs.
                 EmitKeyedLogicalShiftCore(c, true, false, strategy);
                 return true;
-                // strategy 0: native SHL rax,cl.
-                // strategy 1: SHLD rax, r10(=0), cl — a zero source makes shld
-                //   pull zeroes into the top, so dst = dst<<cl ≡ SHL.  r10 is
-                //   zeroed by the binary-ALU prologue (auxiliary=0) and shld
-                //   leaves its source untouched, so auxiliary stays 0.
-                //
-                // x86 masks the shift count to 5 bits for 1/2/4-byte operands
-                // and 6 bits for 8-byte.  The width mask r9 is all-ones ONLY for
-                // width 8, so (sar r9,63) & 32 is 32 for width 8 and 0 otherwise;
-                // OR 31 yields exactly the 5/6-bit count mask with no width
-                // branch.  Pre-masking cl that way lets a single 64-bit
-                // shl/shld cover every width (operand is zero-extended; the outer
-                // `and rax,r9` trims to width).  This is label-free — every byte
-                // is a fixed Raw — so the variant kernel validator's isolated
-                // re-emission matches the inline bytes exactly.
             }
             case VM_UOP_SHR: {
                 EmitKeyedLogicalShiftCore(c, true, true, strategy);
                 return true;
-                // Same count pre-mask as SHL.
-                // strategy 0: native SHR rax,cl.
-                // strategy 1: SHRD rax, r10(=0), cl pulls zeroes into the bottom
-                //   so dst = dst>>cl ≡ SHR.
             }
             case VM_UOP_SAR:
                 if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
@@ -4098,22 +4126,13 @@ bool EmitBusinessCoreVariant(
             X86StoreD(c, CtxMutationScratch + 4u, 2);
             return true;
         case VM_UOP_SHL: {
+            // The helper publishes CL before any seed-selected EDX overwrite.
             EmitKeyedLogicalShiftCore(c, false, false, strategy);
             return true;
-            // strategy 0: native SHL eax,cl.  strategy 1: SHLD eax,ebx(=0),cl ≡
-            //   SHL (zero source pulls zeroes into the top).  32-bit mode has no
-            //   8-byte operand, so every width (1/2/4) masks the count to 5
-            //   bits; a single `and cl,31` then one 32-bit shl/shld covers all
-            //   widths (operand zero-extended, outer `and eax,[scratch]` trims
-            //   to width).  Label-free so the validator's isolated re-emission
-            //   matches byte-for-byte.  ebx is free across EmitX86BinaryAlu.
         }
         case VM_UOP_SHR: {
             EmitKeyedLogicalShiftCore(c, false, true, strategy);
             return true;
-            // Same count pre-mask as SHL.
-            // strategy 0: native SHR eax,cl.  strategy 1: SHRD eax,ebx(=0),cl ≡
-            //   SHR (zero source pulls zeroes into the bottom).
         }
         case VM_UOP_SAR:
             if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
@@ -7611,13 +7630,21 @@ bool ValidateVMHandlerSemanticVariantKernel(
             (config.semantic == VM_UOP_BSWAP ||
              config.semantic == VM_UOP_ZERO_EXTEND ||
              config.semantic == VM_UOP_SIGN_EXTEND);
+        const bool shiftContract = config.semantic == VM_UOP_SHL ||
+            config.semantic == VM_UOP_SHR || config.semantic == VM_UOP_SAR ||
+            config.semantic == VM_UOP_ROL || config.semantic == VM_UOP_ROR;
+        const bool x86RotateStackContract = !x64 &&
+            config.semantic == VM_UOP_ROT;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
-               reg == 8 || reg == 9 || reg == 10 || reg == 11)
+               reg == 8 || reg == 9 || reg == 10 || reg == 11 ||
+               (shiftContract && (reg == 12 || reg == 13)))
              : (reg <= 2 || (x86MemoryContract &&
                 (reg == 3 || reg == 6)) ||
                 (x86MultiplyContract && reg == 3) ||
                 (x86SizedAluContract && reg == 3) ||
+                (shiftContract && reg == 3) ||
+                (x86RotateStackContract && reg == 3) ||
                 (x86UmulWideContract && (reg == 3 || reg == 6)));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";

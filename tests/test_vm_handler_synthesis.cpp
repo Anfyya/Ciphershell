@@ -3322,12 +3322,14 @@ PilotRegisterSignature DecodePilotRegisterSignature(
 }
 
 void TestZydisMigratedRegistersVaryByBuildSeed() {
-    constexpr std::array<VM_MICRO_OPCODE, 13> semantics = {
+    constexpr std::array<VM_MICRO_OPCODE, 19> semantics = {
         VM_UOP_LOAD, VM_UOP_STORE,
         VM_UOP_ADD, VM_UOP_SUB,
         VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
         VM_UOP_NOT, VM_UOP_NEG, VM_UOP_MUL,
-        VM_UOP_BSWAP, VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND};
+        VM_UOP_BSWAP, VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND,
+        VM_UOP_SHL, VM_UOP_SHR, VM_UOP_SAR,
+        VM_UOP_ROL, VM_UOP_ROR, VM_UOP_ROT};
     for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
         for (VM_MICRO_OPCODE semantic : semantics) {
             const bool memory = semantic == VM_UOP_LOAD ||
@@ -3337,11 +3339,19 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
             const bool extend = semantic == VM_UOP_ZERO_EXTEND ||
                 semantic == VM_UOP_SIGN_EXTEND;
             const bool multiply = semantic == VM_UOP_MUL;
+            const bool shift = semantic == VM_UOP_SHL ||
+                semantic == VM_UOP_SHR || semantic == VM_UOP_SAR ||
+                semantic == VM_UOP_ROL || semantic == VM_UOP_ROR;
+            const bool rotateStack = semantic == VM_UOP_ROT;
             const bool sizedAlu = semantic == VM_UOP_BSWAP || extend;
             size_t minimumAssignments =
                 architecture == VM_ARCH_X64 ? 4u : 3u;
             if (memory)
                 minimumAssignments = architecture == VM_ARCH_X64 ? 4u : 2u;
+            else if (shift)
+                minimumAssignments = architecture == VM_ARCH_X64 ? 5u : 3u;
+            else if (rotateStack)
+                minimumAssignments = 2u;
             else if (!sizedAlu && unary && architecture == VM_ARCH_X64)
                 minimumAssignments = 5u;
             if (multiply) minimumAssignments = 4u;
@@ -3383,6 +3393,7 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                 }
                 if (memory || semantic == VM_UOP_AND ||
                         semantic == VM_UOP_OR ||
+                        shift || rotateStack ||
                         extend ||
                         (semantic == VM_UOP_BSWAP &&
                             architecture == VM_ARCH_X64) ||
