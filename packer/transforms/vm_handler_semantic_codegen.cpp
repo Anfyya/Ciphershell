@@ -1091,16 +1091,34 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         return plans[plan];
     }
     if (!x64 && semantic == VM_UOP_UMUL_WIDE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if ((coreStrategy & 1u) == 0u) {
+            // K=0 is deliberately independent from K=1's seed-split address
+            // construction.  EAX remains the hardware implicit
+            // multiplicand, EBX saves a for the correction product, ECX
+            // enters as (b + key), and EDI remains the context.  The visible
+            // main-product source is either ECX directly, a proven temporary
+            // EDX/ESI copy, or the dedicated context scratch dword at +4.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {1u, 2u, 3u, 6u}, // MUL ECX (fixed-register baseline)
+                {2u, 1u, 3u, 6u}, // MOV EDX,ECX; MUL EDX
+                {6u, 1u, 3u, 2u}, // MOV ESI,ECX; MUL ESI
+                {1u, 2u, 3u, 0u}  // MUL [EDI+CtxMutationScratch+4]
+            }};
+            return plans[plan];
+        }
         // K=1 keeps EAX as the implicit multiplicand and EBX as the saved
         // correction operand.  Its explicit main-product source may be ESI
         // or EDX, either directly or as a seed-split scratch-memory base.
         // ECX holds (b + key); EDI remains the context throughout.
-        switch ((seedOffset + static_cast<size_t>(variant)) & 3u) {
-            case 0u: return {6u, 1u, 3u, 2u}; // MUL ESI
-            case 1u: return {2u, 1u, 3u, 6u}; // MUL EDX
-            case 2u: return {6u, 1u, 3u, 0u}; // MUL [ESI + disp32]
-            default: return {2u, 1u, 3u, 0u}; // MUL [EDX + disp32]
-        }
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {6u, 1u, 3u, 2u}, // MUL ESI
+            {2u, 1u, 3u, 6u}, // MUL EDX
+            {6u, 1u, 3u, 0u}, // MUL [ESI + disp32]
+            {2u, 1u, 3u, 0u}  // MUL [EDX + disp32]
+        }};
+        return plans[plan];
     }
     std::array<uint8_t, 4> output{};
     if (x64) {
@@ -3922,9 +3940,26 @@ bool EmitBusinessCoreVariant(
             c.Raw({0x0F,0x92,0x87});              // keyed-add carry
             c.U32(CtxMutationScratch);
             if (strategy == 0u) {
-                // Keep K=0 byte-for-byte unchanged.  This is the control arm
-                // for the K=1 explicit-source diversification below.
-                c.Raw({0xF7,0xE1});
+                // K=0 keeps the EDX:EAX implicit result pair fixed but
+                // independently diversifies the explicit multiplier.  The
+                // memory plan uses a dedicated dword; +0 remains the keyed
+                // carry byte.  Every form is Encoder-only and fail-closed.
+                const uint8_t multiplier = c.registerAssignment[0];
+                const bool memorySource = c.registerAssignment[3] == 0u;
+                if (memorySource) {
+                    EmitZydisStore(c, false, 7u,
+                        static_cast<int32_t>(CtxMutationScratch + 4u),
+                        1u, 4u);
+                    EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MUL,
+                        {ZydisMemoryOperand(false, 7u,
+                            static_cast<int32_t>(
+                                CtxMutationScratch + 4u), 4u)});
+                } else {
+                    if (multiplier != 1u)
+                        EmitZydisMove(c, false, multiplier, 1u);
+                    EmitZydisUnary(
+                        c, false, ZYDIS_MNEMONIC_MUL, multiplier);
+                }
             } else {
                 const uint8_t multiplier = c.registerAssignment[0];
                 const bool memorySource = c.registerAssignment[3] == 0u;

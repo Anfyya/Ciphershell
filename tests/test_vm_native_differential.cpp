@@ -768,7 +768,7 @@ void TestX86ZydisUmulWidePerKNativeDifferential() {
             preflight.error);
 
     std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
-    std::set<std::array<uint8_t, 4>> k1Plans;
+    std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
     for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
         VMHandlerSemanticCodegenConfig config{};
         config.architecture = VM_ARCH_X86;
@@ -780,21 +780,19 @@ void TestX86ZydisUmulWidePerKNativeDifferential() {
             "x86 UMUL_WIDE seed selection generation failed: " +
                 generated.error);
         const uint8_t strategy = generated.semanticCoreStrategy;
-        if (strategy == 0u) {
-            if (providerSeedsByStrategy[0].size() < 2u) {
-                providerSeedsByStrategy[0].push_back(
-                    static_cast<uint8_t>(domain));
-            }
-        } else if (k1Plans.insert(generated.registerAssignment).second) {
-            providerSeedsByStrategy[1].push_back(
+        Require(strategy < plansByStrategy.size(),
+            "x86 UMUL_WIDE selected an unknown K strategy");
+        if (plansByStrategy[strategy].insert(
+                generated.registerAssignment).second) {
+            providerSeedsByStrategy[strategy].push_back(
                 static_cast<uint8_t>(domain));
         }
-        if (providerSeedsByStrategy[0].size() == 2u &&
-                k1Plans.size() == 4u) break;
+        if (plansByStrategy[0].size() == 4u &&
+                plansByStrategy[1].size() == 4u) break;
     }
-    Require(providerSeedsByStrategy[0].size() == 2u &&
+    Require(providerSeedsByStrategy[0].size() == 4u &&
             providerSeedsByStrategy[1].size() == 4u,
-        "x86 UMUL_WIDE differential seeds did not cover both K values and all K=1 plans");
+        "x86 UMUL_WIDE differential seeds did not cover four plans for both K values");
 
     for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
         for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
