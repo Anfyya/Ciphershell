@@ -756,3 +756,95 @@ Encoder 猜测活跃性。
 两个架构 job 均完成完整 Release 构建和全部 CTest，因此本批的全矩阵重编码、两架构
 handler 合成、扩展后的多 seed 隔离差分和正式独立 EXE/DLL per-build similarity gate
 均已由最终代码提交的 CI 核实通过。
+
+## 推广批次 5：`ADD_CARRY`、`SUB_BORROW`、`BIT_TEST`、`BIT_SET`、`BIT_RESET`（2026-07-20）
+
+### 范围与局部活跃性契约
+
+本批迁移五个普通显式寄存器语义。carry/borrow core 的值搬运、key correction、
+ADD/SUB 和立即数修正，以及 bit core 的 index 掩码、old-bit 提取、BT/BTS/BTR、
+SETB 和结果合成都改由 `ZydisEncoderRequest` 生成。handler 边界、width dispatch、
+lazy-flags latch 和 context load/store 保持原结构；CFG 分发、栈展开、native bridge、
+故障处理均未进入本批。`CALL_HOST` 与 `BRIDGE_EXTENDED` 继续不迁移。
+
+安全寄存器池由两个 core 各自的活跃性契约导出，没有使用全局共享池：
+
+| 语义/架构 | seed 选择的角色与安全池 | 保留/排除 |
+|---|---|---|
+| carry/borrow x64 | result、b-work、carry/borrow、spare 在 RAX、RDX、R8、RCX 中按三套已审计计划轮转 | R10/R11 保留原始 a/b 供 latch 使用；R9 保留 width mask；R15 保留 context |
+| carry/borrow x86 | result、b-work、carry/borrow、spare 在 EAX、EDX、ECX、EBX 中按三套计划轮转 | 原始值已由 `X86BeginLatch` 落盘；EDI 保留 context；EBX 的旧 width 值进入 core 时已死亡 |
+| bit family x64 | value/result、index、auxiliary、spare 在 RAX/R8、RDX/R11、R10 和剩余局部角色中按四套计划选择 | R10 必须最终发布 old bit；R9 保留 width mask；R15 保留 context；已落盘的 R11 原始 b 可作为替代 index |
+| bit family x86 | value/result、index、auxiliary、spare 在 EAX/EBX、ECX/ESI、EDX 和剩余局部角色中按四套计划选择 | EDX 必须最终发布 old bit；EDI 保留 context；原始值已经落盘，EBX/ESI 仅在本 core 生命周期内复用 |
+
+carry core 会先保护仍需读取的 source/carry，再覆盖 seed 选择的 result；bit core 则在任何
+可能覆盖 EAX/ECX 的计划中先搬走 value/index。该顺序属于活跃性契约，不由 Encoder
+推断。所有新请求继续经过统一的 `EmitZydisInstruction` fail-closed 路径；任何请求失败
+都会写入带 mnemonic、status 和 operand 摘要的编码错误并终止 kernel 生成，不存在
+回退到手写字节的分支。
+
+### 固定寄存器场景的迁移前后字节
+
+将角色固定为旧实现的寄存器时，代表性的寄存器形式保持逐字节一致：
+
+| 指令 | 迁移前 | Zydis Encoder |
+|---|---|---|
+| `add rax,rdx` | `48 01 D0` | `48 01 D0` |
+| `add rax,r8` | `4C 01 C0` | `4C 01 C0` |
+| `sub rax,rdx` | `48 29 D0` | `48 29 D0` |
+| `add eax,edx` | `01 D0` | `01 D0` |
+| `add eax,ecx` | `01 C8` | `01 C8` |
+| `sub eax,edx` | `29 D0` | `29 D0` |
+| `bt rax,rdx` | `48 0F A3 D0` | `48 0F A3 D0` |
+| `bts rax,rdx` | `48 0F AB D0` | `48 0F AB D0` |
+| `btr rax,rdx` | `48 0F B3 D0` | `48 0F B3 D0` |
+| `setb r10b` | `41 0F 92 C2` | `41 0F 92 C2` |
+| `bt eax,ecx` | `0F A3 C8` | `0F A3 C8` |
+| `setb dl` | `0F 92 C2` | `0F 92 C2` |
+
+固定 x64 bit-mask 基线继续使用 32-bit `mov eax,1`，保留旧字节
+`B8 01 00 00 00`，避免无意义地扩大为 64-bit immediate。与此前批次相同，accumulator
+立即数 ADD/SUB 允许 Encoder 在 `81 /0|/5 <imm32>` 和 `05/2D <imm32>` 等等价合法
+形式间规范化；这类预期差异由完整重编码和真实执行闭环验证，不作为寄存器形式的
+byte-equality 失败。
+
+### 本地验证结果与限制
+
+- 完整静态门禁（含比例探针）通过，真实双策略覆盖保持 `54/54`。
+- Release x64 与 Win32 的 `test_vm_handler_synthesis`、
+  `test_vm_native_differential` 均编译并定点执行通过。
+- 最终 x64-host 全矩阵 Decoder→Request→Encoder→Decoder 覆盖通过：x86 456 个
+  kernel、78,290 条指令；x64 456 个 kernel、79,261 条指令。CFG、funclet、
+  CALL_HOST 和 BRIDGE_EXTENDED 继续在覆盖矩阵内，但本批没有改变其边界。
+- register-signature 枚举从 19 个迁移语义扩展到 24 个；carry/borrow 在两架构均得到
+  3 套 assignment，三个 bit 语义在两架构均得到 4 套 assignment。测试同时要求局部
+  temp 角色真实出现在解码后的 core 指令中。
+- signature 测试原先直接比较 Zydis 的窄寄存器 ID，导致 `R10B` 被误认为不是物理
+  R10。本批把解码操作数统一归一化到 largest enclosing register 后再取 ID；这修复的
+  是测试证据本身，不是放宽生产寄存器契约。
+- 隔离原生 CPU 差分会为每个 bit 语义动态挑选覆盖四套 assignment 的 provider seed，
+  每个 seed 执行 32 个 corpus，并保留 ADD 对 BIT_SET 的负控制。carry/borrow 所在
+  ADC/SBB 组合也按语义、按 K 动态选择至少两套 assignment；两架构全部通过。
+- 最终本地定点合成指标为 x86 `core_variant=0.258477`、x64
+  `core_variant=0.342660`，均通过当前回归线。正式完整 CTest 与独立 EXE/DLL
+  per-build similarity gate 仍只以最终提交后的 CI 为准，本地不冒充 Windows-only
+  CI 结论。
+
+### 评估与后续边界
+
+- 开发效率：ADC/SBB 与 BT/BTS/BTR 的 REX、ModRM、窄寄存器 SETB 编码由同一套
+  operand request 生成；增加一套安全 assignment 只改角色计划，不再复制位域公式。
+- 正确性风险：Encoder 消除了扩展寄存器和 byte-register REX 拼接的人工责任；人工
+  审计集中在 source 保护、old-bit auxiliary 和 latch 生命周期。本批两架构多 seed
+  真实 CPU 差分未发现隐藏依赖，测试中的 R10B 归一化问题也能被明确诊断而非静默绕过。
+- per-build 多样性：carry/borrow 获得三套 result/source/carry 编排，bit family 获得
+  四套 value/index/auxiliary 编排；变化直接进入业务 core 的 REX/ModRM，而不是只改变
+  keyed immediate。当前聚合定点指标没有退化，正式效果等待 CI gate 核实。
+
+结论：该路线对剩余简单显式操作数语义仍值得按 3–6 个小批次推进。每批必须继续独立
+导出活跃性契约、保留固定角色字节证据和多 seed 隔离差分。`CALL_HOST`、
+`BRIDGE_EXTENDED` 继续留待独立的 ABI/unwind/故障边界设计，不能混入普通 ALU 批次。
+
+### 最终 CI 闭环
+
+待最终代码提交后的 GitHub Actions 核实；本节将在同一文档中补记 run、三个 job 与
+正式 per-build similarity gate 结果。

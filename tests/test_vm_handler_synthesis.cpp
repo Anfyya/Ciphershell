@@ -3281,6 +3281,8 @@ PilotRegisterSignature DecodePilotRegisterSignature(
             generated.semanticCoreVariantSize),
         "Zydis pilot core range is invalid");
     ZydisDecoder decoder = MakeSemanticDecoder(architecture);
+    const ZydisMachineMode machineMode = architecture == VM_ARCH_X64
+        ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
     PilotRegisterSignature signature{};
     std::ostringstream text;
     size_t relative = 0;
@@ -3298,7 +3300,9 @@ PilotRegisterSignature DecodePilotRegisterSignature(
         for (uint8_t index = 0;
              index < instruction.operand_count_visible; ++index) {
             if (operands[index].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                const int id = ZydisRegisterGetId(operands[index].reg.value);
+                const int id = ZydisRegisterGetId(
+                    ZydisRegisterGetLargestEnclosing(
+                        machineMode, operands[index].reg.value));
                 text << 'r' << id << ',';
                 signature.registerIds.insert(id);
             } else if (operands[index].type == ZYDIS_OPERAND_TYPE_MEMORY) {
@@ -3306,7 +3310,8 @@ PilotRegisterSignature DecodePilotRegisterSignature(
                         operands[index].mem.base,
                         operands[index].mem.index}) {
                     if (reg == ZYDIS_REGISTER_NONE) continue;
-                    const int id = ZydisRegisterGetId(reg);
+                    const int id = ZydisRegisterGetId(
+                        ZydisRegisterGetLargestEnclosing(machineMode, reg));
                     text << 'm' << id << ',';
                     signature.registerIds.insert(id);
                 }
@@ -3322,14 +3327,16 @@ PilotRegisterSignature DecodePilotRegisterSignature(
 }
 
 void TestZydisMigratedRegistersVaryByBuildSeed() {
-    constexpr std::array<VM_MICRO_OPCODE, 19> semantics = {
+    constexpr std::array<VM_MICRO_OPCODE, 24> semantics = {
         VM_UOP_LOAD, VM_UOP_STORE,
         VM_UOP_ADD, VM_UOP_SUB,
         VM_UOP_AND, VM_UOP_OR, VM_UOP_XOR,
         VM_UOP_NOT, VM_UOP_NEG, VM_UOP_MUL,
         VM_UOP_BSWAP, VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND,
         VM_UOP_SHL, VM_UOP_SHR, VM_UOP_SAR,
-        VM_UOP_ROL, VM_UOP_ROR, VM_UOP_ROT};
+        VM_UOP_ROL, VM_UOP_ROR, VM_UOP_ROT,
+        VM_UOP_ADD_CARRY, VM_UOP_SUB_BORROW,
+        VM_UOP_BIT_TEST, VM_UOP_BIT_SET, VM_UOP_BIT_RESET};
     for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
         for (VM_MICRO_OPCODE semantic : semantics) {
             const bool memory = semantic == VM_UOP_LOAD ||
@@ -3343,6 +3350,11 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                 semantic == VM_UOP_SHR || semantic == VM_UOP_SAR ||
                 semantic == VM_UOP_ROL || semantic == VM_UOP_ROR;
             const bool rotateStack = semantic == VM_UOP_ROT;
+            const bool carry = semantic == VM_UOP_ADD_CARRY ||
+                semantic == VM_UOP_SUB_BORROW;
+            const bool bit = semantic == VM_UOP_BIT_TEST ||
+                semantic == VM_UOP_BIT_SET ||
+                semantic == VM_UOP_BIT_RESET;
             const bool sizedAlu = semantic == VM_UOP_BSWAP || extend;
             size_t minimumAssignments =
                 architecture == VM_ARCH_X64 ? 4u : 3u;
@@ -3352,6 +3364,10 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                 minimumAssignments = architecture == VM_ARCH_X64 ? 5u : 3u;
             else if (rotateStack)
                 minimumAssignments = 2u;
+            else if (carry)
+                minimumAssignments = 3u;
+            else if (bit)
+                minimumAssignments = 4u;
             else if (!sizedAlu && unary && architecture == VM_ARCH_X64)
                 minimumAssignments = 5u;
             if (multiply) minimumAssignments = 4u;
@@ -3393,7 +3409,7 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
                 }
                 if (memory || semantic == VM_UOP_AND ||
                         semantic == VM_UOP_OR ||
-                        shift || rotateStack ||
+                        shift || rotateStack || carry || bit ||
                         extend ||
                         (semantic == VM_UOP_BSWAP &&
                             architecture == VM_ARCH_X64) ||

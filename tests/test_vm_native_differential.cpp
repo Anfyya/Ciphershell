@@ -524,10 +524,15 @@ void TestBitOperationsNativeDifferentialMatchesRealCpu() {
     // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
     const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
 
-    const struct { const std::vector<uint8_t>* bytes; uint64_t preflightSeed; const char* name; } cases[] = {
-        {&btBytes, 0xB17B17ULL, "BIT_TEST(BT)"},
-        {&btsBytes, 0xB17B18ULL, "BIT_SET(BTS)"},
-        {&btrBytes, 0xB17B19ULL, "BIT_RESET(BTR)"},
+    const struct {
+        const std::vector<uint8_t>* bytes;
+        uint64_t preflightSeed;
+        const char* name;
+        VM_MICRO_OPCODE semantic;
+    } cases[] = {
+        {&btBytes, 0xB17B17ULL, "BIT_TEST(BT)", VM_UOP_BIT_TEST},
+        {&btsBytes, 0xB17B18ULL, "BIT_SET(BTS)", VM_UOP_BIT_SET},
+        {&btrBytes, 0xB17B19ULL, "BIT_RESET(BTR)", VM_UOP_BIT_RESET},
     };
 
     for (const auto& testCase : cases) {
@@ -548,8 +553,46 @@ void TestBitOperationsNativeDifferentialMatchesRealCpu() {
             " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
             preflight.error);
 
-        RunDifferentialCase(bitFunction, bitTranslation, build, 32, true,
-            (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
+        const auto bitInstruction = std::find_if(
+            bitTranslation.instructions.begin(),
+            bitTranslation.instructions.end(),
+            [&](const MicroInstruction& instruction) {
+                return instruction.opcode == testCase.semantic;
+            });
+        Require(bitInstruction != bitTranslation.instructions.end(),
+            "bit-operation fixture omitted its migrated semantic");
+        std::array<std::set<std::array<uint8_t, 4>>, 2>
+            assignmentsByStrategy{};
+        std::vector<uint8_t> providerSeeds;
+        const auto complete = [&] {
+            return assignmentsByStrategy[0].size() >= 2u &&
+                assignmentsByStrategy[1].size() >= 2u;
+        };
+        for (uint16_t domain = 1u; domain <= 0xFFu && !complete(); ++domain) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = testCase.semantic;
+            config.variant = bitInstruction->handlerVariant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "bit-operation provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            if (assignmentsByStrategy[strategy].size() < 2u &&
+                    assignmentsByStrategy[strategy].insert(
+                        generated.registerAssignment).second) {
+                providerSeeds.push_back(static_cast<uint8_t>(domain));
+            }
+        }
+        Require(complete(),
+            "bit-operation differential lacks two plans per K");
+        for (uint8_t providerSeed : providerSeeds) {
+            const std::string label = std::string("native-vs-VM Zydis ") +
+                testCase.name + " seed " + std::to_string(providerSeed);
+            RunDifferentialCase(bitFunction, bitTranslation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
     }
 
     // 单独一个跨语义负控制：native=ADD 的求值结果绝不能被误判为与
@@ -798,19 +841,21 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         const std::vector<uint8_t>* bytes;
         uint64_t preflightSeed;
         const char* label;
-        std::array<VM_MICRO_OPCODE, 4> migratedSemantics;
+        std::array<VM_MICRO_OPCODE, 6> migratedSemantics;
         size_t migratedSemanticCount;
     } cases[] = {
         {&carryShiftBytes, 0xA701ULL,
             "ADC/SBB/BSWAP/SAR/ROL/ROR",
-            {VM_UOP_BSWAP, VM_UOP_SAR, VM_UOP_ROL, VM_UOP_ROR}, 4u},
+            {VM_UOP_ADD_CARRY, VM_UOP_SUB_BORROW, VM_UOP_BSWAP,
+             VM_UOP_SAR, VM_UOP_ROL, VM_UOP_ROR}, 6u},
         {&extendBytes, 0xA702ULL,
             "ZERO_EXTEND/SIGN_EXTEND",
             {VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND,
-             VM_UOP_TRAP, VM_UOP_TRAP}, 2u},
+             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 2u},
         {&wideMultiplyBytes, 0xA703ULL,
             "UMUL_WIDE/SMUL_WIDE",
-            {VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
+            {VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP,
+             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
     };
 
     for (const auto& testCase : cases) {
