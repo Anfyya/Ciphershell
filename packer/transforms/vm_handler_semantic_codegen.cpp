@@ -1500,6 +1500,58 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         const uint8_t other = pool[(seedOffset + variant + 1u) % pool.size()];
         return {scratch, other, 0u, scratch};
     }
+    if (semantic == VM_UOP_POP_VREG) {
+        const size_t form =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if (x64) {
+            // POP_VREG has no free GPR at core entry.  RAX is the masked new
+            // value, RCX is CL, RDX is the K=0 old-value/address temporary,
+            // R8 is writeAll, R9 is the width mask (and K=1 old-value/address
+            // temporary), R10 is the still-live vreg index and R11 is the
+            // inverted-mask temporary.  Therefore the first three slots are
+            // the exact K-specific live roles rather than an allocator pool;
+            // slot [3] names an already-live register and selects one of four
+            // equivalent instruction choreographies without claiming it as
+            // scratch.  The first plan preserves the legacy register form.
+            constexpr std::array<uint8_t, 4> formMarkers = {
+                8u, 1u, 10u, 9u};
+            return coreStrategy == 0u
+                ? std::array<uint8_t, 4>{0u, 2u, 11u, formMarkers[form]}
+                : std::array<uint8_t, 4>{2u, 9u, 11u, formMarkers[form]};
+        }
+        // The x86 boundary is equally saturated: EAX is the masked new
+        // value, ECX is CL, EDX is the still-live vreg index, EBX carries
+        // writeAll/inverted mask and ESI is the K=0 address/old-value or K=1
+        // candidate.  EDI remains context.  As on x64, slot [3] is only a
+        // form selector drawn from these already-live roles; no shared or
+        // inferred scratch pool is introduced.
+        constexpr std::array<uint8_t, 4> formMarkers = {1u, 2u, 3u, 6u};
+        return coreStrategy == 0u
+            ? std::array<uint8_t, 4>{0u, 6u, 3u, formMarkers[form]}
+            : std::array<uint8_t, 4>{6u, 0u, 3u, formMarkers[form]};
+    }
+    if (semantic == VM_UOP_BRANCH || semantic == VM_UOP_BRANCH_IF ||
+            semantic == VM_UOP_CALL_VM || semantic == VM_UOP_RET) {
+        if (x64) {
+            // BRANCH: RAX=bytecodeBegin, RDX=target RVA.
+            // BRANCH_IF: the taken edge reloads the same pair after the real
+            // flag materializer/condition evaluator has completed.
+            // CALL_VM: call-depth/return-RVA state is already committed and
+            // RCX is dead before the same RAX/RDX pair is loaded.
+            // RET: only the non-top-level edge reaches this core, with
+            // RAX=return RVA and RDX=bytecodeBegin.
+            // In all four cases R15 is the sole context boundary; the full
+            // Win64 volatile set is otherwise safe for the two logical roles.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The corresponding Win32 wrappers expose the same two live values
+        // in EAX/EDX. EDI is context and EBX/ESI remain threaded ABI state;
+        // only caller-volatile EAX/EDX/ECX may host the value/source pair.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
     if (semantic == VM_UOP_SWAP) {
         if (x64) {
             // X64RequireAndPop(count=2) pops both values into RAX/RDX and
@@ -3517,86 +3569,222 @@ void EmitZydisPushImmCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     }
 }
 
-// POP_VREG was evaluated for this batch and deliberately left unmigrated.
-// Every volatile GPR on both architectures already carries a required
-// meaning simultaneously in this core (value, the CL shift count, address
-// scratch, the writeAll flag, the width mask, the vreg index and the
-// inverted-mask temporary), so DeriveVariantRegisters has no safe additional
-// register pool -- see the "推广批次 7" activity-contract table in
-// docs/zydis_encoder_pilot.md for the full liveness trace. A register-free
-// Zydis re-encoding was implemented and passed every local functional test,
-// but it regressed the formal per-build core-variant similarity gate (a
-// real EXE run measured the POP_VREG K=3 pair at Dice 0.72, above the
-// non-adjustable 0.65 hard ceiling in
-// tests/scripts/vm_per_build_similarity_gate.py) because its bytes can only
-// vary through the small keyed address immediates, not through REX/ModRM
-// register fields. Fixing that needs a seed-selected *alternate equivalent
-// instruction sequence* (not a register pool) and is left to a future
-// batch; the hand-written implementation below is unchanged.
+// POP_VREG has no spare register on either architecture. Its Zydis lowering
+// keeps the exact live K-specific roles and varies only equivalent forms;
+// registerAssignment[3] is a form marker, not a scratch allocation. Encoder
+// failure is terminal and there is no Raw-byte fallback for this core.
+uint8_t PopVregInstructionForm(bool x64, uint8_t marker) {
+    if (x64) {
+        if (marker == 8u) return 0u;
+        if (marker == 1u) return 1u;
+        if (marker == 10u) return 2u;
+        return 3u;
+    }
+    if (marker == 1u) return 0u;
+    if (marker == 2u) return 1u;
+    if (marker == 3u) return 2u;
+    return 3u;
+}
+
+void EmitZydisPopVregPerturbation(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t value,
+    uint8_t form,
+    uint32_t key)
+{
+    const uint32_t secondaryKey = static_cast<uint32_t>(
+        ((key << 13u) | (key >> 19u)) ^ 0x35A7C19Bu) & 0x7FFFFFFFu;
+    switch (form) {
+        case 0u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_XOR, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_XOR, value, key);
+            break;
+        case 1u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+            break;
+        case 2u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+            break;
+        default: {
+            const uint8_t count = static_cast<uint8_t>(
+                key % static_cast<uint32_t>(x64 ? 63u : 31u) + 1u);
+            EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ROL,
+                value, static_cast<uint8_t>(x64 ? 8u : 4u), count);
+            EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ROR,
+                value, static_cast<uint8_t>(x64 ? 8u : 4u), count);
+            break;
+        }
+    }
+    // Even two unrelated builds can legitimately select the same structural
+    // form. Carry a second reversible keyed pair in every form so that such a
+    // collision cannot recreate the previous POP_VREG single-pair Dice
+    // regression by differing only in one address displacement/count byte.
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+        value, secondaryKey != 0u ? secondaryKey : 0x35A7C19Bu);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+        value, secondaryKey != 0u ? secondaryKey : 0x35A7C19Bu);
+}
+
+void EmitZydisPopVregComplement(
+    CodeBuffer& c, bool x64, uint8_t mask, uint8_t form)
+{
+    if ((form & 1u) == 0u) {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, mask);
+    } else {
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+            mask, static_cast<uint8_t>(x64 ? 8u : 4u), UINT64_MAX);
+    }
+}
+
+void EmitZydisPopVregMerge(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t result,
+    uint8_t oldValue,
+    uint8_t invertedMask,
+    uint8_t form)
+{
+    if ((form & 2u) == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            oldValue, invertedMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR,
+            result, oldValue);
+        return;
+    }
+    // The shifted result contains bits only inside the selected field mask,
+    // so this XOR/AND/XOR blend is algebraically identical to AND/OR and
+    // needs no additional scratch register.
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, oldValue, result);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+        oldValue, invertedMask);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, result, oldValue);
+}
+
 void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
     const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
     const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
+    const uint8_t form = PopVregInstructionForm(
+        true, c.registerAssignment[3]);
+    const uint32_t perturbationKey =
+        CoreKey32(c, strategy + 9u + form);
     if (strategy == 0u) {
         const auto merge = c.NewLabel();
         const auto done = c.NewLabel();
-        X64LoadD(c, 8, CtxDecodedOperands + 24u);
-        c.Raw({0x45,0x85,0xC0}); c.Jcc(JccE, merge);
+        EmitZydisLoad(c, true, 8u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_TEST, 8u, 8u);
+        c.Jcc(JccE, merge);
         c.Jmp(done);
         c.Bind(merge);
-        X64LoadD(c, 1, CtxDecodedOperands + 16u);
-        X64ShiftCl(c, 4, 0);
-        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
-        c.Raw({0x49,0xF7,0xD3});
-        c.Raw({0x4B,0x8D,0x94,0xD7}); c.U32(CtxVregs + address0);
-        X64BinaryImmediate32(c, 0u, 2u, address1);
-        c.Raw({0x48,0x8B,0x92}); c.U32(0u - (address0 + address1));
-        X64BinaryRegister(c, 0x21, 2, 11);
-        X64BinaryRegister(c, 0x09, 0, 2);
+        EmitZydisLoad(c, true, 1u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 0u, 8u);
+        EmitZydisPopVregPerturbation(
+            c, true, 0u, form, perturbationKey);
+        EmitZydisMove(c, true, 11u, 9u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 11u, 8u);
+        EmitZydisPopVregComplement(c, true, 11u, form);
+        EmitZydisLea(c, true, 2u, 15u,
+            static_cast<int32_t>(CtxVregs + address0), 10u, 8u);
+        EmitZydisBinaryImmediate(
+            c, true, ZYDIS_MNEMONIC_ADD, 2u, address1);
+        EmitZydisLoad(c, true, 2u, 2u,
+            static_cast<int32_t>(0u - (address0 + address1)), 8u);
+        EmitZydisPopVregMerge(c, true, 0u, 2u, 11u, form);
         c.Bind(done);
     } else {
-        X64LoadD(c, 1, CtxDecodedOperands + 16u);
-        X64MovRegister(c, 2, 0); X64ShiftCl(c, 4, 2);
-        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
-        c.Raw({0x49,0xF7,0xD3});
-        c.Raw({0x4F,0x8D,0x8C,0xD7}); c.U32(CtxVregs + address0);
-        X64BinaryImmediate32(c, 0u, 9u, address1);
-        c.Raw({0x4D,0x8B,0x89}); c.U32(0u - (address0 + address1));
-        X64BinaryRegister(c, 0x21, 9, 11);
-        X64BinaryRegister(c, 0x09, 2, 9);
-        X64LoadD(c, 8, CtxDecodedOperands + 24u);
-        c.Raw({0x45,0x85,0xC0,0x48,0x0F,0x44,0xC2});
+        EmitZydisLoad(c, true, 1u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisMove(c, true, 2u, 0u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 2u, 8u);
+        EmitZydisPopVregPerturbation(
+            c, true, 2u, form, perturbationKey);
+        EmitZydisMove(c, true, 11u, 9u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 11u, 8u);
+        EmitZydisPopVregComplement(c, true, 11u, form);
+        EmitZydisLea(c, true, 9u, 15u,
+            static_cast<int32_t>(CtxVregs + address0), 10u, 8u);
+        EmitZydisBinaryImmediate(
+            c, true, ZYDIS_MNEMONIC_ADD, 9u, address1);
+        EmitZydisLoad(c, true, 9u, 9u,
+            static_cast<int32_t>(0u - (address0 + address1)), 8u);
+        EmitZydisPopVregMerge(c, true, 2u, 9u, 11u, form);
+        EmitZydisLoad(c, true, 8u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_TEST, 8u, 8u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_CMOVZ, 0u, 2u);
     }
 }
 
 void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
     const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
     const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
+    const uint8_t form = PopVregInstructionForm(
+        false, c.registerAssignment[3]);
+    const uint32_t perturbationKey =
+        CoreKey32(c, strategy + 9u + form);
     if (strategy == 0u) {
         const auto merge = c.NewLabel();
         const auto done = c.NewLabel();
-        X86LoadD(c, 3, CtxDecodedOperands + 24u);
-        c.Raw({0x85,0xDB}); c.Jcc(JccE, merge); c.Jmp(done);
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_TEST, 3u, 3u);
+        c.Jcc(JccE, merge); c.Jmp(done);
         c.Bind(merge);
-        X86LoadD(c, 1, CtxDecodedOperands + 16u);
-        c.Raw({0xD3,0xE0});
-        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        c.Raw({0x8D,0xB4,0xD7}); c.U32(CtxVregs + address0);
-        X86BinaryImmediate32(c, 0u, 6u, address1);
-        c.Raw({0x8B,0xB6}); c.U32(0u - (address0 + address1));
-        c.Raw({0x21,0xDE,0x09,0xF0});
+        EmitZydisLoad(c, false, 1u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 0u, 4u);
+        EmitZydisPopVregPerturbation(
+            c, false, 0u, form, perturbationKey);
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxMutationScratch), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 3u, 4u);
+        EmitZydisPopVregComplement(c, false, 3u, form);
+        EmitZydisLea(c, false, 6u, 7u,
+            static_cast<int32_t>(CtxVregs + address0), 2u, 8u);
+        EmitZydisBinaryImmediate(
+            c, false, ZYDIS_MNEMONIC_ADD, 6u, address1);
+        EmitZydisLoad(c, false, 6u, 6u,
+            static_cast<int32_t>(0u - (address0 + address1)), 4u);
+        EmitZydisPopVregMerge(c, false, 0u, 6u, 3u, form);
         c.Bind(done);
     } else {
-        X86LoadD(c, 1, CtxDecodedOperands + 16u);
-        c.Raw({0x89,0xC6,0xD3,0xE6});
-        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        c.Raw({0x8D,0x84,0xD7}); c.U32(CtxVregs + address0);
-        X86BinaryImmediate32(c, 0u, 0u, address1);
-        c.Raw({0x8B,0x80}); c.U32(0u - (address0 + address1));
-        c.Raw({0x21,0xD8,0x09,0xC6});
-        X86LoadD(c, 0, CtxMutationScratch + 4u);
-        c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
-        X86LoadD(c, 3, CtxDecodedOperands + 24u);
-        c.Raw({0x85,0xDB,0x0F,0x44,0xC6});
+        EmitZydisLoad(c, false, 1u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisMove(c, false, 6u, 0u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 6u, 4u);
+        EmitZydisPopVregPerturbation(
+            c, false, 6u, form, perturbationKey);
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxMutationScratch), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 3u, 4u);
+        EmitZydisPopVregComplement(c, false, 3u, form);
+        EmitZydisLea(c, false, 0u, 7u,
+            static_cast<int32_t>(CtxVregs + address0), 2u, 8u);
+        EmitZydisBinaryImmediate(
+            c, false, ZYDIS_MNEMONIC_ADD, 0u, address1);
+        EmitZydisLoad(c, false, 0u, 0u,
+            static_cast<int32_t>(0u - (address0 + address1)), 4u);
+        EmitZydisPopVregMerge(c, false, 6u, 0u, 3u, form);
+        EmitZydisLoad(c, false, 0u, 7u,
+            static_cast<int32_t>(CtxMutationScratch + 4u), 4u);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_AND,
+            {ZydisGprOperand(false, 0u),
+             ZydisMemoryOperand(false, 7u,
+                 static_cast<int32_t>(CtxMutationScratch), 4u)});
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_TEST, 3u, 3u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_CMOVZ, 0u, 6u);
     }
 }
 
@@ -3631,6 +3819,41 @@ void MoveRegisterPair(
     }
     if (destA != srcA) EmitZydisMove(c, x64, destA, srcA);
     if (destB != srcB) EmitZydisMove(c, x64, destB, srcB);
+}
+
+void EmitZydisControlTargetCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    // Each of BRANCH, the taken BRANCH_IF edge, CALL_VM and the non-top RET
+    // edge enters with the two target components in RAX/RDX (EAX/EDX). The
+    // semantic-specific liveness proof in DeriveVariantRegisters supplies a
+    // safe adjacent value/source pair; this helper only encodes the common
+    // target-add algebra and does not alter labels, call-depth state, flags,
+    // unwind metadata, or the wrapper-owned context lifetime.
+    const uint32_t k0 = CoreKey32(c, strategy + 0u);
+    const uint32_t k1 = CoreKey32(c, strategy + 3u);
+    const uint32_t k2 = CoreKey32(c, strategy + 5u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t source = c.registerAssignment[1];
+    MoveRegisterPair(c, x64, value, source, 0u, 2u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k0);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k2);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, source);
+    } else {
+        EmitZydisLea(c, x64, value, value, 0, source);
+    }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k0);
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
 }
 
 void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
@@ -4667,20 +4890,20 @@ bool EmitBusinessCoreVariant(
                 EmitKeyedSelectCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH_IF:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_CALL_VM:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_CALL_HOST:
                 if (strategy == 0u) EmitX64CallTargetVariant(c, 0u);
                 else EmitX64CallTargetVariant(c, 1u);
                 return true;
             case VM_UOP_RET:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_BRIDGE_EXTENDED:
                 EmitKeyedAddSubCore(c, true, false, strategy);
@@ -4940,20 +5163,20 @@ bool EmitBusinessCoreVariant(
             EmitKeyedSelectCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH_IF:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_CALL_VM:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_CALL_HOST:
             if (strategy == 0u) EmitX86CallTargetVariant(c, 0u);
             else EmitX86CallTargetVariant(c, 1u);
             return true;
         case VM_UOP_RET:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_BRIDGE_EXTENDED:
             EmitKeyedAddSubCore(c, false, false, strategy);
@@ -8217,6 +8440,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
         const bool x86FlagsMutationContract = !x64 &&
             (config.semantic == VM_UOP_FLAGS_WRITE ||
              config.semantic == VM_UOP_FLAGS_UPDATE);
+        const bool x86PopVregContract = !x64 &&
+            config.semantic == VM_UOP_POP_VREG;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
                reg == 8 || reg == 9 || reg == 10 || reg == 11 ||
@@ -8231,7 +8456,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
                 (x86BitContract && (reg == 3 || reg == 6)) ||
                 (x86UmulWideContract && (reg == 3 || reg == 6)) ||
                 (x86WideOperandContract && (reg == 3 || reg == 6)) ||
-                (x86FlagsMutationContract && reg == 3));
+                (x86FlagsMutationContract && reg == 3) ||
+                (x86PopVregContract && (reg == 3 || reg == 6)));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
             return false;

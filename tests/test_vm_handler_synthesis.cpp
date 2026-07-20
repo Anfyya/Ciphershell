@@ -3472,15 +3472,11 @@ void TestZydisMigratedRegistersVaryByBuildSeed() {
     }
 }
 
-// Batch 7 (PUSH_FLAGS/PUSH_IMAGE_BASE/PUSH_IP/PUSH_VREG/PUSH_IMM) activity
-// contracts are heterogeneous per architecture -- x86 PUSH_VREG has exactly
-// one safe register plan (see docs/zydis_encoder_pilot.md) -- so this uses
-// an explicit per-semantic expectation table instead of forcing them through
-// the generic TestZydisMigratedRegistersVaryByBuildSeed loop. POP_VREG was
-// evaluated but left on its pre-existing hand-written implementation (no
-// safe register pool on either architecture, and the register-free Zydis
-// re-encoding alone regressed the formal per-build similarity gate), so it
-// is intentionally absent here.
+// Batch 7 PUSH-family contracts are heterogeneous per architecture -- x86
+// PUSH_VREG has exactly one safe register plan -- so this keeps the explicit
+// per-semantic expectation table. POP_VREG now has its own test immediately
+// below because its saturated live set varies instruction forms rather than
+// allocating an otherwise-free register.
 void TestZydisPushPopFamilyRegisterDiversity() {
     struct Expectation {
         VM_MICRO_OPCODE semantic;
@@ -3549,6 +3545,176 @@ void TestZydisPushPopFamilyRegisterDiversity() {
                       << " semantic="
                       << static_cast<unsigned>(expectation.semantic)
                       << " assignments=" << assignments.size() << '\n';
+        }
+    }
+}
+
+void TestZydisPopVregInstructionFormDiversity() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        std::array<std::set<uint8_t>, 2> formMarkersByStrategy{};
+        std::array<std::set<std::string>, 2> signaturesByStrategy{};
+        for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+            for (uint8_t variant = 0;
+                 variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(0xB6u);
+                config.buildSeed[static_cast<uint8_t>(VM_UOP_POP_VREG) & 31u] =
+                    seedByte;
+                config.semantic = VM_UOP_POP_VREG;
+                config.variant = variant;
+                const auto generated =
+                    GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "POP_VREG generation failed: " + generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "POP_VREG validation failed: " + validationError);
+                const uint8_t strategy = generated.semanticCoreStrategy;
+                Require(strategy < 2u,
+                    "POP_VREG selected an invalid core strategy");
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                for (uint8_t role = 0u; role < 4u; ++role) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[role]) != 0u,
+                        "published POP_VREG live role/form marker is absent "
+                        "from the decoded core");
+                }
+                formMarkersByStrategy[strategy].insert(
+                    generated.registerAssignment[3]);
+                signaturesByStrategy[strategy].insert(signature.text);
+            }
+        }
+        for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+            Require(formMarkersByStrategy[strategy].size() == 4u,
+                "POP_VREG did not cover all four live-role form markers "
+                "for a fixed K");
+            Require(signaturesByStrategy[strategy].size() >= 4u,
+                "POP_VREG decoded instruction signatures did not vary "
+                "across all four forms for a fixed K");
+        }
+        std::cout << "[zydis-registers-pop-vreg] arch=" << architecture
+                  << " forms=" << formMarkersByStrategy[0].size()
+                  << "/" << formMarkersByStrategy[1].size()
+                  << " signatures=" << signaturesByStrategy[0].size()
+                  << "/" << signaturesByStrategy[1].size() << '\n';
+    }
+}
+
+void TestZydisControlTargetRegisterDiversity() {
+    constexpr std::array<VM_MICRO_OPCODE, 4> semantics = {
+        VM_UOP_BRANCH, VM_UOP_BRANCH_IF, VM_UOP_CALL_VM, VM_UOP_RET};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t expectedAssignments =
+            architecture == VM_ARCH_X64 ? 7u : 3u;
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            std::set<std::array<uint8_t, 4>> assignments;
+            std::array<std::set<std::string>, 2> signaturesByStrategy{};
+            for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+                for (uint8_t variant = 0;
+                     variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                    VMHandlerSemanticCodegenConfig config{};
+                    config.architecture = architecture;
+                    config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                        0xC0u + static_cast<uint8_t>(semantic)));
+                    config.buildSeed[
+                        static_cast<uint8_t>(semantic) & 31u] = seedByte;
+                    config.semantic = semantic;
+                    config.variant = variant;
+                    const auto generated =
+                        GenerateVMHandlerSemanticKernel(config);
+                    Require(generated.success,
+                        "control-target generation failed: " +
+                            generated.error);
+                    std::string validationError;
+                    Require(ValidateVMHandlerSemanticVariantKernel(
+                            config, generated, validationError),
+                        "control-target validation failed: " +
+                            validationError);
+                    const auto signature = DecodePilotRegisterSignature(
+                        architecture, generated);
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[0]) != 0u &&
+                            signature.registerIds.count(
+                                generated.registerAssignment[1]) != 0u,
+                        "published control-target value/source pair is "
+                        "absent from the decoded core");
+                    assignments.insert(generated.registerAssignment);
+                    signaturesByStrategy[
+                        generated.semanticCoreStrategy].insert(signature.text);
+                }
+            }
+            Require(assignments.size() >= expectedAssignments,
+                "control-target seed matrix did not cover the proven "
+                "register pair pool");
+            for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+                Require(signaturesByStrategy[strategy].size() >= 2u,
+                    "control-target register operands did not vary at a "
+                    "fixed business strategy");
+            }
+            std::cout << "[zydis-registers-control] arch=" << architecture
+                      << " semantic=" << static_cast<unsigned>(semantic)
+                      << " assignments=" << assignments.size()
+                      << " signatures=" << signaturesByStrategy[0].size()
+                      << "/" << signaturesByStrategy[1].size() << '\n';
+        }
+    }
+}
+
+void TestZydisPopControlFixedRegisterPlans() {
+    constexpr std::array<VM_MICRO_OPCODE, 5> semantics = {
+        VM_UOP_POP_VREG, VM_UOP_BRANCH, VM_UOP_BRANCH_IF,
+        VM_UOP_CALL_VM, VM_UOP_RET};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = architecture;
+            config.buildSeed.fill(0u);
+            config.semantic = semantic;
+            config.variant = 0u;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "fixed POP/control plan generation failed: " +
+                    generated.error);
+            if (semantic == VM_UOP_POP_VREG) {
+                const std::array<uint8_t, 3> expected =
+                    architecture == VM_ARCH_X64
+                    ? (generated.semanticCoreStrategy == 0u
+                        ? std::array<uint8_t, 3>{0u, 2u, 11u}
+                        : std::array<uint8_t, 3>{2u, 9u, 11u})
+                    : (generated.semanticCoreStrategy == 0u
+                        ? std::array<uint8_t, 3>{0u, 6u, 3u}
+                        : std::array<uint8_t, 3>{6u, 0u, 3u});
+                Require(generated.registerAssignment[0] == expected[0] &&
+                        generated.registerAssignment[1] == expected[1] &&
+                        generated.registerAssignment[2] == expected[2] &&
+                        generated.registerAssignment[3] ==
+                            (architecture == VM_ARCH_X64 ? 8u : 1u),
+                    "zero-seed POP_VREG plan no longer reproduces the "
+                    "legacy K-specific live roles/form zero");
+            } else {
+                Require(generated.registerAssignment[0] == 0u &&
+                        generated.registerAssignment[1] == 2u,
+                    "zero-seed control target no longer reproduces the "
+                    "legacy RAX/RDX or EAX/EDX pair");
+            }
+            const auto core = Slice(generated.code,
+                generated.semanticCoreVariantOffset,
+                generated.semanticCoreVariantSize);
+            std::ostringstream bytes;
+            bytes << std::hex;
+            for (uint8_t byte : core) {
+                if (byte < 0x10u) bytes << '0';
+                bytes << static_cast<unsigned>(byte);
+            }
+            std::cout << "[zydis-pop-control-fixed-bytes] arch="
+                      << architecture << " semantic="
+                      << static_cast<unsigned>(semantic) << " K="
+                      << static_cast<unsigned>(
+                          generated.semanticCoreStrategy)
+                      << " bytes=" << bytes.str() << '\n';
         }
     }
 }
@@ -4115,6 +4281,12 @@ int main() {
         &TestZydisMigratedRegistersVaryByBuildSeed, failures);
     Run("Zydis push/pop family register allocation",
         &TestZydisPushPopFamilyRegisterDiversity, failures);
+    Run("Zydis POP_VREG instruction-form allocation",
+        &TestZydisPopVregInstructionFormDiversity, failures);
+    Run("Zydis control-target register allocation",
+        &TestZydisControlTargetRegisterDiversity, failures);
+    Run("Zydis POP/control fixed-register byte plans",
+        &TestZydisPopControlFixedRegisterPlans, failures);
     Run("Zydis SWAP register allocation",
         &TestZydisSwapRegisterDiversity, failures);
     Run("Zydis wide operand register/memory form allocation",

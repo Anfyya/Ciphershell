@@ -1609,6 +1609,191 @@ void TestZydisFlagsLifecycleNativeDifferential() {
     }
 }
 
+void TestZydisPopAndControlNativeDifferential() {
+    const auto seed = MakeSeed(0xE7u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "POP/control disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // mov al,dl reaches partial-field POP_VREG; TEST/JZ reaches BRANCH_IF;
+    // the nonzero edge reaches CALL_VM and an unconditional BRANCH, while
+    // both the main body and the called body reach RET. MOV/ADD additionally
+    // cover write-all POP_VREG. Every target comes from the production
+    // translator; no isolated semantic-only differential is manufactured.
+    std::vector<uint8_t> bytes = {
+        0xEB,0x03,                         // jmp +3 -> 0x1005
+        0x01,0xC8,                         // sub: add eax,ecx
+        0xC3,                              // sub: ret
+        0x88,0xD0,                         // main: mov al,dl
+        0x85,0xC0,                         // test eax,eax
+        0x74,0x07,                         // jz  +7 -> 0x1012
+        0xE8,0xF2,0xFF,0xFF,0xFF,          // call -14 -> 0x1002
+        0xEB,0x05,                         // jmp +5 -> 0x1017
+        0xB8,0x01,0x00,0x00,0x00,          // mov eax,1
+    };
+    if constexpr (kIs64) {
+        // Native CALL leaves its return address in dead stack memory after
+        // RET, while CALL_VM deliberately uses the bounded context call
+        // stack. Overwrite that dead qword through an ordinary production
+        // STORE on both paths so the differential compares only live,
+        // architecturally retained memory effects rather than stale call
+        // machinery. No memory corpus or comparator is excluded.
+        const std::array<uint8_t, 9> clearDeadReturn = {
+            0x48,0xC7,0x44,0x24,0xF8,0x00,0x00,0x00,0x00};
+        bytes.insert(bytes.end(),
+            clearDeadReturn.begin(), clearDeadReturn.end());
+    } else {
+        const std::array<uint8_t, 8> clearDeadReturn = {
+            0xC7,0x44,0x24,0xFC,0x00,0x00,0x00,0x00};
+        bytes.insert(bytes.end(),
+            clearDeadReturn.begin(), clearDeadReturn.end());
+    }
+    bytes.push_back(0xC3);                 // ret
+    Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    // AnalyzeFunctionRange deliberately does not follow CALL targets. A real
+    // trusted function-boundary provider supplies every in-range block, so
+    // decode the local callee with the same production disassembler and add
+    // those blocks to the same trusted Function before invoking Translator.
+    const Function localCallee = DecodeStandaloneFunction(
+        disassembler, {0x01,0xC8,0xC3}, kEntry + 2u);
+    function.blocks.insert(function.blocks.end(),
+        localCallee.blocks.begin(), localCallee.blocks.end());
+    function.decodedBytes += localCallee.decodedBytes;
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    struct TargetHandler {
+        VM_MICRO_OPCODE semantic = VM_UOP_POP_VREG;
+        uint8_t variant = 0u;
+        bool operator==(const TargetHandler& other) const {
+            return semantic == other.semantic && variant == other.variant;
+        }
+    };
+    constexpr std::array<VM_MICRO_OPCODE, 5> semantics = {
+        VM_UOP_POP_VREG, VM_UOP_BRANCH, VM_UOP_BRANCH_IF,
+        VM_UOP_CALL_VM, VM_UOP_RET};
+    std::array<bool, semantics.size()> sawSemantic{};
+    std::vector<TargetHandler> targets;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        const auto found = std::find(
+            semantics.begin(), semantics.end(), instruction.opcode);
+        if (found == semantics.end()) continue;
+        sawSemantic[static_cast<size_t>(found - semantics.begin())] = true;
+        const TargetHandler target{
+            instruction.opcode, instruction.handlerVariant};
+        if (std::find(targets.begin(), targets.end(), target) == targets.end())
+            targets.push_back(target);
+    }
+    Require(std::all_of(sawSemantic.begin(), sawSemantic.end(),
+            [](bool value) { return value; }) && !targets.empty(),
+        "POP/control fixture did not reach all five target semantics through "
+        "the production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        targets.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (const TargetHandler& target : targets) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = target.semantic;
+            config.variant = target.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "POP/control provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "POP/control provider seed selected an invalid K");
+            candidate.strategies.push_back(generated.semanticCoreStrategy);
+            candidate.assignments.push_back(generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    const auto requiredAssignments = [&](size_t targetIndex) {
+        return targets[targetIndex].semantic == VM_UOP_POP_VREG ? 4u : 2u;
+    };
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            for (const auto& perStrategy : assignments[targetIndex]) {
+                complete = complete &&
+                    perStrategy.size() >= requiredAssignments(targetIndex);
+            }
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t targetIndex = 0u;
+                 targetIndex < targets.size(); ++targetIndex) {
+                const uint8_t strategy = candidate.strategies[targetIndex];
+                const auto& covered = assignments[targetIndex][strategy];
+                if (covered.size() < requiredAssignments(targetIndex) &&
+                        covered.count(
+                            candidate.assignments[targetIndex]) == 0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "POP/control differential seed selection stalled before "
+            "covering every reached handler-variant/K/assignment/form cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            const uint8_t strategy = selected.strategies[targetIndex];
+            auto& covered = assignments[targetIndex][strategy];
+            if (covered.size() < requiredAssignments(targetIndex))
+                covered.insert(selected.assignments[targetIndex]);
+        }
+    }
+    for (size_t targetIndex = 0u;
+         targetIndex < targets.size(); ++targetIndex) {
+        for (const auto& perStrategy : assignments[targetIndex]) {
+            Require(perStrategy.size() >= requiredAssignments(targetIndex),
+                "POP/control provider seeds did not cover the required "
+                "assignments/forms for every reached handler variant and K");
+        }
+    }
+
+    std::cout << "[pop-control-provider-seeds] count="
+              << providerSeeds.size() << '\n';
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM POP/BRANCH/BRANCH_IF/CALL_VM/RET seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 16, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestUndefinedFlagsReadFailsClosed() {
     const auto seed = MakeSeed(0xD5);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -1775,6 +1960,12 @@ int main(int argc, char** argv) {
             std::string(argv[1]) == "--flags-lifecycle-only") {
         Run("Zydis FLAGS_LAZY/FLAGS_UPDATE production translator multi-seed native differential",
             &TestZydisFlagsLifecycleNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 &&
+            std::string(argv[1]) == "--pop-control-only") {
+        Run("Zydis POP_VREG/control-flow production translator multi-seed native differential",
+            &TestZydisPopAndControlNativeDifferential, failures);
         return failures == 0 ? 0 : 1;
     }
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",

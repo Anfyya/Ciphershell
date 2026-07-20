@@ -1648,3 +1648,127 @@ caller-volatile 寄存器，而是将两种合法三循环分别固定为两条 
 控制流五语义可评估为一个独立高风险批次，但必须逐 edge 验证 VIP/call-stack、
 真实 branch target 和 RET materialization；若其规模不适合 3～6 个小批，则优先单独
 处理 x64 `UMUL_WIDE`，不为凑数量重试 `POP_VREG`。
+
+## 推广批次 12：`POP_VREG`、`BRANCH`、`BRANCH_IF`、`CALL_VM`、`RET`（2026-07-20）
+
+### 范围、HEAD 核对与结论
+
+本批按指定范围补回批次 7 曾回退的 `POP_VREG`，并迁移四个控制流语义
+`BRANCH`、`BRANCH_IF`、`CALL_VM`、`RET`；`CALL_HOST` 与
+`BRIDGE_EXTENDED` 明确未动。五个 business core 的目标指令全部走正式
+`ZydisEncoderRequest`，Encoder 失败写入 `CodeBuffer::FailEncoding` 并使生成
+失败，没有 Zydis 失败后回退 `c.Raw` 的双轨路径。`CodeBuffer::Jcc/Jmp` 仍只负责
+POP 的局部 merge edge 和既有 wrapper 的控制边 fixup，不承担业务指令编码。
+
+开工时重新核对 `5711a9f` 发现：该提交的生产源码只新增并接入
+`EmitZydisPushConditionCore`；`SELECT` 虽然进入了该批 host-arch 下游执行矩阵，
+当前 HEAD 的正式 core 仍调用含 `X64/X86BinaryImmediate32` 与 `c.Raw` 的
+`EmitKeyedSelectCore`。因此本批遵守指定范围没有重做 `SELECT`，但进度统计不能把
+“已被下游测试覆盖”写成“已迁移到 Zydis”。按当前生产源码逐项计数，本批从
+**45/54** 增加五项到 **50/54**；真 K 静态覆盖保持 **54/54**。
+
+### 每语义、每架构的真实活跃性契约
+
+| 语义/架构 | core 入口实际状态 | seed 选择的角色/形式 | 保留与排除依据 |
+|---|---|---|---|
+| POP_VREG x64 | RAX=已按 width mask 截断的新值；RCX=CL；R8=writeAll；R9=width mask（K1 兼作旧值/address）；R10=vreg index；R11=inverted mask；K0 的 RDX=旧值/address | 无空闲池。K0 固定角色 `{RAX,RDX,R11}`，K1 固定 `{RDX,R9,R11}`；slot 3 只在已存活的 R8/RCX/R10/R9 中选择四种等价 instruction form | R10 在 core 后仍用于最终 vreg store，R15=context；所有易失 GPR 均已有意义，禁止借用所谓全局 scratch |
+| POP_VREG x86 | EAX=新值；ECX=CL；EDX=vreg index；EBX=writeAll/inverted mask；ESI=K0 address/旧值或 K1 candidate；EDI=context | 无空闲池。K0 固定 `{EAX,ESI,EBX}`，K1 固定 `{ESI,EAX,EBX}`；slot 3 在 ECX/EDX/EBX/ESI 四个已存活角色中选择形式 | EDX 在 core 后用于最终 store，EBX/ESI 已是该 core 的必要局部角色，不能再发明第四个 scratch |
+| BRANCH x64/x86 | RAX/EAX=bytecodeBegin，RDX/EDX=decoded target RVA | x64 value/source 在 `{RAX,RDX,RCX,R8,R9,R10,R11}` 相邻轮转 7 套；x86 在 `{EAX,EDX,ECX}` 轮转 3 套 | x64 R15、x86 EDI 为 context；x86 EBX/ESI 为 threaded ABI state；其余候选在 wrapper 中未承载 live 值 |
+| BRANCH_IF x64/x86 | 只有 taken edge 进入 core；真实 materializer 与 condition evaluator 已结束，wrapper 随后重新加载与 BRANCH 相同的 pair | 与 BRANCH 相同，但独立按本语义 seed 派生 | false edge 完全跳过 core；不移动、不重算 flags，也不改变既有 edge label |
+| CALL_VM x64/x86 | callDepth 上限检查、递增和 return RVA 保存均已提交；随后 RAX/EAX=bytecodeBegin、RDX/EDX=target RVA | 与 BRANCH 相同；每个语义独立 seed | RCX/ECX 的 depth 临时值已死；core 只计算 target，不触碰 context call stack、fault 或 ABI 状态 |
+| RET x64/x86 | 只有非顶层返回 edge 进入 core；depth 已递减，RAX/EAX=return RVA、RDX/EDX=bytecodeBegin | 与 BRANCH 相同；每个语义独立 seed | 顶层 RET 的 halt/cleanup edge 跳过 core；返回栈、unwind 与 stack cleanup 仍全部由旧 wrapper 管理 |
+
+四个控制流语义共用的只是经过上述逐 wrapper 证明后的 target-add Encoder helper，
+`DeriveVariantRegisters` 仍以四个明确语义为条件，不会影响同样调用旧
+`EmitKeyedAddSubCore` 的 `BRIDGE_EXTENDED`。`MoveRegisterPair` 处理 pair 对调和
+重叠，结果再固定回 RAX/EAX；变化真实进入 REX/ModRM，而不是只靠立即数。
+
+### 固定旧寄存器计划的代表字节
+
+永久测试 `TestZydisPopControlFixedRegisterPlans` 使用零 seed/variant 0，锁定
+POP 的旧 K-specific 角色和控制流的 RAX:RDX/EAX:EDX pair，并完整解码、打印 core。
+
+| 架构/语义 | 迁移前代表形式 | Zydis 输出/差异 | 结论 |
+|---|---|---|---|
+| x86 POP_VREG K0 | `D3 E0 ... D3 E3 F7 D3 ... 21 DE 09 F0` | 保留相同 SHL/NOT/AND/OR、SIB address 与 load；新增 `35 07A26441`×2、`35 B729E721`×2 两组可逆 keyed XOR | 新值在 merge 前后不变；新增 key 防止两个 build 选中同一结构形式时重现 0.72 单 pair 回归 |
+| x64 POP_VREG K1 | `48 89 C2 48 D3 E2 ... 49 F7 D3 ... 4D 21 D9 4C 09 CA ... 48 0F 44 C2` | 相同固定角色和 CMOVZ 边界；新增 `48 81 F2 A605DC51`×2、`48 81 F2 A00B1335`×2 | 两组 XOR 均自消；flags 随后由既有 TEST 覆盖，VM flags 仍来自 context |
+| x86 control K0 | `81 C0 <k0> 81 E8 <k1> 81 C0 <k2> 01 D0 ...` | `05 <k0> 2D <k1> 05 <k2> 01 D0 ...` | Zydis 合法使用 EAX accumulator short form；操作数宽度、key algebra 与 target 完全相同 |
+| x64 control K0 | `48 81 C0 <k0> ... 48 01 D0 ...` | `48 05 <k0> ... 48 01 D0 ...`（小 key 时也可选 `48 83 /n imm8`） | 同一合法规范化；K1 的 `LEA value,[value+source]` 保持等价，非固定 pair 额外出现 MOV/XCHG 与真实 REX/ModRM 变化 |
+
+零 seed 的完整代表输出包括：x86 BRANCH K0
+`05 2FF6D61E 2D 78CA3157 05 DD42BD7B 01D0 2D DD42BD7B 05 78CA3157 2D 2FF6D61E`；
+x64 CALL_VM K0
+`48 05 B8AC044D 48 2D 171C770C 48 05 0EA68D22 48 01D0 48 2D 0EA68D22 48 05 171C770C 48 2D B8AC044D`。
+项目没有为了保留旧 `81 /n` 长形式而插入 NOP 或回退手写字节。
+
+### 实现与验证中实际发现并修复的问题
+
+1. `POP_VREG` 第一版 Encoder 重写虽然所有功能矩阵通过，但两个固定种子恰好都
+   选中同一个 form，x86 semantic 6/K0 的单 pair Dice 仍为 **0.712121**，复现了
+   批次 7 的阻塞，而不是测试噪音。最终四种结构形式分别使用 NOT/XOR complement、
+   AND/OR 或 XOR/AND/XOR blend 与不同可逆 choreography；同时每种形式都携带第二
+   组独立可逆 key，保证相同 form 碰撞也不只靠一个 displacement/count 字节变化。
+   修复后同一固定 pair 降为 **0.592105**，低于不可调的 0.65 正式 ceiling；阈值
+   没有修改。
+2. 首个真实 CALL fixture 的 native differential 在 `offset=0xe000` 报 memory
+   side-effect mismatch。根因是硬件 CALL/RET 会在已恢复的 SP 下方留下死 return
+   address，而 `CALL_VM` 按设计使用 context call stack，不写 guest stack；比较器
+   正确地把两侧整块内存差异报告出来。本批没有忽略该差异、删 corpus 或放宽
+   comparator，而是在真实 guest fixture 的公共 RET 前通过普通生产 STORE 同时把
+   该死槽清零（x64 `[rsp-8]` qword、x86 `[esp-4]` dword）。所有活路径都执行该
+   store，完整内存比较仍开启，随后两架构全部通过。
+3. `AnalyzeFunctionRange` 按设计不跟随 CALL target。专项测试模拟真实 trusted
+   function-boundary provider：分别用同一个生产 Disassembler 解码主 CFG 与本地
+   callee block，再组成一个有可信范围的 Function 交给生产 Translator；没有手造
+   micro-op 或 differential-only semantic 入口。
+
+### native differential、host-arch 与控制流证据
+
+- 新 hard-gate `vm_pop_control_native_differential` 使用真实 guest：partial
+  `mov al,dl`、`test/jz`、本地 direct `call`、unconditional `jmp`、callee `add/ret`
+  与 write-all `mov`，生产 Translator 实际产生五个目标语义；没有伪造隔离入口。
+- 从 255 个 provider seed 对全部实际到达的 `(semantic,handlerVariant)` 动态做最大
+  覆盖选择。POP 的每个 K 强制四套 form，四个控制流语义的每个 K 至少两套不同
+  assignment。x64 实选 `1/3/4/25/2/7/9/21`，Win32 实选
+  `1/2/4/208/3/9/10/21`；每 seed 16 个真实 CPU corpus，全部通过。
+- `TestZydisPopVregInstructionFormDiversity` 解码实测 x86/x64 两个 K 都是 `4/4`
+  form 与 `4/4` 不同 instruction signature；`TestZydisControlTargetRegisterDiversity`
+  对每个语义实测 x86 3 套、x64 7 套 assignment，固定 K 下分别 3/7 种 decode
+  signature。
+- 既有 `ExecuteControlFlowBoundaryMatrix` 继续用 host-arch 真 handler 覆盖
+  BRANCH_IF true/false、嵌套 CALL_VM/RET、顶层 RET 和 BRANCH；POP 继续由全宽度
+  数据/栈/算术/flags/控制流矩阵覆盖 partial/writeAll、两个 K 和所有发布形式。
+  VIP、callDepth、returnRva、flags materialization、fault 和 stack cleanup 断言均未
+  放宽。
+
+### 双架构验证与 per-build similarity
+
+- Release x64 与 Win32 目标重新生成、编译通过，未新增或下载依赖。
+- x64 除 similarity 外 CTest **16/16** 通过（完整旧 native differential
+  98.76 秒，新专项 5.02 秒）；正式 similarity 另行完整运行 318.69 秒通过，因此
+  17 个注册测试的实际底层命令均已验证。
+- Win32 除正式 similarity 与旧完整 native wrapper 外 CTest **15/15** 通过；
+  similarity 独立运行 380.57 秒通过。旧 `vm_native_differential` 保持既有 120 秒
+  CTest 属性不变，直接运行同一二进制 137.5 秒自然完成、退出码 0，所有旧子测试
+  PASS；没有把 wrapper timeout 写成通过，也没有提高 timeout。
+- `vm_kernel_static_gate -V` 明确输出生产双策略覆盖 **54/54**。
+- 固定种子合成代理：x86 `core_variant=0.252408`、最差 pair
+  `POP_VREG K0=0.592105`；x64 `core_variant=0.324894`、最差 pair `0.447059`。
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers | business/core max pair |
+|---|---:|---:|---:|---:|---:|
+| x64 EXE | 0.2706 | 0.1545 | 0.1436 | 0.0001 | 0.3813 / 0.4167 |
+| x64 DLL | 0.2721 | 0.1208 | 0.1534 | 0.0001 | 0.3748 / 0.3902 |
+| Win32 EXE | 0.2572 | 0.0989 | 0.0231 | 0.0001 | 0.4007 / 0.4865 |
+| Win32 DLL | 0.2663 | 0.0873 | 0.0226 | 0.0001 | 0.4067 / 0.3947 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；business/core/codec/encrypted 聚合
+阈值、单 pair ceiling、corpus、skip 规则与 timeout 均未修改。
+
+### 当前剩余语义与下一批边界
+
+按当前生产源码，剩余 **4/54**：仍为手写 core 的 `SELECT`、`CALL_HOST`、
+`BRIDGE_EXTENDED`，以及仅 x64 尚未迁移的 `UMUL_WIDE`。其中
+`CALL_HOST`/`BRIDGE_EXTENDED` 按本批指示继续保留，后续必须作为 ABI/unwind/bridge
+高风险独立批；x64 `UMUL_WIDE` 也不与它们混做。`SELECT` 的测试覆盖与 Encoder
+迁移状态需要继续明确区分，不能仅凭 `5711a9f` 的批次描述计为已迁移。
