@@ -1465,6 +1465,150 @@ void TestZydisFlagsBoundaryNativeDifferential() {
     }
 }
 
+void TestZydisFlagsLifecycleNativeDifferential() {
+    const auto seed = MakeSeed(0xF2u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "flags-lifecycle disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // ADD reaches FLAGS_LAZY through the production translator. CLC/STC/CMC
+    // reach FLAGS_UPDATE in all three modes, and RET materializes the final
+    // observable flags. FLAGS_WRITE is deliberately absent: production POPF
+    // lowering remains fail-closed because privilege/trap/RF behavior is not
+    // losslessly virtualized, so manufacturing a differential-only entry
+    // would overstate the evidence boundary.
+    const std::vector<uint8_t> bytes = {
+        0x01,0xC8, // add eax,ecx
+        0xF8,      // clc
+        0xF9,      // stc
+        0xF5,      // cmc
+        0xC3,      // ret
+    };
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    struct TargetHandler {
+        VM_MICRO_OPCODE semantic = VM_UOP_FLAGS_LAZY;
+        uint8_t variant = 0u;
+        bool operator==(const TargetHandler& other) const {
+            return semantic == other.semantic && variant == other.variant;
+        }
+    };
+    std::vector<TargetHandler> targets;
+    bool sawLazy = false;
+    bool sawUpdate = false;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        if (instruction.opcode != VM_UOP_FLAGS_LAZY &&
+                instruction.opcode != VM_UOP_FLAGS_UPDATE) continue;
+        sawLazy = sawLazy || instruction.opcode == VM_UOP_FLAGS_LAZY;
+        sawUpdate = sawUpdate || instruction.opcode == VM_UOP_FLAGS_UPDATE;
+        const TargetHandler target{
+            instruction.opcode, instruction.handlerVariant};
+        if (std::find(targets.begin(), targets.end(), target) == targets.end())
+            targets.push_back(target);
+    }
+    Require(sawLazy && sawUpdate && !targets.empty(),
+        "ADD/CLC/STC/CMC/RET fixture did not reach FLAGS_LAZY and "
+        "FLAGS_UPDATE through the production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        targets.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (const TargetHandler& target : targets) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = target.semantic;
+            config.variant = target.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "flags-lifecycle provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "flags-lifecycle provider seed selected an invalid K");
+            candidate.strategies.push_back(
+                generated.semanticCoreStrategy);
+            candidate.assignments.push_back(generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perTarget : assignments) {
+            for (const auto& perStrategy : perTarget)
+                complete = complete && perStrategy.size() >= 2u;
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t targetIndex = 0u;
+                 targetIndex < targets.size(); ++targetIndex) {
+                const uint8_t strategy = candidate.strategies[targetIndex];
+                if (assignments[targetIndex][strategy].size() < 2u &&
+                        assignments[targetIndex][strategy].count(
+                            candidate.assignments[targetIndex]) == 0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "flags-lifecycle differential seed selection stalled before "
+            "covering every reached handler-variant/K/assignment cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            const uint8_t strategy = selected.strategies[targetIndex];
+            if (assignments[targetIndex][strategy].size() < 2u) {
+                assignments[targetIndex][strategy].insert(
+                    selected.assignments[targetIndex]);
+            }
+        }
+    }
+    for (const auto& perTarget : assignments) {
+        for (const auto& perStrategy : perTarget) {
+            Require(perStrategy.size() >= 2u,
+                "flags-lifecycle provider seeds did not cover two register "
+                "assignments for every reached handler variant and K");
+        }
+    }
+
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM ADD/CLC/STC/CMC/RET flags lifecycle seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestUndefinedFlagsReadFailsClosed() {
     const auto seed = MakeSeed(0xD5);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -1625,6 +1769,12 @@ int main(int argc, char** argv) {
             std::string(argv[1]) == "--flags-boundary-only") {
         Run("Zydis FLAGS_MATERIALIZE/PACK_AH/UNPACK_AH multi-seed native differential",
             &TestZydisFlagsBoundaryNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 &&
+            std::string(argv[1]) == "--flags-lifecycle-only") {
+        Run("Zydis FLAGS_LAZY/FLAGS_UPDATE production translator multi-seed native differential",
+            &TestZydisFlagsLifecycleNativeDifferential, failures);
         return failures == 0 ? 0 : 1;
     }
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",

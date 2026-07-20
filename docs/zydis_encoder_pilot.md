@@ -1532,3 +1532,119 @@ fallback。
 生命周期必须逐字段证明。控制流、CALL_HOST、BRIDGE_EXTENDED、POP_VREG 和 x64
 UMUL_WIDE 不与该批混做。本文档只记录本地验证；本批尚未 push，也没有对应的
 远端 GitHub Actions 运行，因此不宣称远端 CI 状态。
+
+## 推广批次 11：`FLAGS_LAZY`、`FLAGS_UPDATE`、`FLAGS_WRITE`（2026-07-20）
+
+### 范围、风险边界与结论
+
+本批完成 flags 生命周期第二个三语义子批，不混入控制流、ABI bridge、
+`POP_VREG` 或 x64 `UMUL_WIDE`。`FLAGS_LAZY` 的逐字段 record 搬运、
+`FLAGS_UPDATE` 的 clear/set/toggle 与 keyed correction、`FLAGS_WRITE` 的
+masked merge 均改由正式 `ZydisEncoderRequest` 路径编码；Encoder 失败写入
+`CodeBuffer::FailEncoding` 并使 kernel 生成失败，不存在回退 `c.Raw` 的双轨路径。
+用于内部 label/fixup 的 `CodeBuffer::Jcc/Jmp` 仍只承担控制边连接，不负责业务
+指令编码。
+
+完成后累计 Zydis business-core 迁移进度为 **45/54**；VM 真 K 双策略静态覆盖
+保持 **54/54**。
+
+### 每语义、每架构的真实活跃性契约
+
+| 语义/架构 | core 入口实际状态 | seed 选择的角色与安全计划 | 保留/排除依据 |
+|---|---|---|---|
+| FLAGS_LAZY x64 | 真实 materializer 调用后，校验路径只暂存 operation/width/mask 于 RAX/RCX/RDX/R11；这些值在 core 后全部从 context 重载 | address/value 在 R10、RAX、RCX、RDX、R8、R9、R11 相邻轮转，共 7 套；R10/RAX 为旧固定计划 | R15=context 保留；RSP/nonvolatile 排除；所有候选均在 core 后无条件被覆盖 |
+| FLAGS_LAZY x86 | cdecl materializer 与校验后仅 EDI=context 跨 core 存活 | address/value 在 EDX、EAX、ECX 相邻轮转，共 3 套；EDX/EAX 为旧固定计划 | EBX/ESI 未被该语义旧实现证明安全，继续排除 |
+| FLAGS_WRITE x64 | wrapper 在 materializer 后精确重载 RAX=old、RCX=mask、RDX=value | old/mask/value 使用固定边界或互不覆盖源值的 R8/R9/R10 高寄存器计划，共 8 套；scratch=R11 | 其余 Win64 volatile 在调用后死亡；高目标不会覆盖仍待搬运的 RAX/RCX/RDX 源；R15/context 与 nonvolatile 排除 |
+| FLAGS_WRITE x86 | EAX=old、ECX=mask、EDX=value | 三个逻辑角色在 EAX/ECX/EDX 上采用固定计划和两个三循环，共 3 套；scratch=EBX | 两个三循环由保 flags 的两条 `XCHG` 完成；EBX 是旧 K=0 core 已实际使用的 inverted-mask scratch，因此是该语义局部已证明角色，ESI/EDI 排除 |
+| FLAGS_UPDATE x64 | materializer 后 RAX=flags、RCX=mode、RDX=mask；RCX 仅在 keyed dispatch 前存活 | flags/mask 使用 RAX/RDX 或 R8/R9 的 6 套显式安全 pair，scratchA/B=R10/R11 | `MoveRegisterPair` 处理 RAX/RDX 对调；RCX 保持 mode 到分发完成，不被偷作数据 scratch；R15/nonvolatile 排除 |
+| FLAGS_UPDATE x86 | EAX=flags、ECX=mode、EDX=mask；分发后 ECX 死亡 | flags/mask/scratchA 在 EAX/EDX/EBX 上 4 套显式计划，scratchB=ECX | EBX 与分发后 ECX 都是旧 core 已使用的同语义局部 scratch；`MoveRegisterPair` 的 swap 使用 `XCHG`，不改变进入 keyed dispatch 的 EFLAGS；ESI/EDI 排除 |
+
+这些是三个独立的 `DeriveVariantRegisters` 分支，不是共享全局 scratch pool。
+`TestZydisFlagsLifecycleRegisterDiversity` 对每个 seed 生成并完整解码 core，验证发布
+角色确实出现在寄存器/内存 operand 中，并要求固定 K 下的真实 REX/ModRM/SIB
+signature 变化。实测 assignment 数为：`FLAGS_LAZY` x64 7 / x86 3，
+`FLAGS_WRITE` 8 / 3，`FLAGS_UPDATE` 6 / 4。
+
+### 固定旧寄存器计划的代表性字节
+
+`TestZydisFlagsLifecycleFixedRegisterPlans` 用零 seed、variant 0 锁定旧物理角色并
+打印完整 core。逐指令核对结果如下：
+
+| 架构/语义 | 迁移前代表字节 | Zydis 输出 | 结论 |
+|---|---|---|---|
+| x64 FLAGS_LAZY keyed copy | `4D 8D 97 <disp32> 49 8B 82 <disp32> 4D 8D 97 <disp32> 49 89 82 <disp32>` | 相同 | R10 address、RAX value 的 LEA/load/LEA/store 逐字节一致 |
+| x86 FLAGS_LAZY keyed copy | `8D 97 <disp32> 8B 82 <disp32> 8D 97 <disp32> 89 82 <disp32>` | 相同 | EDX/EAX 固定计划逐字节一致 |
+| x64 FLAGS_WRITE K=0 首个 XOR | `48 81 F0 4FD97161` | `48 35 4FD97161` | 合法 RAX accumulator short form；其余 mask complement/AND/OR 与最终 decode 等价 |
+| x86 FLAGS_WRITE K=0 首个 XOR | `81 F0 5D792F01` | `35 5D792F01` | 合法 EAX accumulator short form；完整新 core 为 `35 5D792F01 81 F2 5D792F01 89 CB F7 D3 21 D8 21 CA 09 D0 35 5D792F01` |
+| x64 FLAGS_UPDATE K=0 mode LEA/CMP | `48 8D 89 15000000 48 81 F9 15000000` | `48 8D 49 15 48 83 F9 15` | Zydis 合法选择 disp8/imm8；目标仍是 RCX+0x15 与 modeKey+CLEAR，分支条件和 flags 相同 |
+| x86 FLAGS_UPDATE K=1 keyed XOR | `81 F0 1A000000` | `83 F0 1A` | 合法 imm8 sign-extended short form；值为正 0x1A，XOR 位模式完全相同 |
+
+项目没有为保留长 opcode 而插入 NOP 或回退手写编码。短形式只改变合法编码长度，
+不改变 operand 宽度、flags、fault、context/stack 生命周期或 label 目标；完整 decode、
+host-arch 执行与 native differential 共同证明等价。
+
+### 实现和验证中发现的问题
+
+第一轮 Win32 pack-time 合成在 `FLAGS_WRITE` 上 fail-closed，错误为
+`variant register allocation violates its liveness contract`。原因不是生成了危险计划，
+而是永久 validator 尚未认识本批逐语义证明的 EBX 局部契约。处理方式是只为
+`FLAGS_WRITE/FLAGS_UPDATE` 增加精确的 `x86FlagsMutationContract && reg==3`，没有
+放宽其他语义、没有提高阈值；随后 Win32 真 handler 全矩阵通过。该失败验证了
+validator 会在发布未知计划时立即阻断，而不是静默接受。
+
+`FLAGS_WRITE` 的 x86 三寄存器轮换还暴露了与批次 7 `PUSH_IP` 相同类别、但为三元
+循环的搬运风险：顺序 MOV 会覆盖尚未读取的源。本批没有尝试寻找不存在的第四个
+caller-volatile 寄存器，而是将两种合法三循环分别固定为两条 `XCHG`，其既保留三
+个输入，又不修改 EFLAGS。host-arch 真 handler 执行覆盖两个 K 和所有发布计划。
+
+### native differential 与 host-arch 证据边界
+
+- `FLAGS_LAZY` 与 `FLAGS_UPDATE` 可由生产 translator 真实触达。新增独立 hard-gate
+  `vm_flags_lifecycle_native_differential`，使用真实函数
+  `add eax,ecx; clc; stc; cmc; ret`：ADD 产生 lazy record，CLC/STC/CMC 覆盖
+  clear/set/toggle，RET materialize 最终可观察 flags。
+- provider seed 从实际生成的所有已触达 `(semantic, handlerVariant)` 选择，而不是
+  猜 seed byte；每个目标 variant、每个 K 至少覆盖两个不同 assignment。x64 选择
+  seed `1/2/5/10`，Win32 选择 `1/2/6/30`，每 seed 32 个真实 CPU corpus，全部通过。
+- `FLAGS_WRITE` 没有一对一生产 translator 入口：`POPF/POPFD/POPFQ` 因 privilege、
+  trap、RF 语义无法无损虚拟化而明确 fail-closed。因此本批没有伪造 isolated native
+  differential。证据来自 host-arch `ExecuteFlagsVariantMatrix` 的真实合成 handler
+  执行；矩阵已覆盖全 status mask，并新增仅写 CF 的窄 mask corpus，以验证未选中的
+  architectural flags 保留，同时覆盖两个 K、全部宽度和下游 PUSH/POP 读取。
+
+### 双架构验证与 per-build similarity
+
+- Release x64 与 Win32 的目标均重新生成并编译通过，未安装或下载依赖。
+- x64 全量 CTest **16/16** 通过：旧完整 native differential 97.56 秒，新 lifecycle
+  differential 5.08 秒，正式 per-build gate 289.37 秒。
+- Win32 CTest 16 项中 **15 项完成且 14 项通过**，唯一未完成项仍是既有
+  `vm_native_differential` 被其固定 `TIMEOUT 120` 在 120.03 秒截断；同一可执行文件
+  不经 CTest 直接完整运行 134.7 秒、退出码 0，全部旧子测试 PASS。新增 lifecycle
+  differential 6.12 秒、54/54 static gate 和正式 per-build gate 383.61 秒均通过。
+  没有修改 timeout 或删减 corpus。
+- 固定种子 handler 合成代理：x86 `core_variant=0.243326`、最差 pair `0.583333`；
+  x64 `core_variant=0.324319`、最差 pair `0.447059`。既有硬阈值未修改。
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers |
+|---|---:|---:|---:|---:|
+| x64 EXE | 0.2669 | 0.1387 | 0.1050 | 0.0001 |
+| x64 DLL | 0.2768 | 0.1412 | 0.0982 | 0.0001 |
+| Win32 EXE | 0.2565 | 0.0921 | 0.0265 | 0.0001 |
+| Win32 DLL | 0.2663 | 0.0840 | 0.0441 | 0.0001 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；聚合阈值、单 pair ceiling、corpus
+与跳过规则均未更改。
+
+### 剩余语义和下一批风险边界
+
+当前剩余 **9/54**：
+
+- 控制流/上下文：`SELECT`、`BRANCH`、`BRANCH_IF`、`CALL_VM`、`RET`；
+- ABI/bridge：`CALL_HOST`、`BRIDGE_EXTENDED`；
+- 已有明确阻塞证据：`POP_VREG`，继续保留原正式实现；
+- 部分架构尚未完成：x64 `UMUL_WIDE` business core。
+
+下一批不得把 `CALL_HOST`/`BRIDGE_EXTENDED` 与普通控制流或 x64 宽乘法混做。
+控制流五语义可评估为一个独立高风险批次，但必须逐 edge 验证 VIP/call-stack、
+真实 branch target 和 RET materialization；若其规模不适合 3～6 个小批，则优先单独
+处理 x64 `UMUL_WIDE`，不为凑数量重试 `POP_VREG`。

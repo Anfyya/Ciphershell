@@ -1655,6 +1655,14 @@ void ExecuteFlagsVariantMatrix(
                 Uop(VM_UOP_FLAGS_WRITE, {VM_FLAG_STATUS_MASK}, variant(VM_UOP_FLAGS_WRITE)),
                 Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
                 Uop(VM_UOP_POP_VREG, {7, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
+                // A second, narrow FLAGS_WRITE proves that the unselected
+                // architectural bits survive the selected register plan;
+                // the preceding full-status write alone cannot expose an
+                // accidental use of mask complement as the retained value.
+                Uop(VM_UOP_PUSH_IMM, {0, addressWidth}, variant(VM_UOP_PUSH_IMM)),
+                Uop(VM_UOP_FLAGS_WRITE, {VM_FLAG_CF}, variant(VM_UOP_FLAGS_WRITE)),
+                Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
+                Uop(VM_UOP_POP_VREG, {11, addressWidth, 0, 1}, variant(VM_UOP_POP_VREG)),
                 Uop(VM_UOP_PUSH_IMM, {0xD5, 1}, variant(VM_UOP_PUSH_IMM)),
                 Uop(VM_UOP_FLAGS_UNPACK_AH, {}, variant(VM_UOP_FLAGS_UNPACK_AH)),
                 Uop(VM_UOP_PUSH_FLAGS, {VM_FLAG_ARCHITECTURAL_MASK}, variant(VM_UOP_PUSH_FLAGS)),
@@ -3845,6 +3853,140 @@ void TestZydisFlagsBoundaryFixedRegisterPlans() {
     }
 }
 
+// Batch 11 completes the flags lifecycle core set. These contracts are kept
+// separate because the live boundaries differ materially: FLAGS_LAZY owns a
+// keyed address/value pair after validation; FLAGS_WRITE consumes the fixed
+// old/mask/value triple and needs an inverted-mask scratch only in K=0; and
+// FLAGS_UPDATE keeps mode fixed in RCX/ECX through dispatch while publishing
+// four distinct data-path roles.
+void TestZydisFlagsLifecycleRegisterDiversity() {
+    struct Expectation {
+        VM_MICRO_OPCODE semantic;
+        size_t minimumX64;
+        size_t minimumX86;
+        size_t alwaysLiveRoleCount;
+    };
+    constexpr std::array<Expectation, 3> expectations = {{
+        {VM_UOP_FLAGS_LAZY, 7u, 3u, 2u},
+        {VM_UOP_FLAGS_WRITE, 8u, 3u, 3u},
+        {VM_UOP_FLAGS_UPDATE, 6u, 4u, 4u},
+    }};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (const Expectation& expectation : expectations) {
+            const size_t minimum = architecture == VM_ARCH_X64
+                ? expectation.minimumX64 : expectation.minimumX86;
+            std::set<std::array<uint8_t, 4>> assignments;
+            std::array<std::set<std::string>, 2> signaturesByStrategy{};
+            for (uint8_t seedByte = 0u; seedByte < 24u; ++seedByte) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                    0xB0u + static_cast<uint8_t>(expectation.semantic)));
+                config.buildSeed[
+                    static_cast<uint8_t>(expectation.semantic) & 31u] =
+                        seedByte;
+                config.semantic = expectation.semantic;
+                config.variant = 0u;
+                const auto generated = GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "flags-lifecycle generation failed: " + generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "flags-lifecycle validation failed: " + validationError);
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                for (size_t role = 0u;
+                     role < expectation.alwaysLiveRoleCount; ++role) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[role]) != 0u,
+                        "published flags-lifecycle role is absent from the "
+                        "decoded core signature");
+                }
+                if (expectation.semantic == VM_UOP_FLAGS_WRITE &&
+                        generated.semanticCoreStrategy == 0u) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[3]) != 0u,
+                        "FLAGS_WRITE K=0 scratch role is absent from the "
+                        "decoded core signature");
+                }
+                Require(generated.semanticCoreStrategy < 2u,
+                    "flags-lifecycle semantic selected an invalid K");
+                assignments.insert(generated.registerAssignment);
+                signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                    signature.text);
+            }
+            Require(assignments.size() >= minimum,
+                "build seed did not cover the flags-lifecycle liveness pool");
+            bool sameStrategyVaries = false;
+            for (size_t strategy = 0u; strategy < 2u; ++strategy) {
+                if (signaturesByStrategy[strategy].size() >= 2u)
+                    sameStrategyVaries = true;
+            }
+            Require(sameStrategyVaries,
+                "flags-lifecycle REX/ModRM/SIB signature did not vary at a "
+                "fixed K");
+            std::cout << "[zydis-registers-flags-lifecycle] arch="
+                      << architecture << " semantic="
+                      << static_cast<unsigned>(expectation.semantic)
+                      << " assignments=" << assignments.size() << '\n';
+        }
+    }
+}
+
+void TestZydisFlagsLifecycleFixedRegisterPlans() {
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {{
+        VM_UOP_FLAGS_LAZY,
+        VM_UOP_FLAGS_WRITE,
+        VM_UOP_FLAGS_UPDATE,
+    }};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = architecture;
+            config.buildSeed.fill(0u);
+            config.semantic = semantic;
+            config.variant = 0u;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "fixed flags-lifecycle plan generation failed: " +
+                    generated.error);
+            std::array<uint8_t, 4> expected{};
+            if (semantic == VM_UOP_FLAGS_LAZY) {
+                expected = architecture == VM_ARCH_X64
+                    ? std::array<uint8_t, 4>{10u, 0u, 1u, 2u}
+                    : std::array<uint8_t, 4>{2u, 0u, 1u, 2u};
+            } else if (semantic == VM_UOP_FLAGS_WRITE) {
+                expected = architecture == VM_ARCH_X64
+                    ? std::array<uint8_t, 4>{0u, 1u, 2u, 11u}
+                    : std::array<uint8_t, 4>{0u, 1u, 2u, 3u};
+            } else {
+                expected = architecture == VM_ARCH_X64
+                    ? std::array<uint8_t, 4>{0u, 2u, 10u, 11u}
+                    : std::array<uint8_t, 4>{0u, 2u, 3u, 1u};
+            }
+            Require(generated.registerAssignment == expected,
+                "zero-seed flags-lifecycle assignment no longer reproduces "
+                "the legacy fixed register plan");
+            const auto core = Slice(generated.code,
+                generated.semanticCoreVariantOffset,
+                generated.semanticCoreVariantSize);
+            std::ostringstream bytes;
+            bytes << std::hex;
+            for (uint8_t byte : core) {
+                if (byte < 0x10u) bytes << '0';
+                bytes << static_cast<unsigned>(byte);
+            }
+            std::cout << "[zydis-flags-lifecycle-fixed-bytes] arch="
+                      << architecture << " semantic="
+                      << static_cast<unsigned>(semantic) << " K="
+                      << static_cast<unsigned>(
+                             generated.semanticCoreStrategy)
+                      << " bytes=" << bytes.str() << '\n';
+        }
+    }
+}
+
 void TestX86ZydisUmulWidePerKSourcePlans() {
     const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
         {{1u, 2u, 3u, 6u},
@@ -3983,6 +4125,10 @@ int main() {
         &TestZydisFlagsBoundaryRegisterDiversity, failures);
     Run("Zydis flags boundary fixed-register byte plans",
         &TestZydisFlagsBoundaryFixedRegisterPlans, failures);
+    Run("Zydis flags lifecycle register allocation",
+        &TestZydisFlagsLifecycleRegisterDiversity, failures);
+    Run("Zydis flags lifecycle fixed-register byte plans",
+        &TestZydisFlagsLifecycleFixedRegisterPlans, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;
