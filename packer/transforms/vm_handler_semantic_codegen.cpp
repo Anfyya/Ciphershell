@@ -1388,6 +1388,36 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             {3u, 1u, 2u, 0u}}};
         return plans[plan];
     }
+    if (x64 && semantic == VM_UOP_UMUL_WIDE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        // The wrapper enters the core with RAX=a, R9=b, R8=copy-a and
+        // R10=copy-b after pre-latching the exact operands. RDX:RAX is the
+        // CPU-fixed result pair, R15 is the
+        // context, and every nonvolatile register stays outside the local
+        // contract.  Width dispatch has finished, so RCX/R11 are the only
+        // additional volatile registers whose previous values are dead.
+        // Role [0] is the visible MUL source or memory base; [1]/[2] name
+        // actual boundary copies or proven-dead reusable registers so the
+        // published assignment remains an auditable liveness contract; [3]
+        // selects register or
+        // memory form.  Each K retains its legacy register plan while also
+        // exposing three structurally different seed-selected forms.
+        constexpr std::array<std::array<uint8_t, 4>, 4> k0Plans = {{
+            {9u, 8u, 10u, 1u},  // MUL R9 (legacy K=0)
+            {1u, 8u, 10u, 1u},  // MOV RCX,R9; MUL RCX
+            {11u, 8u, 10u, 1u}, // MOV R11,R9; MUL R11
+            {11u, 8u, 10u, 0u}  // MUL [R11 + seed-split displacement]
+        }};
+        constexpr std::array<std::array<uint8_t, 4>, 4> k1Plans = {{
+            {10u, 8u, 11u, 1u}, // MOV R10,R9; MUL R10 (legacy K=1)
+            {1u, 8u, 10u, 1u},  // MOV RCX,R9; MUL RCX
+            {11u, 8u, 10u, 1u}, // MOV R11,R9; MUL R11
+            {1u, 8u, 10u, 0u}   // MUL [RCX + seed-split displacement]
+        }};
+        return (coreStrategy & 1u) == 0u
+            ? k0Plans[plan] : k1Plans[plan];
+    }
     if (!x64 && semantic == VM_UOP_UMUL_WIDE) {
         const size_t plan =
             (seedOffset + static_cast<size_t>(variant)) & 3u;
@@ -4725,6 +4755,41 @@ void EmitZydisWideOperandCore(
              static_cast<int32_t>(0u - key), bytes)});
 }
 
+void EmitZydisX64UmulWideCore(CodeBuffer& c, uint8_t strategy) {
+    // RAX is the hardware-fixed multiplicand and RDX:RAX is the hardware-
+    // fixed high:low output pair.  Only the explicit multiplier form varies.
+    // R9 contains b; the wrapper has already pre-latched a/b. R8 keeps the
+    // legacy a copy. R10 enters as a b copy and the legacy K=1 form may use
+    // that same value as its explicit multiplier without changing it. The
+    // memory plans use only RCX/R11, whose width-
+    // dispatch values are dead on entry to the selected width branch.
+    const uint8_t multiplier = c.registerAssignment[0];
+    const bool memoryForm = c.registerAssignment[3] == 0u;
+    if (memoryForm) {
+        const uint32_t key = CoreAddressKey(c, strategy + 11u);
+        EmitZydisLea(c, true, multiplier, 15u,
+            static_cast<int32_t>(CtxMutationScratch + key));
+        EmitZydisStore(c, true, multiplier,
+            static_cast<int32_t>(0u - key), 9u, 8u);
+        EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MUL,
+            {ZydisMemoryOperand(true, multiplier,
+                static_cast<int32_t>(0u - key), 8u)});
+        return;
+    }
+
+    // A bare register MUL contains no seed-dependent byte when two builds
+    // choose the same plan.  The reversible keyed pair keeps those builds
+    // distinct without changing b.  Copying after the pair preserves the
+    // legacy K=0 `mul r9` and K=1 `mov r10,r9; mul r10` byte sequences as
+    // exact suffixes of their fixed-register plans.
+    const uint32_t key = CoreKey32(c, strategy + 11u);
+    EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 9u, key);
+    EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 9u, key);
+    if (multiplier != 9u)
+        EmitZydisMove(c, true, multiplier, 9u);
+    EmitZydisUnary(c, true, ZYDIS_MNEMONIC_MUL, multiplier);
+}
+
 bool EmitBusinessCoreVariant(
     CodeBuffer& c,
     bool x64,
@@ -4882,8 +4947,7 @@ bool EmitBusinessCoreVariant(
                 else EmitX64ExtendVariant(c, true, 1u);
                 return true;
             case VM_UOP_UMUL_WIDE:
-                if (strategy == 0u) c.Raw({0x49,0xF7,0xE1});
-                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xE2});
+                EmitZydisX64UmulWideCore(c, strategy);
                 return true;
             case VM_UOP_SMUL_WIDE:
                 EmitZydisWideOperandCore(
@@ -6723,7 +6787,15 @@ void EmitX64WideMultiply(
 {
     X64RequireAndPop(c, 2, stackFailure); X64ValidateWidth(c, 0, widthFailure);
     X64MaskForWidthInR11(c); X64Binary(c, 0x21, 0, 9); X64Binary(c, 0x21, 2, 9);
-    X64Move(c, 8, 0); X64Move(c, 11, 2); X64Move(c, 9, 2);
+    // Pre-latch the original masked operands before width dispatch can reuse
+    // R11 or a seed-selected source form can reuse another volatile GPR. The
+    // old post-core R11 latch silently recorded the operand width as b; the
+    // split begin/finish lifetime also remains correct for signed narrow
+    // products whose explicit multiplier is sign-extended inside the branch.
+    X64ClearLastAlu(c);
+    X64StoreQ(c, RECORD_OFFSET(CtxLastAlu, a), 0);
+    X64StoreQ(c, RECORD_OFFSET(CtxLastAlu, b), 2);
+    X64Move(c, 8, 0); X64Move(c, 10, 2); X64Move(c, 9, 2);
     const WidthLabels width = MakeWidthLabels(c); const auto product = c.NewLabel();
     const auto split = c.NewLabel(); const auto finish = c.NewLabel();
     X64DispatchWidth(c, 0, width);
@@ -6752,7 +6824,7 @@ void EmitX64WideMultiply(
     c.Bind(product); c.Bind(split);
     c.Bind(finish);
     X64LoadByte(c, 1, CtxDecodedOperands);
-    X64Latch(c, 8, 11, 0, 2, 1); X64PushTwo(c, 0, 2, stackFailure);
+    X64FinishPrelatched(c, 0, 2, 1); X64PushTwo(c, 0, 2, stackFailure);
 }
 
 void EmitX64WideDivide(

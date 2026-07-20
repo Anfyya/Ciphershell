@@ -939,11 +939,16 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
     // movzx eax,cl; movsx edx,cl; ret. MOVZX/MOVSX 必须保持输入 flags。
     const std::vector<uint8_t> extendBytes = {
         0x0F,0xB6,0xC1, 0x0F,0xBE,0xD1, 0xC3};
-    // mul ecx; imul ecx; add eax,0; ret. 两条 implicit multiply 分别落到
-    // UMUL_WIDE/SMUL_WIDE；末尾 ADD 关闭 MUL/IMUL 未定义状态位。
-    const std::vector<uint8_t> wideMultiplyBytes = {
-        0xF7,0xE1, 0xF7,0xE9,
-        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+    // x64 必须显式使用 REX.W，才能让真实 CPU 的 RDX:RAX 64 位高低半
+    // 对照迁移后的 UMUL_WIDE；末尾同宽 ADD 只关闭 MUL/IMUL 未定义 flags。
+    // Win32 保持对应的 EDX:EAX 32 位 fixture。
+    const std::vector<uint8_t> wideMultiplyBytes = kIs64
+        ? std::vector<uint8_t>{
+            0x48,0xF7,0xE1, 0x48,0xF7,0xE9,
+            0x48,0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3}
+        : std::vector<uint8_t>{
+            0xF7,0xE1, 0xF7,0xE9,
+            0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
 
     const struct {
         const std::vector<uint8_t>* bytes;
@@ -1050,6 +1055,87 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         }
     }
 }
+
+#if defined(_M_X64)
+void TestX64ZydisUmulWidePerKNativeDifferential() {
+    const auto seed = MakeSeed(0xB9u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(true),
+        "x64 UMUL_WIDE per-K disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+    // mul rcx; add rax,rdx; ret. ADD consumes both halves asymmetrically:
+    // final RDX remains the hardware high half, while final RAX includes low
+    // and high, and its defined flags close MUL's undefined-flags window.
+    const std::vector<uint8_t> bytes = {
+        0x48,0xF7,0xE1,
+        0x48,0x01,0xD0,
+        0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    const auto umul = std::find_if(
+        translation.instructions.begin(), translation.instructions.end(),
+        [](const MicroInstruction& instruction) {
+            return instruction.opcode == VM_UOP_UMUL_WIDE;
+        });
+    Require(umul != translation.instructions.end(),
+        "x64 MUL fixture emitted no UMUL_WIDE instruction");
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0x554D554C583634ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "x64 UMUL_WIDE per-K software IR preflight failed: " +
+            preflight.error);
+
+    std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+    std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = VM_ARCH_X64;
+        config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+        config.semantic = VM_UOP_UMUL_WIDE;
+        config.variant = umul->handlerVariant;
+        const auto generated = GenerateVMHandlerSemanticKernel(config);
+        Require(generated.success,
+            "x64 UMUL_WIDE seed selection generation failed: " +
+                generated.error);
+        const uint8_t strategy = generated.semanticCoreStrategy;
+        Require(strategy < plansByStrategy.size(),
+            "x64 UMUL_WIDE selected an unknown K strategy");
+        if (plansByStrategy[strategy].insert(
+                generated.registerAssignment).second) {
+            providerSeedsByStrategy[strategy].push_back(
+                static_cast<uint8_t>(domain));
+        }
+        if (plansByStrategy[0].size() == 4u &&
+                plansByStrategy[1].size() == 4u) break;
+    }
+    Require(plansByStrategy[0].size() == 4u &&
+            plansByStrategy[1].size() == 4u &&
+            providerSeedsByStrategy[0].size() == 4u &&
+            providerSeedsByStrategy[1].size() == 4u,
+        "x64 UMUL_WIDE differential seeds did not cover four plans for both K values");
+
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+            const std::string label =
+                "native-vs-VM x64 Zydis UMUL_WIDE low/high K=" +
+                std::to_string(strategy) + " seed " +
+                std::to_string(providerSeed);
+            RunDifferentialCase(function, translation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
+    }
+}
+#endif
 
 #if defined(_M_IX86)
 void TestX86ZydisUmulWidePerKNativeDifferential() {
@@ -2163,6 +2249,10 @@ int main(int argc, char** argv) {
         &TestShiftOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("剩余算术家族真 K 变体: 真实 CPU 与合成 handler 链一致性检测",
         &TestRemainingArithmeticFamiliesNativeDifferential, failures);
+#if defined(_M_X64)
+    Run("x64 Zydis UMUL_WIDE RDX:RAX per-K/multi-seed native differential",
+        &TestX64ZydisUmulWidePerKNativeDifferential, failures);
+#endif
 #if defined(_M_IX86)
     Run("x86 Zydis UMUL_WIDE per-K/multi-seed native differential",
         &TestX86ZydisUmulWidePerKNativeDifferential, failures);

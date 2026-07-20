@@ -1899,3 +1899,149 @@ corpus、skip 规则与 timeout 全部保持原值。
   固定约束，只在显式乘数来源允许的范围内变化；除普通差分外必须专项验证 high/
   low half 没有颠倒。既有 0.714 单点仅作为受硬件约束的基线，不为追求普通 ALU
   数字引入危险寄存器或放宽门禁。
+
+## 独立批次 14：x64 `UMUL_WIDE` 硬件隐式结果对（2026-07-21）
+
+### 范围与结论
+
+本批只迁移 x64 `VM_UOP_UMUL_WIDE`，没有触碰 `CALL_HOST` 或
+`BRIDGE_EXTENDED`。原 x64 K0 的 `c.Raw({49 F7 E1})` 与 K1 的
+`c.Raw({4D 89 CA 49 F7 E2})` 已由 `EmitZydisX64UmulWideCore` 的正式
+`ZydisEncoderRequest` 路径替换；寄存器直接和内存 source form 都只走 Encoder，
+编码失败继续 `FailEncoding`，没有 Raw fallback 或双轨实现。累计进度由
+**51/54** 增至 **52/54**，生产双策略静态覆盖保持 **54/54**。
+
+历史数字也在本批重新核对：首轮表中的 `0.714286` 是 x86
+`UMUL_WIDE K=1`，不是 x64；当时 x64 全架构最差 core pair 是 `0.517241`。
+因此本批不拿错误的 x86 单点当 x64 目标，而是新增 x64 per-K 独立观测，并以
+当前固定种子实测值设回归上限。
+
+### x64 真实活跃性与硬件约束
+
+`EmitX64WideMultiply` 在进入每个 width branch 的 business core 时已经完成：
+
+- `RAX=masked a`，同时是 CPU 焊死的隐式乘数输入和 low 输出；
+- `RDX=masked b`，执行 `MUL r/m64` 后由 CPU 焊死为 high 输出；
+- `R9=b`，是唯一可变化的显式 multiplier 来源；
+- `R8=copy-a`；`R10` 入 core 时是 copy-b，原 b 已 pre-latch，因此旧 K1
+  可把同一个 b 值直接作为显式 multiplier 使用；
+- `R11=width`，完成分派后该值在 core 内已死，narrow 后段会重新加载；
+- `RCX` 的 pop/index/width 生命周期均已结束，后段使用前会重写；
+- `R15=context`，`RSP` 与全部非易失 GPR 始终排除。
+
+RAX/RDX 绝不进入 seed pool。每个 K 都有四套从上述局部状态单独证明的计划：
+
+| K | registerAssignment | 实际显式形式 |
+|---|---|---|
+| 0 | `{R9,R8,R10,reg}` | `mul r9`，旧 K0 计划 |
+| 0 | `{RCX,R8,R10,reg}` | `mov rcx,r9; mul rcx` |
+| 0 | `{R11,R8,R10,reg}` | `mov r11,r9; mul r11` |
+| 0 | `{R11,R8,R10,mem}` | seed-split `lea/store; mul qword ptr [r11+disp32]` |
+| 1 | `{R10,R8,R11,reg}` | `mov r10,r9; mul r10`，旧 K1 计划 |
+| 1 | `{RCX,R8,R10,reg}` | `mov rcx,r9; mul rcx` |
+| 1 | `{R11,R8,R10,reg}` | `mov r11,r9; mul r11` |
+| 1 | `{RCX,R8,R10,mem}` | seed-split `lea/store; mul qword ptr [rcx+disp32]` |
+
+寄存器形式的 MOV/MUL 让变化进入 REX/ModRM；内存形式进一步改变 base、disp32 与
+memory operand。寄存器形式若两个 build 偶然选择同一计划，本身仍可能逐字节相同，
+所以在 MOV/MUL 前保留一对作用于 R9 的同 key XOR。它们真实消费 build seed、严格
+自消，不改变 multiplier；多样性不是只靠该立即数，因为四套 decode signature
+仍分别不同。
+
+Win32 本批不改生产代码。它继续使用独立批次 2/3B 已证明的 EAX/EDX 隐式 pair、
+四套 per-K source plans 与专属 native differential；本批仍完整重跑 Win32，证明
+共享 codegen、validator 和测试注册没有回归。
+
+### 固定旧计划的代表字节
+
+`TestX64ZydisUmulWidePerKSourcePlans` 穷举完整 seed byte × 全部 handler variant，
+真实解码每条 core，并要求 Zydis 隐式 operand 中同时存在 RAX 与 RDX。首次命中的
+固定旧计划输出如下：
+
+| K | 迁移前 | Zydis 后完整 core | 说明 |
+|---|---|---|---|
+| 0 | `49 F7 E1` | `49 81 F1 B5D27431 49 81 F1 B5D27431 49 F7 E1` | 尾部 `mul r9` 逐字节相同；前置双 XOR 自消并携带 build seed |
+| 1 | `4D 89 CA 49 F7 E2` | `49 81 F1 A15E4B62 49 81 F1 A15E4B62 4D 89 CA 49 F7 E2` | 尾部 `mov r10,r9; mul r10` 逐字节相同；同样只增加自消扰动 |
+
+这里没有强制 Zydis 选非规范编码、插 NOP 或保留手写 fallback。`MUL` 最终覆盖
+CF/OF；其余状态位本来就未定义，lazy-flags 只根据保存的 low/high record 生成
+架构定义的 CF/OF，因此前置 XOR 不扩大可观察 flags 集合。
+
+### 实现中发现并修复的问题
+
+1. 旧 x64 wrapper 在 core 前执行 `R11=b`，随后 `X64DispatchWidth` 又把 R11
+   覆盖为 width，最后 `X64Latch(...,R11,...)` 因而把 width 错记成
+   `lastAlu.b`。普通乘积仍可能正确，只有继续观察 lazy record 时才暴露。最终沿用
+   现有 binary/divide wrapper 的 split-latch 模式：分派前先清 record 并保存精确
+   masked a/b，core 后只补 low/high/width/valid。这样也覆盖共享 wrapper 的
+   `SMUL_WIDE` 窄宽度 sign-extension 生命周期，不依赖某个 source plan 恰好不覆盖
+   保存寄存器。
+2. 首版 x64 native fixture 用合法的 accumulator short form
+   `48 05 00000000` 表示 `add rax,0`，但生产 translator 的该二元立即数入口
+   fail-closed，不接受 short form。测试没有给 translator 加特例，而是改用同语义、
+   同 64 位宽度的通用 ModRM 形式 `48 81 C0 00000000`，继续通过真实生产入口关闭
+   MUL 的未定义 flags 窗口。
+3. 终审发现 mixed `mul; imul` fixture 会在最终快照前用 IMUL 覆写首条 UMUL 的
+   RDX high，因而不能宣称 high 在该差分中独立可观察。最终新增专属
+   `mul rcx; add rax,rdx; ret` fixture，并按两个 K 的全部八套 source plan 重跑；
+   RDX 保持 high，RAX 消费两半，证据不再依赖后续会覆写结果的指令。
+4. 首次同时跑两架构全套 CTest 时，两个静态 gate 争用同一个
+   `build_vm_micro_op_ratio_gate`，MSBuild 明确报同一 OBJ 被另一进程占用。最终将该
+   共享门禁串行重跑，两架构均通过；没有把文件锁忽略为噪音，也没有改 corpus、
+   timeout 或断言。
+
+### high/low、native differential 与证据边界
+
+- 新增具名 host-arch 真 handler 矩阵，以
+  `a=0x8000000000000001, b=3` 执行两个 K。预期
+  `low=0x8000000000000003`、`high=1`；UMUL 先 push low 再 push high，故第一个
+  POP 必须读到 high、第二个读到 low。矩阵同时逐字段检查
+  `lastAlu.a/b/result/auxiliary/width/valid`，交换 RAX/RDX 或继续错记 b 都会失败。
+- `UMUL_WIDE` 有生产 translator 入口。原 mixed fixture 已升级为真正的 REX.W
+  `mul/imul`；另新增专属 `48 F7 E1; 48 01 D0; C3`，即
+  `mul rcx; add rax,rdx; ret`。末尾 ADD 关闭未定义 flags，保留 RDX 为独立 high
+  输出，并让 RAX 同时消费 low/high；provider 比较全部 GPR，因此两半都实际可观察，
+  不会再被后续 IMUL 覆盖。
+- 专属 fixture 从 255 个 provider seed 动态选择 K0 `2/5/12/20`、K1
+  `1/4/9/17`，覆盖实际 translator 到达的 UMUL handler variant、两个 K、每 K
+  四套 assignment/source form；每 seed 32 个真实 CPU corpus 全部通过。既有
+  mixed SMUL coverage 同时保留。
+- Win32 generic wide fixture 继续通过，x86 专项另以 K0 seeds
+  `1/4/5/22`、K1 seeds `2/3/7/19` 覆盖全部四套旧计划。它是回归证据，不冒充
+  本批 x64 迁移证据。
+- 本语义没有调用、ABI frame、unwind funclet、SIMD 借用或预期 fault；因此本批
+  不伪造异常 unwind 证据。异常/unwind 与 SIMD 保存恢复要求留给接下来的
+  `CALL_HOST`/`BRIDGE_EXTENDED` 独立批。
+
+### 双架构验证与 per-build similarity
+
+- Release x64/Win32 目标重新编译通过；没有新增、安装或下载依赖。
+- x64 除 similarity 外串行 CTest **17/17** 通过；补齐专属 high/low fixture 后，
+  当前完整 `test_vm_native_differential.exe` 直接运行 109.0 秒、退出码 0；正式
+  similarity 310.41 秒通过。
+- Win32 除既有完整 native CTest wrapper 与 similarity 外 **16/16** 通过；同一
+  `test_vm_native_differential.exe` 直接运行 134.1 秒自然完成、退出码 0；正式
+  similarity 373.96 秒通过。保持既有 CTest `TIMEOUT 120`，没有提高 timeout。
+- `vm_kernel_static_gate` 在两架构构建树串行通过，并明确保持生产双策略
+  **54/54**。
+- 固定种子合成中 x64 `core_variant=0.323927`，全局最差 pair `0.447059`；新增
+  x64 UMUL K0/K1 独立 pair 均为 `0.000000`，固化 `<0.10` 的专属 deterministic
+  上限。x86 `core_variant=0.252309`，既有最差 pair `0.592105` 未变。
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers | business/core max pair |
+|---|---:|---:|---:|---:|---:|
+| x64 EXE | 0.2666 | 0.1445 | 0.1163 | 0.0001 | 0.3677 / 0.4091 |
+| x64 DLL | 0.2757 | 0.1498 | 0.1400 | 0.0001 | 0.3883 / 0.3866 |
+| Win32 EXE | 0.2649 | 0.1116 | 0.0237 | 0.0001 | 0.4093 / 0.4483 |
+| Win32 DLL | 0.2691 | 0.1011 | 0.0000 | 0.0001 | 0.4053 / 0.2987 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；聚合阈值、单 pair ceiling、
+corpus、skip 规则与 CTest timeout 全部保持原值。
+
+### 当前剩余语义与下一批边界
+
+按当前生产源码，剩余 **2/54**：`CALL_HOST` 与 `BRIDGE_EXTENDED`。二者必须继续
+拆成两个独立高风险批；先完成并稳定 `CALL_HOST`，再开始 `BRIDGE_EXTENDED`。
+任何随机 frame/register 计划必须由同一份数据同时驱动指令与 unwind/.pdata，且
+必须真实执行“目标代码内部故意抛异常”的 Windows unwind 测试，并对所有临时借用的
+XMM/SIMD 状态做调用前后逐字节一致性检查。正常返回结果正确仍不是充分证据。

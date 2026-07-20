@@ -975,7 +975,8 @@ void ExecuteOracleEquivalentProgram(
     TestRuntimeIatImage& testImage,
     const std::array<uint64_t, 32>& initialGprs,
     uint64_t initialFlags,
-    std::vector<uint8_t>* memory = nullptr)
+    std::vector<uint8_t>* memory = nullptr,
+    VM_MICRO_EXECUTION_CONTEXT* observedContext = nullptr)
 {
     const std::vector<uint8_t> bytecode =
         EncodeStraightLineRuntimeProgram(program, encoding);
@@ -1056,6 +1057,7 @@ void ExecuteOracleEquivalentProgram(
         label + " 未在顶层 RET/EXIT 边界停机");
     if (memory) Require(*memory == expectedMemory,
         label + " 的内存副作用与 oracle 不一致");
+    if (observedContext) *observedContext = context;
 }
 
 void RequireLazyRecordEqual(
@@ -1597,6 +1599,52 @@ void ExecuteArithmeticVariantMatrix(
                 program, config, result, loaded, encoding, testImage,
                 initialGprs, 0x202ULL);
         }
+    }
+}
+
+void ExecuteX64UmulWidePlacementMatrix(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+    constexpr uint64_t a = 0x8000000000000001ULL;
+    constexpr uint64_t b = 3u;
+    constexpr uint64_t expectedLow = 0x8000000000000003ULL;
+    constexpr uint64_t expectedHigh = 1u;
+    for (uint8_t strategy : kCoreStrategies) {
+        const auto variant = [&](VM_MICRO_OPCODE semantic) {
+            return CoreVariantForStrategy(config, semantic, strategy);
+        };
+        const std::vector<MicroInstruction> program = {
+            Uop(VM_UOP_PUSH_IMM, {a, 8u}, variant(VM_UOP_PUSH_IMM)),
+            Uop(VM_UOP_PUSH_IMM, {b, 8u}, variant(VM_UOP_PUSH_IMM)),
+            Uop(VM_UOP_UMUL_WIDE, {8u}, variant(VM_UOP_UMUL_WIDE)),
+            // UMUL pushes low then high, so the first pop must observe high.
+            Uop(VM_UOP_POP_VREG, {9u, 8u, 0u, 1u},
+                variant(VM_UOP_POP_VREG)),
+            Uop(VM_UOP_POP_VREG, {8u, 8u, 0u, 1u},
+                variant(VM_UOP_POP_VREG)),
+            Uop(VM_UOP_RET, {0u}, variant(VM_UOP_RET)),
+        };
+        VM_MICRO_EXECUTION_CONTEXT observed{};
+        const std::array<uint64_t, 32> initialGprs{};
+        ExecuteOracleEquivalentProgram(
+            "x64 UMUL_WIDE RDX:RAX placement strategy=" +
+                std::to_string(strategy),
+            program, config, result, loaded, encoding, testImage,
+            initialGprs, 0x202ULL, nullptr, &observed);
+        Require(observed.vregs[8] == expectedLow &&
+                observed.vregs[9] == expectedHigh,
+            "x64 UMUL_WIDE low/high halves were swapped or truncated");
+        Require(observed.lastAlu.a == a && observed.lastAlu.b == b &&
+                observed.lastAlu.result == expectedLow &&
+                observed.lastAlu.auxiliary == expectedHigh &&
+                observed.lastAlu.width == 8u &&
+                observed.lastAlu.valid == 1u,
+            "x64 UMUL_WIDE lazy record lost a/b or RDX:RAX placement");
     }
 }
 
@@ -2282,6 +2330,11 @@ void TestHostContextEntryExecution() {
     std::cout << "[阶段] 算术/扩展/宽乘除全宽度双策略差分\n";
     ExecuteArithmeticVariantMatrix(
         config, result, loaded, encoding, testImage);
+#if defined(_M_X64)
+    std::cout << "[阶段] x64 UMUL_WIDE RDX:RAX 高低半与 lazy record 专项\n";
+    ExecuteX64UmulWidePlacementMatrix(
+        config, result, loaded, encoding, testImage);
+#endif
     std::cout << "[阶段] FLAGS 家族全宽度/下游组合双策略差分\n";
     ExecuteFlagsVariantMatrix(
         config, result, loaded, encoding, testImage);
@@ -2561,6 +2614,11 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     constexpr double kMaxPairCeilingCoreVariant = 0.75;
     constexpr double kX86UmulWideK0PairCeiling = 0.65;
     constexpr double kX86UmulWideK1PairCeiling = 0.55;
+    // This deterministic x64 seed pair measures 0.0 for both K values after
+    // the four source-form plans landed.  Keep a small non-zero allowance so
+    // harmless encoding normalization can move while a structural collapse
+    // cannot hide behind the global pair ceiling.
+    constexpr double kX64UmulWidePairCeiling = 0.10;
     const auto seedA = MakeSeed(static_cast<uint8_t>(
         architecture == VMHandlerArchitecture::X64 ? 0x64 : 0x32));
     const auto seedB = MakeSeed(static_cast<uint8_t>(
@@ -2685,6 +2743,7 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
     double maxBusinessCorePairSimilarity = -1.0;
     std::string maxBusinessCorePairLabel;
     std::array<double, 2> x86UmulWidePairSimilarity = {-1.0, -1.0};
+    std::array<double, 2> x64UmulWidePairSimilarity = {-1.0, -1.0};
     const auto orderedA = SortedHandlers(buildA);
     const auto orderedB = SortedHandlers(buildB);
     std::map<uint8_t, std::pair<std::vector<uint8_t>, std::vector<uint8_t>>>
@@ -2764,6 +2823,12 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
                 x86UmulWidePairSimilarity[left->variant] =
                     corePairSimilarity;
             }
+            if (architecture == VMHandlerArchitecture::X64 &&
+                    left->semantic == VM_UOP_UMUL_WIDE &&
+                    left->variant < x64UmulWidePairSimilarity.size()) {
+                x64UmulWidePairSimilarity[left->variant] =
+                    corePairSimilarity;
+            }
             if (corePairSimilarity > maxCoreVariantPairSimilarity) {
                 maxCoreVariantPairSimilarity = corePairSimilarity;
                 maxCoreVariantPairLabel = pairKey;
@@ -2827,6 +2892,23 @@ void ValidatePerBuildDivergence(VMHandlerArchitecture architecture) {
                     std::to_string(ceilings[strategy]) + ": " +
                     std::to_string(
                         x86UmulWidePairSimilarity[strategy]));
+        }
+    }
+    if (architecture == VMHandlerArchitecture::X64) {
+        for (size_t strategy = 0u;
+             strategy < x64UmulWidePairSimilarity.size(); ++strategy) {
+            Require(x64UmulWidePairSimilarity[strategy] >= 0.0,
+                "x64 UMUL_WIDE per-K pair metric was not sampled");
+            std::cout << "[x64-umul-wide-k" << strategy <<
+                "-similarity] dice=" <<
+                x64UmulWidePairSimilarity[strategy] << '\n';
+            Require(x64UmulWidePairSimilarity[strategy] <
+                    kX64UmulWidePairCeiling,
+                "x64 UMUL_WIDE K=" + std::to_string(strategy) +
+                    " core pair similarity regressed above " +
+                    std::to_string(kX64UmulWidePairCeiling) + ": " +
+                    std::to_string(
+                        x64UmulWidePairSimilarity[strategy]));
         }
     }
     Require(identicalCoreVariants.empty(),
@@ -4349,6 +4431,181 @@ void TestX86ZydisUmulWidePerKSourcePlans() {
     }
 }
 
+void TestX64ZydisUmulWidePerKSourcePlans() {
+    const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
+        {{9u, 8u, 10u, 1u},
+         {1u, 8u, 10u, 1u},
+         {11u, 8u, 10u, 1u},
+         {11u, 8u, 10u, 0u}},
+        {{10u, 8u, 11u, 1u},
+         {1u, 8u, 10u, 1u},
+         {11u, 8u, 10u, 1u},
+         {1u, 8u, 10u, 0u}}
+    }};
+    std::array<std::set<std::array<uint8_t, 4>>, 2> observedPlans{};
+    std::array<std::set<std::string>, 2> operandSignatures{};
+    std::array<std::set<std::string>, 2> structuralSignatures{};
+    std::array<bool, 2> sawLegacySuffix{};
+    for (uint16_t seedByte = 0u; seedByte <= 0xFFu; ++seedByte) {
+        for (uint8_t variant = 0u;
+             variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = VM_ARCH_X64;
+            config.buildSeed = MakeSeed(0xB6u);
+            config.buildSeed[static_cast<uint8_t>(VM_UOP_UMUL_WIDE) & 31u] =
+                static_cast<uint8_t>(seedByte);
+            config.semantic = VM_UOP_UMUL_WIDE;
+            config.variant = variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "x64 Zydis UMUL_WIDE generation failed: " + generated.error);
+            std::string validationError;
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    config, generated, validationError),
+                "x64 Zydis UMUL_WIDE validation failed: " + validationError);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < expectedPlans.size() &&
+                    expectedPlans[strategy].count(
+                        generated.registerAssignment) != 0u,
+                "x64 UMUL_WIDE published an unknown per-K liveness plan");
+
+            ZydisDecoder decoder = MakeSemanticDecoder(VM_ARCH_X64);
+            const uint8_t* core = generated.code.data() +
+                generated.semanticCoreVariantOffset;
+            size_t relative = 0u;
+            size_t multiplyCount = 0u;
+            while (relative < generated.semanticCoreVariantSize) {
+                ZydisDecodedInstruction instruction{};
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+                Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        &decoder, core + relative,
+                        generated.semanticCoreVariantSize - relative,
+                        &instruction, operands)),
+                    "Zydis could not decode x64 UMUL_WIDE per-K core");
+                relative += instruction.length;
+                if (instruction.mnemonic != ZYDIS_MNEMONIC_MUL) continue;
+                ++multiplyCount;
+                Require(instruction.operand_count_visible == 1u,
+                    "x64 UMUL_WIDE MUL lacks one explicit source");
+                const uint8_t expectedRegister =
+                    generated.registerAssignment[0];
+                const bool memorySource =
+                    generated.registerAssignment[3] == 0u;
+                if (memorySource) {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                            ZydisRegisterGetId(operands[0].mem.base) ==
+                                expectedRegister &&
+                            operands[0].size == 64u,
+                        "x64 UMUL_WIDE memory MUL does not use its 64-bit liveness base");
+                    operandSignatures[strategy].insert(
+                        "memory:" + std::to_string(expectedRegister));
+                } else {
+                    Require(operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            ZydisRegisterGetId(operands[0].reg.value) ==
+                                expectedRegister &&
+                            operands[0].size == 64u,
+                        "x64 UMUL_WIDE register MUL does not use its 64-bit liveness source");
+                    operandSignatures[strategy].insert(
+                        "register:" + std::to_string(expectedRegister));
+                }
+                std::set<int> implicitRegisterIds;
+                bool sawRaxRead = false;
+                bool sawRaxWrite = false;
+                bool sawRdxWrite = false;
+                for (uint8_t index = instruction.operand_count_visible;
+                     index < instruction.operand_count; ++index) {
+                    if (operands[index].type !=
+                            ZYDIS_OPERAND_TYPE_REGISTER) continue;
+                    const ZydisRegister enclosing =
+                        ZydisRegisterGetLargestEnclosing(
+                            ZYDIS_MACHINE_MODE_LONG_64,
+                            operands[index].reg.value);
+                    const int registerId = ZydisRegisterGetId(enclosing);
+                    implicitRegisterIds.insert(registerId);
+                    const bool reads = (operands[index].actions &
+                        ZYDIS_OPERAND_ACTION_MASK_READ) != 0u;
+                    const bool writes = (operands[index].actions &
+                        ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0u;
+                    if (registerId == 0) {
+                        sawRaxRead = sawRaxRead || reads;
+                        sawRaxWrite = sawRaxWrite || writes;
+                    } else if (registerId == 2) {
+                        sawRdxWrite = sawRdxWrite || writes;
+                    }
+                }
+                Require(implicitRegisterIds.count(0) != 0u &&
+                        implicitRegisterIds.count(2) != 0u &&
+                        sawRaxRead && sawRaxWrite && sawRdxWrite,
+                    "x64 UMUL_WIDE lost the hardware-fixed RAX read/low write or RDX high write");
+            }
+            Require(relative == generated.semanticCoreVariantSize &&
+                    multiplyCount == 1u,
+                "x64 UMUL_WIDE core did not contain exactly one hardware MUL");
+
+            observedPlans[strategy].insert(generated.registerAssignment);
+            structuralSignatures[strategy].insert(
+                DecodePilotRegisterSignature(VM_ARCH_X64, generated).text);
+            if (strategy == 0u && generated.registerAssignment ==
+                    std::array<uint8_t, 4>{9u, 8u, 10u, 1u} &&
+                    !sawLegacySuffix[0]) {
+                const std::array<uint8_t, 3> legacy = {0x49, 0xF7, 0xE1};
+                Require(generated.semanticCoreVariantSize >= legacy.size() &&
+                        std::equal(legacy.begin(), legacy.end(),
+                            core + generated.semanticCoreVariantSize -
+                                legacy.size()),
+                    "x64 UMUL_WIDE K=0 fixed plan no longer ends in legacy MUL R9 bytes");
+                const auto fixedCore = Slice(generated.code,
+                    generated.semanticCoreVariantOffset,
+                    generated.semanticCoreVariantSize);
+                std::ostringstream bytes;
+                bytes << std::hex;
+                for (uint8_t byte : fixedCore) {
+                    if (byte < 0x10u) bytes << '0';
+                    bytes << static_cast<unsigned>(byte);
+                }
+                std::cout << "[x64-umul-wide-fixed-bytes] K=0 bytes=" <<
+                    bytes.str() << '\n';
+                sawLegacySuffix[0] = true;
+            }
+            if (strategy == 1u && generated.registerAssignment ==
+                    std::array<uint8_t, 4>{10u, 8u, 11u, 1u} &&
+                    !sawLegacySuffix[1]) {
+                const std::array<uint8_t, 6> legacy = {
+                    0x4D, 0x89, 0xCA, 0x49, 0xF7, 0xE2};
+                Require(generated.semanticCoreVariantSize >= legacy.size() &&
+                        std::equal(legacy.begin(), legacy.end(),
+                            core + generated.semanticCoreVariantSize -
+                                legacy.size()),
+                    "x64 UMUL_WIDE K=1 fixed plan no longer ends in legacy MOV/MUL bytes");
+                const auto fixedCore = Slice(generated.code,
+                    generated.semanticCoreVariantOffset,
+                    generated.semanticCoreVariantSize);
+                std::ostringstream bytes;
+                bytes << std::hex;
+                for (uint8_t byte : fixedCore) {
+                    if (byte < 0x10u) bytes << '0';
+                    bytes << static_cast<unsigned>(byte);
+                }
+                std::cout << "[x64-umul-wide-fixed-bytes] K=1 bytes=" <<
+                    bytes.str() << '\n';
+                sawLegacySuffix[1] = true;
+            }
+        }
+    }
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        Require(observedPlans[strategy] == expectedPlans[strategy] &&
+                operandSignatures[strategy].size() == 4u &&
+                structuralSignatures[strategy].size() == 4u &&
+                sawLegacySuffix[strategy],
+            "x64 UMUL_WIDE per-K coverage lacks four real source forms");
+        std::cout << "[x64-umul-wide-k" << static_cast<unsigned>(strategy) <<
+            "-plans] assignments=" << observedPlans[strategy].size() <<
+            " operand_signatures=" << operandSignatures[strategy].size() <<
+            " structural_signatures=" <<
+                structuralSignatures[strategy].size() << '\n';
+    }
+}
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -4408,5 +4665,7 @@ int main() {
         &TestZydisFlagsLifecycleFixedRegisterPlans, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
+    Run("x64 Zydis UMUL_WIDE per-K source plans",
+        &TestX64ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;
 }
