@@ -3722,6 +3722,129 @@ void TestZydisPushConditionRegisterDiversity() {
     }
 }
 
+// Batch 10 is a flags-boundary batch, so each semantic is checked against its
+// own post-call liveness contract instead of being folded into a shared ALU
+// pool: MATERIALIZE publishes a seed-selected address role, PACK_AH a single
+// 32-bit work/result role, and UNPACK_AH a packed/flags pair.
+void TestZydisFlagsBoundaryRegisterDiversity() {
+    struct Expectation {
+        VM_MICRO_OPCODE semantic;
+        size_t minimumX64;
+        size_t minimumX86;
+        size_t liveRoleCount;
+    };
+    constexpr std::array<Expectation, 3> expectations = {{
+        {VM_UOP_FLAGS_MATERIALIZE, 7u, 3u, 1u},
+        {VM_UOP_FLAGS_PACK_AH, 7u, 3u, 1u},
+        {VM_UOP_FLAGS_UNPACK_AH, 7u, 3u, 2u},
+    }};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (const Expectation& expectation : expectations) {
+            const size_t minimum = architecture == VM_ARCH_X64
+                ? expectation.minimumX64 : expectation.minimumX86;
+            std::set<std::array<uint8_t, 4>> assignments;
+            std::array<std::set<std::string>, 2> signaturesByStrategy{};
+            for (uint8_t seedByte = 0u; seedByte < 16u; ++seedByte) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                    0xA0u + static_cast<uint8_t>(expectation.semantic)));
+                config.buildSeed[
+                    static_cast<uint8_t>(expectation.semantic) & 31u] =
+                        seedByte;
+                config.semantic = expectation.semantic;
+                config.variant = 0u;
+                const auto generated = GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "flags-boundary generation failed: " + generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "flags-boundary validation failed: " + validationError);
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                for (size_t role = 0u;
+                     role < expectation.liveRoleCount; ++role) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[role]) != 0u,
+                        "published flags-boundary register role is not in "
+                        "decoded core instructions");
+                }
+                Require(generated.semanticCoreStrategy < 2u,
+                    "flags-boundary semantic selected an invalid core "
+                    "strategy");
+                assignments.insert(generated.registerAssignment);
+                signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                    signature.text);
+            }
+            Require(assignments.size() >= minimum,
+                "build seed did not cover the flags-boundary liveness pool");
+            bool sameStrategyVaries = false;
+            for (size_t strategy = 0u; strategy < 2u; ++strategy) {
+                if (signaturesByStrategy[strategy].size() >= 2u)
+                    sameStrategyVaries = true;
+            }
+            Require(sameStrategyVaries,
+                "flags-boundary REX/ModRM/SIB signature did not vary at a "
+                "fixed business strategy");
+            std::cout << "[zydis-registers-flags-boundary] arch="
+                      << architecture << " semantic="
+                      << static_cast<unsigned>(expectation.semantic)
+                      << " assignments=" << assignments.size() << '\n';
+        }
+    }
+}
+
+void TestZydisFlagsBoundaryFixedRegisterPlans() {
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {{
+        VM_UOP_FLAGS_MATERIALIZE,
+        VM_UOP_FLAGS_PACK_AH,
+        VM_UOP_FLAGS_UNPACK_AH,
+    }};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = architecture;
+            config.buildSeed.fill(0u);
+            config.semantic = semantic;
+            config.variant = 0u;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "fixed flags-boundary plan generation failed: " +
+                    generated.error);
+            std::array<uint8_t, 2> expectedRoles{};
+            if (semantic == VM_UOP_FLAGS_MATERIALIZE) {
+                expectedRoles = architecture == VM_ARCH_X64
+                    ? std::array<uint8_t, 2>{10u, 0u}
+                    : std::array<uint8_t, 2>{1u, 0u};
+            } else if (semantic == VM_UOP_FLAGS_PACK_AH) {
+                expectedRoles = {0u, 1u};
+            } else {
+                expectedRoles = {0u, 2u};
+            }
+            Require(generated.registerAssignment[0] == expectedRoles[0] &&
+                    (semantic != VM_UOP_FLAGS_UNPACK_AH ||
+                     generated.registerAssignment[1] == expectedRoles[1]),
+                "zero-seed flags-boundary assignment no longer reproduces "
+                "the legacy fixed register plan");
+            const auto core = Slice(generated.code,
+                generated.semanticCoreVariantOffset,
+                generated.semanticCoreVariantSize);
+            std::ostringstream bytes;
+            bytes << std::hex;
+            for (uint8_t byte : core) {
+                if (byte < 0x10u) bytes << '0';
+                bytes << static_cast<unsigned>(byte);
+            }
+            std::cout << "[zydis-flags-fixed-bytes] arch=" << architecture
+                      << " semantic=" << static_cast<unsigned>(semantic)
+                      << " K="
+                      << static_cast<unsigned>(generated.semanticCoreStrategy)
+                      << " bytes=" << bytes.str() << '\n';
+        }
+    }
+}
+
 void TestX86ZydisUmulWidePerKSourcePlans() {
     const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
         {{1u, 2u, 3u, 6u},
@@ -3856,6 +3979,10 @@ int main() {
         &TestZydisWideOperandRegisterDiversity, failures);
     Run("Zydis PUSH_CONDITION register allocation",
         &TestZydisPushConditionRegisterDiversity, failures);
+    Run("Zydis flags boundary register allocation",
+        &TestZydisFlagsBoundaryRegisterDiversity, failures);
+    Run("Zydis flags boundary fixed-register byte plans",
+        &TestZydisFlagsBoundaryFixedRegisterPlans, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;

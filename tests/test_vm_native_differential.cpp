@@ -1322,6 +1322,149 @@ void TestBranchToRetMaterializesObservableFlags() {
         "branch-to-RET observable flags materialization");
 }
 
+void TestZydisFlagsBoundaryNativeDifferential() {
+    const auto seed = MakeSeed(0xEAu);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "flags-boundary disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // LAHF ; SAHF ; RET is a production-translator-reachable chain for all
+    // three migrated semantics. LAHF publishes status flags into AH through
+    // FLAGS_PACK_AH, SAHF consumes that byte through FLAGS_UNPACK_AH while
+    // preserving OF and non-status architectural bits, and RET forces the
+    // final FLAGS_MATERIALIZE boundary observed by the native return frame.
+    const std::vector<uint8_t> bytes = {0x9F, 0x9E, 0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {{
+        VM_UOP_FLAGS_MATERIALIZE,
+        VM_UOP_FLAGS_PACK_AH,
+        VM_UOP_FLAGS_UNPACK_AH,
+    }};
+    std::array<uint8_t, semantics.size()> variants{};
+    for (size_t semanticIndex = 0u;
+         semanticIndex < semantics.size(); ++semanticIndex) {
+        const auto instruction = std::find_if(
+            translation.instructions.begin(), translation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == semantics[semanticIndex];
+            });
+        Require(instruction != translation.instructions.end(),
+            "LAHF/SAHF/RET fixture did not reach every migrated flags "
+            "semantic through the production translator");
+        variants[semanticIndex] = instruction->handlerVariant;
+    }
+
+    // Provider seeds are selected from the actual synthesized handlers, not
+    // guessed from the seed byte. For every migrated semantic and both real K
+    // strategies, execute at least two distinct register assignments. The
+    // synthesis test separately decodes every assignment's REX/ModRM/SIB
+    // signature; this matrix supplies real CPU evidence for both K values and
+    // multiple forms without manufacturing a differential-only micro-op entry.
+    std::array<std::array<std::set<std::array<uint8_t, 4>>, 2>,
+        semantics.size()> assignments{};
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::array<uint8_t, semantics.size()> strategies{};
+        std::array<std::array<uint8_t, 4>, semantics.size()> assignments{};
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (size_t semanticIndex = 0u;
+             semanticIndex < semantics.size(); ++semanticIndex) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = semantics[semanticIndex];
+            config.variant = variants[semanticIndex];
+            const auto generated =
+                GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "flags-boundary provider-seed generation failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < 2u,
+                "flags-boundary provider seed selected an invalid K");
+            candidate.strategies[semanticIndex] = strategy;
+            candidate.assignments[semanticIndex] =
+                generated.registerAssignment;
+        }
+        candidates.push_back(candidate);
+    }
+
+    // Greedily choose the candidate that adds the most still-missing
+    // semantic/K/assignment cells. This preserves the exact structural
+    // coverage contract while avoiding redundant worker launches that can
+    // push the complete Win32 differential suite over its fixed CTest budget.
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perSemantic : assignments) {
+            for (const auto& perStrategy : perSemantic)
+                complete = complete && perStrategy.size() >= 2u;
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t semanticIndex = 0u;
+                 semanticIndex < semantics.size(); ++semanticIndex) {
+                const uint8_t strategy = candidate.strategies[semanticIndex];
+                if (assignments[semanticIndex][strategy].size() < 2u) {
+                    gain += assignments[semanticIndex][strategy].count(
+                        candidate.assignments[semanticIndex]) == 0u ? 1u : 0u;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "flags-boundary differential seed selection stalled before "
+            "covering every semantic/K/assignment cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t semanticIndex = 0u;
+             semanticIndex < semantics.size(); ++semanticIndex) {
+            const uint8_t strategy = selected.strategies[semanticIndex];
+            if (assignments[semanticIndex][strategy].size() < 2u) {
+                assignments[semanticIndex][strategy].insert(
+                    selected.assignments[semanticIndex]);
+            }
+        }
+    }
+    for (const auto& perSemantic : assignments) {
+        for (const auto& perStrategy : perSemantic) {
+            Require(perStrategy.size() >= 2u,
+                "flags-boundary differential seeds did not cover two "
+                "register assignments for each K");
+        }
+    }
+
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM LAHF/SAHF/RET flags boundary seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestUndefinedFlagsReadFailsClosed() {
     const auto seed = MakeSeed(0xD5);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -1473,11 +1616,17 @@ void Run(const char* name, void (*test)(), int& failures) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     int failures = 0;
 #if defined(_M_X64) || defined(_M_IX86)
+    if (argc == 2 &&
+            std::string(argv[1]) == "--flags-boundary-only") {
+        Run("Zydis FLAGS_MATERIALIZE/PACK_AH/UNPACK_AH multi-seed native differential",
+            &TestZydisFlagsBoundaryNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
     Run("Zydis AND/OR/XOR build-seed register native differential",

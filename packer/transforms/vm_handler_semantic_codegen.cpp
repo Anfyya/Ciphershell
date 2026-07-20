@@ -1545,6 +1545,61 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             : (coreStrategy == 0u ? 3u : 6u);
         return {address, 1u, 2u, memoryForm ? 0u : 1u};
     }
+    if (semantic == VM_UOP_FLAGS_MATERIALIZE) {
+        if (x64) {
+            // This core is the first operation in the handler. R15 is the
+            // context boundary and RDX is the prepared-call mask output; no
+            // other volatile GPR carries live state into the core. The
+            // address role may therefore use every Win64 volatile GPR,
+            // including RDX itself (MOV rdx,[rdx+disp] reads the effective
+            // address before publishing the loaded mask). R10 remains first
+            // so the zero-seed plan reproduces the old fixed-register form.
+            constexpr std::array<uint8_t, 7> pool = {
+                10u, 0u, 1u, 2u, 8u, 9u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The x86 core is likewise the first handler operation. EDI remains
+        // context; EBX/ESI remain direct-threaded ABI state. EAX/ECX/EDX are
+        // all dead on entry and EDX is only the post-core mask boundary.
+        // ECX stays first to preserve the old fixed-register byte baseline.
+        constexpr std::array<uint8_t, 3> pool = {1u, 0u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_PACK_AH) {
+        if (x64) {
+            // The real flag-materializer call has just clobbered every Win64
+            // volatile GPR, after which the wrapper loads virtualFlags only
+            // into RDX. R15/context is the sole nonvolatile boundary. The
+            // selected work/result role may use the complete volatile set;
+            // RAX remains first for the legacy fixed-register plan and is
+            // restored as the PushOne result boundary after the core.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 1u, 2u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The materializer call leaves only EDI/context and the x86 threaded
+        // ABI registers reserved; the wrapper then loads virtualFlags into
+        // EDX. EAX/ECX/EDX are therefore the complete safe work/result pool.
+        constexpr std::array<uint8_t, 3> pool = {0u, 1u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_UNPACK_AH) {
+        if (x64) {
+            // After the materializer call the wrapper reloads exactly two
+            // live values: packed AH in RAX and virtualFlags in RDX. Every
+            // other Win64 volatile GPR is dead and R15/context stays fixed.
+            // Roles are packed and flags; the RAX/RDX prefix preserves the
+            // old plan while every adjacent pair is safe via parallel moves.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The same post-call boundary on x86 leaves packed AH in EAX and
+        // virtualFlags in EDX. Only caller-volatile EAX/EDX/ECX participate;
+        // EBX/ESI/EDI remain outside this core's liveness contract.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
     std::array<uint8_t, 4> output{};
     if (x64) {
         constexpr std::array<uint8_t, 7> pool = {0, 1, 2, 8, 9, 10, 11};
@@ -3520,6 +3575,105 @@ void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     MoveRegisterPair(c, x64, 0u, 2u, a, b);
 }
 
+void EmitZydisFlagsMaterializeCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    // The core prepares the requested flags mask in the fixed RDX/EDX call
+    // boundary. Only the keyed address role varies; R15/EDI remains context.
+    const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxDecodedOperands + k0));
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, address, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k3);
+    EmitZydisLoad(c, x64, 2u, address,
+        static_cast<int32_t>(0u - (k0 + k1 - k2 + k3)), nativeBytes);
+}
+
+void EmitZydisFlagsPackAhCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
+        VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+    const uint32_t rawKey = CoreKey32(c, strategy + 2u);
+    uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
+    if (packedKey == 0u) {
+        packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
+            (rawKey % 5u == 1u) ? 2u :
+            (rawKey % 5u == 2u) ? 4u :
+            (rawKey % 5u == 3u) ? 6u : 7u);
+    }
+    const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
+    const uint32_t rotatedMask = strategy == 0u
+        ? ((packedMask >> rotation) | (packedMask << (32u - rotation)))
+        : ((packedMask << rotation) | (packedMask >> (32u - rotation)));
+    const uint8_t value = c.registerAssignment[0];
+
+    // virtualFlags enters in RDX/EDX. All arithmetic intentionally stays
+    // 32-bit: architectural status bits live in the low dword and every
+    // 32-bit write zero-extends on x64 just like the previous fixed-EAX code.
+    if (value != 2u) EmitZydisSizedMove(c, x64, value, 2u, 4u);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, value, 4u, packedKey);
+    EmitZydisSizedBinaryImmediate(c, x64,
+        strategy == 0u ? ZYDIS_MNEMONIC_ROR : ZYDIS_MNEMONIC_ROL,
+        value, 4u, rotation);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_AND, value, 4u, rotatedMask);
+    EmitZydisSizedBinaryImmediate(c, x64,
+        strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+        value, 4u, rotation);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, value, 4u, packedKey);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_OR, value, 4u, 0x02u);
+    if (value != 0u) EmitZydisSizedMove(c, x64, 0u, value, 4u);
+}
+
+void EmitZydisFlagsUnpackAhCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    constexpr uint32_t statusMask = VM_FLAG_SF | VM_FLAG_ZF |
+        VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+    const uint32_t key = CoreKey32(c, strategy + 6u);
+    const uint8_t packed = c.registerAssignment[0];
+    const uint8_t flags = c.registerAssignment[1];
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+
+    // The wrapper publishes packed AH in RAX/EAX and virtualFlags in RDX/EDX.
+    // Parallel move-in handles every seed-selected adjacent pair, including
+    // the exact swapped pair, without a hidden scratch register.
+    MoveRegisterPair(c, x64, packed, flags, 0u, 2u);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, packed, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, key);
+    if (strategy == 0u) {
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            flags, nativeBytes, x64
+                ? ZydisSignExtendImmediateBits(
+                    ~static_cast<uint32_t>(statusMask), 4u)
+                : ~static_cast<uint32_t>(statusMask));
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            packed, 4u, statusMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, flags, packed);
+    } else {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, packed, flags);
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            packed, 4u, statusMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, flags, packed);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, key);
+    if (flags != 2u) EmitZydisMove(c, x64, 2u, flags);
+}
+
 void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 6u);
     const bool alternate = c.registerAssignment[1] != 2u;
@@ -4304,18 +4458,7 @@ bool EmitBusinessCoreVariant(
                 }
                 return true;
             case VM_UOP_FLAGS_MATERIALIZE:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxDecodedOperands + k0);
-                    X64BinaryImmediate32(c, 0u, 10u, k1);
-                    X64BinaryImmediate32(c, 5u, 10u, k2);
-                    X64BinaryImmediate32(c, 0u, 10u, k3);
-                    c.Raw({0x49,0x8B,0x92});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisFlagsMaterializeCore(c, true, strategy);
                 return true;
             case VM_UOP_FLAGS_WRITE:
                 EmitKeyedFlagsWriteCore(c, true, strategy);
@@ -4387,54 +4530,11 @@ bool EmitBusinessCoreVariant(
                 return true;
             }
             case VM_UOP_FLAGS_PACK_AH: {
-                constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
-                    VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
-                const uint32_t rawKey = CoreKey32(c, strategy + 2u);
-                uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
-                if (packedKey == 0u)
-                    packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
-                        (rawKey % 5u == 1u) ? 2u :
-                        (rawKey % 5u == 2u) ? 4u :
-                        (rawKey % 5u == 3u) ? 6u : 7u);
-                const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
-                const uint32_t rotatedMask = strategy == 0u
-                    ? ((packedMask >> rotation) |
-                        (packedMask << (32u - rotation)))
-                    : ((packedMask << rotation) |
-                        (packedMask >> (32u - rotation)));
-
-                // Rotate an encoded flags value and its live mask together,
-                // apply the real selection in that domain, then rotate/decode.
-                c.Raw({0x89,0xD0});
-                X86BinaryImmediate32(c, 6u, 0u, packedKey);
-                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
-                    rotation, 0x25});
-                c.U32(rotatedMask);
-                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
-                    rotation});
-                X86BinaryImmediate32(c, 6u, 0u, packedKey);
-                c.Raw({0x83,0xC8,0x02});
+                EmitZydisFlagsPackAhCore(c, true, strategy);
                 return true;
             }
             case VM_UOP_FLAGS_UNPACK_AH: {
-                const uint32_t key = CoreKey32(c, strategy + 6u);
-                // Both selectable values use the same seed representation;
-                // masked selection therefore produces an encoded result that
-                // is decoded only after the real flags transformation.
-                X64BinaryImmediate32(c, 6u, 0u, key);
-                X64BinaryImmediate32(c, 6u, 2u, key);
-                if (strategy == 0u) {
-                    c.Raw({0x48,0x81,0xE2});
-                    c.U32(~static_cast<uint32_t>(
-                        VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
-                    X64BinaryRegister(c, 0x09, 2, 0);
-                } else {
-                    X64BinaryRegister(c, 0x31, 0, 2);
-                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                }
-                X64BinaryImmediate32(c, 6u, 2u, key);
+                EmitZydisFlagsUnpackAhCore(c, true, strategy);
                 return true;
             }
             case VM_UOP_PUSH_CONDITION:
@@ -4686,18 +4786,7 @@ bool EmitBusinessCoreVariant(
             }
             return true;
         case VM_UOP_FLAGS_MATERIALIZE:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x8F}); c.U32(CtxDecodedOperands + k0);
-                X86BinaryImmediate32(c, 0u, 1u, k1);
-                X86BinaryImmediate32(c, 5u, 1u, k2);
-                X86BinaryImmediate32(c, 0u, 1u, k3);
-                c.Raw({0x8B,0x91});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisFlagsMaterializeCore(c, false, strategy);
             return true;
         case VM_UOP_FLAGS_WRITE:
             EmitKeyedFlagsWriteCore(c, false, strategy);
@@ -4760,45 +4849,11 @@ bool EmitBusinessCoreVariant(
             return true;
         }
         case VM_UOP_FLAGS_PACK_AH: {
-            constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
-                VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
-            const uint32_t rawKey = CoreKey32(c, strategy + 2u);
-            uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
-            if (packedKey == 0u)
-                packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
-                    (rawKey % 5u == 1u) ? 2u :
-                    (rawKey % 5u == 2u) ? 4u :
-                    (rawKey % 5u == 3u) ? 6u : 7u);
-            const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
-            const uint32_t rotatedMask = strategy == 0u
-                ? ((packedMask >> rotation) |
-                    (packedMask << (32u - rotation)))
-                : ((packedMask << rotation) |
-                    (packedMask >> (32u - rotation)));
-            c.Raw({0x89,0xD0});
-            X86BinaryImmediate32(c, 6u, 0u, packedKey);
-            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
-                rotation, 0x25});
-            c.U32(rotatedMask);
-            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
-                rotation});
-            X86BinaryImmediate32(c, 6u, 0u, packedKey);
-            c.Raw({0x83,0xC8,0x02});
+            EmitZydisFlagsPackAhCore(c, false, strategy);
             return true;
         }
         case VM_UOP_FLAGS_UNPACK_AH: {
-            // Uniform XOR conjugation commutes with the masked bit-select:
-            // status bits come from EAX, every other bit remains from EDX.
-            const uint32_t key = CoreKey32(c, strategy + 6u);
-            X86BinaryImmediate32(c, 6u, 0u, key);
-            X86BinaryImmediate32(c, 6u, 2u, key);
-            if (strategy == 0u) {
-                c.Raw({0x81,0xE2});
-                c.U32(~static_cast<uint32_t>(
-                    VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-                c.Raw({0x25,0xD5,0x00,0x00,0x00,0x09,0xC2});
-            } else c.Raw({0x31,0xD0,0x25,0xD5,0x00,0x00,0x00,0x31,0xC2});
-            X86BinaryImmediate32(c, 6u, 2u, key);
+            EmitZydisFlagsUnpackAhCore(c, false, strategy);
             return true;
         }
         case VM_UOP_PUSH_CONDITION:

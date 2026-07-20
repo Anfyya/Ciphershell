@@ -1399,3 +1399,136 @@ IDIV_WIDE），也可能出现在看起来只是"分支到不同手写字节"的
 第二类：`FLAGS_LAZY`、`FLAGS_MATERIALIZE`、`FLAGS_PACK_AH`、
 `FLAGS_UNPACK_AH`、`FLAGS_UPDATE`、`FLAGS_WRITE` 六个标志位管理语义，
 要求双倍复核、覆盖全部宽度与下游语义组合、可拆分成两个 3 语义子批。
+
+## 推广批次 10：`FLAGS_MATERIALIZE`、`FLAGS_PACK_AH`、`FLAGS_UNPACK_AH`（2026-07-20）
+
+### 范围、风险边界与结论
+
+本批迁移第二类 flags 家族的第一个三语义子批：
+`FLAGS_MATERIALIZE`、`FLAGS_PACK_AH`、`FLAGS_UNPACK_AH`。三者都位于真实
+flag-materializer 调用边界：前者准备 requested mask 后立即调用 materializer，
+后两者分别实现 `LAHF`/`SAHF` 的 status-bit 打包与合并。它们按 flags/ABI 高风险
+语义执行两遍活跃性与边界复核，没有与普通 ALU、控制流或 ABI bridge 混做。
+
+三个 business core 的正式生产路径均只调用 `EmitZydisFlags*Core`，每条目标
+指令都通过 `ZydisEncoderRequest` 生成；Encoder 失败写入
+`CodeBuffer::FailEncoding` 并使 kernel 生成失败。不存在 Zydis 失败后回退
+`c.Raw` 的双轨实现。
+
+本批完成后累计 Zydis business-core 迁移进度为 **42/54**；VM 真 K 双策略
+静态覆盖保持 **54/54**。
+
+### 按语义/架构导出的真实活跃性契约
+
+| 语义/架构 | core 入口真实状态 | seed 选择的安全角色池 | 固定边界与排除依据 |
+|---|---|---|---|
+| FLAGS_MATERIALIZE x64 | handler 第一段代码，只有 R15=context；requested mask 尚未加载 | address 在 R10、RAX、RCX、RDX、R8、R9、R11 中轮转（7 套） | RDX 是 core 结束后的 materializer mask 输出，不是入口 live 值；`mov rdx,[rdx+disp]` 先取有效地址再覆盖 RDX，安全；RSP/nonvolatile 全排除 |
+| FLAGS_MATERIALIZE x86 | handler 第一段代码，只有 EDI=context | address 在 ECX、EAX、EDX 中轮转（3 套） | EDX 仅是 post-core mask 输出；EBX/ESI 是 direct-threaded ABI 状态，排除 |
+| FLAGS_PACK_AH x64 | 真实 Win64 materializer 调用已清空易失 GPR，随后仅 RDX=virtualFlags | 32 位 work/result 在 RAX、RCX、RDX、R8、R9、R10、R11 中轮转（7 套） | R15=context；最后结果移回 RAX 供 `X64PushOne`；全部运算保持 32 位，和旧 EAX 实现一样零扩展高 32 位 |
+| FLAGS_PACK_AH x86 | cdecl materializer 返回后仅 EDX=virtualFlags | work/result 在 EAX、ECX、EDX 中轮转（3 套） | EDI=context，EBX/ESI threaded state；结果移回 EAX 供 `X86PushOne` |
+| FLAGS_UNPACK_AH x64 | materializer 返回后包装层只重载 RAX=packed AH、RDX=virtualFlags | packed/flags 相邻角色在 RAX、RDX、RCX、R8、R9、R10、R11 中轮转（7 套） | `MoveRegisterPair` 处理包括 RAX/RDX 对调在内的全部重叠；结果固定回 RDX 存入 context；R15/nonvolatile 排除 |
+| FLAGS_UNPACK_AH x86 | 包装层只重载 EAX=packed AH、EDX=virtualFlags | packed/flags 在 EAX、EDX、ECX 中轮转（3 套） | 同一并行搬运推理；EBX/ESI/EDI 排除 |
+
+这里没有共享“全局 scratch pool”：三个语义分别有独立的
+`DeriveVariantRegisters` 分支与逐架构注释。永久测试遍历每个语义的 16 个
+seed byte，验证发布 assignment 确实出现在解码后的寄存器/内存 operand 中，
+并要求固定 K 下的真实 decode signature 发生变化；实测三语义均为 x86 3 套、
+x64 7 套，变化进入 ModRM/REX/内存 base 字段，不依赖随机立即数刷相似度。
+
+### 固定旧寄存器计划的代表字节
+
+零 seed、variant 0 固定为旧计划：MATERIALIZE 使用 x64 R10/x86 ECX，
+PACK_AH 使用 EAX，UNPACK_AH 使用 RAX:RDX/EAX:EDX。永久回归
+`TestZydisFlagsBoundaryFixedRegisterPlans` 同时锁定这些角色并打印实际 core 字节。
+
+| 架构/语义 | 迁移前代表字节 | Zydis 输出 | 结论 |
+|---|---|---|---|
+| x86 MATERIALIZE K=1 | `8D 8F CB260103 81 C1 D8B11A0D 81 E9 8AA6D309 81 C1 CF0E2001 8B 91 DCCD97F8` | 完全相同 | LEA、三段 keyed 地址修正与最终 mask load 逐字节一致 |
+| x64 MATERIALIZE K=1 | `4D 8D 97 52D2A605 49 81 C2 458B2D0B 49 83 EA 3D 49 81 C2 F5ACF301 49 8B 92 750438ED` | 完全相同 | Zydis 对小的 SUB key 合法选择 `83 /5 imm8`；旧 helper 本来也是该形式 |
+| x86 PACK_AH K=0 的首个 keyed XOR | `81 F0 94000000` | `35 94000000` | 合法 EAX accumulator short form；旋转、mask、逆旋转、固定 bit1 完全不变 |
+| x64 PACK_AH K=0 的首个 keyed XOR（仍是 32 位 EAX） | `81 F0 85000000` | `35 85000000` | 同一 accumulator 规范化；完整新 core 为 `89 D0 35 85000000 C1 C8 1A 25 40350000 C1 C0 1A 35 85000000 83 C8 02` |
+| x86 UNPACK_AH K=0 首个 XOR | `81 F0 5D546472` | `35 5D546472` | 仅 EAX accumulator 规范化；EDX key、`~0xD5` mask、OR 与最终 decode 不变 |
+| x64 UNPACK_AH K=0 首个 XOR | `48 81 F0 6CF25946` | `48 35 6CF25946` | 同一规范化；完整新 core 为 `48 35 6CF25946 48 81 F2 6CF25946 48 81 E2 2AFFFFFF 25 D5000000 48 09 C2 48 81 F2 6CF25946` |
+
+项目没有为保持旧 `81 /6` 长形式而回退手写字节或插入 NOP。上述差异只改变
+合法 opcode 选择，不改变 operand 位宽、flags 位掩码、key 共轭、fault 行为或
+context/stack 生命周期；固定计划、Zydis 完整解码、真实 handler 执行和 native
+differential 共同验证其语义等价。
+
+### 实现中实际发现并修复的问题
+
+第一版 x64 `FLAGS_UNPACK_AH` 把 `~0xD5 == 0xFFFFFF2A` 直接作为 64 位无符号
+立即数交给 `AND r64,imm32` 请求。真实 Zydis Encoder 正确拒绝：该正数无法由
+架构唯一可用的 sign-extended imm32 表示。旧手写 `48 81 /4 2AFFFFFF` 的真实
+含义是把 `0xFFFFFF2A` 符号扩展为 `0xFFFFFFFFFFFFFF2A`。修复是先调用
+`ZydisSignExtendImmediateBits(...,4)`，再构造 64 位目标请求；没有回退
+`c.Raw`。修复后 x64/x86 全矩阵、固定重发射和真实 CPU 差分均通过。
+
+验证过程中还确认旧 `vm_native_differential` 在本机 Win32 Release 下即使完全
+不运行本批入口也需要 124.4 秒，超过其既有 CTest `TIMEOUT 120`，但直接运行
+同一可执行文件自然结束时 15 个旧测试全部 PASS。为避免提高超时或削减本批
+覆盖，新矩阵注册为同一可执行文件的独立 hard-gate
+`vm_flags_boundary_native_differential`，使用 `--flags-boundary-only` 入口；
+旧入口、旧 corpus、旧 timeout 均未修改。
+
+### native differential、host-arch 与 flags/ABI 证据
+
+- production translator 可真实触达三者：`LAHF` 下沉为 `FLAGS_PACK_AH`，
+  `SAHF` 下沉为 `FLAGS_UNPACK_AH`，`RET` 强制发出
+  `FLAGS_MATERIALIZE(VM_FLAG_ARCHITECTURAL_MASK)`。因此使用真实
+  `LAHF; SAHF; RET` 函数，不伪造 differential-only micro-op。
+- 新 hard-gate 从 255 个真实候选 provider seed 生成三个目标 handler，按尚未
+  覆盖的 semantic/K/assignment 单元做最大覆盖选择。x64 实选 seed
+  `1/2/3/7`，Win32 实选 `1/4/6/15`；每 seed 32 个真实 CPU corpus。每个语义
+  的两个 K 和不同寄存器 assignment 都被实际执行，x64/Win32 全部通过。
+- `LAHF` 验证 SF/ZF/AF/PF/CF 到 AH 的精确布局及固定 bit1；随后的 `SAHF`
+  验证只覆盖 status mask、保留 OF 与其他 architectural flags；`RET` 再把所有
+  待决 flags materialize 到真实 native 返回 frame。差分逐 GPR/FLAGS 比较，
+  不是只检查“无崩溃”。
+- 既有 `ExecuteFlagsVariantMatrix` 继续在 host architecture 上覆盖宽度
+  1/2/4/8、两个 core strategy、lazy record、preserve mask、PACK/UNPACK、
+  UPDATE/WRITE 与下游 PUSH/SELECT/POP 组合；本批没有放宽任何断言。
+- x64 三个语义仍发布既有 `kX64FlagCallStackBytes=0x28` stack funclet，调用位置、
+  prolog/epilog、`.pdata`/UNWIND_INFO 生成路径均未改；全量 unwind/handler
+  合成门禁通过。
+
+### 双架构验证与 per-build similarity
+
+- x64、Win32 全量 Release 构建通过；未安装或下载任何依赖。
+- x64 完整 CTest **15/15** 通过：旧 native differential 114.99 秒，新 flags
+  hard-gate 5.47 秒，54/54 static gate 与真实 per-build gate 均通过。
+- Win32 除上述旧 wrapper 固定 120 秒超时项外 CTest **14/14** 通过；新 flags
+  hard-gate 6.75 秒。旧 native differential 直接运行 124.4 秒、退出码 0，
+  15 个旧子测试全部 PASS。这里不把它写成 Win32 全量 CTest 15/15。
+- 固定种子 handler 合成代理（不是正式 per-build gate）：x86
+  `core_variant=0.250882`、x64 `core_variant=0.332414`；最差 pair 分别
+  `0.583333`、`0.447059`，均低于既有独立硬上限，阈值未改。
+- 正式独立 seed、真实 EXE/DLL 打包执行数据如下：
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers |
+|---|---:|---:|---:|---:|
+| x64 EXE | 0.2618 | 0.1169 | 0.0799 | 0.0001 |
+| x64 DLL | 0.2815 | 0.1613 | 0.1323 | 0.0001 |
+| Win32 EXE | 0.2580 | 0.0929 | 0.0226 | 0.0000 |
+| Win32 DLL | 0.2728 | 0.1074 | 0.0432 | 0.0001 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；business/core/codec/encrypted
+聚合阈值与单 pair ceiling 均未改，未删除 corpus、跳过语义或使用 native
+fallback。
+
+### 剩余语义与下一批边界
+
+当前剩余 **12/54**：
+
+- flags 高风险：`FLAGS_LAZY`、`FLAGS_UPDATE`、`FLAGS_WRITE`；
+- 控制流/上下文：`SELECT`、`BRANCH`、`BRANCH_IF`、`CALL_VM`、`RET`；
+- ABI/bridge：`CALL_HOST`、`BRIDGE_EXTENDED`；
+- 已有明确阻塞证据：`POP_VREG`（无安全寄存器池且曾触发单 pair similarity
+  回归，继续保留原正式实现）；
+- 部分架构尚未完成：x64 `UMUL_WIDE` business core。
+
+下一批最多继续处理剩余三个 flags 语义，并保持同样的双倍复核；
+`FLAGS_UPDATE/WRITE` 的 mask merge、preserve semantics 与 `FLAGS_LAZY` 的 record
+生命周期必须逐字段证明。控制流、CALL_HOST、BRIDGE_EXTENDED、POP_VREG 和 x64
+UMUL_WIDE 不与该批混做。本文档只记录本地验证；本批尚未 push，也没有对应的
+远端 GitHub Actions 运行，因此不宣称远端 CI 状态。
