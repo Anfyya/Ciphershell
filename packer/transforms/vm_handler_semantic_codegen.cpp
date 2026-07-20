@@ -1500,6 +1500,51 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         const uint8_t other = pool[(seedOffset + variant + 1u) % pool.size()];
         return {scratch, other, 0u, scratch};
     }
+    if (semantic == VM_UOP_SWAP) {
+        if (x64) {
+            // X64RequireAndPop(count=2) pops both values into RAX/RDX and
+            // leaves RCX dead (its index scratch); R8/R9/R10/R11 are never
+            // touched before or after this core. Roles are a, b.
+            constexpr std::array<uint8_t, 7> pool =
+                {0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // Same reasoning restricted to the caller-volatile EAX/ECX/EDX set.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_SMUL_WIDE || semantic == VM_UOP_UDIV_WIDE ||
+            semantic == VM_UOP_IDIV_WIDE) {
+        // R9 (x64) / ECX (x86) already holds the prepared explicit
+        // multiplier/divisor and is dead immediately after this core runs
+        // (see EmitZydisWideOperandCore). R10/R11 (x64) and EBX/ESI (x86)
+        // are both free scratch regardless of K -- R10/EBX is this
+        // semantic's pre-existing K=0 address register and R11/ESI its
+        // pre-existing K=1 one (ESI already proven safe in this exact
+        // wrapper by independent batch 2's x86 UMUL_WIDE K=1), so the
+        // K-to-address binding is kept unchanged and only the seed picks
+        // register-direct vs. that K's established memory-address form.
+        // RDX:RAX/EDX:EAX remain the untouched hardware-implicit pair
+        // either way, so #DE stays purely hardware-driven. Slots [1]/[2]
+        // are unused padding required only by the generic "three distinct
+        // physical registers" invariant.
+        //
+        // The register-direct form is `<op> sourceReg` with no address
+        // register encoded at all, so if both K=0 and K=1 resolved to
+        // register-direct for the same seed they would be byte-identical
+        // (failing the required real dual-strategy difference). Tie which
+        // *one* K is eligible for register-direct to the seed instead of
+        // deciding each K independently, so exactly one of the two K's is
+        // register-direct and the other always falls back to its
+        // (K-distinct) memory-address form.
+        const bool k0IsRegisterDirect = ((seedOffset + variant) & 1u) == 0u;
+        const bool memoryForm = (coreStrategy == 0u)
+            ? !k0IsRegisterDirect : k0IsRegisterDirect;
+        const uint8_t address = x64
+            ? (coreStrategy == 0u ? 10u : 11u)
+            : (coreStrategy == 0u ? 3u : 6u);
+        return {address, 1u, 2u, memoryForm ? 0u : 1u};
+    }
     std::array<uint8_t, 4> output{};
     if (x64) {
         constexpr std::array<uint8_t, 7> pool = {0, 1, 2, 8, 9, 10, 11};
@@ -3416,23 +3461,63 @@ void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
     }
 }
 
-void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
-    const uint32_t key = CoreKey32(c, strategy + 4u);
-    if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x48,0x92});
-        else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-    } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.U8(0x92);
-        else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
+// Copies srcA's content into destA and srcB's content into destB, where
+// destA/destB (each distinct) may overlap with srcA/srcB (each distinct) in
+// any way, including the one case that is a genuine data-dependency cycle (a
+// full swap of the two source registers). This is the general 2-element
+// parallel-move primitive the move-in/move-out steps of both
+// EmitZydisKeyedIpCore-style boundary handling and EmitZydisKeyedSwapCore
+// need; it emits the smallest correct instruction sequence with no third
+// scratch register and is a no-op when the destinations already hold the
+// right values.
+void MoveRegisterPair(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t destA,
+    uint8_t destB,
+    uint8_t srcA,
+    uint8_t srcB)
+{
+    if (destA == srcA && destB == srcB) return;
+    if (destA == srcB && destB == srcA) {
+        EmitZydisExchange(c, x64, srcA, srcB);
+        return;
     }
+    if (destA == srcB) {
+        // Writing destA first would destroy srcB's data before it can be
+        // copied to destB, so capture destB first.
+        if (destB != srcB) EmitZydisMove(c, x64, destB, srcB);
+        if (destA != srcA) EmitZydisMove(c, x64, destA, srcA);
+        return;
+    }
+    if (destA != srcA) EmitZydisMove(c, x64, destA, srcA);
+    if (destB != srcB) EmitZydisMove(c, x64, destB, srcB);
+}
+
+void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // SWAP pops both values into the fixed RAX/RDX (EAX/EDX) boundary and
+    // pushes the result from the same pair; DeriveVariantRegisters supplies
+    // which physical registers actually host the two values during the
+    // core (roles a, b), free from that fixed boundary via
+    // MoveRegisterPair. When a==0 and b==2 (the legacy fixed baseline) both
+    // MoveRegisterPair calls are no-ops, reproducing the original bytes
+    // exactly.
+    const uint32_t key = CoreKey32(c, strategy + 4u);
+    const uint8_t a = c.registerAssignment[0];
+    const uint8_t b = c.registerAssignment[1];
+    MoveRegisterPair(c, x64, a, b, 0u, 2u);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, a, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, b, key);
+    if (strategy == 0u) {
+        EmitZydisExchange(c, x64, a, b);
+    } else {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, a, b);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, b, a);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, a, b);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, a, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, b, key);
+    MoveRegisterPair(c, x64, 0u, 2u, a, b);
 }
 
 void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
@@ -3938,30 +4023,58 @@ void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     }
 }
 
-void EmitX64SeedAddressedWideOperation(
+void EmitZydisWideOperandCore(
     CodeBuffer& c,
-    uint8_t group,
+    bool x64,
+    ZydisMnemonic mnemonic,
     uint8_t strategy,
     size_t keyIndex)
 {
-    // The real multiplier/divisor is materialized in the execution-context
-    // scratch slot and consumed directly by the hardware wide operation.  The
-    // build seed splits that slot's effective address between LEA and the
-    // memory operand displacement; neither half can be removed or changed
-    // without changing the value consumed by IMUL/DIV/IDIV.  LEA and MOV do
-    // not alter flags, while the one-operand F7 form retains the full
-    // RDX:RAX result and native #DE behaviour.
+    // R9 (x64) / ECX (x86) already holds the exact multiplier/divisor value
+    // the surrounding wide-multiply/divide wrapper prepared before this core
+    // runs (EmitX64WideMultiply/EmitX64WideDivide or their x86
+    // equivalents), and it is dead immediately afterward -- every width
+    // branch unconditionally reloads/overwrites it while rebuilding the
+    // width mask. The seed picks between applying the hardware wide
+    // operation directly to that register, or spilling it through a
+    // seed-split CtxMutationScratch effective address using the K-selected
+    // address register this semantic already established (R10/EBX for
+    // K=0, R11/ESI for K=1) -- the same explicit-operand/hardware-implicit-
+    // pair contract as independent batch 2 (x86 UMUL_WIDE K=1). RDX:RAX
+    // (EDX:EAX) remain the untouched hardware-implicit pair either way, so
+    // divide-by-zero and quotient-overflow #DE stay purely hardware-driven
+    // regardless of which form the seed selects.
+    const uint8_t sourceReg = x64 ? 9u : 1u;
+    const uint8_t addressReg = c.registerAssignment[0];
+    const bool memoryForm = c.registerAssignment[3] == 0u;
+    if (!memoryForm) {
+        // A bare `<op> sourceReg` carries no build-seed-dependent bytes at
+        // all, so two different builds that both land on register-direct
+        // for the same K would be byte-identical -- failing the required
+        // real per-build difference for that (semantic,K). Bracket the
+        // operation with a self-cancelling double keyed XOR (the same
+        // reversible-perturbation idiom used elsewhere in this file, e.g.
+        // PUSH_VREG/PUSH_IMM's keyed XOR pairs) so the register-direct form
+        // also carries a real per-build immediate without changing the
+        // value the hardware operation consumes.
+        const uint32_t registerKey = CoreKey32(c, keyIndex + strategy);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, sourceReg, registerKey);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, sourceReg, registerKey);
+        EmitZydisUnary(c, x64, mnemonic, sourceReg);
+        return;
+    }
     const uint32_t key = CoreAddressKey(c, keyIndex + strategy);
-    const uint8_t address = strategy == 0u ? 10u : 11u;
-    c.Raw({0x4D, 0x8D, static_cast<uint8_t>(
-        0x80u | ((address & 7u) << 3u) | 7u)});
-    c.U32(CtxMutationScratch + key);              // lea address,[r15+slot+key]
-    c.Raw({0x4D, 0x89, static_cast<uint8_t>(
-        0x80u | (1u << 3u) | (address & 7u))});
-    c.U32(0u - key);                              // mov [address-key],r9
-    c.Raw({0x49, 0xF7, static_cast<uint8_t>(
-        0x80u | ((group & 7u) << 3u) | (address & 7u))});
-    c.U32(0u - key);                              // F7 /group [address-key]
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t bytes = x64 ? 8u : 4u;
+    EmitZydisLea(c, x64, addressReg, context,
+        static_cast<int32_t>(CtxMutationScratch + key));
+    EmitZydisStore(c, x64, addressReg, static_cast<int32_t>(0u - key),
+        sourceReg, bytes);
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisMemoryOperand(x64, addressReg,
+             static_cast<int32_t>(0u - key), bytes)});
 }
 
 bool EmitBusinessCoreVariant(
@@ -4125,13 +4238,16 @@ bool EmitBusinessCoreVariant(
                 else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xE2});
                 return true;
             case VM_UOP_SMUL_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 5u, strategy, 2u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_IMUL, strategy, 2u);
                 return true;
             case VM_UOP_UDIV_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 6u, strategy, 4u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_DIV, strategy, 4u);
                 return true;
             case VM_UOP_IDIV_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 7u, strategy, 6u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_IDIV, strategy, 6u);
                 return true;
             case VM_UOP_FLAGS_LAZY:
                 for (uint8_t field : coreOrder(6u)) {
@@ -4315,8 +4431,16 @@ bool EmitBusinessCoreVariant(
                 EmitKeyedAddSubCore(c, true, false, strategy);
                 return true;
             case VM_UOP_INT3:
-                if (strategy == 0u) c.U8(0xCC);
-                else c.Raw({0xCD,0x03});
+                // INT3 takes no operands, so there is no register role to
+                // vary; the two K strategies are already the complete real
+                // dual-encoding (short INT3 vs. two-byte INT imm8) and the
+                // Zydis output is byte-identical to the previous hand-written
+                // form on both paths.
+                if (strategy == 0u)
+                    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_INT3, {});
+                else
+                    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_INT,
+                        {ZydisImmediateOperand(3u)});
                 return true;
             default:
                 return false;
@@ -4509,30 +4633,16 @@ bool EmitBusinessCoreVariant(
             return true;
         }
         case VM_UOP_SMUL_WIDE:
-            if (strategy == 0u) c.Raw({0xF7,0xE9});
-            else c.Raw({0x89,0xCB,0xF7,0xEB});
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_IMUL, strategy, 2u);
             return true;
-        case VM_UOP_UDIV_WIDE: {
-            // Spill the actual divisor through a seed-split effective address
-            // and make that memory operand the source of DIV.  Zero divisors
-            // and quotient overflow therefore still fault in the hardware DIV
-            // itself with the original EDX:EAX dividend.
-            const uint32_t key = CoreAddressKey(c, strategy + 4u);
-            const uint32_t slot = strategy == 0u ? 0u : 4u;
-            if (strategy == 0u) {
-                c.Raw({0x8D,0x9F}); c.U32(CtxMutationScratch + slot + key);
-                c.Raw({0x89,0x8B}); c.U32(0u - key);
-                c.Raw({0xF7,0xB3}); c.U32(0u - key);
-            } else {
-                c.Raw({0x8D,0xB7}); c.U32(CtxMutationScratch + slot + key);
-                c.Raw({0x89,0x8E}); c.U32(0u - key);
-                c.Raw({0xF7,0xB6}); c.U32(0u - key);
-            }
+        case VM_UOP_UDIV_WIDE:
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_DIV, strategy, 4u);
             return true;
-        }
         case VM_UOP_IDIV_WIDE:
-            if (strategy == 0u) c.Raw({0xF7,0xF9});
-            else c.Raw({0x89,0xCB,0xF7,0xFB});
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_IDIV, strategy, 6u);
             return true;
         case VM_UOP_FLAGS_LAZY:
             for (uint8_t field : coreOrder(static_cast<uint8_t>(
@@ -4686,8 +4796,13 @@ bool EmitBusinessCoreVariant(
             EmitKeyedAddSubCore(c, false, false, strategy);
             return true;
         case VM_UOP_INT3:
-            if (strategy == 0u) c.U8(0xCC);
-            else c.Raw({0xCD,0x03});
+            // See the x64 branch above: INT3 has no operands, so there is no
+            // register role to vary.
+            if (strategy == 0u)
+                EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_INT3, {});
+            else
+                EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_INT,
+                    {ZydisImmediateOperand(3u)});
             return true;
         default:
             return false;
@@ -7932,6 +8047,10 @@ bool ValidateVMHandlerSemanticVariantKernel(
             (config.semantic == VM_UOP_BIT_TEST ||
              config.semantic == VM_UOP_BIT_SET ||
              config.semantic == VM_UOP_BIT_RESET);
+        const bool x86WideOperandContract = !x64 &&
+            (config.semantic == VM_UOP_SMUL_WIDE ||
+             config.semantic == VM_UOP_UDIV_WIDE ||
+             config.semantic == VM_UOP_IDIV_WIDE);
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
                reg == 8 || reg == 9 || reg == 10 || reg == 11 ||
@@ -7944,7 +8063,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
                 (x86RotateStackContract && reg == 3) ||
                 (x86CarryContract && reg == 3) ||
                 (x86BitContract && (reg == 3 || reg == 6)) ||
-                (x86UmulWideContract && (reg == 3 || reg == 6)));
+                (x86UmulWideContract && (reg == 3 || reg == 6)) ||
+                (x86WideOperandContract && (reg == 3 || reg == 6)));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
             return false;

@@ -3545,6 +3545,129 @@ void TestZydisPushPopFamilyRegisterDiversity() {
     }
 }
 
+// Batch 8: SWAP has no production translator entry (like ROT in batch 6), so
+// its register diversity is validated the same way -- host-arch
+// direct-threaded execution and static register-signature decoding, not an
+// isolated native differential. SMUL_WIDE/UDIV_WIDE/IDIV_WIDE reuse
+// independent batch 2's contract: only the explicit multiplier/divisor
+// varies between a register-direct form and a seed-split memory-address
+// form; RDX:RAX/EDX:EAX stay the untouched hardware-implicit pair.
+void TestZydisSwapRegisterDiversity() {
+    struct Expectation {
+        size_t minimumX64;
+        size_t minimumX86;
+    };
+    constexpr Expectation expectation{7u, 3u};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t minimum = architecture == VM_ARCH_X64
+            ? expectation.minimumX64 : expectation.minimumX86;
+        std::set<std::array<uint8_t, 4>> assignments;
+        std::array<std::set<std::string>, 2> signaturesByStrategy{};
+        for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = architecture;
+            config.buildSeed = MakeSeed(0x99u);
+            config.buildSeed[static_cast<uint8_t>(VM_UOP_SWAP) & 31u] =
+                seedByte;
+            config.semantic = VM_UOP_SWAP;
+            config.variant = 0u;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "SWAP generation failed: " + generated.error);
+            std::string validationError;
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    config, generated, validationError),
+                "SWAP validation failed: " + validationError);
+            const auto signature = DecodePilotRegisterSignature(
+                architecture, generated);
+            Require(signature.registerIds.count(
+                        generated.registerAssignment[0]) != 0u,
+                "published Zydis SWAP role a is not in emitted code");
+            Require(signature.registerIds.count(
+                        generated.registerAssignment[1]) != 0u,
+                "published Zydis SWAP role b is not in emitted code");
+            Require(generated.semanticCoreStrategy < 2u,
+                "SWAP selected an invalid core strategy");
+            assignments.insert(generated.registerAssignment);
+            signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                signature.text);
+        }
+        Require(assignments.size() >= minimum,
+            "build seed did not cover the SWAP liveness register pool");
+        bool sameStrategyVaries = false;
+        for (size_t strategy = 0; strategy < 2u; ++strategy) {
+            if (signaturesByStrategy[strategy].size() >= 2u)
+                sameStrategyVaries = true;
+        }
+        Require(sameStrategyVaries,
+            "SWAP register operands did not vary at a fixed business "
+            "strategy");
+        std::cout << "[zydis-registers-swap] arch=" << architecture
+                  << " assignments=" << assignments.size() << '\n';
+    }
+}
+
+void TestZydisWideOperandRegisterDiversity() {
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {
+        VM_UOP_SMUL_WIDE, VM_UOP_UDIV_WIDE, VM_UOP_IDIV_WIDE};
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        for (VM_MICRO_OPCODE semantic : semantics) {
+            std::array<bool, 2> sawRegisterForm{};
+            std::array<bool, 2> sawMemoryForm{};
+            std::array<std::set<int>, 2> memoryAddressRegisters{};
+            for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+                for (uint8_t variant = 0;
+                     variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                    VMHandlerSemanticCodegenConfig config{};
+                    config.architecture = architecture;
+                    config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                        0x50u + static_cast<uint8_t>(semantic)));
+                    config.buildSeed[
+                            static_cast<uint8_t>(semantic) & 31u] = seedByte;
+                    config.semantic = semantic;
+                    config.variant = variant;
+                    const auto generated =
+                        GenerateVMHandlerSemanticKernel(config);
+                    Require(generated.success,
+                        "wide operand generation failed: " +
+                            generated.error);
+                    std::string validationError;
+                    Require(ValidateVMHandlerSemanticVariantKernel(
+                            config, generated, validationError),
+                        "wide operand validation failed: " +
+                            validationError);
+                    const uint8_t strategy = generated.semanticCoreStrategy;
+                    Require(strategy < 2u,
+                        "wide operand selected an invalid core strategy");
+                    const bool memoryForm =
+                        generated.registerAssignment[3] == 0u;
+                    if (memoryForm) {
+                        sawMemoryForm[strategy] = true;
+                        memoryAddressRegisters[strategy].insert(
+                            generated.registerAssignment[0]);
+                    } else {
+                        sawRegisterForm[strategy] = true;
+                    }
+                }
+            }
+            for (uint8_t strategy = 0; strategy < 2u; ++strategy) {
+                Require(sawRegisterForm[strategy] && sawMemoryForm[strategy],
+                    "wide operand did not exercise both register-direct "
+                    "and memory forms for a fixed K");
+                Require(memoryAddressRegisters[strategy].size() == 1u,
+                    "wide operand memory form used more than one address "
+                    "register for a fixed K");
+            }
+            std::cout << "[zydis-registers-wide] arch=" << architecture
+                      << " semantic=" << static_cast<unsigned>(semantic)
+                      << " register_form=" << sawRegisterForm[0]
+                      << "/" << sawRegisterForm[1]
+                      << " memory_form=" << sawMemoryForm[0]
+                      << "/" << sawMemoryForm[1] << '\n';
+        }
+    }
+}
+
 void TestX86ZydisUmulWidePerKSourcePlans() {
     const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
         {{1u, 2u, 3u, 6u},
@@ -3673,6 +3796,10 @@ int main() {
         &TestZydisMigratedRegistersVaryByBuildSeed, failures);
     Run("Zydis push/pop family register allocation",
         &TestZydisPushPopFamilyRegisterDiversity, failures);
+    Run("Zydis SWAP register allocation",
+        &TestZydisSwapRegisterDiversity, failures);
+    Run("Zydis wide operand register/memory form allocation",
+        &TestZydisWideOperandRegisterDiversity, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;

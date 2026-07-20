@@ -962,8 +962,8 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
              VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 2u},
         {&wideMultiplyBytes, 0xA703ULL,
             "UMUL_WIDE/SMUL_WIDE",
-            {VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP,
-             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 0u},
+            {VM_UOP_SMUL_WIDE, VM_UOP_TRAP, VM_UOP_TRAP,
+             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 1u},
     };
 
     for (const auto& testCase : cases) {
@@ -1135,6 +1135,12 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
     // 一致)与"除零/商溢出"(两侧都应触发 #DE)两类样本。VMNativeDifferentialConfig
     // ::expectDivideFault 让验证器按样本实际结果分别核对，而不是把任何 fault
     // 都当成硬性失败。
+    //
+    // UDIV_WIDE/IDIV_WIDE 的显式除数在推广批次 8 之后有两种编码形式(直接对
+    // 寄存器 F7 /group，或经 seed-split CtxMutationScratch 地址的内存形式)，
+    // 按 K 各自独立选择；下面动态挑选 provider seed 覆盖每个 K 下两种形式各
+    // 至少一次，而不是只用单一固定 seed 验证其中一种形式，这样 #DE 差分证据
+    // 才能覆盖两种形式而不是巧合地只测到其中之一。
     const auto seed = MakeSeed(0xE4);
     const HarnessBuild build = SetUpMutatedIsa(seed);
 
@@ -1177,11 +1183,62 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
                 " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
                 preflight.error);
 
-        RunDifferentialCase(divideFunction, divideTranslation, build, 64, true,
-            signedDivide ? "native-vs-VM IDIV_WIDE(128-bit dividend)/#DE 一致"
-                         : "native-vs-VM UDIV_WIDE(128-bit dividend)/#DE 一致",
-            /*expectDivideFault=*/true, /*providerSeedDomain=*/0xC7u,
-            /*expectBreakpointFault=*/false, /*expectedNativeFaultOffset=*/0);
+        const VM_MICRO_OPCODE wideDivideSemantic =
+            signedDivide ? VM_UOP_IDIV_WIDE : VM_UOP_UDIV_WIDE;
+        const auto divideInstruction = std::find_if(
+            divideTranslation.instructions.begin(),
+            divideTranslation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == wideDivideSemantic;
+            });
+        Require(divideInstruction != divideTranslation.instructions.end(),
+            std::string(signedDivide ? "IDIV" : "DIV") +
+                " fixture emitted no wide-divide instruction");
+
+        std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
+        std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+        for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = wideDivideSemantic;
+            config.variant = divideInstruction->handlerVariant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "wide divide provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < plansByStrategy.size(),
+                "wide divide selected an unknown K strategy");
+            if (plansByStrategy[strategy].size() < 2u &&
+                    plansByStrategy[strategy].insert(
+                        generated.registerAssignment).second) {
+                providerSeedsByStrategy[strategy].push_back(
+                    static_cast<uint8_t>(domain));
+            }
+            if (plansByStrategy[0].size() == 2u &&
+                    plansByStrategy[1].size() == 2u) break;
+        }
+        Require(providerSeedsByStrategy[0].size() == 2u &&
+                providerSeedsByStrategy[1].size() == 2u,
+            "wide divide differential seeds did not cover both "
+            "register-direct and memory forms for both K values");
+
+        for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+            for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+                const std::string label = std::string("native-vs-VM ") +
+                    (signedDivide ? "IDIV_WIDE(128-bit dividend)/#DE K="
+                                  : "UDIV_WIDE(128-bit dividend)/#DE K=") +
+                    std::to_string(strategy) + " seed " +
+                    std::to_string(providerSeed);
+                RunDifferentialCase(divideFunction, divideTranslation, build,
+                    64, true, label.c_str(),
+                    /*expectDivideFault=*/true,
+                    /*providerSeedDomain=*/providerSeed,
+                    /*expectBreakpointFault=*/false,
+                    /*expectedNativeFaultOffset=*/0);
+            }
+        }
     }
 }
 
