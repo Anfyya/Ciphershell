@@ -4001,6 +4001,51 @@ void EmitKeyedFlagsWriteCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     }
 }
 
+void EmitZydisPushConditionCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // X64EvaluateCondition/X86EvaluateCondition (unmigrated control-dispatch
+    // infrastructure -- out of this batch's scope) already resolve the
+    // branch condition to a clean 0/1 in the fixed RAX/EAX boundary before
+    // this core runs. That evaluator's own RCX/RDX (EDX) scratch is dead by
+    // the time it returns, and R8/R9/R10/R11 (x64) were never touched by
+    // either it or the preceding X64CallFlagMaterializer/
+    // X86CallFlagMaterializer real call (which, per the Win64/cdecl ABI,
+    // already clobbers every volatile GPR it doesn't explicitly preserve).
+    // The seed picks which physical register performs the keyed
+    // add/sub + compare + SETcc identity before the result moves back to
+    // the fixed PushOne boundary.
+    const uint32_t key = CoreAddressKey(c, strategy + 1u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t bytes = x64 ? 8u : 4u;
+    if (value != 0u) EmitZydisMove(c, x64, value, 0u);
+    if (strategy == 0u) {
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_ADD, value, bytes, key);
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_CMP, value, bytes, key + 1u);
+    } else {
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_SUB, value, bytes, key);
+        // 1u - key intentionally wraps (uint32_t arithmetic): the CMP must
+        // consume the exact same 32-bit bit pattern the original hand
+        // written 0x81 /7 imm32 encoding did, which the CPU sign-extends to
+        // the full destination width. ZydisSignExtendImmediateBits only
+        // sign-extends its *bytes* argument when bytes is 1/2/4 -- for an
+        // 8-byte (x64) destination it is a no-op, because every other
+        // caller of EmitZydisSizedBinaryImmediate with bytes=8 always
+        // passes an already-small non-negative value where that no-op is
+        // correct. Explicitly sign-extend from the low 32 bits first so the
+        // wrapped pattern is preserved either way (redundant, still
+        // correct, for the bytes=4 x86 path).
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP, value,
+            bytes, ZydisSignExtendImmediateBits(1u - key, 4u));
+    }
+    EmitZydisSizedUnary(c, x64, ZYDIS_MNEMONIC_SETZ, value, 1u);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOVZX,
+        {ZydisSizedGprOperand(x64, value, bytes),
+         ZydisSizedGprOperand(x64, value, 1u)});
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+}
+
 void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 4u);
     if (x64) {
@@ -4392,22 +4437,9 @@ bool EmitBusinessCoreVariant(
                 X64BinaryImmediate32(c, 6u, 2u, key);
                 return true;
             }
-            case VM_UOP_PUSH_CONDITION: {
-                // X64EvaluateCondition supplies exactly 0 or 1.  Normalize it
-                // through a seed-shifted predicate rather than decorating an
-                // already-computed result: (condition +/- key) is compared
-                // with the correspondingly shifted representation of true.
-                const uint32_t key = CoreAddressKey(c, strategy + 1u);
-                if (strategy == 0u) {
-                    X64BinaryImmediate32(c, 0u, 0u, key);
-                    X64BinaryImmediate32(c, 7u, 0u, key + 1u);
-                } else {
-                    X64BinaryImmediate32(c, 5u, 0u, key);
-                    X64BinaryImmediate32(c, 7u, 0u, 1u - key);
-                }
-                c.Raw({0x0F,0x94,0xC0,0x0F,0xB6,0xC0});
+            case VM_UOP_PUSH_CONDITION:
+                EmitZydisPushConditionCore(c, true, strategy);
                 return true;
-            }
             case VM_UOP_SELECT:
                 EmitKeyedSelectCore(c, true, strategy);
                 return true;
@@ -4770,8 +4802,14 @@ bool EmitBusinessCoreVariant(
             return true;
         }
         case VM_UOP_PUSH_CONDITION:
-            if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
-            else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
+            // The previous x86 form (AND eax,1 / TEST+SETNE) carried no
+            // build-seed-dependent bytes at all, unlike the x64 side's
+            // keyed add/sub+CMP+SETcc identity. Migrating to the same keyed
+            // formula as x64 (see EmitZydisPushConditionCore) both closes
+            // that diversity gap and lets x86 share the identical, already
+            // logically-reviewed transform instead of maintaining a second
+            // one.
+            EmitZydisPushConditionCore(c, false, strategy);
             return true;
         case VM_UOP_SELECT:
             EmitKeyedSelectCore(c, false, strategy);

@@ -3668,6 +3668,60 @@ void TestZydisWideOperandRegisterDiversity() {
     }
 }
 
+// Batch 9: PUSH_CONDITION closes category 1. It has exactly one live role
+// (the condition value itself), unlike most semantics in
+// TestZydisMigratedRegistersVaryByBuildSeed which always publish a second
+// real role in registerAssignment[1] -- so it gets its own minimal check
+// instead of being folded into that generic table (which would wrongly
+// require an unused padding slot to appear in the decoded core).
+void TestZydisPushConditionRegisterDiversity() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t minimum = architecture == VM_ARCH_X64 ? 4u : 3u;
+        std::set<std::array<uint8_t, 4>> assignments;
+        std::array<std::set<std::string>, 2> signaturesByStrategy{};
+        for (uint8_t seedByte = 0; seedByte < 16u; ++seedByte) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = architecture;
+            config.buildSeed = MakeSeed(0x62u);
+            config.buildSeed[static_cast<uint8_t>(VM_UOP_PUSH_CONDITION) & 31u] =
+                seedByte;
+            config.semantic = VM_UOP_PUSH_CONDITION;
+            config.variant = 0u;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "PUSH_CONDITION generation failed: " + generated.error);
+            std::string validationError;
+            Require(ValidateVMHandlerSemanticVariantKernel(
+                    config, generated, validationError),
+                "PUSH_CONDITION validation failed: " + validationError);
+            const auto signature = DecodePilotRegisterSignature(
+                architecture, generated);
+            Require(signature.registerIds.count(
+                        generated.registerAssignment[0]) != 0u,
+                "published Zydis PUSH_CONDITION value register is not in "
+                "emitted code");
+            Require(generated.semanticCoreStrategy < 2u,
+                "PUSH_CONDITION selected an invalid core strategy");
+            assignments.insert(generated.registerAssignment);
+            signaturesByStrategy[generated.semanticCoreStrategy].insert(
+                signature.text);
+        }
+        Require(assignments.size() >= minimum,
+            "build seed did not cover the PUSH_CONDITION liveness "
+            "register pool");
+        bool sameStrategyVaries = false;
+        for (size_t strategy = 0; strategy < 2u; ++strategy) {
+            if (signaturesByStrategy[strategy].size() >= 2u)
+                sameStrategyVaries = true;
+        }
+        Require(sameStrategyVaries,
+            "PUSH_CONDITION register operands did not vary at a fixed "
+            "business strategy");
+        std::cout << "[zydis-registers-push-condition] arch=" << architecture
+                  << " assignments=" << assignments.size() << '\n';
+    }
+}
+
 void TestX86ZydisUmulWidePerKSourcePlans() {
     const std::array<std::set<std::array<uint8_t, 4>>, 2> expectedPlans = {{
         {{1u, 2u, 3u, 6u},
@@ -3800,6 +3854,8 @@ int main() {
         &TestZydisSwapRegisterDiversity, failures);
     Run("Zydis wide operand register/memory form allocation",
         &TestZydisWideOperandRegisterDiversity, failures);
+    Run("Zydis PUSH_CONDITION register allocation",
+        &TestZydisPushConditionRegisterDiversity, failures);
     Run("x86 Zydis UMUL_WIDE per-K source plans",
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     return failures == 0 ? 0 : 1;
