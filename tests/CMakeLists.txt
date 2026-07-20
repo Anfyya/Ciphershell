@@ -315,6 +315,12 @@ set_tests_properties(vm_pop_control_native_differential PROPERTIES
     LABELS "vm;hard-gate"
     TIMEOUT 120
 )
+add_test(NAME vm_select_native_differential
+    COMMAND test_vm_native_differential --select-only)
+set_tests_properties(vm_select_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
 add_test(NAME cfg_flattener_differential COMMAND test_cfg_flattener_differential)
 set_tests_properties(cfg_flattener_differential PROPERTIES
     LABELS "cfg;hard-gate"

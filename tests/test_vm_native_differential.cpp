@@ -1794,6 +1794,167 @@ void TestZydisPopAndControlNativeDifferential() {
     }
 }
 
+void TestZydisSelectNativeDifferential() {
+    const auto seed = MakeSeed(0xF5u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "SELECT disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // CMP makes ZF deterministically true. CMOVNZ therefore exercises the
+    // not-selected path and CMOVZ exercises the selected path without either
+    // instruction changing flags; both lower through the production CMOV ->
+    // SELECT translator entry. The final XOR makes both selected values
+    // observable. On x64 a not-taken r32 CMOV must preserve the complete
+    // destination while a taken one writes r32 and clears its upper half, so
+    // finish with a 64-bit XOR there to keep both high-half effects visible.
+    std::vector<uint8_t> bytes = {
+        0x39,0xC9,                         // cmp ecx,ecx (ZF=1)
+        0x0F,0x45,0xC2,                    // cmovnz eax,edx (not taken)
+        0x0F,0x44,0xCA,                    // cmovz  ecx,edx (taken)
+    };
+    if constexpr (kIs64) {
+        bytes.insert(bytes.end(), {0x48,0x31,0xC8}); // xor rax,rcx
+    } else {
+        bytes.insert(bytes.end(), {0x31,0xC8});      // xor eax,ecx
+    }
+    bytes.push_back(0xC3);                         // ret
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    std::vector<uint8_t> variants;
+    size_t selectCount = 0u;
+    bool sawSelected = false;
+    bool sawNotSelected = false;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        if (instruction.opcode != VM_UOP_SELECT) continue;
+        ++selectCount;
+        Require(!instruction.operands.empty(),
+            "production SELECT instruction has no condition operand");
+        sawSelected = sawSelected ||
+            instruction.operands[0] == VM_CONDITION_E;
+        sawNotSelected = sawNotSelected ||
+            instruction.operands[0] == VM_CONDITION_NE;
+        if (std::find(variants.begin(), variants.end(),
+                instruction.handlerVariant) == variants.end()) {
+            variants.push_back(instruction.handlerVariant);
+        }
+    }
+    Require(selectCount == 2u && sawSelected && sawNotSelected &&
+            !variants.empty(),
+        "CMOV fixture did not reach taken and not-taken SELECT through the "
+        "production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        variants.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (uint8_t variant : variants) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = VM_UOP_SELECT;
+            config.variant = variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "SELECT provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "SELECT provider seed selected an invalid K");
+            candidate.strategies.push_back(
+                generated.semanticCoreStrategy);
+            candidate.assignments.push_back(
+                generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    // Cover every SELECT-specific register plan under each real K for every
+    // handler variant actually reached by the production translation. This
+    // is deliberately selected from synthesized provider output instead of
+    // assuming a relationship between a seed-domain byte and an assignment.
+    const size_t requiredAssignments = kIs64 ? 6u : 3u;
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perVariant : assignments) {
+            for (const auto& perStrategy : perVariant) {
+                complete = complete &&
+                    perStrategy.size() >= requiredAssignments;
+            }
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t variantIndex = 0u;
+                 variantIndex < variants.size(); ++variantIndex) {
+                const uint8_t strategy =
+                    candidate.strategies[variantIndex];
+                const auto& covered =
+                    assignments[variantIndex][strategy];
+                if (covered.size() < requiredAssignments &&
+                        covered.count(candidate.assignments[variantIndex]) ==
+                            0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "SELECT differential seed selection stalled before covering "
+            "every reached handler-variant/K/register-plan cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t variantIndex = 0u;
+             variantIndex < variants.size(); ++variantIndex) {
+            const uint8_t strategy = selected.strategies[variantIndex];
+            auto& covered = assignments[variantIndex][strategy];
+            if (covered.size() < requiredAssignments) {
+                covered.insert(selected.assignments[variantIndex]);
+            }
+        }
+    }
+    for (const auto& perVariant : assignments) {
+        for (const auto& perStrategy : perVariant) {
+            Require(perStrategy.size() == requiredAssignments,
+                "SELECT provider seeds did not cover every register plan "
+                "for each reached handler variant and K");
+        }
+    }
+
+    std::cout << "[select-provider-seeds] count="
+              << providerSeeds.size() << '\n';
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM SELECT taken/not-taken seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 16, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestUndefinedFlagsReadFailsClosed() {
     const auto seed = MakeSeed(0xD5);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -1906,8 +2067,9 @@ void TestCmovR32PreservesOrClearsUpperHalf() {
     Require(disassembler.Initialize(true), "Disassembler initialization failed");
     constexpr uint64_t kEntry = 0x1000;
 
-    // cmp ecx,ecx sets ZF. In 64-bit mode CMOV r32 clears RAX[63:32]
-    // regardless of whether the low-32 destination assignment is taken.
+    // cmp ecx,ecx sets ZF. In 64-bit mode a taken CMOV r32 writes the
+    // destination and clears its upper half; a not-taken CMOV leaves the
+    // complete destination unchanged.
     const std::vector<uint8_t> notTakenBytes = {
         0x39,0xC9, 0x0F,0x45,0xC2, 0xC3};
     const std::vector<uint8_t> takenBytes = {
@@ -1916,7 +2078,7 @@ void TestCmovR32PreservesOrClearsUpperHalf() {
         const std::vector<uint8_t>* bytes;
         const char* label;
     } cases[] = {
-        {&notTakenBytes, "x64 CMOV r32 not-taken clears upper RAX"},
+        {&notTakenBytes, "x64 CMOV r32 not-taken preserves full RAX"},
         {&takenBytes, "x64 CMOV r32 taken zero-extends RAX"},
     };
     for (const auto& testCase : cases) {
@@ -1966,6 +2128,11 @@ int main(int argc, char** argv) {
             std::string(argv[1]) == "--pop-control-only") {
         Run("Zydis POP_VREG/control-flow production translator multi-seed native differential",
             &TestZydisPopAndControlNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--select-only") {
+        Run("Zydis SELECT production translator multi-seed native differential",
+            &TestZydisSelectNativeDifferential, failures);
         return failures == 0 ? 0 : 1;
     }
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",

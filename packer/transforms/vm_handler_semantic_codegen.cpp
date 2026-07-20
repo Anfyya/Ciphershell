@@ -1530,6 +1530,28 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             ? std::array<uint8_t, 4>{0u, 6u, 3u, formMarkers[form]}
             : std::array<uint8_t, 4>{6u, 0u, 3u, formMarkers[form]};
     }
+    if (semantic == VM_UOP_SELECT) {
+        if (x64) {
+            // The wrapper has completed the real flag-materializer call and
+            // condition evaluation before this core begins.  It then fixes
+            // the clean 0/1 predicate in R10 and pops the two candidates into
+            // RAX/RDX.  RCX is dead after the pop-depth path; R8/R9 were not
+            // touched and R11's value-codec temporary is dead.  Keep R10 and
+            // R15/context fixed and rotate only candidate-a, candidate-b and
+            // the K=1 mask scratch.  The first plan is the exact legacy
+            // RAX/RDX/R11 role assignment.
+            constexpr std::array<uint8_t, 6> pool = {
+                0u, 2u, 11u, 1u, 8u, 9u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // Win32 enters with EAX/EDX as the candidates and ECX as the clean
+        // predicate.  The legacy K=1 core already proves EBX handler-local
+        // for this exact lifetime; ESI remains threaded ABI state and EDI is
+        // context.  Rotate the two candidates and mask scratch only within
+        // EAX/EDX/EBX, keeping ECX out of the allocation entirely.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 3u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
     if (semantic == VM_UOP_BRANCH || semantic == VM_UOP_BRANCH_IF ||
             semantic == VM_UOP_CALL_VM || semantic == VM_UOP_RET) {
         if (x64) {
@@ -4608,26 +4630,45 @@ void EmitZydisPushConditionCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     if (value != 0u) EmitZydisMove(c, x64, 0u, value);
 }
 
-void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+void EmitZydisSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // The wrapper materializes the VM status flags and resolves the requested
+    // condition to a clean 0/1 before entering this core.  Consequently the
+    // core consumes only the fixed predicate register (R10/ECX) and never
+    // relies on host EFLAGS left by the evaluator.  Candidate values arrive
+    // in RAX/RDX (EAX/EDX); the SELECT-specific liveness contract supplies
+    // seed-selected candidate/scratch roles without touching context, stack,
+    // funclet metadata or the virtual/pending flags lifetime.
     const uint32_t key = CoreKey32(c, strategy + 4u);
-    if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
-        else {
-            X64MovRegister(c, 11u, 10u); X64UnaryGroup(c, 3u, 11u);
-            X64BinaryRegister(c, 0x31u, 2u, 0u);
-            X64BinaryRegister(c, 0x21u, 2u, 11u);
-            X64BinaryRegister(c, 0x31u, 0u, 2u);
-        }
-        X64BinaryImmediate32(c, 6u, 0u, key);
+    const uint8_t candidateA = c.registerAssignment[0];
+    const uint8_t candidateB = c.registerAssignment[1];
+    const uint8_t scratch = c.registerAssignment[2];
+    const uint8_t predicate = x64 ? 10u : 1u;
+    MoveRegisterPair(c, x64, candidateA, candidateB, 0u, 2u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateA, key);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateB, key);
+    if (strategy == 0u) {
+        // The historical x64 form deliberately tested r10d rather than r10;
+        // the predicate is 0/1 either way, but retaining the 32-bit form
+        // preserves its representative fixed-plan encoding.
+        EmitZydisSizedBinary(c, x64, ZYDIS_MNEMONIC_TEST,
+            predicate, predicate, 4u);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_CMOVNZ, candidateA, candidateB);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
-        else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
-        X86BinaryImmediate32(c, 6u, 0u, key);
+        EmitZydisMove(c, x64, scratch, predicate);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NEG, scratch);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, candidateB, candidateA);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_AND, candidateB, scratch);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, candidateA, candidateB);
     }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateA, key);
+    if (candidateA != 0u) EmitZydisMove(c, x64, 0u, candidateA);
 }
 
 void EmitZydisWideOperandCore(
@@ -4887,7 +4928,7 @@ bool EmitBusinessCoreVariant(
                 EmitZydisPushConditionCore(c, true, strategy);
                 return true;
             case VM_UOP_SELECT:
-                EmitKeyedSelectCore(c, true, strategy);
+                EmitZydisSelectCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH:
                 EmitZydisControlTargetCore(c, true, strategy);
@@ -5160,7 +5201,7 @@ bool EmitBusinessCoreVariant(
             EmitZydisPushConditionCore(c, false, strategy);
             return true;
         case VM_UOP_SELECT:
-            EmitKeyedSelectCore(c, false, strategy);
+            EmitZydisSelectCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH:
             EmitZydisControlTargetCore(c, false, strategy);
@@ -8442,6 +8483,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
              config.semantic == VM_UOP_FLAGS_UPDATE);
         const bool x86PopVregContract = !x64 &&
             config.semantic == VM_UOP_POP_VREG;
+        const bool x86SelectContract = !x64 &&
+            config.semantic == VM_UOP_SELECT;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
                reg == 8 || reg == 9 || reg == 10 || reg == 11 ||
@@ -8457,7 +8500,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
                 (x86UmulWideContract && (reg == 3 || reg == 6)) ||
                 (x86WideOperandContract && (reg == 3 || reg == 6)) ||
                 (x86FlagsMutationContract && reg == 3) ||
-                (x86PopVregContract && (reg == 3 || reg == 6)));
+                (x86PopVregContract && (reg == 3 || reg == 6)) ||
+                (x86SelectContract && reg == 3));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
             return false;

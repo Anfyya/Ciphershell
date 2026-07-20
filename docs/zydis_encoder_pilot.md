@@ -1772,3 +1772,130 @@ x64 CALL_VM K0
 `CALL_HOST`/`BRIDGE_EXTENDED` 按本批指示继续保留，后续必须作为 ABI/unwind/bridge
 高风险独立批；x64 `UMUL_WIDE` 也不与它们混做。`SELECT` 的测试覆盖与 Encoder
 迁移状态需要继续明确区分，不能仅凭 `5711a9f` 的批次描述计为已迁移。
+
+## 推广批次 13：`SELECT`（2026-07-21）
+
+### 范围与结论
+
+本批只迁移 `SELECT`，不触碰 `CALL_HOST`、`BRIDGE_EXTENDED` 或 x64
+`UMUL_WIDE`。原 `EmitKeyedSelectCore` 中的 `X64/X86BinaryImmediate32`、寄存器
+手写 helper 与 `c.Raw` business 指令全部由 `EmitZydisSelectCore` 的正式
+`ZydisEncoderRequest` 替换；两种 K 都只走 Encoder，失败继续汇入
+`CodeBuffer::FailEncoding`，没有 Raw fallback 或双轨实现。累计进度由
+**50/54** 增至 **51/54**，生产双策略静态覆盖保持 **54/54**。
+
+`SELECT` 的 wrapper 仍先调用真实 flag materializer，再由既有 condition evaluator
+把条件归一为 0/1，最后弹出两个候选值。迁移的 core 只消费这个布尔寄存器和两个
+候选值，不读取 evaluator 留下的宿主 EFLAGS，不改 virtual/pending flags，也不改变
+stack、fault、funclet 或 context 生命周期。x64 的 `0x28` flag-call stack funclet
+仍由原调用 helper 在发射调用指令时同步记录；本批没有随机化栈帧指令或复制一套
+独立 metadata 逻辑。
+
+### 每架构真实活跃性契约
+
+| 架构 | core 入口实际状态 | seed 选择的角色 | 固定保留与排除依据 |
+|---|---|---|---|
+| x64 | RAX=candidate A，RDX=candidate B，R10=已归一的 0/1 predicate，R15=context；RCX 的 pop-depth/index 生命周期已结束，R8/R9 未被 wrapper 使用，R11 的 value-codec 临时值已死 | candidate A/B 与 K1 mask scratch 在 `{RAX,RDX,R11,RCX,R8,R9}` 按连续三角色轮转，共 6 套；第一套固定 `{RAX,RDX,R11}` 复现旧计划 | R10 必须保持 predicate，绝不进入池；R15、RSP 和全部非易失 GPR 排除。K0 不使用 scratch，K1 使用第三角色；`MoveRegisterPair` 处理源/目标重叠后只把结果移回 RAX |
+| Win32 | EAX=candidate A，EDX=candidate B，ECX=0/1 predicate，EDI=context | candidate A/B 与 K1 mask scratch 只在 `{EAX,EDX,EBX}` 轮转，共 3 套；第一套 `{EAX,EDX,EBX}` 是旧计划 | 原 K1 已在这个精确 core 生命周期使用 EBX，故只为 SELECT 增加 validator 的精确 EBX 合同；ECX 仍为 predicate，ESI 仍是 threaded ABI state，EDI 仍是 context，均不借用 |
+
+不能复用此前的通用 fallback：其 x64 池含仍存活的 R10，会覆盖 predicate；其 x86
+池只有 EAX/ECX/EDX，但 ECX 此时也存活，只剩两个可用寄存器。这里新增的是
+SELECT 专属合同，而不是放宽全局 scratch pool。六套/三套计划的变化进入 MOV/XCHG、
+REX 与 ModRM；key 仍是原有等价扰动，不靠新增随机立即数刷 similarity。
+
+### 固定旧寄存器计划的代表字节
+
+永久测试 `TestZydisSelectRegisterDiversityAndFixedPlans` 穷举 SELECT 的完整 seed byte
+与四个 handler variant，分别找到两个 K 下的旧角色计划，完整解码 core 并打印
+字节。代表输出如下（空格仅为阅读分组）：
+
+| 架构/K | 迁移前手写代表形式 | Zydis 输出 | 等价性说明 |
+|---|---|---|---|
+| x86 K0 | `81 F0 66DE0B12 81 F2 66DE0B12 85 C9 0F 45 C2 81 F0 66DE0B12` | `35 66DE0B12 81 F2 66DE0B12 85 C9 0F 45 C2 35 66DE0B12` | 只有 `xor eax,imm32` 规范化为 accumulator short form；TEST/CMOVNZ、寄存器、key 与选择方向相同 |
+| x86 K1 | `81 F0 0A222A2A 81 F2 0A222A2A 89 CB F7 DB 31 C2 21 DA 31 D0 81 F0 0A222A2A` | `35 0A222A2A 81 F2 0A222A2A 89 CB F7 DB 31 C2 21 DA 31 D0 35 0A222A2A` | 同一 XOR-keyed mask-select 恒等式；EBX 仍只承载 `-predicate` mask |
+| x64 K0 | `48 81 F0 AD8C613A 48 81 F2 AD8C613A 45 85 D2 48 0F 45 C2 48 81 F0 AD8C613A` | `48 35 AD8C613A 48 81 F2 AD8C613A 45 85 D2 48 0F 45 C2 48 35 AD8C613A` | Zydis 合法选择 RAX short form；继续用 `test r10d,r10d` 和 64 位 CMOVNZ |
+| x64 K1 | `48 81 F0 CB91DC11 48 81 F2 CB91DC11 4D 89 D3 49 F7 DB 48 31 C2 4C 21 DA 48 31 D0 48 81 F0 CB91DC11` | `48 35 CB91DC11 48 81 F2 CB91DC11 4D 89 D3 49 F7 DB 48 31 C2 4C 21 DA 48 31 D0 48 35 CB91DC11` | 角色与 mask 代数逐条相同，只规范化 RAX 立即数编码 |
+
+项目没有为保留 `81 /6` 长形式插入 NOP、强制 Encoder 选码或保留手写 fallback。
+非固定计划通过安全 MOV/XCHG 搬入角色，K0 使用 Zydis TEST+CMOVNZ，K1 使用
+Zydis MOV+NEG+XOR/AND/XOR，结果统一移回 RAX/EAX。
+
+### 实现中发现并消除的风险
+
+1. 开工审计确认 `5711a9f` 只迁移了 `PUSH_CONDITION`；SELECT 当时只是作为下游
+   消费者被 host 矩阵执行，生产 core 从未接入 Encoder。本批删除该统计歧义对应的
+   最后一条 SELECT 手写 business 路径，不把旧测试覆盖冒充迁移完成。
+2. 通用寄存器 fallback 对 SELECT 不安全：x64 会把 live predicate R10 当候选，
+   Win32 则无法表达旧 core 已证明安全的局部 EBX。最终实现先从 wrapper 的真实入口
+   反推专属计划，并只给 SELECT validator 增加 `reg==EBX` 的窄合同；没有允许其他
+   x86 语义使用 EBX。
+3. seed 轮转会产生 candidate 与固定 RAX/RDX 源重叠或交换的计划。顺序 MOV 可能
+   覆盖尚未读取的源，因此复用已验证的 `MoveRegisterPair`：完整 swap 用 XCHG，
+   单向依赖先捕获会被覆盖的源；其余值在 core 后已死。穷举全部计划的 decode 与
+   host/native 真执行均通过。
+4. 终审发现首版 native fixture 的注释错误声称 not-taken r32 CMOV 会清高半，且
+   末尾 `xor eax,ecx` 的确会掩盖该高半状态。x86-64 的正确语义是 not-taken 保留
+   完整目的寄存器、taken 的 r32 写才清高半。最终 x64 fixture 改用
+   `xor rax,rcx`，让两种状态同时可观察；同步修正既有该专项的误导性标签后，完整
+   K/assignment seed 矩阵重新通过。这是加强证据，不是放宽比较。
+
+### native differential 与 host-arch 证据
+
+- SELECT 有一对一生产入口：`Translator::LowerConditionalData` 将真实 `CMOVcc`
+  lower 为两个 operand read、`VM_UOP_SELECT(condition)` 与 destination write。本批
+  因此新增 hard-gate `vm_select_native_differential`，没有制造 differential-only
+  micro-op。
+- fixture 在 Win32 为
+  `cmp ecx,ecx; cmovnz eax,edx; cmovz ecx,edx; xor eax,ecx; ret`，x64 将末尾
+  改为 `xor rax,rcx`。ZF 固定为 1，使第一条必定 not-taken、第二条必定 taken；
+  x64 的 64 位 XOR 让未取分支后完整 RAX 保留、取分支后 ECX 写入清零 RCX 高
+  32 位同时进入最终可观察结果，避免后续 32 位写掩盖高半错误。
+- 从 255 个实际 provider seed 动态选择并覆盖生产翻译实际到达的每个
+  `(handlerVariant,K,registerAssignment)`。x64 六套计划/每 K 全覆盖，实选 seed
+  `1/2/3/4/5/6/7/9/10/13/24/25`；Win32 三套计划/每 K 全覆盖，实选
+  `1/2/3/6/7/9`。每 seed 16 个真实 CPU corpus，全部通过。
+- `TestZydisSelectRegisterDiversityAndFixedPlans` 的真实 decode signature 结果为
+  x64 `6/6` assignment、每 K `6/6` signature；Win32 `3/3`、每 K `3/3`。
+- 既有 `ExecuteFlagsVariantMatrix` 继续在 host-arch 真 handler 中覆盖 O/E 条件、
+  selected/not-selected、1/2/4/8 字节（Win32 到 4 字节）、两个 K，以及下游
+  POP_VREG 对结果的读取。该矩阵与新增生产 translator differential 是互补证据，
+  不互相冒充。
+
+### 双架构验证与 per-build similarity
+
+- Release x64 与 Win32 完整目标重新生成并编译通过，未新增、安装或下载依赖。
+- x64 除 similarity 外 CTest **17/17** 通过，完整旧 native differential
+  110.10 秒；高半证据修正后的 SELECT hard-gate 7.37 秒通过；正式 similarity
+  独立运行 338.00 秒通过。
+- Win32 除旧完整 native wrapper 与 similarity 外 CTest **16/16** 通过，新 SELECT
+  hard-gate 修正后 4.39 秒通过；旧 `vm_native_differential` 保持既有 `TIMEOUT 120` 不变，
+  直接运行同一二进制 132.2 秒自然完成、退出码 0；正式 similarity 独立运行
+  401.80 秒通过。没有提高 timeout、删除 corpus 或跳过失败语义。
+- `vm_kernel_static_gate -V` 明确输出生产双策略覆盖 **54/54**。
+- 固定种子合成代理：x86 `core_variant=0.252309`、最差 pair 仍为既有
+  `POP_VREG K0=0.592105`；x64 `core_variant=0.324421`、最差 pair `0.447059`。
+  SELECT 没有成为新的最差单点。
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers | business/core max pair |
+|---|---:|---:|---:|---:|---:|
+| x64 EXE | 0.2641 | 0.1385 | 0.1068 | 0.0001 | 0.3759 / 0.3243 |
+| x64 DLL | 0.2837 | 0.1595 | 0.0933 | 0.0001 | 0.4014 / 0.4134 |
+| Win32 EXE | 0.2667 | 0.1200 | 0.0452 | 0.0001 | 0.4200 / 0.4865 |
+| Win32 DLL | 0.2724 | 0.1162 | 0.0231 | 0.0001 | 0.4029 / 0.4865 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；聚合阈值、单 pair ceiling、
+corpus、skip 规则与 timeout 全部保持原值。
+
+### 当前剩余语义与后续风险边界
+
+按当前生产源码，剩余 **3/54**：`CALL_HOST`、`BRIDGE_EXTENDED` 与仅 x64 尚未
+迁移的 `UMUL_WIDE`。
+
+- `CALL_HOST` 与 `BRIDGE_EXTENDED` 必须拆成两个独立高风险批。任何 per-build
+  栈帧/保存寄存器变化都必须由同一发射数据结构同步生成指令与 unwind/.pdata，
+  并新增在目标代码内部故意触发 Windows 异常、实际执行 stack unwind 的测试；
+  正常返回不构成充分证据。借用 XMM/SIMD 时还必须逐寄存器核对调用前后状态。
+- x64 `UMUL_WIDE` 另做独立硬件隐式寄存器批：RDX:RAX 的输入/高低结果是 CPU
+  固定约束，只在显式乘数来源允许的范围内变化；除普通差分外必须专项验证 high/
+  low half 没有颠倒。既有 0.714 单点仅作为受硬件约束的基线，不为追求普通 ALU
+  数字引入危险寄存器或放宽门禁。

@@ -3896,6 +3896,109 @@ void TestZydisPushConditionRegisterDiversity() {
     }
 }
 
+void TestZydisSelectRegisterDiversityAndFixedPlans() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t expectedAssignments =
+            architecture == VM_ARCH_X64 ? 6u : 3u;
+        const uint8_t predicate =
+            architecture == VM_ARCH_X64 ? 10u : 1u;
+        const std::array<uint8_t, 3> legacyRoles =
+            architecture == VM_ARCH_X64
+            ? std::array<uint8_t, 3>{0u, 2u, 11u}
+            : std::array<uint8_t, 3>{0u, 2u, 3u};
+        std::array<std::set<std::array<uint8_t, 4>>, 2>
+            assignmentsByStrategy{};
+        std::array<std::set<std::string>, 2> signaturesByStrategy{};
+        std::array<bool, 2> fixedPlanSeen{};
+
+        // Sweep the complete SELECT seed byte and every handler variant. This
+        // proves each K can independently reach every SELECT-specific live
+        // role plan instead of inferring coverage from the allocator formula.
+        for (uint16_t seedByte = 0u; seedByte <= 0xFFu; ++seedByte) {
+            for (uint8_t variant = 0u;
+                 variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(0x73u);
+                config.buildSeed[
+                    static_cast<uint8_t>(VM_UOP_SELECT) & 31u] =
+                    static_cast<uint8_t>(seedByte);
+                config.semantic = VM_UOP_SELECT;
+                config.variant = variant;
+                const auto generated =
+                    GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "SELECT generation failed: " + generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "SELECT validation failed: " + validationError);
+                const uint8_t strategy = generated.semanticCoreStrategy;
+                Require(strategy < 2u,
+                    "SELECT selected an invalid core strategy");
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                Require(signature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u &&
+                        signature.registerIds.count(
+                            generated.registerAssignment[1]) != 0u &&
+                        signature.registerIds.count(predicate) != 0u,
+                    "published SELECT candidates/predicate are absent from "
+                    "the decoded core");
+                if (strategy == 1u) {
+                    Require(signature.registerIds.count(
+                                generated.registerAssignment[2]) != 0u,
+                        "published SELECT mask scratch is absent from the "
+                        "decoded K=1 core");
+                }
+                assignmentsByStrategy[strategy].insert(
+                    generated.registerAssignment);
+                signaturesByStrategy[strategy].insert(signature.text);
+
+                const bool legacyPlan =
+                    generated.registerAssignment[0] == legacyRoles[0] &&
+                    generated.registerAssignment[1] == legacyRoles[1] &&
+                    generated.registerAssignment[2] == legacyRoles[2];
+                if (legacyPlan && !fixedPlanSeen[strategy]) {
+                    const auto core = Slice(generated.code,
+                        generated.semanticCoreVariantOffset,
+                        generated.semanticCoreVariantSize);
+                    std::ostringstream bytes;
+                    bytes << std::hex;
+                    for (uint8_t byte : core) {
+                        if (byte < 0x10u) bytes << '0';
+                        bytes << static_cast<unsigned>(byte);
+                    }
+                    std::cout << "[zydis-select-fixed-bytes] arch="
+                              << architecture << " K="
+                              << static_cast<unsigned>(strategy)
+                              << " bytes=" << bytes.str() << '\n';
+                    fixedPlanSeen[strategy] = true;
+                }
+            }
+        }
+
+        for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+            Require(assignmentsByStrategy[strategy].size() ==
+                    expectedAssignments,
+                "SELECT did not cover every proven register plan for a "
+                "fixed K");
+            Require(signaturesByStrategy[strategy].size() >=
+                    expectedAssignments,
+                "SELECT decoded signatures did not vary across every "
+                "register plan for a fixed K");
+            Require(fixedPlanSeen[strategy],
+                "SELECT could not reproduce the legacy fixed register plan "
+                "for both K strategies");
+        }
+        std::cout << "[zydis-registers-select] arch=" << architecture
+                  << " assignments=" << assignmentsByStrategy[0].size()
+                  << "/" << assignmentsByStrategy[1].size()
+                  << " signatures=" << signaturesByStrategy[0].size()
+                  << "/" << signaturesByStrategy[1].size() << '\n';
+    }
+}
+
 // Batch 10 is a flags-boundary batch, so each semantic is checked against its
 // own post-call liveness contract instead of being folded into a shared ALU
 // pool: MATERIALIZE publishes a seed-selected address role, PACK_AH a single
@@ -4293,6 +4396,8 @@ int main() {
         &TestZydisWideOperandRegisterDiversity, failures);
     Run("Zydis PUSH_CONDITION register allocation",
         &TestZydisPushConditionRegisterDiversity, failures);
+    Run("Zydis SELECT register allocation and fixed-plan bytes",
+        &TestZydisSelectRegisterDiversityAndFixedPlans, failures);
     Run("Zydis flags boundary register allocation",
         &TestZydisFlagsBoundaryRegisterDiversity, failures);
     Run("Zydis flags boundary fixed-register byte plans",
