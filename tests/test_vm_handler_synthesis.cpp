@@ -1815,6 +1815,24 @@ extern "C" void __fastcall GateInstructionBridgeTarget(
 }
 #endif
 
+#if defined(_M_X64) || defined(_M_IX86)
+// Isolated on purpose: an optimizing compiler is free to schedule an
+// unrelated stack array's vectorized zero-init (e.g. `pxor xmm0,xmm0`) any
+// time before its first use, including around an FXSAVE/FXRSTOR intrinsic
+// that textually precedes or follows it, because it does not model
+// FXRSTOR/FXSAVE as touching the same "resource" as its own scratch use of
+// XMM registers.  A tiny noinline function with nothing else in its body
+// removes any such candidate instruction the compiler could interleave.
+__declspec(noinline safebuffers) void SnapshotAmbientFpState(
+    uint8_t (&out)[512]) {
+#if defined(_M_X64)
+    _fxsave64(out);
+#else
+    _fxsave(out);
+#endif
+}
+#endif
+
 #if defined(_M_X64)
 constexpr uint64_t kCallHostWin64Result = 0xA11CE5EED1234567ULL;
 constexpr uint64_t kCallHostWin64StackMutation = 0x55AA33CC0FF00FF0ULL;
@@ -1836,6 +1854,93 @@ extern "C" __declspec(noinline) uint64_t __fastcall GateCallHostWin64Target(
         reinterpret_cast<volatile uint64_t*>(_AddressOfReturnAddress());
     callerStack[5] = e ^ kCallHostWin64StackMutation;
     return kCallHostWin64Result;
+}
+
+// Real guest/target-mutated x87/MXCSR/XMM0 fixtures for CALL_HOST FP/SIMD
+// state evidence.  Every value is a legal, non-reserved control-register
+// pattern (masked exceptions, defined rounding control) so LDMXCSR/FLDCW can
+// never fault; only FCW/MXCSR/XMM0 are asserted on to avoid false failures
+// from the compiler's own incidental use of the other 15 XMM registers as
+// scratch space around these calls.  There is deliberately no fixed "host"
+// pattern here: host-thread isolation is proven differentially (see
+// ExecuteCallHostExtendedStateCases) rather than by imposing a specific
+// ambient value from outside the VM, because this VM's own context-entry
+// dispatch code legitimately uses XMM0-3 as scratch/cache before CALL_HOST's
+// own code ever runs.
+constexpr uint16_t kCallHostFpGuestFcw = 0x027Fu;
+constexpr uint32_t kCallHostFpGuestMxcsr = 0x9FC0u;
+constexpr uint64_t kCallHostFpGuestXmm0Low = 0x3333333333333333ULL;
+constexpr uint64_t kCallHostFpGuestXmm0High = 0x4444444444444444ULL;
+constexpr uint16_t kCallHostFpTargetFcw = 0x0B7Fu;
+constexpr uint32_t kCallHostFpTargetMxcsr = 0x5F80u;
+constexpr uint64_t kCallHostFpTargetXmm0Low = 0x5555555555555555ULL;
+constexpr uint64_t kCallHostFpTargetXmm0High = 0x6666666666666666ULL;
+
+void BuildCallHostFpImage(
+    const uint8_t (&templateImage)[512],
+    uint16_t fcw, uint32_t mxcsr, uint64_t xmm0Low, uint64_t xmm0High,
+    uint8_t (&out)[512])
+{
+    std::memcpy(out, templateImage, sizeof(out));
+    std::memcpy(out + 0, &fcw, sizeof(fcw));
+    std::memcpy(out + 24, &mxcsr, sizeof(mxcsr));
+    std::memcpy(out + 160, &xmm0Low, sizeof(xmm0Low));
+    std::memcpy(out + 168, &xmm0High, sizeof(xmm0High));
+}
+
+void ReadCallHostFpImage(
+    const uint8_t (&image)[512],
+    uint16_t& fcw, uint32_t& mxcsr, uint64_t& xmm0Low, uint64_t& xmm0High)
+{
+    std::memcpy(&fcw, image + 0, sizeof(fcw));
+    std::memcpy(&mxcsr, image + 24, sizeof(mxcsr));
+    std::memcpy(&xmm0Low, image + 160, sizeof(xmm0Low));
+    std::memcpy(&xmm0High, image + 168, sizeof(xmm0High));
+}
+
+volatile uint16_t gCallHostFpObservedFcw = 0;
+volatile uint32_t gCallHostFpObservedMxcsr = 0;
+volatile uint64_t gCallHostFpObservedXmm0Low = 0;
+volatile uint64_t gCallHostFpObservedXmm0High = 0;
+alignas(16) uint8_t gCallHostFpTargetMutatedImage[512] = {};
+
+// This target deliberately never touches a GPR argument beyond a marker (Win64
+// only ever passes integers in RCX-R9; XMM0 at entry is therefore pure
+// carry-over ambient state, exactly what CALL_HOST is required to have
+// restored to the guest's value immediately before this call).
+extern "C" __declspec(noinline safebuffers) uint64_t __fastcall
+GateCallHostFpTarget(
+    uint64_t marker)
+{
+    // Must not be zero-initialized: FXSAVE fully overwrites it, and a
+    // compiler-generated zero-init (e.g. `pxor xmm0,xmm0`) could clobber the
+    // real XMM0 this call is trying to observe before FXSAVE captures it.
+    alignas(16) uint8_t entrySnapshot[512];
+    _fxsave64(entrySnapshot);
+    uint16_t fcw = 0; uint32_t mxcsr = 0; uint64_t xmmLow = 0, xmmHigh = 0;
+    ReadCallHostFpImage(entrySnapshot, fcw, mxcsr, xmmLow, xmmHigh);
+    gCallHostFpObservedFcw = fcw;
+    gCallHostFpObservedMxcsr = mxcsr;
+    gCallHostFpObservedXmm0Low = xmmLow;
+    gCallHostFpObservedXmm0High = xmmHigh;
+    // Simulate ordinary host library code that legitimately uses the FPU/SSE
+    // internally and leaves its own state behind on return.
+    _fxrstor64(gCallHostFpTargetMutatedImage);
+    return marker ^ 0xF9F9F9F9F9F9F9F9ULL;
+}
+
+// Deliberately dirties FP/SIMD state and then faults with a genuine hardware
+// exception (write through a null pointer) before ever returning normally.
+// There is no software-simulated cleanup call anywhere in this path: the
+// exception must be handled by the real Windows unwind dispatcher walking
+// through CALL_HOST's own UNW_FLAG_UHANDLER thunk.
+extern "C" __declspec(noinline safebuffers) uint64_t __fastcall
+GateCallHostFaultTarget(uint64_t address)
+{
+    _fxrstor64(gCallHostFpTargetMutatedImage);
+    *reinterpret_cast<volatile uint64_t*>(static_cast<uintptr_t>(address)) =
+        0xDEADDEADDEADDEADULL;
+    return 0; // unreachable
 }
 #elif defined(_M_IX86)
 constexpr uint32_t kCallHostX86StackMutation = 0x55AA33CCu;
@@ -1901,6 +2006,82 @@ extern "C" __declspec(noinline) uint32_t __stdcall GateCallHostAutoTarget(
         reinterpret_cast<volatile uint32_t*>(_AddressOfReturnAddress());
     callerStack[1] = a ^ kCallHostX86StackMutation;
     return 0xA070CA11u;
+}
+
+// x86 host/guest/target-mutated x87/MXCSR/XMM0 fixtures, mirroring the x64
+// evidence above.  EAX/ECX/EDX carry the one integer argument under cdecl;
+// XMM0 at entry is pure ambient carry-over, unrelated to the call's own
+// argument passing.
+constexpr uint16_t kCallHostFpHostFcw = 0x037Fu;
+constexpr uint32_t kCallHostFpHostMxcsr = 0x1F80u;
+constexpr uint64_t kCallHostFpHostXmm0Low = 0x1111111111111111ULL;
+constexpr uint64_t kCallHostFpHostXmm0High = 0x2222222222222222ULL;
+constexpr uint16_t kCallHostFpGuestFcw = 0x027Fu;
+constexpr uint32_t kCallHostFpGuestMxcsr = 0x9FC0u;
+constexpr uint64_t kCallHostFpGuestXmm0Low = 0x3333333333333333ULL;
+constexpr uint64_t kCallHostFpGuestXmm0High = 0x4444444444444444ULL;
+constexpr uint16_t kCallHostFpTargetFcw = 0x0B7Fu;
+constexpr uint32_t kCallHostFpTargetMxcsr = 0x5F80u;
+constexpr uint64_t kCallHostFpTargetXmm0Low = 0x5555555555555555ULL;
+constexpr uint64_t kCallHostFpTargetXmm0High = 0x6666666666666666ULL;
+
+void BuildCallHostFpImage(
+    const uint8_t (&templateImage)[512],
+    uint16_t fcw, uint32_t mxcsr, uint64_t xmm0Low, uint64_t xmm0High,
+    uint8_t (&out)[512])
+{
+    std::memcpy(out, templateImage, sizeof(out));
+    std::memcpy(out + 0, &fcw, sizeof(fcw));
+    std::memcpy(out + 24, &mxcsr, sizeof(mxcsr));
+    std::memcpy(out + 160, &xmm0Low, sizeof(xmm0Low));
+    std::memcpy(out + 168, &xmm0High, sizeof(xmm0High));
+}
+
+void ReadCallHostFpImage(
+    const uint8_t (&image)[512],
+    uint16_t& fcw, uint32_t& mxcsr, uint64_t& xmm0Low, uint64_t& xmm0High)
+{
+    std::memcpy(&fcw, image + 0, sizeof(fcw));
+    std::memcpy(&mxcsr, image + 24, sizeof(mxcsr));
+    std::memcpy(&xmm0Low, image + 160, sizeof(xmm0Low));
+    std::memcpy(&xmm0High, image + 168, sizeof(xmm0High));
+}
+
+volatile uint16_t gCallHostFpObservedFcw = 0;
+volatile uint32_t gCallHostFpObservedMxcsr = 0;
+volatile uint64_t gCallHostFpObservedXmm0Low = 0;
+volatile uint64_t gCallHostFpObservedXmm0High = 0;
+alignas(16) uint8_t gCallHostFpTargetMutatedImage[512] = {};
+
+extern "C" __declspec(noinline safebuffers) uint32_t __cdecl
+GateCallHostFpTarget(
+    uint32_t marker)
+{
+    // See the x64 GateCallHostFpTarget above: must stay uninitialized so a
+    // compiler zero-init cannot clobber the real XMM0 before FXSAVE reads it.
+    alignas(16) uint8_t entrySnapshot[512];
+    _fxsave(entrySnapshot);
+    uint16_t fcw = 0; uint32_t mxcsr = 0; uint64_t xmmLow = 0, xmmHigh = 0;
+    ReadCallHostFpImage(entrySnapshot, fcw, mxcsr, xmmLow, xmmHigh);
+    gCallHostFpObservedFcw = fcw;
+    gCallHostFpObservedMxcsr = mxcsr;
+    gCallHostFpObservedXmm0Low = xmmLow;
+    gCallHostFpObservedXmm0High = xmmHigh;
+    _fxrstor(gCallHostFpTargetMutatedImage);
+    return marker ^ 0xF9F9F9F9u;
+}
+
+// x86 counterpart of GateCallHostFaultTarget: dirties FP/SIMD state, then
+// faults with a genuine null-pointer write, letting the real Win32 frame-
+// based SEH unwind dispatcher invoke CALL_HOST's inline registration
+// handler.
+extern "C" __declspec(noinline safebuffers) uint32_t __cdecl
+GateCallHostFaultTarget(uint32_t address)
+{
+    _fxrstor(gCallHostFpTargetMutatedImage);
+    *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(address)) =
+        0xDEADDEADu;
+    return 0; // unreachable
 }
 #endif
 
@@ -2198,6 +2379,456 @@ void ExecuteCallHostVariantCases(
 #endif
 }
 
+// Real execution evidence that CALL_HOST correctly threads x87/MXCSR/XMM0
+// state across the host/guest boundary: the native target must observe the
+// *guest* pattern (not host), the thread hosting the VM must have its own
+// (host) FP/SIMD state exactly restored after the call regardless of what the
+// target did, and the VM must save the target's post-call mutation back into
+// the guest extended-state image so a subsequent guest instruction would see
+// it.  Every image is built from a real ambient FXSAVE template so reserved
+// fields, tag words, and FIP/FDP stay whatever a genuine snapshot produced;
+// only FCW/MXCSR/XMM0 -- which this function fully controls -- are asserted
+// on, so incidental compiler use of the other 15 XMM registers as scratch
+// space cannot produce a false failure.
+void ExecuteCallHostExtendedStateCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& bootstrapImage)
+{
+#if defined(_M_X64)
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+    CallHostTestImage callImage(
+        reinterpret_cast<uintptr_t>(&GateCallHostFpTarget));
+#elif defined(_M_IX86)
+    if (config.architecture != VMHandlerArchitecture::X86) return;
+    CallHostTestImage callImage(
+        reinterpret_cast<uintptr_t>(&GateCallHostFpTarget));
+#else
+    (void)config; (void)result; (void)loaded; (void)encoding;
+    (void)bootstrapImage;
+    return;
+#endif
+#if defined(_M_X64) || defined(_M_IX86)
+    // IMPORTANT: none of these 512-byte snapshot buffers may be
+    // zero-initialized ("= {}") -- an optimizing compiler is free to zero a
+    // local array with a `pxor xmmN, xmmN` / vectorized store sequence, which
+    // would silently clobber whatever real XMM registers this test is trying
+    // to observe.  Every one of these buffers is fully overwritten by FXSAVE
+    // or by a same-sized memcpy before it is ever read, so leaving them
+    // uninitialized is both safe and required here.
+    //
+    // A first version of this test tried to *impose* a specific "host"
+    // x87/MXCSR/XMM0 pattern from outside by FXRSTOR-ing it immediately
+    // before calling into the VM, then asserting that exact pattern survived
+    // the call.  That is unsound for this VM: its own context-entry dispatch
+    // code legitimately uses XMM0-3 as scratch/cache registers (see the
+    // MOVDQU-based bulk register transfer in vm_handler_entry_codegen.cpp)
+    // before CALL_HOST's own code ever runs, so nothing outside the VM can
+    // control -- or needs to control -- what is "ambient" at the exact
+    // instant CALL_HOST's internal host-FXSAVE executes.  The property that
+    // actually matters, and that *is* soundly testable from outside, is
+    // differential: whatever that ambient state turns out to be, it must be
+    // identical whether or not the *native target itself* touches FP/SIMD
+    // state.  If CALL_HOST correctly isolates the guest/target's FP/SIMD
+    // effects from the host thread, a run through a target that never
+    // touches FP/SIMD (the existing, unrelated GateCallHostWin64Target /
+    // GateCallHostCdeclTarget) and a run through a target that aggressively
+    // mutates FP/SIMD state (GateCallHostFpTarget) must leave the *same*
+    // ambient state behind.
+    alignas(16) uint8_t guestImage[512];
+    {
+        alignas(16) uint8_t ambientTemplate[512];
+#if defined(_M_X64)
+        _fxsave64(ambientTemplate);
+#else
+        _fxsave(ambientTemplate);
+#endif
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpGuestFcw,
+            kCallHostFpGuestMxcsr, kCallHostFpGuestXmm0Low,
+            kCallHostFpGuestXmm0High, guestImage);
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpTargetFcw,
+            kCallHostFpTargetMxcsr, kCallHostFpTargetXmm0Low,
+            kCallHostFpTargetXmm0High, gCallHostFpTargetMutatedImage);
+    }
+
+    for (uint8_t strategy : kCoreStrategies) {
+        std::array<uint64_t, 32> gprs{};
+#if defined(_M_X64)
+        alignas(16) std::array<uint8_t, 64> nativeStack{};
+        gprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        gprs[1] = 0xF00DF00Du;
+#else
+        alignas(16) std::array<uint32_t, 4> nativeStack{};
+        gprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+#endif
+
+        // (A) Neutral run: reuse the already-thoroughly-tested Win64/cdecl
+        // ABI target, which never touches FP/SIMD state, through the same
+        // ExecuteCallHostOnce harness used by ExecuteCallHostVariantCases.
+        // Its own internally captured extended state is irrelevant here;
+        // only the ambient state left behind afterward matters.
+#if defined(_M_X64)
+        ExecuteCallHostOnce(
+            "FP isolation neutral run strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostWin64Target),
+            VM_ABI_WIN64, 0, strategy, gprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result, loaded,
+            encoding, bootstrapImage);
+#else
+        ExecuteCallHostOnce(
+            "FP isolation neutral run strategy=" + std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostCdeclTarget),
+            VM_ABI_X86_CDECL, 8, strategy, gprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result, loaded,
+            encoding, bootstrapImage);
+#endif
+        alignas(16) uint8_t observedNeutralAfter[512];
+        SnapshotAmbientFpState(observedNeutralAfter);
+
+        // (A') Apples-to-apples mutating comparison run: *same*
+        // ExecuteCallHostOnce call path/frame shape as (A), varying only the
+        // target function pointer, so any difference in ambient state after
+        // the call can only be explained by what the target itself did, not
+        // by incidental differences between two structurally different call
+        // sites.  Its own internally captured "guest" state (ambient at call
+        // time) is irrelevant; only the ambient state left behind matters.
+#if defined(_M_X64)
+        ExecuteCallHostOnce(
+            "FP isolation mutating-comparison run strategy=" +
+                std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostFpTarget),
+            VM_ABI_WIN64, 0, strategy, gprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result, loaded,
+            encoding, bootstrapImage);
+#else
+        ExecuteCallHostOnce(
+            "FP isolation mutating-comparison run strategy=" +
+                std::to_string(strategy),
+            VM_MICRO_CALL_INDIRECT,
+            reinterpret_cast<uintptr_t>(&GateCallHostFpTarget),
+            VM_ABI_X86_CDECL, 4, strategy, gprs, callImage.Base(),
+            callImage.Metadata(), VM_MICRO_ERR_NONE, config, result, loaded,
+            encoding, bootstrapImage);
+#endif
+        alignas(16) uint8_t observedMutatingComparisonAfter[512];
+        SnapshotAmbientFpState(observedMutatingComparisonAfter);
+
+        // (B) Guest-visibility run: identical GPR/stack setup, but this run
+        // supplies its own explicit guest extended-state image so the
+        // guest-visibility and guest-save-back properties can be checked
+        // precisely (ExecuteCallHostOnce does not expose that control).  Its
+        // own ambient-after value is intentionally not used for the
+        // host-isolation comparison above, since its call path/frame shape
+        // differs from (A)/(A').
+        alignas(64) VM_EXTENDED_STATE extendedState{};
+        std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+        extendedState.flags = 0; // exercise the FXSAVE/FXRSTOR path
+        gCallHostFpObservedFcw = 0;
+        gCallHostFpObservedMxcsr = 0;
+        gCallHostFpObservedXmm0Low = 0;
+        gCallHostFpObservedXmm0High = 0;
+
+        std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+        for (uint8_t index = 0; index < registerMap.size(); ++index)
+            registerMap[index] = index;
+        VM_MICRO_EXECUTION_CONTEXT context{};
+#if defined(_M_X64)
+        const uint8_t addressWidth = 8u;
+        const std::vector<MicroInstruction> program = {
+            Uop(VM_UOP_PUSH_IMM,
+                {reinterpret_cast<uintptr_t>(&GateCallHostFpTarget),
+                 addressWidth},
+                CoreVariantForStrategy(config, VM_UOP_PUSH_IMM, strategy)),
+            Uop(VM_UOP_CALL_HOST,
+                {static_cast<uint64_t>(VM_MICRO_CALL_INDIRECT),
+                 static_cast<uint64_t>(VM_ABI_WIN64), 0u},
+                CoreVariantForStrategy(config, VM_UOP_CALL_HOST, strategy)),
+            Uop(VM_UOP_RET, {0},
+                CoreVariantForStrategy(config, VM_UOP_RET, strategy)),
+        };
+        const std::vector<uint8_t> bytecode =
+            EncodeStraightLineRuntimeProgram(program, encoding);
+        context = MakeRuntimeContext(bytecode, encoding, config, registerMap,
+            bootstrapImage, gprs, VM_FLAG_FIXED_1);
+#else
+        const uint8_t addressWidth = 4u;
+        const std::vector<MicroInstruction> program = {
+            Uop(VM_UOP_PUSH_IMM,
+                {reinterpret_cast<uintptr_t>(&GateCallHostFpTarget),
+                 addressWidth},
+                CoreVariantForStrategy(config, VM_UOP_PUSH_IMM, strategy)),
+            Uop(VM_UOP_CALL_HOST,
+                {static_cast<uint64_t>(VM_MICRO_CALL_INDIRECT),
+                 static_cast<uint64_t>(VM_ABI_X86_CDECL), 4u},
+                CoreVariantForStrategy(config, VM_UOP_CALL_HOST, strategy)),
+            Uop(VM_UOP_RET, {0},
+                CoreVariantForStrategy(config, VM_UOP_RET, strategy)),
+        };
+        const std::vector<uint8_t> bytecode =
+            EncodeStraightLineRuntimeProgram(program, encoding);
+        context = MakeRuntimeContext(bytecode, encoding, config, registerMap,
+            bootstrapImage, gprs, VM_FLAG_FIXED_1);
+#endif
+        context.imageBase = reinterpret_cast<uintptr_t>(callImage.Base());
+        context.metadata = reinterpret_cast<uintptr_t>(callImage.Metadata());
+        context.extendedState = reinterpret_cast<uintptr_t>(&extendedState);
+
+        const auto entry = reinterpret_cast<SynthEntry>(
+            loaded.Base() + result.contextEntryOffset);
+        DWORD exceptionCode = 0;
+        const uint32_t runtimeError =
+            InvokeSynthEntry(entry, &context, &exceptionCode);
+
+        Require(exceptionCode == 0 && runtimeError == VM_MICRO_ERR_NONE &&
+                context.error == VM_MICRO_ERR_NONE,
+            "CALL_HOST FP/SIMD strategy=" + std::to_string(strategy) +
+            " 执行边界错误 exception=" + std::to_string(exceptionCode) +
+            " runtime=" + std::to_string(runtimeError) + " context=" +
+            std::to_string(context.error));
+
+        uint16_t observedGuestAtEntryFcw = gCallHostFpObservedFcw;
+        uint32_t observedGuestAtEntryMxcsr = gCallHostFpObservedMxcsr;
+        uint64_t observedGuestAtEntryXmmLow = gCallHostFpObservedXmm0Low;
+        uint64_t observedGuestAtEntryXmmHigh = gCallHostFpObservedXmm0High;
+
+        uint16_t neutralFcw = 0, mutatingFcw = 0, guestAfterFcw = 0;
+        uint32_t neutralMxcsr = 0, mutatingMxcsr = 0, guestAfterMxcsr = 0;
+        uint64_t neutralXmmLow = 0, mutatingXmmLow = 0, guestAfterXmmLow = 0;
+        uint64_t neutralXmmHigh = 0, mutatingXmmHigh = 0, guestAfterXmmHigh = 0;
+        ReadCallHostFpImage(observedNeutralAfter, neutralFcw, neutralMxcsr,
+            neutralXmmLow, neutralXmmHigh);
+        ReadCallHostFpImage(observedMutatingComparisonAfter, mutatingFcw,
+            mutatingMxcsr, mutatingXmmLow, mutatingXmmHigh);
+        alignas(16) uint8_t guestAfter[512];
+        std::memcpy(guestAfter, extendedState.xsaveArea, sizeof(guestAfter));
+        ReadCallHostFpImage(guestAfter, guestAfterFcw, guestAfterMxcsr,
+            guestAfterXmmLow, guestAfterXmmHigh);
+
+        // (1) The native target must have seen guest state, not whatever
+        // ambient state preceded it.
+        Require(observedGuestAtEntryFcw == kCallHostFpGuestFcw &&
+                observedGuestAtEntryMxcsr == kCallHostFpGuestMxcsr &&
+                observedGuestAtEntryXmmLow == kCallHostFpGuestXmm0Low &&
+                observedGuestAtEntryXmmHigh == kCallHostFpGuestXmm0High,
+            "CALL_HOST strategy=" + std::to_string(strategy) +
+            " native target 入口未观察到 guest FP/SIMD 状态: fcw=" +
+            std::to_string(observedGuestAtEntryFcw) + " mxcsr=" +
+            std::to_string(observedGuestAtEntryMxcsr));
+
+        // (2) Host-thread isolation: the ambient FP/SIMD state left behind
+        // must be identical regardless of whether the native target itself
+        // mutated FP/SIMD state, proving CALL_HOST's host save/restore around
+        // the call is not leaking the target's (or the guest's) effects into
+        // the thread hosting the VM.
+        Require(neutralFcw == mutatingFcw && neutralMxcsr == mutatingMxcsr &&
+                neutralXmmLow == mutatingXmmLow &&
+                neutralXmmHigh == mutatingXmmHigh,
+            "CALL_HOST strategy=" + std::to_string(strategy) +
+            " 调用后宿主 FP/SIMD 状态受 target 内部状态影响，未被正确隔离: "
+            "neutral(fcw=" + std::to_string(neutralFcw) + ",mxcsr=" +
+            std::to_string(neutralMxcsr) + ",xmm=" +
+            std::to_string(neutralXmmLow) + "/" +
+            std::to_string(neutralXmmHigh) + ") mutating(fcw=" +
+            std::to_string(mutatingFcw) + ",mxcsr=" +
+            std::to_string(mutatingMxcsr) + ",xmm=" +
+            std::to_string(mutatingXmmLow) + "/" +
+            std::to_string(mutatingXmmHigh) + ")");
+
+        // (3) The VM must have saved the target's post-call (mutated)
+        // FP/SIMD state back into the guest extended-state image.
+        Require(guestAfterFcw == kCallHostFpTargetFcw &&
+                guestAfterMxcsr == kCallHostFpTargetMxcsr &&
+                guestAfterXmmLow == kCallHostFpTargetXmm0Low &&
+                guestAfterXmmHigh == kCallHostFpTargetXmm0High,
+            "CALL_HOST strategy=" + std::to_string(strategy) +
+            " 未把 target 修改后的 guest FP/SIMD 状态保存回 context: fcw=" +
+            std::to_string(guestAfterFcw) + " mxcsr=" +
+            std::to_string(guestAfterMxcsr));
+    }
+#endif
+}
+
+// Real Windows unwind evidence for CALL_HOST: the native target dirties
+// FP/SIMD state and then faults with a genuine hardware exception (a write
+// through a null pointer -- not a simulated call into any cleanup routine).
+// The exception must propagate through the real Windows exception dispatcher,
+// which on x64 walks the .pdata/.xdata for this synthesized image and must
+// invoke CALL_HOST's own UNW_FLAG_UHANDLER thunk during the unwind pass; on
+// Win32 the same InvokeSynthEntry __try/__except is serviced by the inline
+// FS:[0] frame CALL_HOST registered.  This function does not special-case
+// either architecture's dispatch mechanism -- it only observes externally
+// visible effects, which is exactly what a real caller would see.
+void ExecuteCallHostRealExceptionCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& bootstrapImage)
+{
+    // In-process real-exception coverage is x64-only here.  LoadedSynthImage
+    // (below) registers the synthesized image's dynamic unwind info with
+    // RtlAddFunctionTable, which is exactly the documented escape hatch that
+    // lets Windows' x64 exception dispatcher trust a UNW_FLAG_UHANDLER thunk
+    // living in ordinary VirtualAlloc'd memory that does not belong to any
+    // loaded PE module.  x86 has no equivalent API: RtlIsValidHandler
+    // unconditionally rejects a frame-based SEH handler that is not part of
+    // a loaded module (this is the documented DEP-era mitigation against
+    // heap-sprayed fake exception handlers), regardless of whether the
+    // memory is executable.  Verified empirically: routing this exact test
+    // through Win32's LoadedSynthImage crashes the whole process with an
+    // uncaught STATUS_ACCESS_VIOLATION *before* CALL_HOST's own inline
+    // FS:[0] handler is ever considered, because the handler is not
+    // module-backed -- not because of any defect in
+    // EmitX86CallHostSehRegistration itself. A real x86 real-exception test
+    // therefore requires the handler to live inside an actual loaded PE
+    // module (i.e. a fully packed EXE/DLL executed as its own process), not
+    // this in-process synthesized-image harness; that is tracked separately
+    // as part of the PE-metadata evidence work and is not yet implemented.
+#if defined(_M_X64)
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+    CallHostTestImage callImage(
+        reinterpret_cast<uintptr_t>(&GateCallHostFaultTarget));
+#else
+    (void)config; (void)result; (void)loaded; (void)encoding;
+    (void)bootstrapImage;
+    return;
+#endif
+#if defined(_M_X64)
+    for (uint8_t strategy : kCoreStrategies) {
+        std::array<uint64_t, 32> baseGprs{};
+        alignas(16) std::array<uint8_t, 64> nativeStack{};
+        baseGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        // A real, safely writable target for the non-faulting comparison
+        // run; the fault run instead writes through a null address.  Both
+        // runs call the *exact same* GateCallHostFaultTarget function --
+        // only this argument differs -- so their ambient-after snapshots are
+        // as apples-to-apples as this test can make them.
+        volatile uint64_t safeWriteTarget = 0;
+        constexpr uint64_t kExpectedSafeWrite = 0xDEADDEADDEADDEADULL;
+
+        const auto runOnce = [&](uint64_t argument,
+                                 uint32_t expectedRuntimeError,
+                                 DWORD expectedExceptionCode,
+                                 uint8_t (&ambientAfter)[512],
+                                 const char* label) {
+            std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+            for (uint8_t index = 0; index < registerMap.size(); ++index)
+                registerMap[index] = index;
+            alignas(64) VM_EXTENDED_STATE extendedState{};
+            CaptureCallHostExtendedState(extendedState);
+            std::array<uint64_t, 32> gprs = baseGprs;
+            // Win64 fastcall/ABI: the first integer argument is RCX.
+            gprs[1] = argument;
+            VM_MICRO_EXECUTION_CONTEXT context{};
+            const uint8_t addressWidth = 8u;
+            const std::vector<MicroInstruction> program = {
+                Uop(VM_UOP_PUSH_IMM,
+                    {reinterpret_cast<uintptr_t>(&GateCallHostFaultTarget),
+                     addressWidth},
+                    CoreVariantForStrategy(config, VM_UOP_PUSH_IMM, strategy)),
+                Uop(VM_UOP_CALL_HOST,
+                    {static_cast<uint64_t>(VM_MICRO_CALL_INDIRECT),
+                     static_cast<uint64_t>(VM_ABI_WIN64), 0u},
+                    CoreVariantForStrategy(config, VM_UOP_CALL_HOST, strategy)),
+                Uop(VM_UOP_RET, {0},
+                    CoreVariantForStrategy(config, VM_UOP_RET, strategy)),
+            };
+            const std::vector<uint8_t> bytecode =
+                EncodeStraightLineRuntimeProgram(program, encoding);
+            context = MakeRuntimeContext(bytecode, encoding, config,
+                registerMap, bootstrapImage, gprs, VM_FLAG_FIXED_1);
+            context.imageBase = reinterpret_cast<uintptr_t>(callImage.Base());
+            context.metadata = reinterpret_cast<uintptr_t>(callImage.Metadata());
+            context.extendedState = reinterpret_cast<uintptr_t>(&extendedState);
+            const auto entry = reinterpret_cast<SynthEntry>(
+                loaded.Base() + result.contextEntryOffset);
+            DWORD exceptionCode = 0;
+            const uint32_t runtimeError =
+                InvokeSynthEntry(entry, &context, &exceptionCode);
+            SnapshotAmbientFpState(ambientAfter);
+            Require(exceptionCode == expectedExceptionCode &&
+                    runtimeError == expectedRuntimeError,
+                std::string(label) + " strategy=" +
+                std::to_string(strategy) + " 执行结果不符: exception=" +
+                std::to_string(exceptionCode) + "(期望" +
+                std::to_string(expectedExceptionCode) + ") runtime=" +
+                std::to_string(runtimeError) + "(期望" +
+                std::to_string(expectedRuntimeError) + ")");
+        };
+
+        // (A) Baseline: a real, successful call through GateCallHostFaultTarget
+        // itself (writing to a safe stack address instead of faulting).
+        alignas(16) uint8_t ambientBaseline[512];
+        runOnce(reinterpret_cast<uintptr_t>(&safeWriteTarget),
+            VM_MICRO_ERR_NONE, 0, ambientBaseline,
+            "CALL_HOST 异常展开基线");
+        Require(safeWriteTarget == kExpectedSafeWrite,
+            "CALL_HOST 异常展开基线 strategy=" + std::to_string(strategy) +
+            " target 未真正执行写入");
+
+        // (B) Real hardware exception: the same target now writes through a
+        // null pointer.  EXCEPTION_ACCESS_VIOLATION is raised by the CPU
+        // inside the native call, unwinds through CALL_HOST's real prolog,
+        // and must be caught by InvokeSynthEntry's __except.
+        alignas(16) uint8_t ambientAfterFault[512];
+        runOnce(0, VM_MICRO_ERR_HANDLER_BUG, EXCEPTION_ACCESS_VIOLATION,
+            ambientAfterFault, "CALL_HOST 真实硬件异常展开");
+
+        // (C) Host isolation across the unwind: whatever ambient FP/SIMD
+        // state a successful call leaves behind must match what an
+        // *exception-unwound* call leaves behind, proving the real Windows
+        // unwind dispatcher actually invoked CALL_HOST's cleanup (nothing
+        // else in the unwind path knows how to restore FXSAVE state) and
+        // that the guest/target's dirtied state did not leak back into the
+        // thread hosting the VM through the exception CONTEXT.  Only
+        // FCW/MXCSR/XMM0 are compared -- see ExecuteCallHostExtendedState-
+        // Cases for why a full 512-byte memcmp is not sound here (compiler
+        // use of the other 15 XMM registers as incidental scratch).
+        uint16_t baselineFcw = 0, faultFcw = 0;
+        uint32_t baselineMxcsr = 0, faultMxcsr = 0;
+        uint64_t baselineXmmLow = 0, faultXmmLow = 0;
+        uint64_t baselineXmmHigh = 0, faultXmmHigh = 0;
+        ReadCallHostFpImage(ambientBaseline, baselineFcw, baselineMxcsr,
+            baselineXmmLow, baselineXmmHigh);
+        ReadCallHostFpImage(ambientAfterFault, faultFcw, faultMxcsr,
+            faultXmmLow, faultXmmHigh);
+        Require(baselineFcw == faultFcw && baselineMxcsr == faultMxcsr &&
+                baselineXmmLow == faultXmmLow &&
+                baselineXmmHigh == faultXmmHigh,
+            "CALL_HOST 真实异常展开 strategy=" + std::to_string(strategy) +
+            " 后宿主 FP/SIMD 状态与基线不一致，UHANDLER/SEH 清理未生效或"
+            "guest 状态通过异常 CONTEXT 污染了 host: baseline(fcw=" +
+            std::to_string(baselineFcw) + ",mxcsr=" +
+            std::to_string(baselineMxcsr) + ",xmm=" +
+            std::to_string(baselineXmmLow) + "/" +
+            std::to_string(baselineXmmHigh) + ") fault(fcw=" +
+            std::to_string(faultFcw) + ",mxcsr=" +
+            std::to_string(faultMxcsr) + ",xmm=" +
+            std::to_string(faultXmmLow) + "/" +
+            std::to_string(faultXmmHigh) + ")");
+
+        // (D) Stack/unwind-chain sanity: the thread must still be able to
+        // run an ordinary successful CALL_HOST after unwinding through a
+        // real exception, proving the stack pointer and nonvolatile
+        // registers were left in a valid state and dispatch can continue
+        // normally afterward.
+        safeWriteTarget = 0;
+        alignas(16) uint8_t ambientAfterRecovery[512];
+        runOnce(reinterpret_cast<uintptr_t>(&safeWriteTarget),
+            VM_MICRO_ERR_NONE, 0, ambientAfterRecovery,
+            "CALL_HOST 异常展开后恢复验证");
+        Require(safeWriteTarget == kExpectedSafeWrite,
+            "CALL_HOST 异常展开后恢复验证 strategy=" +
+            std::to_string(strategy) + " target 未真正执行写入");
+    }
+#endif
+}
+
 void ExecuteExternalSemanticVariantCases(
     const VMHandlerSynthesisConfig& config,
     const VMHandlerSynthesisResult& result,
@@ -2343,6 +2974,12 @@ void TestHostContextEntryExecution() {
         config, result, loaded, encoding, testImage);
     std::cout << "[阶段] CALL_HOST 目标解析/ABI/栈回写双策略差分\n";
     ExecuteCallHostVariantCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] CALL_HOST host/guest x87/MXCSR/XMM 状态证据\n";
+    ExecuteCallHostExtendedStateCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] CALL_HOST 真实 Windows 异常展开证据\n";
+    ExecuteCallHostRealExceptionCases(
         config, result, loaded, encoding, testImage);
     std::cout << "[阶段] BRIDGE_EXTENDED/INT3 外部效果双策略差分\n";
     ExecuteExternalSemanticVariantCases(
@@ -4606,6 +5243,115 @@ void TestX64ZydisUmulWidePerKSourcePlans() {
     }
 }
 
+// The CALL_HOST target resolver runs entirely before the native-call frame
+// is established (see EmitZydisCallTargetCore) and is seed-keyed
+// independently of the shared coreStrategy (ADD-vs-LEA image-base
+// normalization) via DeriveVariantRegisters's dedicated CALL_HOST branch:
+// x64 rotates through 7 plans, Win32 through 3.  This sweeps the complete
+// seed byte and every handler variant to prove each of those plans is
+// really reachable (not merely present in source), that the resolved
+// target register is always normalized back to RAX/EAX by the end of the
+// core, that the legacy fixed plan still reproduces its own byte sequence,
+// and that both coreStrategy forms remain independently reachable.
+void TestZydisCallHostResolverRegisterDiversity() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t expectedPlans = architecture == VM_ARCH_X64 ? 7u : 3u;
+        const uint8_t normalizedTarget = 0u; // RAX / EAX
+        const std::array<uint8_t, 4> legacyPlan = {0u, 2u, 1u, 0u};
+        std::set<std::array<uint8_t, 4>> assignments;
+        std::set<std::string> signatures;
+        std::set<uint8_t> coreStrategiesSeen;
+        bool fixedPlanSeen = false;
+
+        for (uint16_t seedByte = 0u; seedByte <= 0xFFu; ++seedByte) {
+            for (uint8_t variant = 0u;
+                 variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(0x5Eu);
+                config.buildSeed[
+                    static_cast<uint8_t>(VM_UOP_CALL_HOST) & 31u] =
+                    static_cast<uint8_t>(seedByte);
+                config.semantic = VM_UOP_CALL_HOST;
+                config.variant = variant;
+                const auto generated = GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "CALL_HOST resolver generation failed: " +
+                        generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "CALL_HOST resolver validation failed: " +
+                        validationError);
+                Require(generated.semanticCoreStrategy < 2u,
+                    "CALL_HOST resolver selected an invalid core strategy");
+                coreStrategiesSeen.insert(generated.semanticCoreStrategy);
+
+                const auto signature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                // registerAssignment[0..2] (target/imageBase/callKind) must
+                // all actually appear in the decoded core; [3] duplicates
+                // [0] by construction (see DeriveVariantRegisters) and is
+                // not published as a separate live role.
+                Require(signature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u &&
+                        signature.registerIds.count(
+                            generated.registerAssignment[1]) != 0u &&
+                        signature.registerIds.count(
+                            generated.registerAssignment[2]) != 0u,
+                    "published CALL_HOST resolver target/imageBase/callKind "
+                    "role is absent from the decoded core");
+                // The resolver always normalizes its result back into
+                // RAX/EAX before the native-call frame is established
+                // (EmitZydisCallTargetCore's trailing EmitZydisMove), so
+                // RAX/EAX must be live in the decoded core regardless of
+                // which seed-selected plan produced it.
+                Require(signature.registerIds.count(normalizedTarget) != 0u,
+                    "CALL_HOST resolver core does not normalize its result "
+                    "back into RAX/EAX");
+
+                assignments.insert(generated.registerAssignment);
+                signatures.insert(signature.text);
+
+                if (generated.registerAssignment == legacyPlan &&
+                        !fixedPlanSeen) {
+                    const auto core = Slice(generated.code,
+                        generated.semanticCoreVariantOffset,
+                        generated.semanticCoreVariantSize);
+                    std::ostringstream bytes;
+                    bytes << std::hex;
+                    for (uint8_t byte : core) {
+                        if (byte < 0x10u) bytes << '0';
+                        bytes << static_cast<unsigned>(byte);
+                    }
+                    std::cout << "[zydis-callhost-resolver-fixed-bytes] arch="
+                              << architecture << " bytes=" << bytes.str()
+                              << '\n';
+                    fixedPlanSeen = true;
+                }
+            }
+        }
+
+        Require(assignments.size() == expectedPlans,
+            "CALL_HOST resolver did not reach every published seed-selected "
+            "register plan (arch=" + std::to_string(architecture) +
+            " reached=" + std::to_string(assignments.size()) +
+            " expected=" + std::to_string(expectedPlans) + ")");
+        Require(signatures.size() >= expectedPlans,
+            "CALL_HOST resolver decoded signatures did not vary across "
+            "every register plan");
+        Require(coreStrategiesSeen.size() == 2u,
+            "CALL_HOST resolver did not reach both ADD/LEA core strategies");
+        Require(fixedPlanSeen,
+            "CALL_HOST resolver could not reproduce its legacy fixed "
+            "RAX/RDX/RCX register plan");
+        std::cout << "[zydis-registers-callhost-resolver] arch="
+                  << architecture << " plans=" << assignments.size()
+                  << " signatures=" << signatures.size()
+                  << " core_strategies=" << coreStrategiesSeen.size() << '\n';
+    }
+}
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -4667,5 +5413,7 @@ int main() {
         &TestX86ZydisUmulWidePerKSourcePlans, failures);
     Run("x64 Zydis UMUL_WIDE per-K source plans",
         &TestX64ZydisUmulWidePerKSourcePlans, failures);
+    Run("Zydis CALL_HOST resolver register allocation",
+        &TestZydisCallHostResolverRegisterDiversity, failures);
     return failures == 0 ? 0 : 1;
 }

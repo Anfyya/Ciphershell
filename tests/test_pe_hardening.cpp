@@ -394,6 +394,151 @@ void TestSafeSEHHandlerNotExecutable() {
 }
 
 // ============================================================================
+// SafeSEH 合并（PEEmitter::RebuildSafeSEHHandlerTable）
+//
+// 覆盖 CALL_HOST Win32 handler RVA 最终接入 PE 构建路径的核心契约：
+//   - 已有真实 SafeSEH 表时合并新 handler、排序、去重，并通过独立重新解析
+//     （而不仅是同一个 img 对象的内存状态）验证最终字节。
+//   - 已存在的 RVA 再次提交时不重复计入。
+//   - 原 PE 没有 SafeSEH 声明时是 no-op，不伪造契约。
+//   - 原 PE 声明 IMAGE_DLLCHARACTERISTICS_NO_SEH 时 fail-closed。
+//   - x64 image 上调用直接拒绝（x64 从不产生 Win32 SafeSEH 数据）。
+// ============================================================================
+
+CipherShell::CS_PE_IMAGE* BuildSafeSehPe(
+    const std::vector<uint32_t>& existingHandlerRvas) {
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32));  // Size
+    rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable) - sizeof(DWORD));
+    const size_t sehTableRel = rd.mark();
+    rd.u32(0);  // SEHandlerTable (32-bit VA) 占位
+    rd.u32(static_cast<uint32_t>(existingHandlerRvas.size()));  // SEHandlerCount
+    const size_t tableDataOff = rd.mark();
+    for (uint32_t rva : existingHandlerRvas) rd.u32(rva);
+
+    constexpr uint32_t imageBase = 0x10000000;
+    const uint32_t tableRVA = 0x2000u + static_cast<uint32_t>(tableDataOff);
+    const uint32_t tableVA = imageBase + tableRVA;
+    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint32_t));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
+         sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32)}
+    };
+    // .text needs to be large enough to host every existing handler RVA plus
+    // extra bytes new handler RVAs (chosen by each test) can point into.
+    auto lay = BuildPe(false, std::vector<uint8_t>(0x40, 0xCCu), rd.buf, dirs, {});
+    return Parse(lay);
+}
+
+void TestSafeSEHTableMergeAddsAndSortsNewHandler() {
+    auto* img = BuildSafeSehPe({0x1000u, 0x1006u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 2);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    // Deliberately out of order and lower than one existing entry to prove
+    // the merged table is really sorted, not just appended.
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1003u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[1] == 0x1003u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[2] == 0x1006u);
+
+    // Independent re-parse from the final raw bytes: proves the merged table
+    // was really committed to the PE image, not just reflected in the
+    // in-memory CS_LOAD_CONFIG the emitter itself maintains.
+    BYTE* reparsedBytes = new BYTE[img->rawSize];
+    std::memcpy(reparsedBytes, img->rawData, img->rawSize);
+    CipherShell::PEParser reparser;
+    auto* reparsed = reparser.LoadFromBuffer(reparsedBytes, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid && reparsed->loadConfig.valid);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[1] == 0x1003u);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[2] == 0x1006u);
+    reparser.FreeImage(reparsed);
+
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeDedupesExistingRva() {
+    auto* img = BuildSafeSehPe({0x1000u, 0x1002u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    // 0x1000 already exists; only 0x1004 is genuinely new.
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u, 0x1004u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[1] == 0x1002u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[2] == 0x1004u);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeNoOriginalTableIsNoOp() {
+    // No LOAD_CONFIG directory at all: RebuildSafeSEHHandlerTable must not
+    // fabricate a SafeSEH contract the original build never declared.
+    auto lay = BuildPe(false, std::vector<uint8_t>(0x20, 0xCCu), {}, {}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid && !img->loadConfig.valid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(!img->loadConfig.valid);  // still no fabricated table
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeFailsClosedOnNoSehFlag() {
+    auto* img = BuildSafeSehPe({0x1000u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+    img->ntHeaders32->OptionalHeader.DllCharacteristics |=
+        IMAGE_DLLCHARACTERISTICS_NO_SEH;
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1004u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(!ok);
+    CS_TEST_CHECK(!error.empty());
+    // The original two-entry table must be left completely untouched.
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 1);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeRejectsX64Image() {
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64));
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
+         sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(!ok);
+    CS_TEST_CHECK(!error.empty());
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+// ============================================================================
 // TLS
 // ============================================================================
 
@@ -2272,6 +2417,11 @@ int main(int argc, char** argv) {
     TestEmitterDynamicBaseEmptyRelocationsGetsX64Anchor();
     TestEmitterFixedBaseEmptyRelocationsMayStripDirectory();
     TestEmitterDynamicBaseAnchorFailureRollsBack();
+    TestSafeSEHTableMergeAddsAndSortsNewHandler();
+    TestSafeSEHTableMergeDedupesExistingRva();
+    TestSafeSEHTableMergeNoOriginalTableIsNoOp();
+    TestSafeSEHTableMergeFailsClosedOnNoSehFlag();
+    TestSafeSEHTableMergeRejectsX64Image();
     CS_TEST_CHECK(argc == 2);
     TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);
     return 0;

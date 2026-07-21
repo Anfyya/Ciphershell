@@ -681,6 +681,7 @@ struct VMGroupRuntime {
     char runtimeSectionName[8] = {0};
     char unwindSectionName[8] = {0};
     char relocSectionName[8] = {0};
+    char safeSehSectionName[8] = {0};
     char runtimeApiSectionName[8] = {0};
     char traceSectionName[8] = {0};
     CipherShell::MutationEngine mutEngine;
@@ -1409,6 +1410,8 @@ int main(int argc, char* argv[]) {
             CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
                 grp.relocSectionName, buildCtx, buildCtx.vmRelocSectionName, 0x2E10u, g);
             CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
+                grp.safeSehSectionName, buildCtx, buildCtx.vmSafeSehSectionName, 0x5EEBu, g);
+            CipherShell::ProtectionBuildContext::DeriveGroupSectionName(
                 grp.traceSectionName, buildCtx, buildCtx.vmSectionName, 0x7ACEu, g);
 
             CipherShell::MutationConfig mutConfig;
@@ -1846,6 +1849,7 @@ int main(int argc, char* argv[]) {
                     grp.runtimeSectionName,
                     grp.unwindSectionName,
                     grp.relocSectionName,
+                    grp.safeSehSectionName,
                     traceBindingPtr);
                 if (!outcome.runtimeResult.success ||
                     !outcome.runtimeResult.handlerSynthesisVerified ||

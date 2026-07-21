@@ -2045,3 +2045,248 @@ corpus、skip 规则与 CTest timeout 全部保持原值。
 任何随机 frame/register 计划必须由同一份数据同时驱动指令与 unwind/.pdata，且
 必须真实执行“目标代码内部故意抛异常”的 Windows unwind 测试，并对所有临时借用的
 XMM/SIMD 状态做调用前后逐字节一致性检查。正常返回结果正确仍不是充分证据。
+
+## 独立批次 15：`CALL_HOST` 异常展开与 SafeSEH/PE 元数据闭环（2026-07-21）
+
+### 起点与审计方法
+
+本批的起点不是空白页：上一轮会话（另一 AI 工具，`2daecc5` "做了一半callhost"）
+已经把 CALL_HOST 的 x64/Win32 target resolver 迁移到 Zydis Encoder、抽出共享
+typed frame plan、加入 x64 `UNW_FLAG_UHANDLER`/phase 状态机骨架和 Win32 显式
+`FS:[0]` registration 骨架，但没有验证 unwind 元数据是否真的与生产 prolog 同源、
+没有把 x64 handler RVA 或 Win32 SafeSEH handler 列表接入最终 PE 构建路径、也
+没有任何真实执行测试。按指示先逐条核对共享 frame plan、真实
+prolog/epilog、spill offset、栈对齐、8 个异常窗口的 phase/armed 状态转换，
+不采信提交注释里的"已完成"说法。
+
+逐条核对后，x64/Win32 的 frame plan、SUB/ADD 栈分配与 phase 初始化时机（先建帧、
+再清零 phase、再武装 phase、host 状态完整保存后才置 armed、host 状态恢复后立即
+清零 phase）在结构上是正确的；Win32 的 CFG guard-check 已经被移到 guest
+SIMD/x87 restore 之前（探测到旧顺序会把 guard-check 污染的浮点状态暴露给
+native target，本批之前已被修正）。审计发现两处需要修复的真实缺陷（见下）和
+三处必须补齐才能称为"闭环"的缺口：x64 handler RVA 从未从 image-offset 转换成
+最终 PE RVA；Win32 `safeSehHandlerOffsets` 从未被消费；完全没有执行证据。
+
+### 修复的两个真实正确性缺陷
+
+1. **x64 UHANDLER 未强制置位 `CONTEXT_FLOATING_POINT`。**
+   `GenerateVMHandlerX64CallHostUnwindHandler` 恢复 host FXSAVE/XSAVE 镜像后，
+   只用 `AND ContextFlags, ~CONTEXT_XSTATE` 清掉 XSTATE 位，没有同时
+   `OR ContextFlags, CONTEXT_FLOATING_POINT`。如果后续 `RtlRestoreContext`
+   看到的 dispatcher CONTEXT 恰好没有携带 `CONTEXT_FLOATING_POINT`
+   （理论上罕见，但不能假设一定不会发生），已经写入 `CONTEXT.FltSave` 的
+   host 镜像就可能不会被真正采用。修复为清 XSTATE 的同时强制置位
+   FLOATING_POINT，确保 FltSave 覆盖一定生效，不依赖原始 CONTEXT 的偶然状态。
+2. **XRSTOR 使用了错误的 Zydis 操作数宽度。** 新增的 UHANDLER thunk 对
+   `FXRSTOR`/`XRSTOR` 都传了 512 字节内存操作数，Zydis Encoder 对
+   `XRSTOR` 返回 `ZYDIS_STATUS_IMPOSSIBLE_INSTRUCTION`（试执行时才暴露，静态
+   审计看不出来）。用独立探针程序对 `xrstor [r10]` 做
+   Decoder→`ZydisEncoderDecodedInstructionToEncoderRequest`→重编码往返，
+   证实 Zydis 对 `XRSTOR` 声明的操作数宽度是 576 字节（512 legacy 区 + 64
+   字节恒定存在的 XSAVE header），而不是 512；`FXRSTOR`（无 XSAVE header）
+   仍是 512，验证不变。这不是位运算错误，是对 Encoder 操作数语义定义的
+   误用，与既有方法论一致：Encoder 缩小的是编码风险，不能替代对每条指令
+   真实语义的验证。
+
+### x64：handler RVA 最终接入 PE 构建路径
+
+`VMHandlerSynthesisResult` 新增 `callHostUnwindHandlerOffset`（cleanup thunk
+在 synthesized image 内的 offset）与 `imageRvaPatchOffsets`（xdata 内嵌入
+handler RVA 待修正的位置，此前只保存 offset）。`vm_runtime_builder.cpp` 在
+`runtime.bytes` 拷入 `blob`、`AppendSection` 已知最终 `appended.rva`
+之后、`PatchBytes` 最终提交 `blob` 之前，把该 dword 从 offset 一次性改写成
+`appended.rva + offset`，确保 `expectedSectionBytes`（完整性校验用的镜像）
+与真正写入 PE 的字节一致，不存在"改了一次以外又被覆盖"的风险。
+
+### Win32：SafeSEH 表真正合并到最终 PE
+
+新增 `PEEmitter::RebuildSafeSEHHandlerTable`，直接照抄已验证过的
+`RebuildGuardCFFunctionTable` 模式（先证明 LoadConfig 两个字段可 patch，
+再 `AppendSection` 提交合并后的表，最后 `PatchBytes` 回填字段，任何一步
+失败都不会遗留半成品 image）：
+
+- 原 PE 完全没有声明 SafeSEH（`SEHandlerTable/Count` 为零）→ 直接返回成功、
+  不触碰 LoadConfig，绝不伪造一份新契约（伪造会让 SafeSEH 强制校验覆盖到
+  原本从未被枚举过的既有 handler，reject 掉它们）。
+- 原 PE 声明 `IMAGE_DLLCHARACTERISTICS_NO_SEH` → fail-closed，返回带具体原因
+  的错误。这个标志会让 `RtlIsValidHandler` 无条件拒绝该模块内的任何 handler，
+  与 SafeSEH 表是否合并无关，此时安装新 handler 必然产物必崩，没有安全的
+  合并方式。`capability_checker.cpp` 同时在构建前预检：x86 + VM 功能开启 +
+  目标声明 NO_SEH 时直接拒绝整个构建，而不是等打包完成后才在运行时炸掉。
+- 原 PE 有合法 SafeSEH 表 → 用 `std::map<uint32_t,...>` 按 RVA 排序去重合并
+  旧表与新 handler RVA，校验每个新增 RVA 都落在可执行 file-backed 范围内，
+  提交后同步更新 `m_image->loadConfig` 的内存态。
+- x64 image 上调用直接返回失败（x64 从不应产生 Win32 SafeSEH 数据）。
+
+新的 `safeSehSectionName` 参数从 `ProtectionBuildContext`→`VMGroupRuntime`
+→`VMRuntimeBuilder::Build`→ 上述合并调用整条链路穿通；`VMRuntimeBuildResult`
+新增 `callHostUnwindHandlerRVA`/`safeSehHandlerRVAs`/`safeSehMerged` 记录最终
+结果供上层校验。`VMHandlerSynthesizer::Validate` 同时补齐了此前完全没有的
+x86 一致性校验：`safeSehHandlerOffsets` 必须恰好等于所有
+`hasCallHostSehHandler` 的 handler 集合、严格升序无重复，且每个 offset 真的
+指向其 **`handler.plaintextBody`**（未加密源）里的 ENDBR32——`Validate()` 在
+`Synthesize()` 内部于 `EncryptHandlerRegion` 之后运行，此时 `result.image`
+已是密文，误对着密文校验特征字节是本批实现过程中真实踩到的一个坑。
+
+### 真实执行证据
+
+按要求新增四类证据（第五类 PE 元数据证据见下一节），全部在
+`tests/test_vm_handler_synthesis.cpp` 的 host-arch 直接执行门禁里新增，
+`TestHostContextEntryExecution` 依次调用：
+
+1. **CALL_HOST resolver 穷举**（`TestZydisCallHostResolverRegisterDiversity`）：
+   完整 seed byte × 全部 handler variant，x64 实测穷举到全部 7 套、Win32 全部
+   3 套寄存器计划，每套都通过 Zydis 完整 decode 验证 target/imageBase/callKind
+   三个角色确实出现在 core 里、resolver 结尾确实把结果归一回 RAX/EAX、两个
+   `coreStrategy`（ADD 与 LEA 归一化形式）都被覆盖到，并复现历史遗留的
+   RAX/RDX/RCX 固定计划字节。
+2. **host/guest x87/MXCSR/XMM 状态证据**（`ExecuteCallHostExtendedStateCases`，
+   x64 与 Win32 均通过）：调用前给 guest 显式扩展状态与 native target 内部
+   写入的"target 修改后"状态各设一套互不相同、合法（不触发 LDMXCSR/FLDCW
+   保留位故障）的 FCW/MXCSR/XMM0 图案，断言 (1) native target 入口真实观察到
+   guest 图案而非其他状态、(2) target 修改后的图案被正确写回
+   `context.extendedState`、(3) 宿主线程自身的环境不受 target 内部状态影响
+   （见下方"测试方法论教训"，这一步没有对着一个固定外部图案比较，而是用
+   同一调用路径分别跑"不碰 FP 的既有 target"和"会脏写 FP 的新 target"两次，
+   比较两次调用后宿主环境是否一致）。
+3. **真实 Windows 异常展开证据**（`ExecuteCallHostRealExceptionCases`，
+   目前仅 x64，见下方"已知缺口"）：native target 内部脏写 FP/SIMD 状态后
+   对空指针做真实写入触发硬件 `EXCEPTION_ACCESS_VIOLATION`（不是软件模拟
+   调用清理函数），依赖真实 Windows 异常分发器沿 `.pdata`/`UNW_FLAG_UHANDLER`
+   完成第二阶段展开，外层 `__try/__except` 接住后验证：宿主环境的
+   FCW/MXCSR/XMM0 与"同一调用路径、target 不脏写也不异常"的基线完全一致
+   （证明 UHANDLER 真的被系统展开器调用且没有把 guest/target 状态通过异常
+   CONTEXT 泄漏回宿主）、异常码与 runtime 错误码精确匹配预期、且展开后同一
+   线程可以立即再成功执行一次普通 CALL_HOST（栈指针/非易失寄存器/展开链
+   未被破坏的间接证据）。
+4. **PE 元数据证据**（`tests/test_pe_hardening.cpp` 新增 5 个
+   `TestSafeSEHTableMerge*` 用例，x64/Win32 均通过；见下一节）。
+
+### 测试方法论教训（本批过程中真实踩到、且有实际纠正的坑）
+
+- **不能对 512 字节 FXSAVE 快照做 `= {}` 零初始化再立即 FXSAVE。** 优化器可能
+  用 `pxor xmmN,xmmN`/向量化 store 实现这个零初始化，且不保证在 `_fxsave`
+  intrinsic 之前完成——如果它被排到 `_fxrstor` 设置真实 XMM0 之后、
+  下一次 `_fxsave` 观测之前执行，会静默清空正在被观测的寄存器。所有参与
+  FXSAVE/FXRSTOR 往返的栈上 512 字节缓冲区改为不初始化（反正会被
+  FXSAVE 或等大小 `memcpy` 完整覆盖），并把"设置环境状态→调用→观测环境
+  状态"收进独立的 `__declspec(noinline)` 小函数，减少编译器在中间插入
+  无关向量化指令的空间。
+- **"host 环境"不能通过在调用 VM 入口前用 `_fxrstor` 设成一个externally
+  imposed 的固定图案来验证。** 这个 VM 自己的 context-entry 分发代码在
+  到达 CALL_HOST 之前就会把 XMM0-3 当作内部 scratch/cache 使用（真实存在于
+  `vm_handler_entry_codegen.cpp` 的 `MOVDQU` 批量寄存器搬运），意味着"调用
+  `entry()` 前的环境"和"CALL_HOST 自己保存 host 时看到的环境"根本不是同一
+  回事，对着一个外部强加的固定值断言必然假失败。改为差分验证：固定
+  GPR/栈/字节码形状，只切换 native target（不碰 FP 的既有 target vs
+  会脏写 FP 的新 target），比较两次调用后的宿主环境是否一致——不需要知道
+  也不需要控制这个环境具体是什么值。
+- **x86 cdecl 的参数必须写进 guest 栈镜像，不是 GPR。** 早期版本沿用 x64 的
+  `gprs[1] = argument` 给 Win32 cdecl target 传参，实际上 CALL_HOST 的
+  cdecl 路径从 `[guest ESP]` 拷贝 `stackArgumentBytes`，`gprs[1]`
+  对 cdecl 完全不起作用；结果是"安全地址"参数从未真正传给 target，
+  target 用零地址写入直接崩溃，且崩溃发生在整个测试进程里、不在任何
+  `__except` 保护范围内。
+- **对 512 字节 FXSAVE 镜像做整体 `memcmp` 不安全。** 编译器可能把
+  XMM6-15 当作与本测试无关的暂存空间使用，整体比较会把这类无关差异
+  误判为失败。改为只解码/比较 FCW（偏移 0）、MXCSR（偏移 24）、
+  XMM0（偏移 160-175）——这些是本测试真正设置和控制的字段。
+
+### 已知缺口（未闭环，明确不隐瞒）
+
+- **Win32 真实异常展开证据未实现。** 现有的 `LoadedSynthImage` 是把
+  synthesized image `VirtualAlloc` 成裸内存直接在当前进程执行；x64 能这样
+  测是因为它额外调用了 `RtlAddFunctionTable` 把这段内存的动态 unwind 信息
+  登记给系统，这是文档化的"信任非模块内存里的 unwind info"的正规逃生舱口。
+  x86 没有等价 API：`RtlIsValidHandler` 会无条件拒绝不属于任何已加载模块的
+  frame-based SEH handler（DEP 时代针对堆喷伪造异常处理链的缓解措施），
+  与内存是否可执行无关。这一点是本批**真实运行**验证出来的：把同一测试路由
+  到 Win32 的 `LoadedSynthImage` 会在触及 CALL_HOST 自己的 `FS:[0]` handler
+  之前，就在"基线"（不触发异常）分支里因未真正传参而崩溃；即便修好传参，
+  故障分支仍会在 CALL_HOST 自己的 handler 被考虑之前，被系统判定 handler
+  非法而进程终止（`STATUS_ACCESS_VIOLATION` 未捕获退出）——这不是
+  `EmitX86CallHostSehRegistration` 的缺陷，是这个进程内测试手段本身对 Win32
+  不成立。真正的 Win32 真实异常展开证据需要 handler 活在一个真正被
+  Windows loader 加载的 PE 模块里，也就是必须走"打包成真实 EXE/DLL 并作为
+  独立进程运行"的路径，本批时间没有覆盖，留给后续批次。
+- **x64 PE 元数据证据止于字节级校验，没有独立解析 `.pdata`/`.xdata`。**
+  `test_vm_runtime_integrity.cpp` 现有的 `VerifyRuntimeContents` 在
+  `PEParser::LoadFromBuffer` 独立重新解析后逐字节比较整个 runtime section
+  （含新的 UHANDLER thunk 与已修正的 handler RVA），这确实证明了"最终字节
+  与构建期承诺的字节一致"，但没有额外用 `RtlLookupFunctionEntry` 风格、独立
+  于 `PEParser` 自身 Exception Directory 解析代码之外的第二条路径去走一遍
+  `RUNTIME_FUNCTION`→`UNWIND_INFO`→handler RVA，也没有覆盖 EXE 和 DLL 两种
+  容器分别独立验证。Win32 SafeSEH 侧的合并证据更完整：`test_pe_hardening.cpp`
+  新增的 5 个用例覆盖合并排序去重、去重已存在 RVA、无原表时 no-op、
+  `NO_SEH` fail-closed、x64 image 拒绝，且合并结果通过独立重新解析验证。
+- 未验证 XSAVE/AVX（`extendedState.flags != 0`）路径；本批全部新证据都在
+  `flags = 0` 的 FXSAVE/FXRSTOR 路径下取得，覆盖 FXSAVE 但未覆盖 XSAVE，
+  也没有做真实 CPUID/XCR0 门控的 skip 逻辑。
+- `BRIDGE_EXTENDED` 完全未动，仍是唯一剩余语义。
+
+只有把上面这些缺口也补齐，才能说 CALL_HOST 完整闭环；本批完成的是"审计
++两个真实缺陷修复+x64 异常展开闭环（含真实硬件异常证据）+Win32 SafeSEH
+合并真正接入最终 PE+resolver 穷举证据+Win32 host/guest FP 状态证据"，
+不是"CALL_HOST 100% 完成"。
+
+### 关于"迁移进度 X/54"这个说法的核实
+
+任务交接时提到"从 52/54 更新为 53/54"，本批没有直接采信这个数字。实测运行
+`tests/scripts/vm_kernel_static_gate.py --source-root .`，输出的是
+"真实双策略覆盖 54/54"——这是该脚本一直在测的指标（每个语义的两套业务
+K 策略是否真的产生不同机器码），与"业务核心是否已经不再包含任何手写
+`c.Raw` 字节"是两回事；从 2026-07-19 批次 1 起这个覆盖数字就一直是
+54/54，与"迁移进度 X/54"是同一份历史记录里并列但独立的两个数字，脚本
+本身不产生后者。就 CALL_HOST 而言，本批只把 target resolver（进入 native-call
+frame 之前的部分）和新增的异常清理 thunk 迁到 Zydis Encoder；frame 建立、
+spill/restore、FXSAVE/XSAVE 本身、`FF 94 24 ...` 间接调用这些指令仍是手写
+字节，沿用既有方法论对"unwind-critical 区域保留精确控制字节"的一贯做法，
+没有也不需要为了凑一个迁移计数而改动它们。因此本批不给出一个单一的
+"X/54"数字；准确的说法是：CALL_HOST 的 resolver 与本批新增的异常/PE
+基础设施已经是 Zydis-only 且无 Raw fallback，CALL_HOST 的 frame 编排代码
+维持手写不变，`BRIDGE_EXTENDED` 是唯一完全未触碰的语义。
+
+### 完整回归结果（本机实测，2026-07-21）
+
+x64 与 Win32 均为 Release、`/W4 /WX` 全量重新构建（复用 `build_resume_x64`/
+`build_resume_win32`），无警告无错误。
+
+**静态门禁**：`vm_kernel_static_gate.py --source-root .` 输出
+`[PASS] 微观 VM 静态门禁通过`，真实双策略覆盖 `54/54`（含比例探针，需要
+`cmake` 在 PATH 上才能构建真实 Disassembler/Translator 采样，本机通过显式
+加入 VS2022 自带 CMake 路径满足）。
+
+**CTest**（`ctest --test-dir <dir> -C Release --output-on-failure --timeout 900`，
+未修改任何既有 TIMEOUT/阈值/corpus/skip 规则）：
+
+| 架构 | ctest 直接结果 | 说明 |
+|---|---|---|
+| x64 | 17/18 通过，`vm_native_differential` 因既有 `TIMEOUT 120` 属性被判超时 | 与历史批次相同的已知限制：该测试自身完整运行需要 100+ 秒，超过 wrapper 的 120 秒 |
+| Win32 | 17/18 通过，同一测试同样因 `TIMEOUT 120` 被判超时 | 同上 |
+
+按既有约定直接运行完整二进制取自然退出结果（未提高 timeout，未跳过任何
+case）：
+
+- x64 `test_vm_native_differential.exe` 直接运行 164.7 秒，退出码 0。
+- Win32 `test_vm_native_differential.exe` 直接运行 204.6 秒，退出码 0。
+
+即两个架构的完整 18 个 CTest 用例（含此前被 wrapper 超时掩盖的一个）全部
+真实通过，没有一个用例被跳过或弱化断言。
+
+**正式 `vm_per_build_similarity_gate`**（独立 verbose 重跑单个用例以取得
+逐 stage 数值；阈值/ceiling 均为脚本既有默认值，未修改）：
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers |
+|---|---:|---:|---:|---:|
+| x64 EXE | 0.2656 | 0.1362 | 0.1498 | 0.0001 |
+| x64 DLL | 0.2803 | 0.1571 | 0.1473 | 0.0001 |
+| Win32 EXE | 0.2597 | 0.1173 | 0.0636 | 0.0001 |
+| Win32 DLL | 0.2720 | 0.1120 | 0.0226 | 0.0001 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；x64 耗时 445.37 秒，Win32
+耗时 555.57 秒，均在脚本自身 900 秒 CTest 属性内（该属性本批同样未修改）。
+
+**本批新增测试覆盖的用例**：`vm_handler_synthesis`（新增 CALL_HOST resolver
+穷举、host/guest FP/SIMD 状态证据、真实异常展开证据三个阶段，见上文）与
+`pe_hardening_regression`（新增 5 个 `TestSafeSEHTableMerge*` 用例）均包含在
+上述 x64/Win32 各 17/18 通过范围内，两个架构都是真实通过，不是编译通过。

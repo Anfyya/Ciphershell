@@ -115,6 +115,24 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
             AddIssue(report, "LoadConfig", 0,
                 "PE advertises CFG but its Load Config Guard metadata is invalid", true);
         }
+        // x86 CALL_HOST always installs an inline FS:[0] SEH handler for
+        // native-call cleanup (VM_UOP_CALL_HOST is present in the fixed
+        // handler table regardless of which opcodes the protected functions
+        // actually use).  IMAGE_DLLCHARACTERISTICS_NO_SEH makes
+        // RtlIsValidHandler unconditionally reject every handler inside this
+        // module -- including our own -- independent of any SafeSEH table,
+        // so a real exception during a native call could never be cleaned up
+        // and would instead crash or terminate the process abnormally.
+        // There is no way to safely merge around that contract, so reject
+        // the build up front instead of shipping a runtime whose cleanup
+        // path is silently unreachable.
+        if (ctx.vm.enabled && !image->is64Bit &&
+            (dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH) != 0) {
+            AddIssue(report, "LoadConfig", 0,
+                "target declares IMAGE_DLLCHARACTERISTICS_NO_SEH; VM CALL_HOST "
+                "requires installing a real SEH cleanup handler in this module, "
+                "which that characteristic makes Windows refuse to call", true);
+        }
         if (image->loadConfig.valid && image->loadConfig.hasRFGuard) {
             AddIssue(report, "LoadConfig", 0,
                 "Return Flow Guard instrumentation is incompatible with generated VM/CFG returns",

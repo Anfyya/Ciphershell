@@ -1995,6 +1995,54 @@ bool VMHandlerSynthesizer::Validate(
             error = "x86 generated runtime unexpectedly contains x64 unwind data";
             return false;
         }
+        // result.safeSehHandlerOffsets must be exactly the set of real (never
+        // junk -- BuildJunkHandler never assigns VM_UOP_CALL_HOST or sets
+        // hasCallHostSehHandler) handlers that declared
+        // hasCallHostSehHandler, each pointing at its own handler's real
+        // ENDBR32 entry, strictly ascending with no duplicate -- this is the
+        // exact contract PEEmitter::RebuildSafeSEHHandlerTable and the final
+        // PE builder rely on to merge a sorted, deduplicated SafeSEH table.
+        constexpr std::array<uint8_t, 4> kEndbr32 = {0xF3, 0x0F, 0x1E, 0xFB};
+        std::vector<uint32_t> expectedSafeSehOffsets;
+        for (const auto& handler : result.handlers) {
+            if (!handler.hasCallHostSehHandler) continue;
+            // result.image has already been through EncryptHandlerRegion by
+            // the time Validate() runs (Synthesize() calls Validate() after
+            // encrypting), so the ENDBR32 signature must be checked against
+            // handler.plaintextBody -- the still-unencrypted source -- not
+            // result.image.  Only the final absolute offset (storageOffset +
+            // callHostSehHandlerOffset) is a result.image/PE-relative value.
+            if (handler.semantic != VM_UOP_CALL_HOST ||
+                handler.callHostSehHandlerOffset >= handler.storageSize ||
+                handler.callHostSehHandlerOffset > handler.plaintextBody.size() ||
+                kEndbr32.size() > handler.plaintextBody.size() -
+                    handler.callHostSehHandlerOffset ||
+                handler.storageOffset >
+                    (std::numeric_limits<uint32_t>::max)() -
+                        handler.callHostSehHandlerOffset) {
+                error = "x86 CALL_HOST SafeSEH handler layout is invalid";
+                return false;
+            }
+            if (!std::equal(kEndbr32.begin(), kEndbr32.end(),
+                    handler.plaintextBody.begin() +
+                        handler.callHostSehHandlerOffset)) {
+                error = "x86 CALL_HOST SafeSEH handler does not start with ENDBR32";
+                return false;
+            }
+            const uint32_t absoluteOffset =
+                handler.storageOffset + handler.callHostSehHandlerOffset;
+            if (absoluteOffset > result.image.size()) {
+                error = "x86 CALL_HOST SafeSEH handler offset is outside the image";
+                return false;
+            }
+            expectedSafeSehOffsets.push_back(absoluteOffset);
+        }
+        std::sort(expectedSafeSehOffsets.begin(), expectedSafeSehOffsets.end());
+        if (result.safeSehHandlerOffsets != expectedSafeSehOffsets) {
+            error = "x86 safeSehHandlerOffsets does not match the declared "
+                "CALL_HOST handler set (missing, extra, unsorted, or duplicate)";
+            return false;
+        }
     }
 
     std::vector<uint8_t> expectedMapMaterial;

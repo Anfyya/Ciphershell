@@ -8346,8 +8346,19 @@ bool GenerateVMHandlerX64CallHostUnwindHandler(
     constexpr uint32_t kContextFlagsOffset = 0x30u;
     constexpr uint32_t kContextMxCsrOffset = 0x34u;
     constexpr uint32_t kContextFltSaveOffset = 0x100u;
+    constexpr uint32_t kContextFloatingPointFlag = 0x08u;
     constexpr uint32_t kContextXStateFlag = 0x40u;
     constexpr uint32_t kFxSaveBytes = 512u;
+    // Zydis's XRSTOR operand definition declares a nominal 576-byte memory
+    // operand (the 512-byte legacy FXSAVE-compatible region plus the
+    // always-present 64-byte XSAVE header); this is a fixed encoder
+    // disambiguation value, not the full VM_XSAVE_AREA_SIZE reservation
+    // (which additionally covers AVX YMM state written/read at runtime
+    // according to XCR0/the requested feature mask in EDX:EAX, independent
+    // of this operand-size field). Verified against Zydis's own
+    // decode->request round trip for `xrstor [r10]`; FXRSTOR has no XSAVE
+    // header and keeps the plain 512-byte legacy size.
+    constexpr uint32_t kXsaveOperandBytes = 576u;
 
     code.clear();
     error.clear();
@@ -8381,7 +8392,7 @@ bool GenerateVMHandlerX64CallHostUnwindHandler(
     EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 7u);
     EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR, 2u, 2u, 4u);
     EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_XRSTOR,
-        {ZydisMemoryOperand(true, 10u, 0, kFxSaveBytes)});
+        {ZydisMemoryOperand(true, 10u, 0, kXsaveOperandBytes)});
     c.Jmp(restored);
     c.Bind(restoreFx);
     EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_FXRSTOR,
@@ -8411,10 +8422,17 @@ bool GenerateVMHandlerX64CallHostUnwindHandler(
     EmitZydisLoad(c, true, 0u, 10u, 0x18, 4u);
     EmitZydisStore(c, true, 8u,
         static_cast<int32_t>(kContextMxCsrOffset), 0u, 4u);
+    // Clear CONTEXT_XSTATE so a later RtlRestoreContext cannot prefer a
+    // stale guest AVX/YMM XSTATE record over the host FltSave image just
+    // written above, and force-set CONTEXT_FLOATING_POINT so that image is
+    // guaranteed to be the one actually restored, independent of whatever
+    // the original faulting CONTEXT happened to declare.
     EmitZydisLoad(c, true, 0u, 8u,
         static_cast<int32_t>(kContextFlagsOffset), 4u);
     EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_AND,
         0u, 4u, ~static_cast<uint64_t>(kContextXStateFlag));
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_OR,
+        0u, 4u, kContextFloatingPointFlag);
     EmitZydisStore(c, true, 8u,
         static_cast<int32_t>(kContextFlagsOffset), 0u, 4u);
     EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,

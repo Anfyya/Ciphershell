@@ -124,6 +124,16 @@ struct VMRuntimeBuildResult {
     VMRuntimeIntegrityExpectation integrityExpectation;
     std::vector<VMTrampolineRecord> trampolines;
     std::vector<VMRuntimeFunctionEntry> unwindEntries;
+    // x64 only: final image RVA of the CALL_HOST phase-two UNW_FLAG_UHANDLER
+    // cleanup thunk, after the placeholder offset embedded by the synthesizer
+    // has been rebased by this runtime's actual section RVA.  Zero on x86.
+    uint32_t callHostUnwindHandlerRVA = 0;
+    // x86 only: final image RVAs (already rebased) of every CALL_HOST inline
+    // SEH registration handler in this runtime.  Empty on x64.  Merged into
+    // the target PE's SafeSEH table (if any) via
+    // PEEmitter::RebuildSafeSEHHandlerTable.
+    std::vector<uint32_t> safeSehHandlerRVAs;
+    bool safeSehMerged = false;
     std::string error;
 };
 
@@ -140,6 +150,7 @@ public:
         const char sectionName[8],
         const char unwindSectionName[8],
         const char relocationSectionName[8],
+        const char safeSehSectionName[8],
         const VMRuntimeTraceBinding* traceBinding = nullptr);
 
     // Re-read the currently parsed PE and bind the emitted runtime bytes to the

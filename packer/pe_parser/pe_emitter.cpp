@@ -637,6 +637,137 @@ bool PEEmitter::RebuildGuardCFFunctionTable(
     return true;
 }
 
+bool PEEmitter::RebuildSafeSEHHandlerTable(
+    const std::vector<uint32_t>& additionalHandlerRVAs,
+    const char sectionName[8],
+    PEAppendSectionResult* sectionResult,
+    std::string* error)
+{
+    if (!IsValid() || !sectionName || additionalHandlerRVAs.empty()) {
+        if (error) *error = "SafeSEH table rebuild requires a valid image and target list";
+        return false;
+    }
+    if (m_image->is64Bit) {
+        if (error) *error = "x64 images never carry Win32 SafeSEH data";
+        return false;
+    }
+    const WORD dllCharacteristics = m_image->ntHeaders32->OptionalHeader.DllCharacteristics;
+    if ((dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH) != 0) {
+        // The module unconditionally declares that no handler inside it is
+        // ever valid.  RtlIsValidHandler enforces this regardless of any
+        // SafeSEH table, so a newly installed handler could never run;
+        // there is no safe way to merge around that contract.
+        if (error) *error = "target declares IMAGE_DLLCHARACTERISTICS_NO_SEH; "
+            "a new SEH handler could never pass RtlIsValidHandler";
+        return false;
+    }
+    if (m_image->loadConfig.seHandlerTable == 0 || m_image->loadConfig.seHandlerCount == 0) {
+        // No pre-existing SafeSEH contract.  Do not fabricate one: every
+        // handler already linked into this module was never enumerated for
+        // a table, so declaring one now would make legitimate pre-existing
+        // handlers fail validation.  Our own handler still works correctly
+        // as an ordinary legacy (non-SafeSEH-checked) handler.
+        if (sectionResult) *sectionResult = {};
+        return true;
+    }
+    if (!m_image->loadConfig.valid) {
+        if (error) *error = "existing SafeSEH handler table is incomplete or unsupported";
+        return false;
+    }
+    constexpr size_t entrySize = sizeof(uint32_t);
+    const uint64_t imageBase = m_image->ntHeaders32->OptionalHeader.ImageBase;
+    if (m_image->loadConfig.seHandlerTable < imageBase ||
+        m_image->loadConfig.seHandlerTable - imageBase > std::numeric_limits<uint32_t>::max() ||
+        m_image->loadConfig.seHandlerCount > std::numeric_limits<size_t>::max() / entrySize) {
+        if (error) *error = "existing SafeSEH table address or size is invalid";
+        return false;
+    }
+    const uint32_t oldTableRVA =
+        static_cast<uint32_t>(m_image->loadConfig.seHandlerTable - imageBase);
+    const uint32_t oldTableOffset = RvaToOffset(oldTableRVA);
+    const size_t oldTableSize = static_cast<size_t>(
+        m_image->loadConfig.seHandlerCount) * entrySize;
+    if (oldTableOffset == 0 || oldTableOffset > m_image->rawSize ||
+        oldTableSize > m_image->rawSize - oldTableOffset) {
+        if (error) *error = "existing SafeSEH table is outside the PE file";
+        return false;
+    }
+
+    std::map<uint32_t, std::vector<uint8_t>> entries;
+    for (size_t i = 0; i < m_image->loadConfig.seHandlerCount; ++i) {
+        const uint8_t* source = m_image->rawData + oldTableOffset + i * entrySize;
+        uint32_t rva = 0;
+        std::memcpy(&rva, source, sizeof(rva));
+        if (rva == 0) {
+            if (error) *error = "existing SafeSEH table contains a null handler";
+            return false;
+        }
+        entries.emplace(rva, std::vector<uint8_t>(source, source + entrySize));
+    }
+    for (uint32_t rva : additionalHandlerRVAs) {
+        if (rva == 0 || !PEUtils::IsExecutableFileBackedAddress(m_image, rva)) {
+            if (error) *error = "new SafeSEH handler is outside the executable file-backed image";
+            return false;
+        }
+        auto inserted = entries.emplace(rva, std::vector<uint8_t>(entrySize, 0));
+        if (inserted.second) std::memcpy(inserted.first->second.data(), &rva, sizeof(rva));
+    }
+    if (entries.size() > std::numeric_limits<uint32_t>::max() / entrySize) {
+        if (error) *error = "rebuilt SafeSEH table exceeds PE limits";
+        return false;
+    }
+    std::vector<uint8_t> table;
+    table.reserve(entries.size() * entrySize);
+    for (const auto& entry : entries) table.insert(
+        table.end(), entry.second.begin(), entry.second.end());
+
+    // As with Guard CF, the two Load Config fields must be proven patchable
+    // before AppendSection commits a new section, so a late failure cannot
+    // strand a half-updated image.
+    const uint32_t tableFieldRVA = m_image->loadConfig.directoryRVA +
+        static_cast<uint32_t>(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable));
+    const uint32_t countFieldRVA = m_image->loadConfig.directoryRVA +
+        static_cast<uint32_t>(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerCount));
+    auto rvaIsPatchable = [&](uint32_t rva) -> bool {
+        const uint32_t off = RvaToOffset(rva);
+        uint32_t end = 0;
+        return off != 0 && CheckedAdd(off, static_cast<uint32_t>(entrySize), end) &&
+            end <= m_image->rawSize;
+    };
+    if (!rvaIsPatchable(tableFieldRVA) || !rvaIsPatchable(countFieldRVA)) {
+        if (error) *error = "SafeSEH directory fields are not patchable";
+        return false;
+    }
+
+    PEAppendSectionResult appended = AppendSection(sectionName, table,
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+    if (!appended.success) {
+        if (error) *error = appended.error;
+        return false;
+    }
+    // SEHandlerTable is a VA (not an RVA).  Its field already carries
+    // whatever base relocation the original /SAFESEH build emitted for it;
+    // only the stored value changes here, not the field's own location, so
+    // that relocation entry continues to describe this field correctly.
+    const uint64_t tableVA = imageBase + appended.rva;
+    const uint32_t count = static_cast<uint32_t>(entries.size());
+    std::vector<uint8_t> tableField(entrySize, 0);
+    std::vector<uint8_t> countField(entrySize, 0);
+    std::memcpy(tableField.data(), &tableVA, tableField.size());
+    std::memcpy(countField.data(), &count, countField.size());
+    if (!PatchBytes(tableFieldRVA, tableField, error) ||
+        !PatchBytes(countFieldRVA, countField, error)) return false;
+
+    m_image->loadConfig.seHandlerTable = tableVA;
+    m_image->loadConfig.seHandlerCount = count;
+    m_image->loadConfig.safeSEHHandlerRVAs.clear();
+    m_image->loadConfig.safeSEHHandlerRVAs.reserve(entries.size());
+    for (const auto& entry : entries)
+        m_image->loadConfig.safeSEHHandlerRVAs.push_back(entry.first);
+    if (sectionResult) *sectionResult = appended;
+    return true;
+}
+
 bool PEEmitter::RebuildBaseRelocationDirectory(
     const std::vector<CS_RELOC_ENTRY>& additionalEntries,
     const char sectionName[8],
