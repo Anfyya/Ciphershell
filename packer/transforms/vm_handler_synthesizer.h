@@ -112,6 +112,8 @@ struct VMSynthesizedHandler {
     uint64_t dispatchTailDigest = 0;
     std::array<uint8_t, 4> registerAssignment{};
     bool semanticComplete = false;
+    uint32_t callHostSehHandlerOffset = 0;
+    bool hasCallHostSehHandler = false;
     std::vector<VMSynthesizedStackFunclet> semanticStackFunclets;
     std::vector<uint8_t> plaintextBody;
     std::vector<uint8_t> ciphertextBody;
@@ -162,6 +164,17 @@ struct VMHandlerSynthesisResult {
     uint32_t decodePlanTableSize = 0;
     uint32_t encryptedHandlerOffset = 0;
     uint32_t encryptedHandlerSize = 0;
+    // x64 CALL_HOST phase-two cleanup thunk.  The UNWIND_INFO handler field is
+    // an image RVA in a packed PE, but an image-relative offset while the
+    // synthesized blob is executed directly by tests.  The listed dword
+    // fields are the only locations the runtime builder rebases by the final
+    // section RVA; code and xdata are otherwise byte-identical.
+    uint32_t callHostUnwindHandlerOffset = 0;
+    std::vector<uint32_t> imageRvaPatchOffsets;
+    // x86 only: absolute offsets inside image for every inline CALL_HOST
+    // registration handler.  A final PE with an existing SafeSEH contract
+    // must merge these targets into its sorted handler table.
+    std::vector<uint32_t> safeSehHandlerOffsets;
     uint32_t keyMarkerOffset = 0;
     uint64_t opcodeMapDigest = 0;
     uint64_t dispatchKeyDigest = 0;

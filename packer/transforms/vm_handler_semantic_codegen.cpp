@@ -106,6 +106,8 @@ public:
     KeyedPermutationPlan coreSelector{};
     std::array<uint8_t, 4> registerAssignment{};
     std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
+    uint32_t callHostSehHandlerOffset = 0;
+    bool hasCallHostSehHandler = false;
 
     void FailEncoding(const std::string& error) {
         if (encodingError.empty()) encodingError = error;
@@ -428,38 +430,55 @@ constexpr uint8_t kX64BridgePrologSize = 7u;
 // copied guest stack arguments, volatile-register spills, and an aligned host
 // XSAVE/FXSAVE image.  Handler entry is RSP==8 (mod 16), so the allocation is
 // also 8 (mod 16) and every nested Win64 call is aligned.
-constexpr uint32_t kX64NativeCallStackBytes = 0x608u;
-constexpr uint8_t kX64NativeCallPrologSize = 7u;
-constexpr uint32_t kNativeCallArgumentBase = 0x20u;
-constexpr uint32_t kNativeCallTargetSpill = 0x220u;
-constexpr uint32_t kNativeCallGuestStackSpill = 0x228u;
-constexpr uint32_t kNativeCallHostExtendedSpill = 0x230u;
-constexpr uint32_t kNativeCallFlagsSpill = 0x238u;
-constexpr uint32_t kNativeCallRaxSpill = 0x240u;
-constexpr uint32_t kNativeCallRcxSpill = 0x248u;
-constexpr uint32_t kNativeCallRdxSpill = 0x250u;
-constexpr uint32_t kNativeCallR8Spill = 0x258u;
-constexpr uint32_t kNativeCallR9Spill = 0x260u;
-constexpr uint32_t kNativeCallR10Spill = 0x268u;
-constexpr uint32_t kNativeCallR11Spill = 0x270u;
-constexpr uint32_t kNativeCallGuardSpill = 0x278u;
-constexpr uint32_t kNativeCallHostExtendedBase = 0x280u;
-constexpr uint32_t kX86NativeCallStackBytes = 0x5C0u;
-constexpr uint32_t kX86NativeCallTargetSpill = 0x200u;
-constexpr uint32_t kX86NativeCallGuestStackSpill = 0x204u;
-constexpr uint32_t kX86NativeCallHostExtendedSpill = 0x208u;
-constexpr uint32_t kX86NativeCallFlagsSpill = 0x20Cu;
-constexpr uint32_t kX86NativeCallEaxSpill = 0x210u;
-constexpr uint32_t kX86NativeCallEcxSpill = 0x214u;
-constexpr uint32_t kX86NativeCallEdxSpill = 0x218u;
-constexpr uint32_t kX86NativeCallCleanupSpill = 0x21Cu;
-constexpr uint32_t kX86NativeCallGuardSpill = 0x220u;
-constexpr uint32_t kX86NativeCallOriginalEbpSpill = 0x224u;
-constexpr uint32_t kX86NativeCallOriginalEbxSpill = 0x228u;
-constexpr uint32_t kX86NativeCallOriginalEsiSpill = 0x22Cu;
-constexpr uint32_t kX86NativeCallOriginalEdiSpill = 0x230u;
-constexpr uint32_t kX86NativeCallStatusSpill = 0x234u;
-constexpr uint32_t kX86NativeCallHostExtendedBase = 0x240u;
+constexpr auto kX64CallHostFrame = kVMHandlerX64CallHostFramePlan;
+constexpr uint32_t kX64NativeCallStackBytes = kX64CallHostFrame.stackBytes;
+constexpr uint8_t kX64NativeCallPrologSize = kX64CallHostFrame.prologSize;
+constexpr uint32_t kNativeCallArgumentBase = kX64CallHostFrame.argumentBase;
+constexpr uint32_t kNativeCallTargetSpill = kX64CallHostFrame.targetSpill;
+constexpr uint32_t kNativeCallGuestStackSpill = kX64CallHostFrame.guestStackSpill;
+constexpr uint32_t kNativeCallHostExtendedSpill = kX64CallHostFrame.hostExtendedSpill;
+constexpr uint32_t kNativeCallFlagsSpill = kX64CallHostFrame.flagsSpill;
+constexpr uint32_t kNativeCallRaxSpill = kX64CallHostFrame.volatileGprSpills[0];
+constexpr uint32_t kNativeCallRcxSpill = kX64CallHostFrame.volatileGprSpills[1];
+constexpr uint32_t kNativeCallRdxSpill = kX64CallHostFrame.volatileGprSpills[2];
+constexpr uint32_t kNativeCallR8Spill = kX64CallHostFrame.volatileGprSpills[3];
+constexpr uint32_t kNativeCallR9Spill = kX64CallHostFrame.volatileGprSpills[4];
+constexpr uint32_t kNativeCallR10Spill = kX64CallHostFrame.volatileGprSpills[5];
+constexpr uint32_t kNativeCallR11Spill = kX64CallHostFrame.volatileGprSpills[6];
+constexpr uint32_t kNativeCallGuardSpill = kX64CallHostFrame.guardSpill;
+constexpr uint32_t kNativeCallHostExtendedBase = kX64CallHostFrame.hostExtendedBase;
+constexpr uint32_t kNativeCallHostExtendedModeSpill =
+    kX64CallHostFrame.hostExtendedModeSpill;
+constexpr uint32_t kNativeCallHostExtendedPhaseSpill =
+    kX64CallHostFrame.hostExtendedPhaseSpill;
+
+constexpr auto kX86CallHostFrame = kVMHandlerX86CallHostFramePlan;
+constexpr uint32_t kX86NativeCallStackBytes = kX86CallHostFrame.stackBytes;
+constexpr uint32_t kX86NativeCallTargetSpill = kX86CallHostFrame.targetSpill;
+constexpr uint32_t kX86NativeCallGuestStackSpill = kX86CallHostFrame.guestStackSpill;
+constexpr uint32_t kX86NativeCallHostExtendedSpill = kX86CallHostFrame.hostExtendedSpill;
+constexpr uint32_t kX86NativeCallFlagsSpill = kX86CallHostFrame.flagsSpill;
+constexpr uint32_t kX86NativeCallEaxSpill = kX86CallHostFrame.volatileGprSpills[0];
+constexpr uint32_t kX86NativeCallEcxSpill = kX86CallHostFrame.volatileGprSpills[1];
+constexpr uint32_t kX86NativeCallEdxSpill = kX86CallHostFrame.volatileGprSpills[2];
+constexpr uint32_t kX86NativeCallCleanupSpill = kX86CallHostFrame.cleanupSpill;
+constexpr uint32_t kX86NativeCallGuardSpill = kX86CallHostFrame.guardSpill;
+constexpr uint32_t kX86NativeCallOriginalEbpSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[0];
+constexpr uint32_t kX86NativeCallOriginalEbxSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[1];
+constexpr uint32_t kX86NativeCallOriginalEsiSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[2];
+constexpr uint32_t kX86NativeCallOriginalEdiSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[3];
+constexpr uint32_t kX86NativeCallStatusSpill = kX86CallHostFrame.statusSpill;
+constexpr uint32_t kX86NativeCallHostExtendedBase = kX86CallHostFrame.hostExtendedBase;
+constexpr uint32_t kX86NativeCallHostExtendedModeSpill =
+    kX86CallHostFrame.hostExtendedModeSpill;
+constexpr uint32_t kX86NativeCallHostExtendedPhaseSpill =
+    kX86CallHostFrame.hostExtendedPhaseSpill;
+constexpr uint32_t kX86NativeCallSehRecordSpill =
+    kX86CallHostFrame.sehRecordSpill;
 constexpr uint8_t kX64CpuidPrologSize = 1u;
 constexpr uint8_t kX64RbxUnwindRegister = 3u;
 
@@ -470,10 +489,13 @@ static_assert((kX64BridgeStackBytes % 8u) == 0u &&
     "x64 bridge stack allocation no longer fits UWOP_ALLOC_LARGE");
 static_assert((kX64NativeCallStackBytes & 0xFu) == 8u &&
         kNativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
+            kNativeCallHostExtendedModeSpill &&
+        kNativeCallHostExtendedPhaseSpill + 4u <=
             kX64NativeCallStackBytes,
     "x64 native-call frame layout or alignment changed");
 static_assert(kX86NativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
-        kX86NativeCallStackBytes,
+        kX86NativeCallHostExtendedModeSpill &&
+        kX86NativeCallSehRecordSpill + 8u <= kX86NativeCallStackBytes,
     "x86 native-call frame layout changed");
 
 void RecordX64StackFunclet(
@@ -1788,6 +1810,40 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             {3u, 2u, 0u, 1u},
             {0u, 3u, 2u, 1u},
             {2u, 0u, 3u, 1u},
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_CALL_HOST) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) % 7u;
+            // CALL_HOST enters its resolver before the native-call frame is
+            // established: RAX is the target token; R15 is the context; RSP
+            // and every Win64 nonvolatile remain live ABI state.  Validation
+            // has killed the earlier RCX/R10/R11 values, so the complete safe
+            // set is the Win64 volatile {RAX,RCX,RDX,R8,R9,R10,R11}.  Roles
+            // are resolved target, image base and call-kind discriminator;
+            // the target is always normalized back to RAX before the frame.
+            constexpr std::array<std::array<uint8_t, 4>, 7> plans = {{
+                {0u, 2u, 1u, 0u},   // legacy RAX/RDX/RCX plan
+                {8u, 9u, 10u, 8u},
+                {9u, 10u, 11u, 9u},
+                {10u, 11u, 8u, 10u},
+                {11u, 8u, 9u, 11u},
+                {1u, 8u, 2u, 1u},
+                {2u, 9u, 1u, 2u},
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // Win32 enters with EAX=target and EDI=context. EBX/ESI are the
+        // direct-threaded dispatch/VIP state and EBP/ESP still belong to the
+        // caller, leaving exactly EAX/ECX/EDX for the resolver.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 2u, 1u, 0u},
+            {1u, 2u, 0u, 1u},
+            {2u, 1u, 0u, 2u},
         }};
         return plans[plan];
     }
@@ -3158,58 +3214,63 @@ void EmitX86MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
     c.Bind(done);
 }
 
-void EmitX64CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
+void EmitZydisCallTargetCore(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t strategy)
+{
+    // The resolver is deliberately complete before CALL_HOST establishes its
+    // native frame.  Seed-selected roles therefore affect only volatile GPR
+    // REX/ModRM/SIB bytes and cannot drift the stack allocation or unwind
+    // record.  DeriveVariantRegisters supplies the architecture-specific
+    // liveness proof; this routine always returns the resolved target in the
+    // fixed RAX/EAX wrapper boundary.
+    const uint8_t target = c.registerAssignment[0];
+    const uint8_t imageBase = c.registerAssignment[1];
+    const uint8_t callKind = c.registerAssignment[2];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t pointerBytes = x64 ? 8u : 4u;
     const auto nativeRva = c.NewLabel();
     const auto importSlot = c.NewLabel();
     const auto indirect = c.NewLabel();
     const auto done = c.NewLabel();
-    X64LoadD(c, 1, CtxDecodedOperands);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
-    c.Raw({0x0F,0x0B});
+    if (target != 0u) EmitZydisMove(c, x64, target, 0u);
+    EmitZydisLoad(c, x64, callKind, context,
+        static_cast<int32_t>(CtxDecodedOperands), 4u);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_NATIVE_RVA);
+    c.Jcc(JccE, nativeRva);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_IMPORT_SLOT);
+    c.Jcc(JccE, importSlot);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_INDIRECT);
+    c.Jcc(JccE, indirect);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_UD2, {});
     c.Bind(nativeRva);
-    X64LoadQ(c, 2, CtxImageBase);
-    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-    else c.Raw({0x48,0x8D,0x04,0x10});
+    EmitZydisLoad(c, x64, imageBase, context,
+        static_cast<int32_t>(CtxImageBase), pointerBytes);
+    if (strategy == 0u)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, target, imageBase);
+    else
+        EmitZydisLea(c, x64, target, target, 0, imageBase);
     c.Jmp(done);
     c.Bind(importSlot);
-    X64LoadQ(c, 2, CtxImageBase);
-    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-    else c.Raw({0x48,0x8D,0x04,0x10});
-    c.Raw({0x48,0x8B,0x00});
+    EmitZydisLoad(c, x64, imageBase, context,
+        static_cast<int32_t>(CtxImageBase), pointerBytes);
+    if (strategy == 0u)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, target, imageBase);
+    else
+        EmitZydisLea(c, x64, target, target, 0, imageBase);
+    EmitZydisLoad(c, x64, target, target, 0, pointerBytes);
     c.Jmp(done);
     c.Bind(indirect);
-    if (strategy == 0u) X64MovRegister(c, 0, 0);
-    else c.Raw({0x48,0x8D,0x40,0x00});
+    if (strategy == 0u)
+        EmitZydisMove(c, x64, target, target);
+    else
+        EmitZydisLea(c, x64, target, target, 0);
     c.Bind(done);
-}
-
-void EmitX86CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
-    const auto nativeRva = c.NewLabel();
-    const auto importSlot = c.NewLabel();
-    const auto indirect = c.NewLabel();
-    const auto done = c.NewLabel();
-    X86LoadD(c, 1, CtxDecodedOperands);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
-    c.Raw({0x0F,0x0B});
-    c.Bind(nativeRva);
-    X86LoadD(c, 2, CtxImageBase);
-    if (strategy == 0u) c.Raw({0x01,0xD0});
-    else c.Raw({0x8D,0x04,0x10});
-    c.Jmp(done);
-    c.Bind(importSlot);
-    X86LoadD(c, 2, CtxImageBase);
-    if (strategy == 0u) c.Raw({0x01,0xD0});
-    else c.Raw({0x8D,0x04,0x10});
-    c.Raw({0x8B,0x00});
-    c.Jmp(done);
-    c.Bind(indirect);
-    if (strategy == 0u) X86MovRegister(c, 0, 0);
-    else c.Raw({0x8D,0x40,0x00});
-    c.Bind(done);
+    if (target != 0u) EmitZydisMove(c, x64, 0u, target);
 }
 
 struct ZydisAluRegisterPlan {
@@ -5004,8 +5065,7 @@ bool EmitBusinessCoreVariant(
                 EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_CALL_HOST:
-                if (strategy == 0u) EmitX64CallTargetVariant(c, 0u);
-                else EmitX64CallTargetVariant(c, 1u);
+                EmitZydisCallTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_RET:
                 EmitZydisControlTargetCore(c, true, strategy);
@@ -5277,8 +5337,7 @@ bool EmitBusinessCoreVariant(
             EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_CALL_HOST:
-            if (strategy == 0u) EmitX86CallTargetVariant(c, 0u);
-            else EmitX86CallTargetVariant(c, 1u);
+            EmitZydisCallTargetCore(c, false, strategy);
             return true;
         case VM_UOP_RET:
             EmitZydisControlTargetCore(c, false, strategy);
@@ -7558,6 +7617,7 @@ void EmitX64CallHost(
     const auto guestSaved = c.NewLabel();
     const auto restoreHostFx = c.NewLabel();
     const auto hostRestored = c.NewLabel();
+    const auto hostModeReady = c.NewLabel();
     const auto materializerFailure = c.NewLabel();
     const auto leave = c.NewLabel();
     const auto leaveFlags = c.NewLabel();
@@ -7565,7 +7625,25 @@ void EmitX64CallHost(
     const auto finished = c.NewLabel();
 
     const size_t funcletBegin = c.bytes.size();
-    c.Raw({0x48,0x81,0xEC}); c.U32(kX64NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_SUB,
+        4u, 8u, kX64CallHostFrame.stackBytes);
+    const size_t allocationCodeOffset = c.bytes.size() - funcletBegin;
+    if (allocationCodeOffset != kX64CallHostFrame.stackAllocationCodeOffset)
+        c.FailEncoding("x64 CALL_HOST stack allocation disagrees with its frame plan");
+    // Keep phase initialization inside SizeOfProlog.  No UHANDLER is exposed
+    // while this slot still contains caller-stack data, closing the
+    // asynchronous-exception window immediately after SUB RSP.
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
+    const size_t emittedPrologSize = c.bytes.size() - funcletBegin;
+    if (emittedPrologSize != kX64CallHostFrame.prologSize)
+        c.FailEncoding("x64 CALL_HOST prolog disagrees with its frame plan");
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedModeSpill), 4u),
+         ZydisImmediateOperand(0u)});
     X64StoreStackQ(c, kNativeCallTargetSpill, 0);
     X64StoreStackQ(c, kNativeCallGuestStackSpill, 10);
     c.Raw({0x31,0xC0}); X64StoreStackQ(c, kNativeCallGuardSpill, 0);
@@ -7607,6 +7685,21 @@ void EmitX64CallHost(
     c.Jmp(hostSaved);
     c.Bind(saveHostFx); c.Raw({0x49,0x0F,0xAE,0x02});
     c.Bind(hostSaved);
+    // Arm phase-two unwind cleanup only after a complete host save.  Mode and
+    // phase live outside the maximum aligned XSAVE image and are part of the
+    // same shared frame plan consumed by the UHANDLER xdata builder.
+    X64LoadQ(c, 11, CtxExtendedState);
+    EmitZydisLoad(c, true, 0u, 11u,
+        static_cast<int32_t>(extendedFlags), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, hostModeReady);
+    EmitZydisMoveImmediate(c, true, 0u, 1u);
+    c.Bind(hostModeReady);
+    X64StoreStackD(c, kNativeCallHostExtendedModeSpill, 0u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(1u)});
 
     // Copy only the statically declared stack-argument window.  Byte loops
     // avoid clobbering RSI/RDI, which remain nonvolatile at every unwind point.
@@ -7688,6 +7781,10 @@ void EmitX64CallHost(
     c.Jmp(hostRestored);
     c.Bind(restoreHostFx); c.Raw({0x49,0x0F,0xAE,0x0A});
     c.Bind(hostRestored);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
 
     c.Raw({0x4C,0x8D,0x94,0x24}); c.U32(kNativeCallArgumentBase);
     X64LoadStackQ(c, 11, kNativeCallGuestStackSpill);
@@ -7711,10 +7808,11 @@ void EmitX64CallHost(
     c.Bind(cfgFailure);
     c.Raw({0x41,0xBB,0x02,0x00,0x00,0x00});
     c.Bind(leave);
-    c.Raw({0x48,0x81,0xC4}); c.U32(kX64NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        4u, 8u, kX64CallHostFrame.stackBytes);
     RecordX64StackFunclet(c, funcletBegin,
         VMHandlerSemanticUnwindKind::StackAllocation,
-        kX64NativeCallStackBytes, kX64NativeCallPrologSize);
+        kX64CallHostFrame.stackBytes, kX64CallHostFrame.prologSize);
     c.Raw({0x45,0x85,0xDB}); c.Jcc(JccE, finished);
     c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, leaveFlags);
     c.Jmp(leaveNative);
@@ -7755,6 +7853,86 @@ void X86StoreMappedVregFromFrame(
     X86LoadFrameD(c, 0, frameDisplacement);
     X86StoreIndexedDVariant(c, CtxVregs, 1, 0);
     c.Raw({0xC7,0x84,0xCF}); c.U32(CtxVregs + 4u); c.U32(0);
+}
+
+void EmitX86CallHostSehRegistration(CodeBuffer& c) {
+    constexpr uint32_t kContextFlagsOffset = 0u;
+    constexpr uint32_t kContextExtendedRegistersOffset = 204u;
+    constexpr uint32_t kContextFloatingPointFlag = 0x08u;
+    constexpr uint32_t kContextExtendedRegistersFlag = 0x20u;
+    constexpr uint32_t kContextXStateFlag = 0x40u;
+    constexpr uint32_t kFxSaveBytes = 512u;
+    const auto setup = c.NewLabel();
+    const auto notUnwinding = c.NewLabel();
+    const auto restoreFx = c.NewLabel();
+    const auto restored = c.NewLabel();
+
+    // CALL skips over the inline handler; its return address is therefore the
+    // exact position-independent handler pointer stored in the registration
+    // record.  The handler participates only in phase-two unwind. Search
+    // phase must leave the guest exception context untouched so a continuable
+    // exception can resume correctly.
+    c.Call(setup);
+    if (c.hasCallHostSehHandler) {
+        c.FailEncoding("x86 CALL_HOST emitted more than one SEH handler");
+    } else {
+        c.callHostSehHandlerOffset = static_cast<uint32_t>(c.bytes.size());
+        c.hasCallHostSehHandler = true;
+    }
+    EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_ENDBR32, {});
+    c.Raw({0x8B,0x44,0x24,0x04});                 // eax = ExceptionRecord
+    c.Raw({0xF7,0x40,0x04}); c.U32(0x06u);       // UNWINDING | EXIT_UNWIND
+    c.Jcc(JccE, notUnwinding);
+    c.Raw({0x8B,0x54,0x24,0x08});                 // edx = registration record
+    c.Raw({0x81,0xEA}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0x83,0xBA}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U8(0x00);
+    c.Jcc(JccE, notUnwinding);
+    c.Raw({0x8B,0x8A}); c.U32(kX86NativeCallHostExtendedSpill);
+    c.Raw({0x83,0xBA}); c.U32(kX86NativeCallHostExtendedModeSpill); c.U8(0x00);
+    c.Jcc(JccE, restoreFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x0F,0xAE,0x29});
+    c.Jmp(restored);
+    c.Bind(restoreFx);
+    c.Raw({0x0F,0xAE,0x09});                      // fxrstor [ecx]
+    c.Bind(restored);
+    // The dispatcher may later restore ContextRecord while transferring to an
+    // outer handler.  Publish the same host FXSAVE image there, select the
+    // ExtendedRegisters representation, and suppress both the stale FSAVE
+    // view and guest XSTATE image.  ESI/EDI are preserved across this handler
+    // call exactly as required by the Win32 ABI.
+    c.Raw({0x8B,0x54,0x24,0x08});
+    c.Raw({0x81,0xEA}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0xC7,0x82}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
+    c.Raw({0x56,0x57});                            // push esi; push edi
+    c.Raw({0x8B,0xB2}); c.U32(kX86NativeCallHostExtendedSpill);
+    c.Raw({0x8B,0x7C,0x24,0x14});                 // edi = ContextRecord
+    c.Raw({0x8B,0x87}); c.U32(kContextFlagsOffset);
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_AND,
+        0u, 4u, ~static_cast<uint64_t>(
+            kContextFloatingPointFlag | kContextXStateFlag));
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_OR,
+        0u, 4u, kContextExtendedRegistersFlag);
+    c.Raw({0x89,0x87}); c.U32(kContextFlagsOffset);
+    c.Raw({0x81,0xC7}); c.U32(kContextExtendedRegistersOffset);
+    EmitZydisSizedMoveImmediate(c, false, 1u, 4u,
+        kFxSaveBytes / sizeof(uint32_t));
+    c.Raw({0xFC,0xF3,0xA5});                      // cld; rep movsd
+    c.Raw({0x5F,0x5E});                            // pop edi; pop esi
+    c.Bind(notUnwinding);
+    c.Raw({0xB8,0x01,0x00,0x00,0x00,0xC3});      // ContinueSearch
+
+    c.Bind(setup);
+    c.U8(0x58);                                   // eax = inline handler
+    X86StoreFrameD(c, kX86NativeCallSehRecordSpill + 4u, 0u);
+    c.Raw({0x64,0xA1,0x00,0x00,0x00,0x00});      // eax = fs:[0]
+    X86StoreFrameD(c, kX86NativeCallSehRecordSpill, 0u);
+    c.Raw({0x8D,0x85}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0x64,0xA3,0x00,0x00,0x00,0x00});      // fs:[0] = record
+}
+
+void RemoveX86CallHostSehRegistration(CodeBuffer& c) {
+    X86LoadFrameD(c, 0u, kX86NativeCallSehRecordSpill);
+    c.Raw({0x64,0xA3,0x00,0x00,0x00,0x00});
 }
 
 void EmitX86CallHost(
@@ -7815,6 +7993,7 @@ void EmitX86CallHost(
     const auto guestSaved = c.NewLabel();
     const auto restoreHostFx = c.NewLabel();
     const auto hostRestored = c.NewLabel();
+    const auto hostModeReady = c.NewLabel();
     const auto skipWriteback = c.NewLabel();
     const auto materializerFailure = c.NewLabel();
     const auto leave = c.NewLabel();
@@ -7822,15 +8001,19 @@ void EmitX86CallHost(
     const auto leaveNative = c.NewLabel();
     const auto finished = c.NewLabel();
 
-    c.Raw({0x81,0xEC}); c.U32(kX86NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_SUB,
+        4u, 4u, kX86CallHostFrame.stackBytes);
     // Save the direct-threaded ABI and establish a frame base that every x86
     // calling convention in the explicit CALL_HOST contract must preserve.
     c.Raw({0x89,0xAC,0x24}); c.U32(kX86NativeCallOriginalEbpSpill);
     c.Raw({0x89,0xE5});
+    X86StoreFrameD(c, kX86NativeCallTargetSpill, 0);
     X86StoreFrameD(c, kX86NativeCallOriginalEbxSpill, 3);
     X86StoreFrameD(c, kX86NativeCallOriginalEsiSpill, 6);
     X86StoreFrameD(c, kX86NativeCallOriginalEdiSpill, 7);
-    X86StoreFrameD(c, kX86NativeCallTargetSpill, 0);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedModeSpill); c.U32(0u);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
+    EmitX86CallHostSehRegistration(c);
     X86LoadD(c, 0, CtxMutationScratch + 4u);
     X86StoreFrameD(c, kX86NativeCallGuestStackSpill, 0);
     c.Raw({0x31,0xC0});
@@ -7869,6 +8052,15 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
     c.Raw({0x0F,0xAE,0x00});
     c.Bind(hostSaved);
+    X86LoadD(c, 2, CtxExtendedState);
+    EmitZydisLoad(c, false, 0u, 2u,
+        static_cast<int32_t>(extendedFlags), 4u);
+    EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, hostModeReady);
+    EmitZydisMoveImmediate(c, false, 0u, 1u);
+    c.Bind(hostModeReady);
+    X86StoreFrameD(c, kX86NativeCallHostExtendedModeSpill, 0u);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(1u);
 
     // ESI/EDI are temporarily used only for the copy and are restored before
     // any external call, preserving the direct-threaded EBX/ESI/EDI contract.
@@ -7879,6 +8071,16 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
     X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
 
+    // GuardCF check is an ordinary external call and may legally clobber the
+    // floating/SIMD environment.  Run it while the handler host state is
+    // active, then restore the guest state immediately before the real
+    // target.  The old order exposed guard-clobbered state to the guest.
+    X86LoadFrameD(c, 0, kX86NativeCallGuardSpill);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, guardComplete);
+    X86LoadFrameD(c, 1, kX86NativeCallTargetSpill);
+    c.Raw({0xFF,0xD0});
+    c.Bind(guardComplete);
+
     X86LoadD(c, 0, CtxExtendedState);
     c.Raw({0x8B,0x88}); c.U32(extendedFlags);
     c.Raw({0x85,0xC9}); c.Jcc(JccE, restoreGuestFx);
@@ -7888,12 +8090,6 @@ void EmitX86CallHost(
     c.Bind(restoreGuestFx);
     X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x08});
     c.Bind(guestRestored);
-
-    X86LoadFrameD(c, 0, kX86NativeCallGuardSpill);
-    c.Raw({0x85,0xC0}); c.Jcc(JccE, guardComplete);
-    X86LoadFrameD(c, 1, kX86NativeCallTargetSpill);
-    c.Raw({0xFF,0xD0});
-    c.Bind(guardComplete);
 
     // Stage guest volatile inputs in locals so register-map lookups cannot
     // overwrite another input immediately before the native call.
@@ -7953,6 +8149,7 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
     c.Raw({0x0F,0xAE,0x08});
     c.Bind(hostRestored);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
 
     X86LoadD(c, 1, CtxDecodedOperands + 16u);
     c.Raw({0x89,0xEE});
@@ -7981,12 +8178,15 @@ void EmitX86CallHost(
     c.Bind(cfgFailure);
     c.Raw({0xC7,0x85}); c.U32(kX86NativeCallStatusSpill); c.U32(2u);
     c.Bind(leave);
+    RemoveX86CallHostSehRegistration(c);
     X86LoadFrameD(c, 0, kX86NativeCallStatusSpill);
     X86LoadFrameD(c, 3, kX86NativeCallOriginalEbxSpill);
     X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
     X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
     X86LoadFrameD(c, 2, kX86NativeCallOriginalEbpSpill);
-    c.Raw({0x89,0xEC,0x89,0xD5,0x81,0xC4}); c.U32(kX86NativeCallStackBytes);
+    c.Raw({0x89,0xEC,0x89,0xD5});
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_ADD,
+        4u, 4u, kX86CallHostFrame.stackBytes);
     c.Raw({0x85,0xC0}); c.Jcc(JccE, finished);
     c.Raw({0x83,0xF8,0x01}); c.Jcc(JccE, leaveFlags);
     c.Jmp(leaveNative);
@@ -8138,6 +8338,101 @@ void EmitX86SpecialSemantic(
 
 
 } // namespace
+
+bool GenerateVMHandlerX64CallHostUnwindHandler(
+    std::vector<uint8_t>& code,
+    std::string& error)
+{
+    constexpr uint32_t kContextFlagsOffset = 0x30u;
+    constexpr uint32_t kContextMxCsrOffset = 0x34u;
+    constexpr uint32_t kContextFltSaveOffset = 0x100u;
+    constexpr uint32_t kContextXStateFlag = 0x40u;
+    constexpr uint32_t kFxSaveBytes = 512u;
+
+    code.clear();
+    error.clear();
+    CodeBuffer c;
+    const auto notArmed = c.NewLabel();
+    const auto restoreFx = c.NewLabel();
+    const auto restored = c.NewLabel();
+    const auto copyLegacyState = c.NewLabel();
+    const auto finish = c.NewLabel();
+
+    // UNW_FLAG_UHANDLER ABI:
+    //   RCX = ExceptionRecord, RDX = EstablisherFrame,
+    //   R8  = dispatcher CONTEXT, R9 = DispatcherContext.
+    // Only volatile registers are borrowed.  R9 is repurposed as the stable
+    // frame base before XRSTOR consumes EDX as the high feature mask.
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_ENDBR64, {});
+    EmitZydisLoad(c, true, 0u, 2u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, notArmed);
+    EmitZydisMove(c, true, 9u, 2u);
+    EmitZydisLoad(c, true, 10u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedSpill), 8u);
+    EmitZydisLoad(c, true, 0u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedModeSpill), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, restoreFx);
+    EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 7u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR, 2u, 2u, 4u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_XRSTOR,
+        {ZydisMemoryOperand(true, 10u, 0, kFxSaveBytes)});
+    c.Jmp(restored);
+    c.Bind(restoreFx);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_FXRSTOR,
+        {ZydisMemoryOperand(true, 10u, 0, kFxSaveBytes)});
+    c.Bind(restored);
+
+    // A later RtlRestoreContext would otherwise reinstall the guest legacy
+    // FP/SIMD state captured at the fault.  Copy the architecturally defined
+    // 512-byte FXSAVE prefix into CONTEXT.FltSave and publish its MXCSR.
+    EmitZydisLea(c, true, 11u, 8u,
+        static_cast<int32_t>(kContextFltSaveOffset));
+    EmitZydisSizedMoveImmediate(c, true, 1u, 4u,
+        kFxSaveBytes / sizeof(uint64_t));
+    c.Bind(copyLegacyState);
+    EmitZydisLoad(c, true, 0u, 10u, 0, 8u);
+    EmitZydisStore(c, true, 11u, 0, 0u, 8u);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        10u, 8u, sizeof(uint64_t));
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        11u, 8u, sizeof(uint64_t));
+    EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_DEC, 1u, 4u);
+    c.Jcc(JccNE, copyLegacyState);
+
+    EmitZydisLoad(c, true, 10u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedSpill), 8u);
+    EmitZydisLoad(c, true, 0u, 10u, 0x18, 4u);
+    EmitZydisStore(c, true, 8u,
+        static_cast<int32_t>(kContextMxCsrOffset), 0u, 4u);
+    EmitZydisLoad(c, true, 0u, 8u,
+        static_cast<int32_t>(kContextFlagsOffset), 4u);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_AND,
+        0u, 4u, ~static_cast<uint64_t>(kContextXStateFlag));
+    EmitZydisStore(c, true, 8u,
+        static_cast<int32_t>(kContextFlagsOffset), 0u, 4u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 9u,
+             static_cast<int32_t>(
+                 kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
+    c.Jmp(finish);
+
+    c.Bind(notArmed);
+    c.Bind(finish);
+    EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 1u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_RET, {});
+
+    if (!c.Resolve(error)) return false;
+    code = std::move(c.bytes);
+    return true;
+}
 
 VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const VMHandlerSemanticCodegenConfig& config)
@@ -8435,6 +8730,8 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     result.stackPushes = descriptor->stackPushes;
     result.decodedOperandCount = descriptor->operandCount;
     result.stackFunclets = std::move(code.stackFunclets);
+    result.callHostSehHandlerOffset = code.callHostSehHandlerOffset;
+    result.hasCallHostSehHandler = code.hasCallHostSehHandler;
     result.valueCodecRanges.reserve(code.valueCodecRanges.size());
     for (const auto& range : code.valueCodecRanges)
         result.valueCodecRanges.push_back({range.first, range.second});
@@ -8585,6 +8882,21 @@ bool ValidateVMHandlerSemanticVariantKernel(
         error = "semantic data-path descriptor is missing";
         return false;
     }
+    const bool expectsCallHostSeh = !x64 && config.semantic == VM_UOP_CALL_HOST;
+    constexpr std::array<uint8_t, 4> kEndbr32 = {0xF3,0x0F,0x1E,0xFB};
+    if (result.hasCallHostSehHandler != expectsCallHostSeh ||
+        (!expectsCallHostSeh && result.callHostSehHandlerOffset != 0u) ||
+        (expectsCallHostSeh &&
+         (!rangeValid(result.callHostSehHandlerOffset,
+              static_cast<uint32_t>(kEndbr32.size())) ||
+          !rangeInside(result.semanticCoreOffset, result.semanticCoreSize,
+              result.callHostSehHandlerOffset,
+              static_cast<uint32_t>(kEndbr32.size())) ||
+          !std::equal(kEndbr32.begin(), kEndbr32.end(),
+              result.code.begin() + result.callHostSehHandlerOffset)))) {
+        error = "x86 CALL_HOST SEH handler metadata is missing or non-canonical";
+        return false;
+    }
     VMHandlerSemanticStackFunclet expectedFunclet{};
     const bool expectsFunclet = x64 && ExpectedX64StackFunclet(
         config.semantic, expectedFunclet);
@@ -8640,12 +8952,28 @@ bool ValidateVMHandlerSemanticVariantKernel(
         } else if (funclet.kind ==
                        VMHandlerSemanticUnwindKind::StackAllocation &&
                    funclet.stackBytes == kX64NativeCallStackBytes) {
-            constexpr std::array<uint8_t, 7> prolog = {
-                0x48,0x81,0xEC,0x08,0x06,0x00,0x00
-            };
-            constexpr std::array<uint8_t, 7> epilog = {
-                0x48,0x81,0xC4,0x08,0x06,0x00,0x00
-            };
+            const uint32_t stackBytes = kX64CallHostFrame.stackBytes;
+            const uint32_t phase = kX64CallHostFrame.hostExtendedPhaseSpill;
+            const std::array<uint8_t, 18> prolog = {{
+                0x48,0x81,0xEC,
+                static_cast<uint8_t>(stackBytes),
+                static_cast<uint8_t>(stackBytes >> 8u),
+                static_cast<uint8_t>(stackBytes >> 16u),
+                static_cast<uint8_t>(stackBytes >> 24u),
+                0xC7,0x84,0x24,
+                static_cast<uint8_t>(phase),
+                static_cast<uint8_t>(phase >> 8u),
+                static_cast<uint8_t>(phase >> 16u),
+                static_cast<uint8_t>(phase >> 24u),
+                0x00,0x00,0x00,0x00
+            }};
+            const std::array<uint8_t, 7> epilog = {{
+                0x48,0x81,0xC4,
+                static_cast<uint8_t>(stackBytes),
+                static_cast<uint8_t>(stackBytes >> 8u),
+                static_cast<uint8_t>(stackBytes >> 16u),
+                static_cast<uint8_t>(stackBytes >> 24u)
+            }};
             constexpr std::array<uint8_t, 2> call = {0xFF,0xD0};
             if (funclet.size < prolog.size() + epilog.size() + call.size() ||
                 !std::equal(prolog.begin(), prolog.end(), begin) ||

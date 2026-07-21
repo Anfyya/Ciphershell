@@ -50,6 +50,80 @@ struct VMHandlerSemanticStackFunclet {
     uint8_t nonvolatileRegister = 0;
 };
 
+/*
+ * CALL_HOST is the one semantic whose native-call frame, host extended-state
+ * save and Windows unwind cleanup are inseparable.  Keep the complete fixed
+ * layout here so semantic instruction emission, the x64 UNWIND_INFO builder
+ * and the Win32 registration/cleanup path consume one typed source instead
+ * of maintaining matching magic numbers in separate translation units.
+ *
+ * Per-build mutation is deliberately excluded from both layouts.  The
+ * seed-selected target resolver runs before either frame is established.
+ */
+struct VMHandlerX64CallHostFramePlan {
+    uint32_t stackBytes = 0;
+    uint8_t prologSize = 0;
+    uint8_t stackAllocationCodeOffset = 0;
+    uint8_t unwindFlags = 0;
+    uint32_t argumentBase = 0;
+    uint32_t targetSpill = 0;
+    uint32_t guestStackSpill = 0;
+    uint32_t hostExtendedSpill = 0;
+    uint32_t flagsSpill = 0;
+    std::array<uint32_t, 7> volatileGprSpills{};
+    uint32_t guardSpill = 0;
+    uint32_t hostExtendedBase = 0;
+    uint32_t hostExtendedModeSpill = 0;
+    uint32_t hostExtendedPhaseSpill = 0;
+};
+
+struct VMHandlerX86CallHostFramePlan {
+    uint32_t stackBytes = 0;
+    uint32_t argumentBase = 0;
+    uint32_t targetSpill = 0;
+    uint32_t guestStackSpill = 0;
+    uint32_t hostExtendedSpill = 0;
+    uint32_t flagsSpill = 0;
+    std::array<uint32_t, 3> volatileGprSpills{};
+    uint32_t cleanupSpill = 0;
+    uint32_t guardSpill = 0;
+    std::array<uint32_t, 4> originalNonvolatileSpills{};
+    uint32_t statusSpill = 0;
+    uint32_t hostExtendedBase = 0;
+    uint32_t hostExtendedModeSpill = 0;
+    uint32_t hostExtendedPhaseSpill = 0;
+    uint32_t sehRecordSpill = 0;
+};
+
+inline constexpr VMHandlerX64CallHostFramePlan
+    kVMHandlerX64CallHostFramePlan = {
+        0x608u, 18u, 7u, 2u, 0x20u,
+        0x220u, 0x228u, 0x230u, 0x238u,
+        {0x240u, 0x248u, 0x250u, 0x258u, 0x260u, 0x268u, 0x270u},
+        0x278u, 0x280u, 0x600u, 0x604u};
+
+inline constexpr VMHandlerX86CallHostFramePlan
+    kVMHandlerX86CallHostFramePlan = {
+        0x5D0u, 0u,
+        0x200u, 0x204u, 0x208u, 0x20Cu,
+        {0x210u, 0x214u, 0x218u},
+        0x21Cu, 0x220u,
+        {0x224u, 0x228u, 0x22Cu, 0x230u},
+        0x234u, 0x240u, 0x5C0u, 0x5C4u, 0x5C8u};
+
+static_assert(kVMHandlerX64CallHostFramePlan.hostExtendedBase +
+        VM_XSAVE_AREA_SIZE + 64u <=
+            kVMHandlerX64CallHostFramePlan.hostExtendedModeSpill &&
+        kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill + 4u <=
+            kVMHandlerX64CallHostFramePlan.stackBytes,
+    "x64 CALL_HOST host-state cleanup slots overlap its XSAVE image");
+static_assert(kVMHandlerX86CallHostFramePlan.hostExtendedBase +
+        VM_XSAVE_AREA_SIZE + 64u <=
+            kVMHandlerX86CallHostFramePlan.hostExtendedModeSpill &&
+        kVMHandlerX86CallHostFramePlan.sehRecordSpill + 8u <=
+            kVMHandlerX86CallHostFramePlan.stackBytes,
+    "x86 CALL_HOST SEH cleanup slots overlap its XSAVE image");
+
 struct VMHandlerSemanticCodeRange {
     uint32_t offset = 0;
     uint32_t size = 0;
@@ -96,6 +170,11 @@ struct VMHandlerSemanticCodegenResult {
     // separate from the business-core range so the quantitative gate cannot
     // let one segment dilute or hide reuse in the other.
     std::vector<VMHandlerSemanticCodeRange> valueCodecRanges;
+    // x86 CALL_HOST only: body-relative address of the inline registration
+    // handler that must be merged into an existing SafeSEH table by the final
+    // PE emitter.  Zero with hasCallHostSehHandler=false on every other path.
+    uint32_t callHostSehHandlerOffset = 0;
+    bool hasCallHostSehHandler = false;
     uint32_t variantSuffixOffset = 0;
     uint32_t variantSuffixSize = 0;
     uint32_t opaquePredicateOffset = 0;
@@ -112,6 +191,14 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
 bool ValidateVMHandlerSemanticVariantKernel(
     const VMHandlerSemanticCodegenConfig& config,
     const VMHandlerSemanticCodegenResult& result,
+    std::string& error);
+
+// x64 UNW_FLAG_UHANDLER target shared by every CALL_HOST funclet.  It restores
+// an armed host FXSAVE/XSAVE image during phase-two unwind and updates the
+// legacy floating-point portion of the dispatcher CONTEXT before continuing
+// the search.  Encoder failure is reported fail-closed.
+bool GenerateVMHandlerX64CallHostUnwindHandler(
+    std::vector<uint8_t>& code,
     std::string& error);
 
 } // namespace CipherShell
