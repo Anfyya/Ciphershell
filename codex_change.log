@@ -254,3 +254,22 @@
 远端验证与未完成：本条写入时尚未提交/push。用户明确要求本批只提交、不 push（push 由用户自行处理），因此没有触发、也不应汇报任何 GitHub Actions CI 结果。批次 17 记录的已知缺口（x64 真实故障注入窗口、checked arithmetic 溢出分支、AVX 单机验证）不因本批而变化，本批只闭合外部复查指出的这两个具体缺陷，不重新宣称 BRIDGE_EXTENDED 100% 完成。
 
 如何部署更改：无需新增依赖；使用现有 VS2022/NASM 环境分别构建 x64/Win32 Release。新增 Translator::SelectBridgeHiddenRegister 是公开静态方法，不改变 Translator 既有公开接口的行为；VMInstructionBridgeBuilder::Build 新增的 hidden-alias 校验只会让此前依赖该未定义行为的调用方 fail-closed，不改变任何合法输入的产出字节。新增 CTest 覆盖已包含在既有 pe_hardening_regression 与 vm_handler_synthesis 目标内，无需新增 CMake target。本批不改变 VM image 格式，不改变 VM_INSTRUCTION_BRIDGE_STATE 的内存布局。
+
+[2026-07-23 02:11] Build() 补齐 usesAvx/usesX87 一致性校验 + 批次 18 校验补负向测试
+变更摘要：本条由 Claude Sonnet 5 完成（沿用此文件的时间戳+摘要格式，不套用 [Agent/模型名]+版本号前缀）。批次 18（提交 525f159，本地提交未 push）修完两个真实缺陷后，仓库所有者对修复本身做了第二轮独立复查：确认 EDX/EAX hidden + XSAVE 的修复没有引入新问题，但指出两项新问题。问题一：VMInstructionBridgeBuilder::Build 仍然完全信任调用方传入的 request.usesAvx/request.usesX87，没有和 request.instruction 的真实指令类别做一致性校验；BuildX64Thunk/BuildX86Thunk 完全根据这两个布尔值决定走 FXSAVE/FXRSTOR 还是 XSAVE/XRSTOR，与指令实际是什么完全无关，直接构造请求把真实 AVX 指令的 usesAvx 谎报成 false 会让 Build() 成功接受，thunk 却走 FXSAVE（不保存 YMM 高 128 位），静默返回错误结果不报错；反过来把 SSE/x87 指令的 usesAvx 谎报成 true 会无理由执行 XRSTOR/XSAVE，在不满足运行前置条件的宿主上可能提前触发异常。与批次 18 的"hidden 与操作数冲突"是同一类"Builder 必须自己 fail-closed、不能依赖 Translator 自律"的问题。修复：把 LowerExtendedBridge 里推导 x87/avx 的两行抽成 Translator::ClassifyBridgeExtendedState 静态方法（与批次 18 的 SelectBridgeHiddenRegister 同一形状），LowerExtendedBridge 自己改为调用它，行为不变；Build() 的每请求校验循环新增一段，对 request.instruction 调用这个方法得到真实分类，与调用方传入值逐项比较，不一致就 fail-closed 拒绝。问题二：批次 18 新增的"hidden 与原生指令操作数冲突"校验代码本身没问题，但没有配套的负向测试真正用 hidden == operand/base/index 去撞它，之前只验证过真实 Translator 管线不会产出这样的输入。
+
+涉及文件：packer/transforms/vm_instruction_bridge_builder.cpp；packer/transforms/translator.h；packer/transforms/translator.cpp；tests/test_pe_hardening.cpp；docs/zydis_encoder_pilot.md；codex_change.log。
+
+原因：外部复查在批次 18 修复被独立验证为正确之后，进一步指出 Build() 还有一个同类的自我校验缺口（usesAvx/usesX87 一致性）和一个测试覆盖缺口（批次 18 新增校验本身没有正面负向测试），要求本批闭合。
+
+成功经验与证据：tests/test_pe_hardening.cpp 的 BuildStandardBridgeFixture 原来硬编码 FABS（D9 E1，零操作数，撞不出"hidden 与操作数冲突"这条校验），抽出更通用的 BuildBridgeFixtureWithInstruction(const std::vector<uint8_t>&) 接受任意指令字节，BuildStandardBridgeFixture 改为调用它并传入 FABS 字节，既有四个负向测试行为不变。新增 TestInstructionBridgeBuilderRejectsHiddenAliasingOperand：换用 MOV EAX,[ECX]（8B 01，EAX 是寄存器操作数 family 0/写，[ECX] 是内存操作数 base family 1），循环验证 hidden=0（撞寄存器操作数分支）与 hidden=1（撞内存 base 分支）都被 Build() 拒绝、image/translations 保持不变——这是批次 18 那条校验第一次被真正撞过的负向测试。新增 TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass：复用真实 FABS（真实分类应为 usesX87=true, usesAvx=false），故意传 usesAvx=true, usesX87=false，验证 Build() 拒绝且 image/translations 保持不变。
+
+测试方法论教训：Win32 完整 CTest 套件与 x64 完整 CTest 套件并发跑时，vm_handler_synthesis 意外 FAILED；单独重跑该测试立刻 100% 通过（19.91 秒）。怀疑是两套全量测试（各自都含真实 CreateProcess/硬件异常展开/CPUID 探测等对 CPU 调度延迟敏感的用例）同时跑、争抢资源导致的偶发 flake，不是代码回归；为坐实这个判断，不与任何其他构建并发、单独把 Win32 完整套件重跑一次，17/18 通过（vm_handler_synthesis 这次干净通过，唯一"失败"仍是 vm_native_differential 既有 TIMEOUT 120），确认是并发争抢问题，不是本批改动引入的真实回归。教训：两个架构的完整 CTest 套件包含大量真实系统调用（CreateProcess、硬件异常、CPUID/XGETBV），并发跑存在偶发资源争抢导致的假失败风险，本机验证这类套件时应避免与另一套完整套件同时跑，或对偶发失败先单独重跑确认再下结论，不能第一次看到 FAILED 就当真回归处理、也不能不经复核就当 flake 忽略。
+
+已知缺口：批次 17/18 记录的已知缺口（x64 真实故障注入窗口、checked arithmetic 溢出分支、AVX 单机验证）不因本批而消失；本批只闭合外部复查这一轮指出的两个具体问题，不重新宣称 BRIDGE_EXTENDED 100% 完成。
+
+验证：x64 与 Win32 两套 Release、/W4 /WX 全量重新构建，零警告零错误（首次编译 for (const uint8_t hidden : {0u, 1u}) 触发 C4244 收窄警告，改成显式 std::initializer_list<uint8_t>{0u, 1u} 后清零）。两个架构 test_pe_hardening.exe（带 vm_runtime_gate_exe 路径参数）与 test_vm_handler_synthesis.exe 均 exit code 0。两个架构完整 ctest --test-dir <dir> -C Release --output-on-failure --timeout 300：x64 17/18（642.07 秒，similarity gate 470.42 秒 PASS）；Win32 排除并发干扰后单独重跑 17/18（693.38 秒，similarity gate 519.48 秒 PASS）。两个架构唯一"失败"都只是 vm_native_differential 既有 TIMEOUT 120（未修改该属性）。vm_kernel_static_gate.py --source-root . 本机直接运行 [PASS]，双策略覆盖 54/54（本批不改任何语义迁移范围）。
+
+远端验证：本条写入后将用 ForgeAgentBot 身份直接 push 到 codex（用户本轮明确要求，因为上一次远端 CI 红了）；push 后按用户要求只查一次 CI check-runs 状态，不轮询，见后续提交记录附带的说明。
+
+如何部署更改：无需新增依赖；使用现有 VS2022/NASM 环境分别构建 x64/Win32 Release。新增 Translator::ClassifyBridgeExtendedState 是公开静态方法，不改变 Translator 既有公开接口的行为；VMInstructionBridgeBuilder::Build 新增的一致性校验只会让此前依赖该未定义行为的调用方 fail-closed，不改变任何合法输入的产出字节。新增 CTest 覆盖已包含在既有 pe_hardening_regression 目标内，无需新增 CMake target。本批不改变 VM image 格式，不改变 VM_INSTRUCTION_BRIDGE_STATE 的内存布局。

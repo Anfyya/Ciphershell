@@ -659,6 +659,33 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
                     return result;
                 }
             }
+            // usesAvx/usesX87 pick which hardware save/restore instruction
+            // BuildX64Thunk/BuildX86Thunk emit (Fxrstor/Fxsave for neither
+            // flag set, Xrstor/Xsave for usesAvx) -- entirely independent of
+            // what request.instruction actually is. The real translator
+            // derives both flags from the instruction it is looking at (see
+            // Translator::ClassifyBridgeExtendedState, extracted from
+            // LowerExtendedBridge), so the production pipeline can never
+            // disagree with itself; but that is Translator's own discipline,
+            // not something Build() enforces, and a caller-supplied request
+            // (this batch's own negative tests included) can set them to
+            // anything. A real AVX instruction routed through usesAvx=false
+            // silently loses the YMM high 128 bits (FXSAVE never touches
+            // them) instead of failing; a non-AVX instruction routed through
+            // usesAvx=true runs XRSTOR/XSAVE on a host that may not actually
+            // support them, and takes the EDX/EAX-preservation branch added
+            // this batch for no reason the instruction itself justifies.
+            // Same rationale as every other independent Build()-level check
+            // added this batch and the last: Translator's own correctness is
+            // not a substitute for Build() rejecting an inconsistent input.
+            // See docs/zydis_encoder_pilot.md batch 19.
+            bool expectedX87 = false, expectedAvx = false;
+            Translator::ClassifyBridgeExtendedState(request.instruction, expectedX87, expectedAvx);
+            if (request.usesX87 != expectedX87 || request.usesAvx != expectedAvx) {
+                result.error =
+                    "VM_BRIDGE: usesAvx/usesX87 does not match the bridged instruction's actual extended-state class";
+                return result;
+            }
             uint32_t blobSizeU32 = 0;
             if (!CheckedSizeToU32(blob.size(), blobSizeU32)) {
                 result.error = "VM_BRIDGE: thunk layout exceeds addressable size";

@@ -902,10 +902,17 @@ uint8_t Translator::SelectBridgeHiddenRegister(const InstructionIR& instruction)
     return 0xFF;
 }
 
-bool Translator::LowerExtendedBridge(const InstructionIR& instruction, TranslationResult& result) {
-    const bool x87 = instruction.instructionSet == InstructionSetClass::X87 ||
+void Translator::ClassifyBridgeExtendedState(
+    const InstructionIR& instruction, bool& usesX87, bool& usesAvx)
+{
+    usesX87 = instruction.instructionSet == InstructionSetClass::X87 ||
         instruction.mnemonic == InstructionMnemonic::FloatingPoint;
-    const bool avx = instruction.instructionSet == InstructionSetClass::Avx;
+    usesAvx = instruction.instructionSet == InstructionSetClass::Avx;
+}
+
+bool Translator::LowerExtendedBridge(const InstructionIR& instruction, TranslationResult& result) {
+    bool x87 = false, avx = false;
+    ClassifyBridgeExtendedState(instruction, x87, avx);
     if ((x87 && !m_config.enableX87Bridge) || (!x87 && !m_config.enableSimdBridge)) {
         return FailInstruction(instruction, x87 ?
             "x87 bridge disabled" : "SIMD bridge disabled");

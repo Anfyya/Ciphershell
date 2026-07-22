@@ -3143,3 +3143,88 @@ translator.h`/`translator.cpp`（新增 `Translator::SelectBridgeHiddenRegister`
 静态方法，`LowerExtendedBridge` 改为调用它）、`tests/test_vm_handler_synthesis.cpp`
 （`ExecuteInstructionBridgeThunkAvxCases` 改用真实选择逻辑；新增
 `#include "packer/transforms/translator.h"` 与 `using CipherShell::Translator;`）。
+
+## 独立批次 19：`Build()` 补齐 `usesAvx`/`usesX87` 一致性校验 + 批次 18 校验补负向测试（2026-07-23）
+
+### 起点
+
+批次 18（提交 `525f159`，本地提交、未 push）修完两个真实缺陷后，仓库所有者对
+修复本身做了第二轮独立复查，确认 EDX/EAX hidden + XSAVE 的修复没有引入新的正确性
+问题（"Win32 默认选 EDX 的那条真实生产路径现在确实被保住了"），但指出两项新问题：
+(1) `VMInstructionBridgeBuilder::Build` 仍然完全信任调用方传入的
+`request.usesAvx`/`request.usesX87`，没有和 `request.instruction` 的真实指令类别
+做一致性校验——真实 Translator 路径不会出现这种不一致，但这只是 Translator 一侧
+的自律，与批次 18 已经修复的"hidden 与操作数冲突"是同一类"Builder 必须自己
+fail-closed，不能依赖 Translator 自律"的问题；(2) 批次 18 新增的"hidden 与原生
+指令操作数冲突"校验代码本身没问题，但没有配套的负向测试真正用
+`hidden == operand/base/index` 去撞它。同时报告 CI 红了，要求本批完成后用
+ForgeAgentBot 身份直接 push 并自行确认一次 CI 结果（不要轮询，避免打爆 `gh api`
+配额）。
+
+### 修复的问题
+
+**`Build()` 补齐 `usesAvx`/`usesX87` 一致性校验。** `BuildX64Thunk`/`BuildX86Thunk`
+完全根据这两个布尔值决定走 `Fxrstor`/`Fxsave`（都为 false）还是
+`Xrstor`/`Xsave`（`usesAvx=true`），与 `request.instruction` 实际是什么指令无关。
+如果直接构造 `VMBridgeRequest`（不经过真实 Translator）把一条真实 AVX 指令的
+`usesAvx` 谎报成 `false`，`Build()` 此前会成功接受，thunk 却走 FXSAVE 路径——
+FXSAVE 不保存 YMM 高 128 位，产出一个静默返回错误结果（不崩溃、不报错）的 thunk；
+反过来把 SSE/x87 指令的 `usesAvx` 谎报成 `true`，会无理由执行 XRSTOR/XSAVE，在
+不满足运行前置条件（AVX/XSAVE 支持）的宿主上可能提前触发 `#UD`/`#GP`。与
+批次 18 的"hidden 与操作数冲突"检查同一类问题：真实 Translator 自己会正确推导
+这两个布尔值（见 `LowerExtendedBridge` 开头的 `x87`/`avx` 局部变量），但那只是
+Translator 一侧的自律，`Build()` 从未独立验证过调用方真的按同一套规则传值。
+修复：把 `LowerExtendedBridge` 里推导 `x87`/`avx` 的两行单独抽成
+`Translator::ClassifyBridgeExtendedState(const InstructionIR&, bool& usesX87,
+bool& usesAvx)` 静态方法（与批次 18 的 `SelectBridgeHiddenRegister` 同一形状，
+避免分类逻辑与校验各写一份、日后漂移），`LowerExtendedBridge` 自己改为调用它，
+行为不变；`Build()` 的每请求校验循环新增一段，对 `request.instruction` 调用这个
+方法得到"真实应该是什么"，与调用方传入的 `request.usesAvx`/`usesX87` 逐项比较，
+任一不一致就 fail-closed 拒绝。
+
+### 测试改动
+
+`tests/test_pe_hardening.cpp`：`BuildStandardBridgeFixture` 原来硬编码 FABS
+（`D9 E1`，零操作数，撞不出"hidden 与操作数冲突"这条校验），抽出一个更通用的
+`BuildBridgeFixtureWithInstruction(const std::vector<uint8_t>& instructionBytes)`
+接受任意指令字节，`BuildStandardBridgeFixture()` 改为调用它并传入 FABS 字节，
+其余四个既有负向测试的行为完全不变。新增两个测试：
+
+- `TestInstructionBridgeBuilderRejectsHiddenAliasingOperand`：换用
+  `MOV EAX,[ECX]`（`8B 01`，EAX 是寄存器操作数 family 0/写，`[ECX]` 是内存操作数
+  的 base family 1），循环验证 `hidden=0`（撞寄存器操作数分支）与 `hidden=1`
+  （撞内存 base 分支）都被 `Build()` 拒绝，`image`/`translations` 保持不变。这是
+  批次 18 那条校验本身第一次被真正撞过的负向测试，之前只验证过真实 Translator
+  管线不会产出这样的输入。
+- `TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass`：复用
+  `BuildStandardBridgeFixture()` 的真实 FABS（真实分类应为
+  `usesX87=true, usesAvx=false`），故意传 `usesAvx=true, usesX87=false`，验证
+  `Build()` 拒绝且 `image`/`translations` 保持不变。
+
+### 验证结果（本机实测，2026-07-23）
+
+x64（`build`）与 Win32（`build32`）两套 Release、`/W4 /WX` 全量重新构建，零警告
+零错误（首次编译时 `for (const uint8_t hidden : {0u, 1u})` 触发 C4244 收窄警告
+——`{0u, 1u}` 推导成 `std::initializer_list<uint32_t>` 绑定到 `uint8_t` 循环变量，
+改成显式 `std::initializer_list<uint8_t>{0u, 1u}` 后清零）。两个架构下
+`test_pe_hardening.exe`（带 `vm_runtime_gate_exe` 路径参数）与
+`test_vm_handler_synthesis.exe` 均 exit code 0，无失败输出，新增的两个负向测试
+均已通过 `main()` 注册并实际执行。两个架构完整
+`ctest --test-dir <dir> -C Release --output-on-failure --timeout 300`：
+x64 17/18 通过（642.07 秒，`vm_per_build_similarity_gate` 470.42 秒 PASS）；
+Win32 首次与 x64 并发跑时 `vm_handler_synthesis` 意外 FAILED，单独重跑该测试
+立刻 100% 通过（19.91 秒），怀疑是两套全量 CTest（各自都含真实 CreateProcess/
+硬件异常/CPUID 探测等对 CPU 调度延迟敏感的用例）同时跑、争抢资源导致的偶发
+flake，于是不与任何其他构建并发、单独把 Win32 完整套件重跑一次做最终确认：
+17/18 通过（693.38 秒，`vm_per_build_similarity_gate` 519.48 秒 PASS，
+`vm_handler_synthesis` 这次干净通过），坐实是并发争抢的偶发问题、不是本批改动
+引入的真实回归。两个架构唯一"失败"都只是 `vm_native_differential` 既有
+`TIMEOUT 120` 属性（与历史批次相同的已知本机限制，未修改该属性）。
+`vm_kernel_static_gate.py --source-root .` 本机直接运行：`[PASS]`，双策略覆盖
+`54/54`（本批不改变语义迁移范围）。
+
+### 已知缺口（未变化）
+
+批次 17/18 记录的已知缺口（x64 真实故障注入窗口、checked arithmetic 溢出分支、
+AVX 单机验证）不因本批而消失；本批只闭合外部复查这一轮指出的两个具体问题，不
+重新宣称 `BRIDGE_EXTENDED` 100% 完成。

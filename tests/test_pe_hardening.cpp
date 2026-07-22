@@ -2530,12 +2530,15 @@ struct BridgeFixture {
 };
 
 // 构造与 VerifyInstructionBridgeBuilds 完全相同的最小 x64 宿主镜像（真实
-// RUNTIME_FUNCTION/UNWIND_INFO，prologSize=0）与真实 Zydis 解码出的 FABS，
-// 但不预先构造 VMBridgeRequest —— 下面每个负向测试都基于 `decoded` 独立
-// 构造自己的请求，只故意破坏自己要测的那一个字段。
-BridgeFixture BuildStandardBridgeFixture() {
+// RUNTIME_FUNCTION/UNWIND_INFO，prologSize=0）与真实 Zydis 解码出的
+// `instructionBytes`，但不预先构造 VMBridgeRequest —— 下面每个负向测试都
+// 基于 `decoded` 独立构造自己的请求，只故意破坏自己要测的那一个字段。
+BridgeFixture BuildBridgeFixtureWithInstruction(const std::vector<uint8_t>& instructionBytes) {
     using namespace CipherShell;
-    const std::vector<uint8_t> textData = {0xC3, 0xD9, 0xE1, 0xC3};
+    std::vector<uint8_t> textData = {0xC3};
+    const uint32_t instructionOffset = static_cast<uint32_t>(textData.size());
+    textData.insert(textData.end(), instructionBytes.begin(), instructionBytes.end());
+    textData.push_back(0xC3);
     Writer rd;
     const size_t entryRel = rd.mark();
     rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
@@ -2562,8 +2565,12 @@ BridgeFixture BuildStandardBridgeFixture() {
     fixture.img = img;
     fixture.function.entryAddress = kExcTextVA;
     fixture.function.size = static_cast<uint32_t>(textData.size());
-    fixture.decoded = DisassembleSingleInstruction({0xD9, 0xE1}, kExcTextVA + 1);
+    fixture.decoded = DisassembleSingleInstruction(instructionBytes, kExcTextVA + instructionOffset);
     return fixture;
+}
+
+BridgeFixture BuildStandardBridgeFixture() {
+    return BuildBridgeFixtureWithInstruction({0xD9, 0xE1}); // FABS
 }
 
 bool MicroInstructionEqual(const CipherShell::MicroInstruction& a, const CipherShell::MicroInstruction& b) {
@@ -2689,6 +2696,100 @@ void TestInstructionBridgeBuilderRejectsOversizedInstructionLength() {
     request.functionRVA = kExcTextVA;
     request.instruction = oversized;
     request.hiddenNativeRegister = 11u;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// hidden 与被桥接指令自身的操作数冲突时必须 fail-closed（批次 18 新增的
+// 校验此前没有专门的负向测试直接撞它——只验证过真实 translator 管线永远不会
+// 产出这样的输入，没有验证 Build() 自己在收到这样的输入时会不会真的拒绝）。
+// FABS 没有任何操作数，撞不出这条校验，换用 MOV EAX,[ECX]（8B 01）：EAX 是
+// 寄存器操作数（family 0，写），[ECX] 是内存操作数的 base（family 1）。
+// 两个子用例分别撞寄存器操作数分支与内存 base 分支。
+void TestInstructionBridgeBuilderRejectsHiddenAliasingOperand() {
+    using namespace CipherShell;
+    const std::vector<uint8_t> movEaxFromEcx = {0x8B, 0x01}; // mov eax,[ecx]
+
+    for (const uint8_t hidden : std::initializer_list<uint8_t>{0u, 1u}) { // 0=EAX(寄存器操作数)，1=ECX(内存 base)
+        BridgeFixture fixture = BuildBridgeFixtureWithInstruction(movEaxFromEcx);
+        std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+        const uint32_t numSectionsBefore = fixture.img->numSections;
+        const DWORD rawSizeBefore = fixture.img->rawSize;
+
+        TranslationResult translation{};
+        translation.registerCount = 32;
+        MicroInstruction bridgeOp{};
+        bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+        bridgeOp.operandCount = 3;
+        bridgeOp.operands[1] = hidden;
+        translation.instructions.push_back(bridgeOp);
+
+        VMBridgeRequest request{};
+        request.microOpIndex = 0;
+        request.functionRVA = kExcTextVA;
+        request.instruction = fixture.decoded;
+        request.hiddenNativeRegister = hidden;
+        translation.bridgeRequests.push_back(request);
+
+        std::vector<Function> functions = {fixture.function};
+        std::vector<TranslationResult> translations = {translation};
+        const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+        VMInstructionBridgeBuilder builder;
+        const auto result = builder.Build(fixture.img, functions, translations,
+            ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+        CS_TEST_CHECK(!result.success);
+        CS_TEST_CHECK(!result.error.empty());
+        CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+        CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+        CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+        CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+        PEParser p; p.FreeImage(fixture.img);
+    }
+}
+
+// request.usesAvx/usesX87 必须与 request.instruction 真实的扩展状态类别一致
+// （批次 19 新增的校验）：FABS 是真实 x87 指令，若声称 usesX87=false/
+// usesAvx=true，Build() 必须拒绝，不能顺着调用方声称的标志走进错误的
+// XRSTOR/XSAVE 分支——真实 FABS 不需要、大概率也没有对应 AVX 状态可保存。
+void TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture(); // FABS：真实 usesX87=true, usesAvx=false
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 11u | VM_MICRO_BRIDGE_AVX;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 11u;
+    request.usesAvx = true;   // 谎称：真实 FABS 不是 AVX 指令
+    request.usesX87 = false;  // 谎称：真实 FABS 就是 x87 指令
     translation.bridgeRequests.push_back(request);
 
     std::vector<Function> functions = {fixture.function};
@@ -2863,6 +2964,8 @@ int main(int argc, char** argv) {
     TestInstructionBridgeBuilderRejectsOutOfRangeHidden();
     TestInstructionBridgeBuilderRejectsStackPointerHidden();
     TestInstructionBridgeBuilderRejectsOversizedInstructionLength();
+    TestInstructionBridgeBuilderRejectsHiddenAliasingOperand();
+    TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass();
     TestInstructionBridgeBuilderRollsBackOnLateFailure();
     CS_TEST_CHECK(argc == 2);
     TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);

@@ -290,6 +290,17 @@ public:
     // docs/zydis_encoder_pilot.md batch 18.
     static uint8_t SelectBridgeHiddenRegister(const InstructionIR& instruction);
 
+    // Reproduces LowerExtendedBridge's own x87/AVX classification of a
+    // bridged instruction (the same `x87`/`avx` locals it derives before
+    // ever constructing a VMBridgeRequest) as a standalone, callable
+    // function, so a caller that already has an InstructionIR -- including
+    // VMInstructionBridgeBuilder::Build itself, independently verifying a
+    // caller-supplied VMBridgeRequest.usesAvx/usesX87 rather than trusting
+    // it -- gets the exact same classification the production translator
+    // would have produced. See docs/zydis_encoder_pilot.md batch 19.
+    static void ClassifyBridgeExtendedState(
+        const InstructionIR& instruction, bool& usesX87, bool& usesAvx);
+
 private:
     struct BranchFixup {
         size_t microOpIndex = 0;
