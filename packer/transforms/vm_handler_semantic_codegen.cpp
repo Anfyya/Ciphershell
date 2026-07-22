@@ -1847,6 +1847,57 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         }};
         return plans[plan];
     }
+    if (semantic == VM_UOP_BRIDGE_EXTENDED) {
+        // BRIDGE_EXTENDED reuses this same three-role contract for two
+        // temporally disjoint phases that never need to be simultaneously
+        // live, so a single 4-wide plan can drive both:
+        //   (1) EmitZydisControlTargetCore's value/source pair (roles [0]/
+        //       [1]) resolves target=imageBase+decodedOperand before the
+        //       stack-allocated funclet exists; the result is normalized
+        //       back into RAX/EAX and immediately persisted to
+        //       CtxMutationScratch, so nothing from this phase survives.
+        //   (2) The GPR-marshal funclet that follows reuses roles [0]/[1]/
+        //       [2] for a different purpose: value, family-index and
+        //       CtxRegisterMap table-base registers used to copy all 16 (x64)
+        //       or 8 (x86) CtxVregs families through CtxRegisterMap into (and
+        //       back out of) the on-stack VM_INSTRUCTION_BRIDGE_STATE. R15/
+        //       EDI is context and RSP/nonvolatile GPRs stay excluded exactly
+        //       as in every other business core; unlike the ALU cores, R9/
+        //       R10 are not reserved for width mask or lazy-flags auxiliary
+        //       here because this semantic never dispatches width or touches
+        //       CtxLastAlu.
+        // Because phase (1)'s legacy fixed form (value=RAX,source=RDX) and
+        // phase (2)'s legacy fixed form (value=RAX,index=RCX,base=R11) need
+        // different roles [1] simultaneously, no single rotation reproduces
+        // both at once; an explicit plan table lets each legacy form be its
+        // own reachable entry instead of forcing an artificial choice.
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) % 7u;
+            constexpr std::array<std::array<uint8_t, 4>, 7> plans = {{
+                {0u, 1u, 11u, 0u},  // legacy marshal form: value/index/base
+                {0u, 2u, 11u, 0u},  // legacy resolver form: value=RAX,source=RDX
+                {8u, 9u, 10u, 8u},
+                {9u, 10u, 11u, 9u},
+                {10u, 11u, 8u, 10u},
+                {11u, 8u, 9u, 11u},
+                {1u, 2u, 8u, 1u},
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // x86 only has three caller-volatile registers proven safe by this
+        // semantic's existing code (EAX/ECX/EDX); EDI is context and
+        // EBX/ESI remain the direct-threaded ABI state this semantic has
+        // never claimed, so all three roles saturate the available pool.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 1u, 2u, 0u},  // legacy marshal form: value/index/base
+            {0u, 2u, 1u, 0u},  // legacy resolver form: value=EAX,source=EDX
+            {1u, 2u, 0u, 1u},
+        }};
+        return plans[plan];
+    }
     std::array<uint8_t, 4> output{};
     if (x64) {
         constexpr std::array<uint8_t, 7> pool = {0, 1, 2, 8, 9, 10, 11};
@@ -2134,15 +2185,6 @@ uint32_t CoreKey32(const CodeBuffer& c, size_t index) {
 uint32_t CoreAddressKey(const CodeBuffer& c, size_t index) {
     const uint32_t key = CoreKey32(c, index) & 0x0FFFFFFFu;
     return key != 0u ? key : 0x06D2B795u;
-}
-
-void X64BinaryImmediate32(
-    CodeBuffer& c, uint8_t group, uint8_t reg, uint32_t value)
-{
-    c.Raw({static_cast<uint8_t>(0x48u | ((reg & 8u) ? 1u : 0u)),
-        0x81, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
-            (reg & 7u))});
-    c.U32(value);
 }
 
 void X86BinaryImmediate32(
@@ -3308,46 +3350,6 @@ void FinishZydisAluRegisters(
     CodeBuffer& c, bool x64, const ZydisAluRegisterPlan& plan)
 {
     if (plan.value != 0u) EmitZydisMove(c, x64, 0u, plan.value);
-}
-
-void EmitKeyedAddSubCore(
-    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
-{
-    const uint32_t k0 = CoreKey32(c, strategy + 0u);
-    const uint32_t k1 = CoreKey32(c, strategy + 3u);
-    const uint32_t k2 = CoreKey32(c, strategy + 5u);
-    if (x64) {
-        X64BinaryImmediate32(c, 0u, 0u, k0);
-        X64BinaryImmediate32(c, 5u, 0u, k1);
-        X64BinaryImmediate32(c, 0u, 0u, k2);
-        if (!subtract) {
-            if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-            else c.Raw({0x48,0x8D,0x04,0x10});
-        } else if (strategy == 0u) {
-            X64BinaryRegister(c, 0x29, 0, 2);
-        } else {
-            c.Raw({0x48,0xF7,0xDA});
-            X64BinaryRegister(c, 0x01, 0, 2);
-        }
-        X64BinaryImmediate32(c, 5u, 0u, k2);
-        X64BinaryImmediate32(c, 0u, 0u, k1);
-        X64BinaryImmediate32(c, 5u, 0u, k0);
-    } else {
-        X86BinaryImmediate32(c, 0u, 0u, k0);
-        X86BinaryImmediate32(c, 5u, 0u, k1);
-        X86BinaryImmediate32(c, 0u, 0u, k2);
-        if (!subtract) {
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
-        } else if (strategy == 0u) {
-            c.Raw({0x29,0xD0});
-        } else {
-            c.Raw({0xF7,0xDA,0x01,0xD0});
-        }
-        X86BinaryImmediate32(c, 5u, 0u, k2);
-        X86BinaryImmediate32(c, 0u, 0u, k1);
-        X86BinaryImmediate32(c, 5u, 0u, k0);
-    }
 }
 
 void EmitZydisKeyedAddSubCore(
@@ -5071,7 +5073,13 @@ bool EmitBusinessCoreVariant(
                 EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_BRIDGE_EXTENDED:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                // Shares EmitZydisControlTargetCore with BRANCH/BRANCH_IF/
+                // CALL_VM/RET: identical value/source-in-RAX/RDX keyed-add
+                // shape used here to resolve target=imageBase+decodedOperand
+                // before the marshal funclet. DeriveVariantRegisters supplies
+                // BRIDGE_EXTENDED's own liveness-derived roles [0]/[1]; this
+                // does not change BRANCH/BRANCH_IF/CALL_VM/RET's behavior.
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_INT3:
                 // INT3 takes no operands, so there is no register role to
@@ -5343,7 +5351,14 @@ bool EmitBusinessCoreVariant(
             EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_BRIDGE_EXTENDED:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            // See the x64 branch above: BRIDGE_EXTENDED was the last
+            // remaining caller of the legacy hand-written
+            // EmitKeyedAddSubCore helper; every other former user
+            // (BRANCH/BRANCH_IF/CALL_VM/RET/CALL_HOST) already migrated to
+            // this Zydis-based core, so EmitKeyedAddSubCore and its
+            // X64BinaryImmediate32 helper were removed as dead code once
+            // this call site switched too.
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_INT3:
             // See the x64 branch above: INT3 has no operands, so there is no
@@ -8206,20 +8221,39 @@ void EmitX64BridgeExtended(
     constexpr uint32_t stateBase = kX64BridgeStateBase;
     constexpr uint32_t allocation = kX64BridgeStackBytes;
     (void)flagsFailure;
+    // Roles for the GPR-marshal funclet below only: [0]=value (the GPR
+    // being transferred to/from the on-stack state), [1]=index (the
+    // CtxRegisterMap family lookup destination), [2]=base (the
+    // CtxRegisterMap pointer, live across all 16 iterations of both
+    // loops). DeriveVariantRegisters documents why these may be any
+    // pairwise-distinct Win64-volatile GPRs.
+    const uint8_t val = c.registerAssignment[0];
+    const uint8_t ix = c.registerAssignment[1];
+    const uint8_t bp = c.registerAssignment[2];
     X64LoadD(c,0,CtxDecodedOperands+8u); c.Raw({0xA9}); c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);
     c.Jcc(JccNE,rangeFailure);
     X64LoadQ(c,0,CtxImageBase); X64LoadD(c,2,CtxDecodedOperands);
     EmitTrackedBusinessCoreVariant(c, true, VM_UOP_BRIDGE_EXTENDED,
         coreStrategy, coreVariantOffset, coreVariantSize);
     X64StoreQ(c,CtxMutationScratch,0);
-    X64LoadQ(c,11,CtxRegisterMap); c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE,rangeFailure);
+    X64LoadQ(c,bp,CtxRegisterMap);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, bp, bp, 8u);
+    c.Jcc(JccE,rangeFailure);
     const size_t funcletBegin = c.bytes.size();
     c.Raw({0x48,0x81,0xEC}); c.U32(allocation);
     for(uint8_t family=0;family<16;++family){
-        c.Raw({0x41,0x0F,0xB6,0x4B,family});
-        X64LoadIndexedQ(c,0,1,CtxVregs);
-        X64StoreStackQ(c,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u,0);
+        EmitZydisLoad(c, true, ix, bp, family, 1u);
+        X64LoadIndexedQ(c,val,ix,CtxVregs);
+        X64StoreStackQ(c,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u,val);
     }
+    // VM_INSTRUCTION_BRIDGE_STATE.rflags is seeded with the fixed
+    // architectural constant 0x00000202 (reserved bit 1 + IF), never from
+    // VM arithmetic/lazy-flags state -- kept as a literal c.Raw MOV/store
+    // pair (not parameterized by val) because
+    // tests/scripts/vm_kernel_static_gate.py's
+    // arithmetic_flags_bridge_closure_gate asserts this exact byte sequence
+    // as positive evidence that no VM flag state can leak into the bridged
+    // native instruction; see docs/zydis_encoder_pilot.md batch 16.
     c.Raw({0xB8,0x02,0x02,0x00,0x00});
     X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,rflags),0);
     X64LoadQ(c,0,CtxMutationScratch); X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,target),0);
@@ -8230,10 +8264,11 @@ void EmitX64BridgeExtended(
     c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK}); X64StoreStackD(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
     X64LoadStackQ(c,0,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,target));
     c.Raw({0x48,0x8D,0x8C,0x24}); c.U32(stateBase); c.Raw({0xFF,0xD0});
-    X64LoadQ(c,11,CtxRegisterMap);
+    X64LoadQ(c,bp,CtxRegisterMap);
     for(uint8_t family=0;family<16;++family){
-        X64LoadStackQ(c,0,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u);
-        c.Raw({0x41,0x0F,0xB6,0x4B,family}); X64StoreIndexedQ(c,CtxVregs,1,0);
+        X64LoadStackQ(c,val,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u);
+        EmitZydisLoad(c, true, ix, bp, family, 1u);
+        X64StoreIndexedQ(c,CtxVregs,ix,val);
     }
     c.Raw({0x48,0x81,0xC4}); c.U32(allocation);
     RecordX64StackFunclet(c, funcletBegin,
@@ -8251,18 +8286,33 @@ void EmitX86BridgeExtended(
 {
     constexpr uint32_t allocation=sizeof(VM_INSTRUCTION_BRIDGE_STATE);
     (void)flagsFailure;
+    // Same three marshal-only roles as the x64 form above: [0]=value,
+    // [1]=index, [2]=base (CtxRegisterMap pointer).
+    const uint8_t val = c.registerAssignment[0];
+    const uint8_t ix = c.registerAssignment[1];
+    const uint8_t bp = c.registerAssignment[2];
     X86LoadD(c,0,CtxDecodedOperands+8u);c.Raw({0xA9});c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);c.Jcc(JccNE,rangeFailure);
     X86LoadD(c,0,CtxImageBase);X86LoadD(c,2,CtxDecodedOperands);
     EmitTrackedBusinessCoreVariant(c, false, VM_UOP_BRIDGE_EXTENDED,
         coreStrategy, coreVariantOffset, coreVariantSize);
     X86StoreD(c,CtxMutationScratch,0);
-    X86LoadD(c,2,CtxRegisterMap);c.Raw({0x85,0xD2});c.Jcc(JccE,rangeFailure);
+    X86LoadD(c,bp,CtxRegisterMap);
+    EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_TEST, bp, bp, 4u);
+    c.Jcc(JccE,rangeFailure);
     c.Raw({0x81,0xEC});c.U32(allocation);
     for(uint8_t family=0;family<8;++family){
-        c.Raw({0x0F,0xB6,0x4A,family});X86LoadIndexedD(c,0,CtxVregs);
-        X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u,0);
-        c.Raw({0xC7,0x84,0x24});c.U32(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u+4u);c.U32(0);
+        EmitZydisLoad(c, false, ix, bp, family, 1u);
+        X86LoadIndexedDVariant(c,val,ix,CtxVregs);
+        X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u,val);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(false, 4u /* ESP */, static_cast<int32_t>(
+                 offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u+4u), 4u),
+             ZydisImmediateOperand(0u)});
     }
+    // See the x64 form above: rflags stays a literal fixed-constant MOV/store
+    // pair, not parameterized by val, because the static gate's
+    // arithmetic_flags_bridge_closure_gate matches this exact byte sequence
+    // as evidence that VM flag state cannot reach the bridged instruction.
     c.Raw({0xB8,0x02,0x02,0x00,0x00});X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,rflags),0);
     X86LoadD(c,0,CtxMutationScratch);X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,target),0);
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,guardTarget),0);
@@ -8271,11 +8321,15 @@ void EmitX86BridgeExtended(
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,extendedStateFlags),2);c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK});
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
     X86LoadStackD(c,0,offsetof(VM_INSTRUCTION_BRIDGE_STATE,target));c.Raw({0x54,0xFF,0xD0,0x83,0xC4,0x04});
-    X86LoadD(c,2,CtxRegisterMap);
+    X86LoadD(c,bp,CtxRegisterMap);
     for(uint8_t family=0;family<8;++family){
-        X86LoadStackD(c,0,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u);
-        c.Raw({0x0F,0xB6,0x4A,family});X86StoreIndexedD(c,CtxVregs,0);
-        c.Raw({0xC7,0x84,0xCF});c.U32(CtxVregs+4u);c.U32(0);
+        X86LoadStackD(c,val,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u);
+        EmitZydisLoad(c, false, ix, bp, family, 1u);
+        X86StoreIndexedDVariant(c,CtxVregs,ix,val);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(false, 7u /* EDI: context */,
+                 static_cast<int32_t>(CtxVregs+4u), 4u, ix, 8u),
+             ZydisImmediateOperand(0u)});
     }
     c.Raw({0x81,0xC4});c.U32(allocation);
 }

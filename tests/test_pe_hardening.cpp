@@ -33,6 +33,9 @@
 #include "../packer/pe_parser/pe_emitter.h"
 #include "../packer/pe_parser/pe_utils.h"
 #include "../packer/analysis/capability_checker.h"
+#include "../packer/analysis/disassembler.h"
+#include "../packer/transforms/vm_instruction_bridge_builder.h"
+#include "../runtime/common/vm_micro_runtime_abi.h"
 
 #include <cstring>
 #include <cstdint>
@@ -2341,6 +2344,175 @@ void TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(const char* fixturePath)
     parser.FreeImage(img);
 }
 
+// ============================================================================
+// VMInstructionBridgeBuilder（BRIDGE_EXTENDED 抽取指令 thunk 构造）
+// ============================================================================
+//
+// 这条代码路径此前完全没有专门测试覆盖：test_vm_handler_synthesis.cpp 里唯一
+// 的 BRIDGE_EXTENDED 执行证据绕开了 VMInstructionBridgeBuilder，直接用一个
+// C++ 静态函数当 hidden-register 调用目标，验证的是 EmitX64/86BridgeExtended
+// 自己的 GPR 搬运/间接调用，不是这里的 thunk 重定位 + .pdata 复制 + CFG 合并。
+// 见 docs/zydis_encoder_pilot.md 独立批次 16。
+
+constexpr uint64_t kBridgeBuilderImageBase = 0x140000000ULL;
+
+// 用真实 Zydis 反汇编器解出待桥接指令的 InstructionIR，而不是手工猜测字段——
+// 这样它与 VMInstructionBridgeBuilder::Build 自身独立反汇编校验用的是同一套
+// 真实解码，不会因为手工构造的 IR 字段偷懒而制造假阳性。
+CipherShell::InstructionIR DisassembleSingleInstruction(
+    const std::vector<uint8_t>& bytes, uint64_t va) {
+    CipherShell::Disassembler disassembler;
+    CS_TEST_CHECK(disassembler.Initialize(true, kBridgeBuilderImageBase));
+    const auto decoded = disassembler.Disassemble(bytes.data(),
+        static_cast<uint32_t>(bytes.size()), va);
+    CS_TEST_CHECK(decoded.size() == 1);
+    CS_TEST_CHECK(decoded.front().length == bytes.size());
+    return decoded.front();
+}
+
+// 构造一个装载了单条 BRIDGE_EXTENDED 请求的 CS_PE_IMAGE + Function +
+// TranslationResult，跑真实 VMInstructionBridgeBuilder::Build，并独立
+// 重新解析最终字节验证 Exception Directory 条目确实合并进了最终 PE
+// （而不仅仅是构建期在内存里自证）。extractedBytes 必须是 Zydis 能真实解码
+// 的单条指令；extractedOffsetInText 是它在 textData 里的偏移，必须
+// >= ReadSimpleUnwind 要求的 prologSize（这里固定用 BuildUnwindInfoValid()
+// 的 prologSize=0，因此任意偏移都满足）。
+void VerifyInstructionBridgeBuilds(
+    const std::vector<uint8_t>& textData,
+    uint32_t extractedOffsetInText,
+    const std::vector<uint8_t>& extractedBytes,
+    uint8_t hiddenNativeRegister,
+    bool usesAvx,
+    bool usesX87) {
+    using namespace CipherShell;
+
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + static_cast<uint32_t>(textData.size());
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, textData, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+
+    // Disassembler::Disassemble's baseAddress parameter is an RVA (checked
+    // to fit uint32_t downstream), not a full imageBase-relative VA.
+    const uint64_t extractedRVA = kExcTextVA + extractedOffsetInText;
+    const InstructionIR decoded = DisassembleSingleInstruction(extractedBytes, extractedRVA);
+
+    Function function{};
+    function.entryAddress = kExcTextVA;
+    function.size = static_cast<uint32_t>(textData.size());
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[0] = 0;
+    bridgeOp.operands[1] = static_cast<uint64_t>(hiddenNativeRegister) |
+        (usesAvx ? VM_MICRO_BRIDGE_AVX : 0u) | (usesX87 ? VM_MICRO_BRIDGE_X87 : 0u);
+    bridgeOp.operands[2] = decoded.rva;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = decoded;
+    request.hiddenNativeRegister = hiddenNativeRegister;
+    request.usesAvx = usesAvx;
+    request.usesX87 = usesX87;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {function};
+    std::vector<TranslationResult> translations = {translation};
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(result.success);
+    CS_TEST_CHECK(result.error.empty());
+    CS_TEST_CHECK(result.cfgTableVerified);
+    CS_TEST_CHECK(result.unwindVerified);
+    CS_TEST_CHECK(result.links.size() == 1);
+    CS_TEST_CHECK(result.links[0].usesAvx == usesAvx);
+    CS_TEST_CHECK(result.links[0].usesX87 == usesX87);
+    CS_TEST_CHECK(result.links[0].hiddenNativeRegister == hiddenNativeRegister);
+    CS_TEST_CHECK(result.links[0].nativeInstructionSize == extractedBytes.size());
+    CS_TEST_CHECK(result.unwindEntries.size() == 1);
+    // Build() takes `translations` by non-const reference and patches the
+    // linked MicroInstruction in place; the mutation lands in translations[0]
+    // (what Build() actually wrote through), not in the `translation` local
+    // that was copied into the vector above.
+    const MicroInstruction& patchedInstruction = translations[0].instructions[0];
+    CS_TEST_CHECK(patchedInstruction.operands[0] == result.links[0].thunkRVA);
+    CS_TEST_CHECK((patchedInstruction.operands[1] & VM_MICRO_BRIDGE_LINKED) != 0);
+    std::string schemaError;
+    CS_TEST_CHECK(VMSchema::ValidateInstruction(
+        patchedInstruction, translations[0].registerCount, schemaError));
+
+    // 独立第二条解析路径：脱离 img 内存态，重新从最终字节里 LoadFromBuffer，
+    // 确认合并进最终 PE 的 Exception Directory 条目确实可以被独立解析出来，
+    // 而不仅仅是构建期在内存里自证；同时用一个全新的 Disassembler 重新解码
+    // 重定位后的指令字节，确认它与抽取前的语义（长度/mnemonic/instruction
+    // set）完全一致——即便 VMInstructionBridgeBuilder::Build 自身已经做过一次
+    // 同样的检查，这里用独立的解码器实例和独立的 image 内存复验，不复用
+    // Build() 内部状态。
+    BYTE* reparsedBuf = new BYTE[img->rawSize];
+    std::memcpy(reparsedBuf, img->rawData, img->rawSize);
+    PEParser reparser;
+    auto* reparsed = reparser.LoadFromBuffer(reparsedBuf, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid);
+    bool foundThunkUnwind = false;
+    for (const auto& e : reparsed->exceptions.entries) {
+        if (e.beginAddress == result.links[0].unwindBeginRVA) {
+            foundThunkUnwind = true;
+            CS_TEST_CHECK(e.endAddress == result.links[0].nativeInstructionRVA +
+                result.links[0].nativeInstructionSize);
+        }
+    }
+    CS_TEST_CHECK(foundThunkUnwind);
+
+    const uint32_t thunkFileOffset = PEUtils::RvaToOffset(reparsed, result.links[0].nativeInstructionRVA);
+    CS_TEST_CHECK(thunkFileOffset != 0 &&
+        thunkFileOffset + result.links[0].nativeInstructionSize <= reparsed->rawSize);
+    Disassembler independentDecoder;
+    CS_TEST_CHECK(independentDecoder.Initialize(true, kBridgeBuilderImageBase));
+    const auto redecoded = independentDecoder.Disassemble(
+        reparsed->rawData + thunkFileOffset, result.links[0].nativeInstructionSize,
+        result.links[0].nativeInstructionRVA);
+    CS_TEST_CHECK(redecoded.size() == 1);
+    CS_TEST_CHECK(redecoded.front().length == decoded.length);
+    CS_TEST_CHECK(redecoded.front().mnemonicText == decoded.mnemonicText);
+    CS_TEST_CHECK(redecoded.front().instructionSet == decoded.instructionSet);
+    CS_TEST_CHECK(std::memcmp(redecoded.front().rawBytes.data(), extractedBytes.data(),
+        extractedBytes.size()) == 0);
+
+    reparser.FreeImage(reparsed);
+    PEParser p; p.FreeImage(img);
+}
+
+// FABS（D9 E1）：无操作数、不读写 EFLAGS 的 x87 指令，真实覆盖
+// BuildX64Thunk 的 FXRSTOR/FXSAVE（非 AVX）分支。
+void TestInstructionBridgeBuilderX87Fabs() {
+    const std::vector<uint8_t> textData = {0xC3, 0xD9, 0xE1, 0xC3};
+    VerifyInstructionBridgeBuilds(textData, 1u, {0xD9, 0xE1},
+        /*hiddenNativeRegister=*/11u, /*usesAvx=*/false, /*usesX87=*/true);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2422,6 +2594,7 @@ int main(int argc, char** argv) {
     TestSafeSEHTableMergeNoOriginalTableIsNoOp();
     TestSafeSEHTableMergeFailsClosedOnNoSehFlag();
     TestSafeSEHTableMergeRejectsX64Image();
+    TestInstructionBridgeBuilderX87Fabs();
     CS_TEST_CHECK(argc == 2);
     TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);
     return 0;

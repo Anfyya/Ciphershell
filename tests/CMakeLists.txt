@@ -256,6 +256,7 @@ add_executable(test_pe_hardening
 
 target_link_libraries(test_pe_hardening PRIVATE
     ciphershell_packer
+    Zydis
 )
 
 target_include_directories(test_pe_hardening PRIVATE ${CMAKE_SOURCE_DIR})

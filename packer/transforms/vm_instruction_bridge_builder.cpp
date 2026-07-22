@@ -14,8 +14,18 @@
 namespace CipherShell {
 namespace {
 
+// Returns UINT32_MAX (never a value a real caller could legitimately land on
+// -- blob sizes here stay far below 4 GiB) to signal overflow/misuse.  An
+// earlier version returned 0 for both "already aligned to offset 0" (the
+// correct result for the very first thunk in an empty blob) and "overflow",
+// which made every Build() call with at least one bridge request fail
+// immediately with a false "thunk layout overflow": AlignUp(0, 16) computes
+// (0 + 15) & ~15 == 0 through the normal, non-error path, and the caller's
+// `if (aligned == 0)` treated that legitimate zero the same as the error
+// sentinel.  See docs/zydis_encoder_pilot.md batch 16.
 uint32_t AlignUp(uint32_t value, uint32_t alignment) {
-    if (!alignment || value > std::numeric_limits<uint32_t>::max() - (alignment - 1u)) return 0;
+    if (!alignment || value > std::numeric_limits<uint32_t>::max() - (alignment - 1u))
+        return std::numeric_limits<uint32_t>::max();
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
@@ -380,7 +390,7 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
                 return result;
             }
             const uint32_t aligned = AlignUp(static_cast<uint32_t>(blob.size()), 16u);
-            if (aligned == 0) {
+            if (aligned == std::numeric_limits<uint32_t>::max()) {
                 result.error = "VM_BRIDGE: thunk layout overflow";
                 return result;
             }
@@ -409,7 +419,7 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
             blob.insert(blob.end(), built.code.begin(), built.code.end());
             if (image->is64Bit) {
                 item.unwindOffset = AlignUp(static_cast<uint32_t>(blob.size()), 4u);
-                if (item.unwindOffset == 0) {
+                if (item.unwindOffset == std::numeric_limits<uint32_t>::max()) {
                     result.error = "VM_BRIDGE: unwind layout overflow";
                     return result;
                 }

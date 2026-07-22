@@ -4053,6 +4053,65 @@ PilotRegisterSignature DecodePilotRegisterSignature(
     return signature;
 }
 
+// Same decode-and-collect logic as DecodePilotRegisterSignature, but over an
+// arbitrary caller-supplied byte range instead of the fixed
+// semanticCoreVariantOffset/Size slice. BRIDGE_EXTENDED's GPR-marshal
+// funclet lives outside the coreVariant region (only its target-resolver
+// phase is inside that slice), so its register diversity test needs to
+// decode the whole semantic body instead.
+PilotRegisterSignature DecodeRegisterSignatureRange(
+    uint32_t architecture,
+    const std::vector<uint8_t>& code,
+    uint32_t offset,
+    uint32_t size)
+{
+    Require(RangeInside(code.size(), offset, size),
+        "Zydis pilot range is invalid");
+    ZydisDecoder decoder = MakeSemanticDecoder(architecture);
+    const ZydisMachineMode machineMode = architecture == VM_ARCH_X64
+        ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
+    PilotRegisterSignature signature{};
+    std::ostringstream text;
+    size_t relative = 0;
+    const uint8_t* base = code.data() + offset;
+    while (relative < size) {
+        ZydisDecodedInstruction instruction{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        Require(ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                &decoder, base + relative,
+                size - relative,
+                &instruction, operands)),
+            "Zydis could not decode a pilot range instruction");
+        text << static_cast<unsigned>(instruction.mnemonic) << ':';
+        for (uint8_t index = 0;
+             index < instruction.operand_count_visible; ++index) {
+            if (operands[index].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                const int id = ZydisRegisterGetId(
+                    ZydisRegisterGetLargestEnclosing(
+                        machineMode, operands[index].reg.value));
+                text << 'r' << id << ',';
+                signature.registerIds.insert(id);
+            } else if (operands[index].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                for (ZydisRegister reg : {
+                        operands[index].mem.base,
+                        operands[index].mem.index}) {
+                    if (reg == ZYDIS_REGISTER_NONE) continue;
+                    const int id = ZydisRegisterGetId(
+                        ZydisRegisterGetLargestEnclosing(machineMode, reg));
+                    text << 'm' << id << ',';
+                    signature.registerIds.insert(id);
+                }
+            }
+        }
+        text << ';';
+        relative += instruction.length;
+    }
+    Require(relative == size,
+        "Zydis pilot range ended between instruction boundaries");
+    signature.text = text.str();
+    return signature;
+}
+
 void TestZydisMigratedRegistersVaryByBuildSeed() {
     constexpr std::array<VM_MICRO_OPCODE, 28> semantics = {
         VM_UOP_LOAD, VM_UOP_STORE,
@@ -5352,6 +5411,153 @@ void TestZydisCallHostResolverRegisterDiversity() {
     }
 }
 
+// BRIDGE_EXTENDED reuses the shared value/source-in-RAX/RDX keyed-add core
+// (EmitZydisControlTargetCore, same as BRANCH/BRANCH_IF/CALL_VM/RET/
+// CALL_HOST) to resolve target=imageBase+decodedOperand, then separately
+// spends its own DeriveVariantRegisters roles [0]/[1]/[2] on the GPR-marshal
+// funclet that copies all CtxVregs families through CtxRegisterMap into (and
+// back out of) the on-stack VM_INSTRUCTION_BRIDGE_STATE. Because these two
+// phases are temporally disjoint but share registerAssignment slots, this
+// test verifies each phase separately: the resolver via the existing
+// semanticCoreVariantOffset/Size slice (DecodePilotRegisterSignature, same
+// tool CALL_HOST's own resolver test uses), and the marshal funclet via the
+// whole semantic body (DecodeRegisterSignatureRange), since the funclet
+// lives outside the coreVariant slice.
+void TestZydisBridgeExtendedRegisterDiversity() {
+    for (uint32_t architecture : {VM_ARCH_X86, VM_ARCH_X64}) {
+        const size_t expectedPlans = architecture == VM_ARCH_X64 ? 7u : 3u;
+        const uint8_t normalizedTarget = 0u; // RAX / EAX
+        const std::array<uint8_t, 4> legacyMarshalPlan =
+            architecture == VM_ARCH_X64
+                ? std::array<uint8_t, 4>{0u, 1u, 11u, 0u}
+                : std::array<uint8_t, 4>{0u, 1u, 2u, 0u};
+        const std::array<uint8_t, 4> legacyResolverPlan =
+            architecture == VM_ARCH_X64
+                ? std::array<uint8_t, 4>{0u, 2u, 11u, 0u}
+                : std::array<uint8_t, 4>{0u, 2u, 1u, 0u};
+        std::set<std::array<uint8_t, 4>> assignments;
+        std::set<std::string> resolverSignatures;
+        std::set<std::string> bodySignatures;
+        std::set<uint8_t> coreStrategiesSeen;
+        bool marshalPlanSeen = false;
+        bool resolverPlanSeen = false;
+
+        for (uint16_t seedByte = 0u; seedByte <= 0xFFu; ++seedByte) {
+            for (uint8_t variant = 0u;
+                 variant < VM_HANDLER_VARIANT_COUNT; ++variant) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(0x7Bu);
+                config.buildSeed[
+                    static_cast<uint8_t>(VM_UOP_BRIDGE_EXTENDED) & 31u] =
+                    static_cast<uint8_t>(seedByte);
+                config.semantic = VM_UOP_BRIDGE_EXTENDED;
+                config.variant = variant;
+                const auto generated = GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success,
+                    "BRIDGE_EXTENDED generation failed: " + generated.error);
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "BRIDGE_EXTENDED validation failed: " + validationError);
+                Require(generated.semanticCoreStrategy < 2u,
+                    "BRIDGE_EXTENDED selected an invalid core strategy");
+                coreStrategiesSeen.insert(generated.semanticCoreStrategy);
+
+                const auto resolverSignature = DecodePilotRegisterSignature(
+                    architecture, generated);
+                Require(resolverSignature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u &&
+                        resolverSignature.registerIds.count(
+                            generated.registerAssignment[1]) != 0u,
+                    "BRIDGE_EXTENDED target resolver value/source role is "
+                    "absent from the decoded core");
+                // EmitZydisControlTargetCore always normalizes its result
+                // back into RAX/EAX before the marshal funclet begins.
+                Require(resolverSignature.registerIds.count(
+                            normalizedTarget) != 0u,
+                    "BRIDGE_EXTENDED target resolver does not normalize its "
+                    "result back into RAX/EAX");
+
+                const auto bodySignature = DecodeRegisterSignatureRange(
+                    architecture, generated.code,
+                    generated.semanticBodyOffset, generated.semanticBodySize);
+                Require(bodySignature.registerIds.count(
+                            generated.registerAssignment[0]) != 0u &&
+                        bodySignature.registerIds.count(
+                            generated.registerAssignment[1]) != 0u &&
+                        bodySignature.registerIds.count(
+                            generated.registerAssignment[2]) != 0u,
+                    "BRIDGE_EXTENDED marshal value/index/base role is absent "
+                    "from the decoded semantic body");
+
+                assignments.insert(generated.registerAssignment);
+                resolverSignatures.insert(resolverSignature.text);
+                bodySignatures.insert(bodySignature.text);
+
+                if (generated.registerAssignment == legacyMarshalPlan &&
+                        !marshalPlanSeen) {
+                    marshalPlanSeen = true;
+                    const auto body = Slice(generated.code,
+                        generated.semanticBodyOffset,
+                        generated.semanticBodySize);
+                    std::ostringstream bytes;
+                    bytes << std::hex;
+                    for (uint8_t byte : body) {
+                        if (byte < 0x10u) bytes << '0';
+                        bytes << static_cast<unsigned>(byte);
+                    }
+                    std::cout << "[zydis-bridge-marshal-fixed-bytes] arch="
+                              << architecture << " bytes=" << bytes.str()
+                              << '\n';
+                }
+                if (generated.registerAssignment == legacyResolverPlan &&
+                        !resolverPlanSeen) {
+                    resolverPlanSeen = true;
+                    const auto core = Slice(generated.code,
+                        generated.semanticCoreVariantOffset,
+                        generated.semanticCoreVariantSize);
+                    std::ostringstream bytes;
+                    bytes << std::hex;
+                    for (uint8_t byte : core) {
+                        if (byte < 0x10u) bytes << '0';
+                        bytes << static_cast<unsigned>(byte);
+                    }
+                    std::cout << "[zydis-bridge-resolver-fixed-bytes] arch="
+                              << architecture << " bytes=" << bytes.str()
+                              << '\n';
+                }
+            }
+        }
+
+        Require(assignments.size() == expectedPlans,
+            "BRIDGE_EXTENDED did not reach every published seed-selected "
+            "register plan (arch=" + std::to_string(architecture) +
+            " reached=" + std::to_string(assignments.size()) +
+            " expected=" + std::to_string(expectedPlans) + ")");
+        Require(resolverSignatures.size() >= expectedPlans,
+            "BRIDGE_EXTENDED target resolver decoded signatures did not "
+            "vary across every register plan");
+        Require(bodySignatures.size() >= expectedPlans,
+            "BRIDGE_EXTENDED marshal funclet decoded signatures did not "
+            "vary across every register plan");
+        Require(coreStrategiesSeen.size() == 2u,
+            "BRIDGE_EXTENDED did not reach both ADD/LEA resolver core "
+            "strategies");
+        Require(marshalPlanSeen,
+            "BRIDGE_EXTENDED could not reproduce its legacy fixed "
+            "value/index/base marshal register plan");
+        Require(resolverPlanSeen,
+            "BRIDGE_EXTENDED could not reproduce its legacy fixed "
+            "value/source resolver register plan");
+        std::cout << "[zydis-registers-bridge-extended] arch="
+                  << architecture << " plans=" << assignments.size()
+                  << " resolver_signatures=" << resolverSignatures.size()
+                  << " body_signatures=" << bodySignatures.size()
+                  << " core_strategies=" << coreStrategiesSeen.size() << '\n';
+    }
+}
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -5415,5 +5621,7 @@ int main() {
         &TestX64ZydisUmulWidePerKSourcePlans, failures);
     Run("Zydis CALL_HOST resolver register allocation",
         &TestZydisCallHostResolverRegisterDiversity, failures);
+    Run("Zydis BRIDGE_EXTENDED resolver/marshal register allocation",
+        &TestZydisBridgeExtendedRegisterDiversity, failures);
     return failures == 0 ? 0 : 1;
 }

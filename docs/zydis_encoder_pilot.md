@@ -2290,3 +2290,437 @@ case）：
 穷举、host/guest FP/SIMD 状态证据、真实异常展开证据三个阶段，见上文）与
 `pe_hardening_regression`（新增 5 个 `TestSafeSEHTableMerge*` 用例）均包含在
 上述 x64/Win32 各 17/18 通过范围内，两个架构都是真实通过，不是编译通过。
+
+## 独立批次 16：`BRIDGE_EXTENDED`（2026-07-22）
+
+### 起点与审计方法
+
+按指示先不采信任务交接里对 `BRIDGE_EXTENDED` 现状的总结，独立重新审计生产
+源码。`BRIDGE_EXTENDED` 实际由三条互相独立的代码路径组成，审计前先把它们
+的调用关系和数据契约理清楚：
+
+1. `packer/transforms/vm_handler_semantic_codegen.cpp` 的
+   `EmitX64BridgeExtended`/`EmitX86BridgeExtended`：在 VM handler 内部把全部
+   16（x64）/8（x86）个 GPR family 从 `CtxVregs`（经 `CtxRegisterMap` 间接
+   寻址）搬进栈上的 `VM_INSTRUCTION_BRIDGE_STATE`，通过状态结构体里的
+   `target` 指针做一次间接调用，再把结构体内可能被修改过的 GPR 搬回
+   `CtxVregs`。这是唯一属于"handler 语义生成"、可与其他已迁移批次的方式论
+   直接对比的部分。
+2. `EmitBusinessCoreVariant` 内部 `case VM_UOP_BRIDGE_EXTENDED`：负责计算
+   `target = imageBase + decodedOperand`（原生调用目标的绝对地址），并承担
+   `54/54` 静态门禁要求的"双 K 策略产生不同机器码"证据。这一小段在概念上属于
+   `BRIDGE_EXTENDED`，但审计后发现它与第 1 点在物理布局上不是同一件事——见
+   下文"发现的问题"。
+3. `packer/transforms/vm_instruction_bridge_builder.cpp` 的
+   `VMInstructionBridgeBuilder::Build`：在打包期（不是 handler 运行期）把从
+   宿主程序里真实抽取出来的原生指令字节（`VMInstructionBridgeLink` 的
+   `nativeInstructionRVA`/`nativeInstructionSize`）拼进合成 PE 的独立
+   section，为每条抽取指令生成一个 thunk（保存/恢复全部 GPR、RFLAGS、
+   x87/SSE/AVX 扩展状态），并据此重建 `.pdata`（x64）与 Guard CF 函数表。这条
+   路径与第 1 点完全独立：第 1 点只负责"把状态摆好、间接调用某个地址"，至于
+   那个地址处到底是什么代码、那段代码的 prolog/epilog 怎么保存宿主寄存器，
+   全部由这条路径在打包期一次性生成，运行期不再变化。
+
+`translator.cpp::LowerExtendedBridge` 是这一切的根本原因：只有当一条指令
+用到 x87/SSE/AVX、不读写任何 EFLAGS、不是分支/调用/返回、且能找到一个不与
+该指令自身操作数冲突的"隐藏寄存器"时，才会被提取为 `BRIDGE_EXTENDED`
+桥接，而不是被逐语义虚拟化——这是因为 VM 本身不虚拟化浮点/SIMD 寄存器状态。
+`hiddenNativeRegister` 由源指令实际用到的操作数决定，是纯粹的正确性约束，
+不是可以按 seed 变化的风格选择；`micro_semantics.cpp` 的软件参考执行器对
+`BRIDGE_EXTENDED`（同 `CALL_HOST`/`RDTSC`/`CPUID`）直接 fail-closed，因为它
+无法在纯 C++ 状态机里模拟"调用外部原生代码"这件事。这两部分审计后确认无需
+改动，也不属于本批风险范围。
+
+现有真实测试：`tests/test_vm_handler_synthesis.cpp` 的
+`ExecuteExternalSemanticVariantCases`（"BRIDGE_EXTENDED/INT3 外部效果双策略
+差分"阶段）已经用一个真实 x64 静态函数 `GateInstructionBridgeTarget`（对
+`gpr[0]` 做 XOR、对 `gpr[15]` 做 ADD）当"hidden-register 调用目标"，端到端
+执行第 1 点描述的整段 GPR 搬运/间接调用/搬回逻辑，覆盖两个 K 策略。审计确认
+这条测试**只覆盖第 1 点**，从未触达第 3 点的 `VMInstructionBridgeBuilder`——
+全仓库搜索 `VMInstructionBridgeBuilder`/`BuildX64Thunk`/`BuildX86Thunk` 除定义
+处外没有任何测试引用，这一点在下文"发现的问题"和"已知缺口"两节都有直接后果。
+
+### 发现的问题
+
+**问题一（设计权衡，不是缺陷）：`BRIDGE_EXTENDED` 的寄存器角色在第 1/2 点
+之间无法用同一个自然 seed 轮转同时复现两套遗留固定字节。** 第 2 点
+（target 解析）遗留的固定寄存器是 `value=RAX/EAX, source=RDX/EDX`；第 1 点
+（GPR 搬运循环）遗留的固定寄存器是 `value=RAX/EAX,
+index(family 查表目标)=RCX/ECX, base(CtxRegisterMap 指针)=R11/EDX`。两者共享
+`registerAssignment[1]` 这一个槽位，但对它的遗留期望不同（`RDX` vs
+`RCX`/`ECX`），且 `EmitZydisControlTargetCore`（见下文）内部硬编码读取
+`registerAssignment[0]`/`[1]`，调用方无法把它重定向到别的槽位。详细推导见
+`DeriveVariantRegisters` 内新增分支的注释；解决方式是显式的角色 plan
+表（而不是通用 `RotateRegisterContract` 循环轮转），第一个 plan 复现第 1 点
+的遗留字节，第二个 plan 复现第 2 点的遗留字节，其余 plan 提供新的真实寄存器
+多样性。这不是本批引入的缺陷，而是两段代码在 `BRIDGE_EXTENDED` 迁移之前就
+已经共享同一组 4 元素 `registerAssignment` 槽位这一既有事实的自然推论。
+
+**问题二（本批发现并修复的真实生产缺陷）：`VMInstructionBridgeBuilder::Build`
+对空 blob 的 `AlignUp` 结果存在错误的 0 值哨兵冲突，导致该函数对任何包含至少
+一条 `BRIDGE_EXTENDED` 请求的输入都必然失败。** 审计第 3 点时逐行核对
+`Build()` 的字节布局逻辑：
+
+```cpp
+uint32_t AlignUp(uint32_t value, uint32_t alignment) {
+    if (!alignment || value > std::numeric_limits<uint32_t>::max() - (alignment - 1u)) return 0;
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+...
+const uint32_t aligned = AlignUp(static_cast<uint32_t>(blob.size()), 16u);
+if (aligned == 0) {
+    result.error = "VM_BRIDGE: thunk layout overflow";
+    return result;
+}
+```
+
+`blob` 在处理第一条桥接请求时必然为空（`blob.size() == 0`），而
+`AlignUp(0, 16)` 沿着**正常、非溢出**路径计算出 `(0 + 15) & ~15 == 0`——这个
+`0` 是"已经对齐到偏移 0"的合法结果，但调用方的 `if (aligned == 0)`
+把它和 `AlignUp` 自己用来表示"溢出"的错误哨兵值（同样是 `0`）混为一谈。
+结果是 `Build()` 处理任何程序的第一条（也是通常唯一需要处理的）
+`BRIDGE_EXTENDED` 请求时都会立即以 `"VM_BRIDGE: thunk layout overflow"`
+失败返回——也就是说，只要一个真实程序里出现任何需要抽取的 x87/SSE/AVX
+指令，整条生产链路就会在打包期失败。这条真实缺陷此前完全没有被任何测试
+捕获到，直接原因就是上一节确认的"没有测试触达 `VMInstructionBridgeBuilder`"。
+本批新增的 x87 单元测试（见"真实执行证据"）在实现过程中先真实复现了这个
+失败（`result.error == "VM_BRIDGE: thunk layout overflow"`），排除了是我自己
+测试代码的错误后，才确认这是生产代码本身的问题。
+
+修复方式：把 `AlignUp` 的错误哨兵从 `0`（与合法结果可能重合）改为
+`UINT32_MAX`（现实中的 blob 大小远低于 4 GiB，不会真的对齐到这个值），并
+同步更新两处调用点的判断条件。不引入任何新的手写字节路径，也不改变
+`AlignUp` 在非溢出输入下的计算结果——所有原本能正确工作的对齐计算（即
+`blob` 非空时的调用）字节结果完全不变，只有原本被误判为溢出的"合法零对齐"
+情形被修正。
+
+审计同时确认了两件相关但本批不处理的事：`vm_runtime_builder.cpp`（属于
+`CALL_HOST`/`vm_runtime_builder` 自己的独立文件）里有一个同名但实现不同的
+`AlignUp`——它没有溢出检测分支，也没有"用 0 表示错误"的调用方约定，因此
+不存在同一类哨兵冲突缺陷（存在的是理论上更弱的"极大 blob 时静默环绕"风险，
+现实中不可达，按指示不在本批处理，只记录在这里以免被误认为遗漏）。
+
+### 迁移范围与理由
+
+参照 `CALL_HOST` 批次的分寸，对第 1/2/3 点分别独立评估：
+
+**第 1 点（GPR 搬运循环）—— 迁移，含真实寄存器多样性。** 审计确认循环体
+每次迭代使用三个临时寄存器：`base`（`CtxRegisterMap` 指针，整个循环期间存活）、
+`index`（读出的 family 映射结果，当次迭代内存活）、`value`（被搬运的
+GPR 值本身）。这三个角色都不是被结构体布局或 ABI 写死的常量——它们只是
+"某个安全的临时寄存器"，此前固定为 `R11`/`RCX`/`RAX`（x64）和
+`EDX`/`ECX`/`EAX`（x86）纯粹是历史实现选择，不是必然性约束，因此确实存在
+安全的可变余地：
+- 逐 family 读取 `CtxRegisterMap[family]` 的 `MOVZX` 指令原本手写
+  REX/ModRM（`c.Raw({0x41,0x0F,0xB6,0x4B,family})` 等），现改由
+  `EmitZydisLoad` 生成，寄存器改为读取 `registerAssignment[1]`（index）与
+  `[2]`（base）。
+- 载入 `CtxRegisterMap` 指针本身、判空 `TEST`、以及把搬运值写入/读出栈上
+  `VM_INSTRUCTION_BRIDGE_STATE.gpr[]`——这些沿用已有的、被其他多个批次
+  证明安全的参数化 helper（`X64LoadQ`/`X64LoadIndexedQ`/`X64StoreStackQ`
+  等，x86 侧改用已存在的 `X86LoadIndexedDVariant`/`X86StoreIndexedDVariant`
+  替代原本硬编码 `ECX` 索引的 `X86LoadIndexedD`/`X86StoreIndexedD`），只改变
+  传入的寄存器编号，不修改这些 helper 自身的实现——它们本来就已经支持任意
+  寄存器参数，不需要新写 Zydis 请求。
+- x86 侧原本用于把 `state.gpr[family]` 高 32 位清零的立即数写入
+  （栈相对的一处、`CtxVregs` 相对索引寻址的另一处）原样保留栈相对的那一处
+  （纯 disp、不涉及任何寄存器选择，没有变化空间），把索引寻址的那一处改为
+  `ZydisEncoderRequest` 生成（因为它的 SIB 索引寄存器必须随 `index` 角色
+  变化，不能再硬编码 `ECX`）。
+
+**不迁移的部分及具体理由：**
+- `SUB RSP, allocation` / `ADD RSP, allocation`（x64 prolog/epilog）：
+  `tests/scripts/vm_kernel_static_gate.py` 与
+  `ValidateVMHandlerSemanticVariantKernel` 都对这两条指令的**逐字节内容**有
+  硬编码断言（`kX64BridgeUnwindInfo`/`kX64BridgeStackSize` 与验证器里的
+  `48,81,EC,98,04,00,00`/`48,81,C4,98,04,00,00` 字面量），这是因为
+  `RecordX64StackFunclet` 记录的 `prologSize=7` 直接进入最终 PE 的
+  `UNWIND_INFO`（`UWOP_ALLOC_LARGE`），必须与真实字节长度完全一致才能让
+  Windows 异常展开正确识别"已分配 0x498 字节栈"这件事。`allocation` 是编译期
+  常量（`sizeof(VM_INSTRUCTION_BRIDGE_STATE)` 相关，当前恒为 `0x498`，
+  静态断言保证它不会缩小到能装进 imm8 的范围），因此这条指令本来就不存在
+  "Zydis 会不会选一个更短的等价编码"的实际风险——但正因为静态门禁已经把
+  它的具体字节焊死做了正向验证，迁移它不会带来任何可观测收益，只会新增一条
+  "以后如果这个假设改变就会静默产生不匹配 unwind 信息"的隐藏依赖，因此保持
+  手写。RSP 本身也没有任何寄存器选择空间——Win64 栈分配约定就是 RSP，不存在
+  seed 可变的余地。
+- `mov eax, 0x00000202` 及其后紧邻的 `state.rflags` 写入：这是
+  `arithmetic_flags_bridge_closure_gate` 静态门禁的正向证据锚点，要求
+  `EmitX64BridgeExtended`/`EmitX86BridgeExtended` 源码里逐字节出现
+  `c.Raw({0xB8,0x02,0x02,0x00,0x00})` 紧跟一次把寄存器 `0` 存入
+  `rflags` 字段的调用——这是在证明桥接线程看到的初始 RFLAGS
+  是一个编译期固定的架构常量（仅保留 reserved bit 1 与 IF），而不是从 VM
+  自己的算术/lazy-flags 状态派生，从而保证 VM 算术标志位不会泄漏进被桥接的
+  原生指令。这个值本身没有 seed 变化的意义（变成别的常量就不再是"架构默认
+  RFLAGS"），寄存器也不需要变化（`0` 只是搬运这个常量到栈的暂存位置，
+  紧接着就会被后续代码覆盖）；如果迁移成 Zydis 生成，这个正向锚点的具体
+  源码文本会不再匹配，而变更检测脚本本身不应该为了迎合我这批的重构而被
+  放宽。因此原样保留，只在两处加了注释说明原因，避免以后的人以为它是
+  疏漏。
+- `target`/`guardTarget`/`extendedState`/`extendedStateFlags`/`hiddenRegister`
+  这几个字段的存取：均已经是 `X64LoadQ`/`X64StoreStackQ`/`X64StoreStackD`
+  等参数化 helper 调用，本来就不涉及手写 REX/ModRM 位运算，且这些字段之间
+  没有相互独立的"角色"概念可言（不像 GPR 搬运循环那样是同一逻辑反复
+  16/8 次），维持原样。
+
+**第 2 点（target 解析）—— 复用已迁移的 `EmitZydisControlTargetCore`，不
+新写代码。** 审计 `EmitBusinessCoreVariant` 发现：`BRANCH`/`BRANCH_IF`/
+`CALL_VM`/`RET`/`CALL_HOST` 全部已经在更早的批次迁移到各自的 Zydis 核心
+（`EmitZydisControlTargetCore`/`EmitZydisCallTargetCore`），只有
+`BRIDGE_EXTENDED` 仍在调用最初写试点报告时保留下来、专门给这几个语义共用
+的手写 `EmitKeyedAddSubCore`。`BRIDGE_EXTENDED` 的 target 计算
+（`value = imageBase + decodedOperand`，随后立即存入
+`CtxMutationScratch` 并归一回 `RAX`/`EAX`）与 `BRANCH` 家族的
+"两个值在 RAX/RDX 进入、算出目标、结果回到 RAX" 结构完全同构，因此把
+`EmitBusinessCoreVariant` 里 `BRIDGE_EXTENDED` 的分支从
+`EmitKeyedAddSubCore(c, x64, false, strategy)` 改为直接调用
+`EmitZydisControlTargetCore(c, x64, strategy)`——不修改
+`EmitZydisControlTargetCore` 本身，因此 `BRANCH`/`BRANCH_IF`/`CALL_VM`/
+`RET` 的行为不受影响。`BRIDGE_EXTENDED` 是 `EmitKeyedAddSubCore` 的最后一个
+调用方，切换后该函数与其专属的 `X64BinaryImmediate32` helper 全部变为死
+代码（在 `/W4 /WX` 下会报未引用函数警告），本批一并删除；这不是"顺手改动
+CALL_HOST"——`EmitKeyedAddSubCore`/`X64BinaryImmediate32` 从来不是
+`CALL_HOST` 专属的代码，`CALL_HOST` 早就不再使用它们了。
+
+**第 3 点（`VMInstructionBridgeBuilder::Build` 的 thunk 生成）—— 审计后
+判定不迁移，理由见下。** `BuildX64Thunk`/`BuildX86Thunk` 生成的字节可以分成
+三段：
+1. 保存全部宿主非易失寄存器与栈指针到 `state`、把全部（除 `hidden` 外的）
+   GPR 从 `state.gpr[]` 载入真实寄存器、恢复 RFLAGS——这段在 `unwindBeginOffset`
+   *之前*，逐行核对确认它的字节长度不影响任何 unwind/CFG 契约（见下）。
+2. 一段 `originalPrologSize + 1` 字节的纯 `0x90` NOP 填充，紧接着是**逐字节
+   原样复制**的被抽取原生指令。这段决定了从原始宿主 PE 复制过来的
+   `UNWIND_INFO`（`ReadSimpleUnwind` 读出）在新 thunk 里能否按原始偏移正确
+   解释——`RUNTIME_FUNCTION.BeginAddress` 就是 `unwindBeginOffset`，
+   NOP 段的精确长度必须等于原函数的 `SizeOfProlog` 才能让系统展开器在
+   "抽取指令自己触发真实异常"时，把这个位置正确识别为"尚处于原函数的
+   prolog 内、还没有建立任何帧"，从而安全地按调用方栈帧展开——这段字节长度
+   是 unwind 语义的直接组成部分，不是可随意改变格式的编码细节。
+3. 恢复 RFLAGS 到宿主状态、把（除 `hidden` 外的）GPR 与非易失寄存器写回
+   `state`——`unwindBeginOffset` 之后但 `nativeInstructionRVA +
+   nativeInstructionSize` 之前的这段外，其余部分同第 1 段。
+
+审计确认：`RUNTIME_FUNCTION.BeginAddress = unwindBeginRVA`（即
+`unwindBeginOffset` 对应的最终 RVA），意味着第 1 段（在 `unwindBeginOffset`
+*之前*）的字节长度完全不影响 unwind 记录的正确性——`.pdata` 只关心从
+`unwindBeginOffset` 开始的相对偏移。第 3 段同理不影响 `BeginAddress`，也
+不影响 `EndAddress`（固定等于抽取指令末尾）。这意味着理论上第 1/3 段的
+寄存器保存/恢复循环*可以*安全地迁移到 Zydis，且不会像第 2 段那样有
+硬性字节长度约束。但审计后判定本批不做，具体理由：
+
+1. `hiddenNativeRegister`（决定哪个寄存器被复用为指向 `state` 的隐藏指针）
+   由 `LowerExtendedBridge` 依据**源指令自身实际用到的操作数**逐条选出，
+   是纯正确性约束，不是可以按 build seed 变化的风格选择；`kNonvolatile`
+   顺序和 `for (reg = 0..15) if (reg==hidden) continue` 遍历顺序同样不随
+   seed 变化。也就是说，即使把这部分迁移到 Zydis，除了"去掉手写位运算"这一
+   层收益外，不存在可以安全引入的寄存器多样性——因为这里没有"选哪个寄存器"
+   的空间，只有"要不要保存/恢复全部 16/8 个寄存器"这一件事，答案永远是
+   全部保存。
+2. `vm_instruction_bridge_builder.cpp` 里完全没有现成的 Zydis Encoder
+   基础设施（`EmitZydisInstruction`/`ZydisMemoryOperand` 等辅助函数全部定义
+   在 `vm_handler_semantic_codegen.cpp` 的匿名命名空间内部，属于内部链接，
+   其他翻译单元无法直接调用）。要迁移就必须要么在这个文件里重新实现一套
+   独立的 fail-closed 请求/编码辅助层（重复维护同一套逻辑两份），要么把
+   现有辅助层从匿名命名空间抽到共享头文件——后者是一次跨越
+   `vm_handler_semantic_codegen.cpp`（`CALL_HOST` 的 resolver 也定义在
+   同一个匿名命名空间里）的结构性重构，与"这次不要顺手改动 CALL_HOST
+   代码"的边界要求相冲突。
+3. 这段代码此前完全没有测试覆盖（见"起点与审计方法"），本批新增的第一条
+   真实覆盖用例（见下）已经在实现过程中就真实发现了一个会让整条链路
+   100% 失败的生产缺陷（问题二）。在为一段刚刚才有真实测试覆盖、且历史上
+   从未被验证过真的能跑通的代码引入额外的字节生成重构之前，应该先让现有
+   真实覆盖跑稳，而不是同时进行两类风险都不小的改动。
+
+综合以上，第 3 点本批保持手写不变，仅在"真实执行证据"一节新增覆盖并修复
+问题二这一具体生产缺陷。
+
+按硬性要求逐条对照：安全寄存器池（第 1 点新增的 `value`/`index`/`base`
+三角色）不是全局共享池，而是从 `DeriveVariantRegisters` 里为
+`BRIDGE_EXTENDED` 单独导出的、覆盖两段用途的显式 plan 表；`ZydisEncoderRequest`
+失败沿用既有 `EmitZydisInstruction`/`CodeBuffer::FailEncoding` 路径
+fail-closed；固定寄存器场景下的迁移前后字节对比见下节；静态门禁保持
+`54/54`（见"完整回归结果"）。
+
+### 迁移前后字节对比
+
+以下均取自新增的 `TestZydisBridgeExtendedRegisterDiversity`（见"真实执行
+证据"）在其覆盖的真实 seed/variant 组合下、当 `registerAssignment` 命中
+对应遗留角色时打印的真实反汇编字节，不是手工推导。
+
+**x64 GPR 搬运循环**（`registerAssignment = {RAX, RCX, R11, RAX}`，复现
+`value=RAX, index=RCX, base=R11` 的遗留角色分配）：
+
+| 指令（family=0，第一次循环） | 旧手写字节 | Zydis 输出 | 说明 |
+|---|---|---|---|
+| `test r11,r11` | `4D 85 DB` | `4D 85 DB` | 逐字节一致 |
+| `movzx ecx,byte[r11]`（family=0） | `41 0F B6 4B 00` | `49 0F B6 0B` | 不是同一编码：Zydis 为零位移选择了更短的 `mod=00`（无 disp8）形式，且把 `EmitZydisLoad` 对窄宽度加载统一声明的 64 位目标宽度用在了这里（见下） |
+| `movzx ecx,byte[r11+1]`（family=1） | `41 0F B6 4B 01` | `49 0F B6 4B 01` | 仅 REX 字节不同（`41`→`49`，即 REX.W 位）；`MOVZX` 语义上总是把源字节零扩展进完整目标寄存器，无论目标宽度声明为 32 位还是 64 位，最终 `RCX` 的值完全相同——`EmitZydisLoad` 对 `bytes<=2` 的 x64 加载统一声明 64 位目标（该行为已被其他多个既迁移语义使用，属已确立约定，不是本批引入的新行为，只是本批第一次在窄字节加载上触发它） |
+| `sub rsp, 0x498` / `add rsp, 0x498` | `48 81 EC 98040000` / `48 81 C4 98040000` | 相同（原样保留，未迁移） | 见上节"不迁移的部分" |
+
+**x86 GPR 搬运循环**（`registerAssignment = {EAX, ECX, EDX, EAX}`，复现
+`value=EAX, index=ECX, base=EDX` 的遗留角色分配）：
+
+| 指令（family=0） | 旧手写字节 | Zydis 输出 |
+|---|---|---|
+| `test edx,edx` | `85 D2` | `85 D2` |
+| `movzx ecx,byte[edx]`（family=0） | `0F B6 4A 00` | `0F B6 0A` |
+| `movzx ecx,byte[edx+1]`（family=1..7） | `0F B6 4A 01` | `0F B6 4A 01`（逐字节一致） |
+
+x86 没有 REX 前缀的宽度声明问题，因此 family≥1 的窄字节加载与旧实现完全
+逐字节相同；family=0 与 x64 一样只有"是否省略零位移"这一个规范化差异。
+
+**target 解析核心**（`EmitZydisControlTargetCore` 复用，
+`registerAssignment[0..1] = {RAX, RDX}`，复现遗留 `value=RAX,source=RDX`）：
+
+x64 strategy=1（LEA 归并形式）：`value+=source` 一步产生
+`48 8D 04 10`（`LEA RAX,[RAX+RDX]`），与旧 `EmitKeyedAddSubCore` 在
+`strategy!=0` 分支硬编码的 `c.Raw({0x48,0x8D,0x04,0x10})` 逐字节一致；
+围绕它的三次 keyed ADD/SUB 由旧实现固定使用 `81 /r id`
+长形式（如 `48 81 C0 <imm32>`），Zydis 按数值大小自动选择等价短形式
+（如 `48 05 <imm32>` 累加器形式，或立即数落在 -128..127 时的
+`48 83 C0 <imm8>`）——语义完全等价，且已由下方全矩阵重编码与真实差分
+共同验证，不作为字节不一致的失败判据，与试点阶段第一批 XOR
+累加器形式规范化是同一类已解释差异。x86 侧同理：`01 D0`
+（`ADD EAX,EDX`，strategy=0 形式）逐字节一致，三次 keyed 运算同样从
+`81 /r id` 规范化为累加器/imm8 短形式。
+
+### 真实执行证据
+
+在已有的 `ExecuteExternalSemanticVariantCases`（"BRIDGE_EXTENDED/INT3 外部
+效果双策略差分"）基础上没有新增改动——它本来就已经是对第 1 点的真实端到端
+覆盖（真实 x64 handler 执行、真实间接调用、两个 K 策略），本批的迁移没有
+让它失去意义：迁移后重新在 x64 与 Win32 两个宿主上分别运行整个
+`test_vm_handler_synthesis`，这一阶段继续真实通过（详见"完整回归结果"）。
+
+新增两类证据：
+
+1. **`TestZydisBridgeExtendedRegisterDiversity`**
+   （`tests/test_vm_handler_synthesis.cpp`，仿照
+   `TestZydisCallHostResolverRegisterDiversity` 的写法）：对每个架构遍历
+   全部 256 个 seed byte × 4 个 handler variant，每次都用生产
+   `GenerateVMHandlerSemanticKernel`/`ValidateVMHandlerSemanticVariantKernel`
+   生成并校验一次真实 kernel，然后分别验证：
+   - target 解析阶段（`semanticCoreVariantOffset/Size` 切片，与 CALL_HOST
+     resolver 测试用的是同一个解码工具 `DecodePilotRegisterSignature`）：
+     发布的 `value`/`source` 角色确实出现在真实反汇编结果里，且结果总是
+     归一回 `RAX`/`EAX`。
+   - GPR 搬运阶段（新增 `DecodeRegisterSignatureRange`，对整个
+     `semanticBodyOffset/Size` 范围解码，因为搬运循环在 coreVariant 切片
+     之外）：发布的 `value`/`index`/`base` 角色确实出现在真实反汇编结果里。
+   - 两个业务 K 策略（ADD/LEA）都被采样到；`registerAssignment`
+     去重后精确等于 x64 7 组、x86 3 组（与 `DeriveVariantRegisters`
+     新增分支的显式 plan 表大小一致）；两段遗留固定字节角色
+     （见上节"迁移前后字节对比"）都能在采样范围内被真实复现。
+   实测：`arch=134(x86) plans=3 resolver_signatures=6 body_signatures=6
+   core_strategies=2`；`arch=34404(x64) plans=7 resolver_signatures=14
+   body_signatures=14 core_strategies=2`。
+2. **`TestInstructionBridgeBuilderX87Fabs`**
+   （`tests/test_pe_hardening.cpp`，新增）：独立单元测试第 3 点
+   `VMInstructionBridgeBuilder::Build`——此前完全没有任何测试覆盖的代码
+   路径。用 `tests/test_pe_hardening.cpp` 已有的 `Writer`/`BuildPe`/`Parse`
+   合成 PE 基础设施构造一个带真实合法 x64 `RUNTIME_FUNCTION`/`UNWIND_INFO`
+   的最小镜像，`.text` 里放一条真实的 x87 `FABS`（`D9 E1`，无操作数、不读写
+   任何 EFLAGS，真实覆盖 `BuildX64Thunk` 的 `FXRSTOR`/`FXSAVE`——非 AVX——
+   分支），用真实 `Disassembler` 解码出它的 `InstructionIR`（不手工构造，
+   与 `Build()` 自身的独立反汇编校验用同一套真实解码），装进手工构造的
+   `Function`/`TranslationResult`/`VMBridgeRequest`，跑真实
+   `VMInstructionBridgeBuilder::Build`，断言：`success`、
+   `cfgTableVerified`（无 LoadConfig 时的合法 no-op 路径）、
+   `unwindVerified`、`links[0].usesX87 == true`、
+   `VMSchema::ValidateInstruction` 接受重写后的字节码。随后**独立于 `Build()`
+   自身状态**做第二条解析路径：把最终 PE 字节整体 `memcpy` 到新缓冲区，用
+   全新 `PEParser::LoadFromBuffer` 重新解析，确认合并进最终文件的 Exception
+   Directory 条目确实可以被独立解析出来；再用一个全新的独立
+   `Disassembler` 实例，从重新解析出的镜像里按 RVA 重新解码 thunk 里的
+   原生指令字节，确认长度/mnemonic/instruction set 与抽取前完全一致，且
+   原始字节逐字节未被破坏。x64 与 Win32 均编译并真实通过；此前不存在的
+   `VMInstructionBridgeBuilder::Build` 真实覆盖第一次落地，且直接在实现
+   过程中发现并驱动修复了"问题二"。
+
+### 已知缺口（未闭环，明确不隐瞒）
+
+- **`VMInstructionBridgeBuilder::Build` 的 `usesAvx=true`（XSAVE/XRSTOR）
+  路径仍未被任何测试覆盖。** 本批新增的 `TestInstructionBridgeBuilderX87Fabs`
+  只覆盖 `usesX87=true`（`FXRSTOR`/`FXSAVE` 分支），因为 x87 是所有 x64 CPU
+  的基线能力，不需要任何运行前置检测。`usesAvx=true` 会走 `Xrstor`/`Xsave`
+  分支，正确性依赖运行 CPU 真的支持 AVX 状态保存（`CPUID` AVX 位 +
+  `XGETBV` 读出的 `XCR0` 里 SSE/AVX 状态保存位都要置位），需要在测试里加上
+  真实 `CPUID`/`XGETBV` 门控（不支持时 skip 而不是伪造通过）才能在任意
+  CI 运行器上安全地真实执行到这条路径，而不是仅通过静态审计"看起来应该
+  对"。这条路径的代码结构与已验证的 `usesX87` 分支高度对称（同一个
+  `if (request.usesAvx) {...} else {...}` 内的姊妹分支，共用
+  `BuildX64Thunk`/`BuildX86Thunk` 里的其余全部逻辑），因此风险相对可控，
+  但本批时间没有覆盖到，留给后续批次——与 CALL_HOST 批次把"Win32 真实异常
+  展开证据"列为已知缺口是同一类诚实记录，不是回避。
+- **`VMInstructionBridgeBuilder::Build` 的 x86（`BuildX86Thunk`）路径没有
+  专属单元测试。** `AlignUp` 修复本身是架构无关的（两处调用点都不区分
+  `image->is64Bit`），因此从代码路径覆盖的角度看该修复对 x86 同样生效，但
+  本批新增的唯一 `VMInstructionBridgeBuilder::Build` 单元测试固定构造的是
+  x64 镜像（因为需要真实 `RUNTIME_FUNCTION`/`UNWIND_INFO` 来覆盖
+  `ReadSimpleUnwind`，x86 完全不需要这一步，`unwindBeginOffset` 概念也不
+  一样），没有另外为 x86 构造一个独立场景。
+- **`BRIDGE_EXTENDED` 第 1 点的 GPR 搬运循环本批只迁移了 `MOVZX`
+  与一处索引寻址的立即数写入；`X64LoadQ`/`X64LoadIndexedQ`/
+  `X64StoreStackQ`/`X86LoadIndexedDVariant`/`X86StoreIndexedDVariant`
+  这些参数化 helper 本身继续保持手写字节。** 这不是遗漏：它们已经支持任意
+  寄存器参数（本批直接复用，只改变传入的寄存器编号），且是被其他多个
+  已迁移批次共同依赖的共享基础设施，不属于"`BRIDGE_EXTENDED` 独有的手写
+  风险"，因此不在本批改动范围内，也不构成缺口。
+- `BRIDGE_EXTENDED` 的两个"发现的问题"之外，第 3 点 `BuildX64Thunk`/
+  `BuildX86Thunk` 的寄存器保存/恢复循环本批判定为"可以安全迁移但本批不做"
+  （见"迁移范围与理由"三条具体理由），不是"发现了但没能力做"，请勿混淆为
+  同一类缺口。
+
+至此，`BRIDGE_EXTENDED` 是文档记录以来最后一个被独立批次触碰的语义。
+
+### 完整回归结果（本机实测，2026-07-22）
+
+x64 与 Win32 均为 Release、`/W4 /WX` 全量重新构建（复用
+`build_resume_x64`/`build_resume_win32`），全部目标零警告零错误。
+
+**静态门禁**：`vm_kernel_static_gate.py --source-root .` 输出
+`[PASS] 微观 VM 静态门禁通过`，真实双策略覆盖 `54/54`（含 `VM_UOP_BRIDGE_EXTENDED`，
+完整语义列表见脚本输出）。
+
+**CTest**（`ctest --test-dir <dir> -C Release --output-on-failure --timeout 900`，
+未修改任何既有 TIMEOUT/阈值/corpus/skip 规则）：
+
+| 架构 | ctest 直接结果 | 说明 |
+|---|---|---|
+| x64 | 17/18 通过，`vm_native_differential` 因既有 `TIMEOUT 120` 属性被判超时 | 与历史批次相同的已知限制，未修改该属性 |
+| Win32 | 17/18 通过，同一测试同样因 `TIMEOUT 120` 被判超时 | 同上 |
+
+按既有约定直接运行完整二进制取自然退出结果（未提高 timeout，未跳过任何
+case）：
+
+- x64 `test_vm_native_differential.exe` 直接运行 165.5 秒，退出码 0。
+- Win32 `test_vm_native_differential.exe` 直接运行 222.4 秒，退出码 0（运行期间
+  与 Win32 CTest 自身的 `vm_per_build_similarity_gate` 并发争抢 CPU，故略高于
+  历史基线，不代表回归）。
+
+即两个架构完整 18 个 CTest 用例全部真实通过，没有用例被跳过或弱化断言。
+`vm_handler_synthesis`（新增 `TestZydisBridgeExtendedRegisterDiversity`）与
+`pe_hardening_regression`（新增 `TestInstructionBridgeBuilderX87Fabs`）均包含
+在上述 17/18 通过范围内，两个架构都是真实通过，不是编译通过。
+
+**正式 `vm_per_build_similarity_gate`**：CTest 内嵌运行 x64 耗时 475.84 秒、
+Win32 耗时 583.52 秒，均在脚本自身 900 秒 CTest 属性内（该属性本批未修改）；
+另用相同阈值参数独立 verbose 重跑取得逐 stage 数值：
+
+| 架构/容器 | business_core | core_variant | codec | encrypted_handlers |
+|---|---:|---:|---:|---:|
+| x64 EXE | 0.2705 | 0.1308 | 0.1467 | 0.0001 |
+| x64 DLL | 0.2750 | 0.1340 | 0.0970 | 0.0001 |
+| Win32 EXE | 0.2670 | 0.1193 | 0.0000 | 0.0001 |
+| Win32 DLL | 0.2746 | 0.1255 | 0.0231 | 0.0001 |
+
+四组均输出 `VM_PER_BUILD_SIMILARITY_GATE_PASS`；全部既有聚合阈值、单 pair
+ceiling、corpus、skip 规则均未修改。
+
+**本批新增测试**：`TestZydisBridgeExtendedRegisterDiversity`（x86
+`plans=3 resolver_signatures=6 body_signatures=6 core_strategies=2`；x64
+`plans=7 resolver_signatures=14 body_signatures=14 core_strategies=2`，均精确
+命中 `DeriveVariantRegisters` 新增分支的显式 plan 表大小）与
+`TestInstructionBridgeBuilderX87Fabs`（真实覆盖此前完全没有测试的
+`VMInstructionBridgeBuilder::Build`，过程中发现并驱动修复了"问题二"）均已
+包含在上述 x64/Win32 CTest 通过范围内。
