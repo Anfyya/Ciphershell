@@ -6918,31 +6918,44 @@ void ExecuteInstructionBridgeThunkRealExceptionCases(
 
 #if defined(_M_IX86)
 // ============================================================================
-// Win32 真实 PE + Windows loader 异常验证（独立批次 17）
+// Win32 真实 PE + Windows loader 异常验证（独立批次 17，批次 20 重做证据采集）
 // ============================================================================
 //
 // docs/zydis_encoder_pilot.md 批次 15 记录的结论是："Win32 没有 RtlAddFunctionTable
 // 那样的逃生舱口，RtlIsValidHandler 会拒绝不属于任何已加载模块的 frame-based
 // SEH handler，真正的 Win32 真实异常展开证据需要 handler 活在一个真正被
-// Windows loader 加载的 PE 模块里"。本节是本批对这句话的真实实践：不注册任何
-// SEH handler（不需要——本测试不追求"捕获并恢复"，只追求"真实、磁盘落地、被
-// Windows loader 正常加载的 PE 模块里，桥接 thunk 内被抽取的原生指令触发硬件
-// 异常时，Windows 是否把它当作标准的未处理异常正确上报"，这件事完全不依赖
-// SafeSEH/RtlIsValidHandler，因为没有任何 handler 需要被验证为"合法"）。
+// Windows loader 加载的 PE 模块里"。批次 17 据此手写了一个不依赖 CRT、没有任何
+// 导入表的最小 x86 EXE，用 CreateProcess 作为独立进程真正加载执行，
+// GetExitCodeProcess 观察最终退出码。
 //
-// 具体做法：手写一个不依赖 CRT、没有任何导入表的最小 x86 EXE，入口点是一段
-// 手写机器码："harness"：把 VM_INSTRUCTION_BRIDGE_STATE 摆在镜像自己的可写
-// 数据段里、把 state.gpr[ECX] 设成调用方指定的地址、把 state.gpr[ESP] 指向
-// 镜像里一块真实可写的 guest 栈、把 state.extendedState 指向一块合法的默认
-// FXSAVE 镜像，然后用真实 VMInstructionBridgeBuilder::Build 产出的 thunk
-// （已经合并进这个磁盘文件本身，不是进程内 VirtualAlloc）真正调用一次
-// MOV EAX,[ECX]。整个 EXE 写到磁盘、用 CreateProcess 作为独立进程真正加载
-// 执行，用 GetExitCodeProcess 观察结果：安全地址时进程应该正常返回约定的
-// EAX 值；ECX=0 时应该被 Windows 当作标准未处理异常终止，退出码等于
-// STATUS_ACCESS_VIOLATION——这正是"没有任何 handler 时，一个真正合法、
-// 模块内的异常应该有的行为"，用来证明桥接 thunk 在真实 PE/loader 路径下不会
-// 导致比这更糟的结果（挂起、立即崩溃到分析不出原因、或者被系统认定为镜像本身
-// 非法而拒绝加载/执行）。
+// 批次 20：仓库所有者复查这个 fixture 时发现两个真实设计问题（不是本轮之前
+// 修的 BRIDGE_EXTENDED 生产逻辑，是这个测试 fixture 自身），对应 CI 上
+// 提交 525f159 在 GitHub Win32 runner 上的真实红：
+//
+// 1. guest ESP（state.gpr[ESP]，BuildX86Thunk 执行被抽取指令前会把真实 ESP
+//    切到这个值）此前指向的是 fixture 自己 .data 段里一块普通的 4KB 缓冲区，
+//    不是 Windows 认可的、被 TEB StackBase/StackLimit 覆盖、带 guard page 的
+//    真实线程栈。故障发生时，KiUserExceptionDispatcher 本身要用*当前* ESP
+//    在栈上搭建临时帧再逐个调用异常处理链——ESP 指向的不是真实栈会让这套
+//    机制本身行为不可预期。这正是本机（本地验证过 EXCEPTION_ACCESS_VIOLATION
+//    可靠复现）与 GitHub runner（返回 STATUS_INVALID_DISPOSITION）结果不一致
+//    的根因，不是"栈缓冲区不够大"的问题，加大缓冲区治标不治本。修复：guest
+//    ESP 改为 harness 自己在运行时读取的*真实*当前 ESP 减去一段安全余量，
+//    始终落在真正的 OS 线程栈里。
+// 2. 原本只看最终 GetExitCodeProcess 退出码，这本身就是"原始故障之后
+//    Windows 如何收尾一个（可能已经不正常的）异常栈环境"的产物，不是故障
+//    本身的直接证据。修复：CreateProcess 时用 DEBUG_ONLY_THIS_PROCESS 把
+//    本测试自己当成调试器，WaitForDebugEvent 捕获 first-chance
+//    EXCEPTION_DEBUG_EVENT——这是 Windows 在搜索任何异常处理器*之前*就会
+//    通知调试器的原始故障事件，直接比对 ExceptionCode/ExceptionAddress/
+//    ExceptionInformation 与 GetThreadContext 读到的 CPU 现场
+//    （Eip/Ecx/Esp/Edx），不再依赖、也不再关心子进程最终以哪个退出码结束。
+//
+// 不注册任何 SEH handler（不需要——本测试不追求"捕获并恢复"，只追求"真实、
+// 磁盘落地、被 Windows loader 正常加载的 PE 模块里，桥接 thunk 内被抽取的
+// 原生指令触发硬件异常时，Windows 是否把它当作真正合法的硬件异常正确上报"，
+// 这件事完全不依赖 SafeSEH/RtlIsValidHandler，因为没有任何 handler 需要被
+// 验证为"合法"）。
 
 // 极简字节写入器，与 BridgeFixtureWriter 同构，独立一份避免引入非必要依赖。
 struct RealPeFixtureWriter {
@@ -6960,14 +6973,21 @@ void RealPeMovAbsImm32(RealPeFixtureWriter& w, uint32_t va, uint32_t imm) {
     w.u8(0xC7); w.u8(0x05); w.u32(va); w.u32(imm);
 }
 
+// mov dword ptr [va], eax (绝对地址寻址；用于把运行时才知道的值——这里是
+// harness 自己读到的真实 ESP——写回 state，imm32 版本做不到这一点)
+void RealPeMovAbsFromEax(RealPeFixtureWriter& w, uint32_t va) {
+    w.u8(0x89); w.u8(0x05); w.u32(va);
+}
+
 // 构造一个不依赖 CRT/无导入表的最小 x86 EXE：.text 放 harness 机器码
 // （数据先用 0 占位，真实 thunk RVA 已知后再原地 patch 那条 CALL 的 rel32）+
 // 真实抽取出的原生指令（MOV EAX,[ECX]，8B 01）；.data 放
-// VM_INSTRUCTION_BRIDGE_STATE + 一份默认安全的 512 字节 FXSAVE 镜像 + 一块
-// 4KB 的 guest 栈，全部可写。入口点执行 harness，成功时 EAX=0x2A 后 ret
-// （无 CRT 的裸 EXE 靠 RtlUserThreadStart 把入口点的返回值当退出码，不需要
-// 导入 ExitProcess）。ecxValue 决定 MOV EAX,[ECX] 读哪个地址：安全地址时
-// 期望正常返回，0 时期望触发真实 EXCEPTION_ACCESS_VIOLATION。
+// VM_INSTRUCTION_BRIDGE_STATE + 一份默认安全的 512 字节 FXSAVE 镜像，全部
+// 可写（不再需要专门的 guest 栈缓冲区——见上方批次 20 说明，guest ESP 现在
+// 直接复用 harness 自己的真实线程栈）。入口点执行 harness，成功时 EAX=0x2A
+// 后 ret（无 CRT 的裸 EXE 靠 RtlUserThreadStart 把入口点的返回值当退出码，
+// 不需要导入 ExitProcess）。ecxValue 决定 MOV EAX,[ECX] 读哪个地址：安全
+// 地址时期望正常返回，0 时期望触发真实 EXCEPTION_ACCESS_VIOLATION。
 constexpr uint32_t kRealPeImageBase = 0x00400000u;
 constexpr uint32_t kRealPeTextVA = 0x1000u;
 constexpr uint32_t kRealPeDataVA = 0x2000u;
@@ -6977,7 +6997,19 @@ constexpr uint32_t kRealPeDataVA = 0x2000u;
 // 这是本 fixture 第一版真实运行时发现并修正的问题，不是猜测）。
 constexpr uint32_t kRealPeSafeReadAddress = kRealPeImageBase + kRealPeDataVA;
 
-std::vector<uint8_t> BuildRealPeExceptionFixture(uint32_t ecxValue) {
+// BuildRealPeExceptionFixture 除了最终 PE 字节，还要把 nativeInstructionRVA
+// （被抽取指令真正落在 thunk 里的位置，直接来自 Builder 自己的
+// VMInstructionBridgeLink，不需要调用方重新猜测/重新计算）和 stateVA
+// （EDX——本 fixture 固定用的 hidden 寄存器——理应指向的地址）一并带出来，
+// 供故障证据核对使用。
+struct RealPeFixtureBuildResult {
+    std::vector<uint8_t> peBytes;
+    uint32_t nativeInstructionRVA = 0;
+    uint32_t stateVA = 0;
+    uint32_t gpr4VA = 0; // state.gpr[ESP] 在子进程内存里的真实地址
+};
+
+RealPeFixtureBuildResult BuildRealPeExceptionFixture(uint32_t ecxValue) {
     using namespace CipherShell;
     constexpr uint32_t kImageBase = kRealPeImageBase;
     constexpr uint32_t kTextVA = kRealPeTextVA;
@@ -6991,23 +7023,30 @@ std::vector<uint8_t> BuildRealPeExceptionFixture(uint32_t ecxValue) {
     // 让 fxsaveVA 落在非对齐地址上。
     constexpr uint32_t kFxsaveOffset = (kStateSize + 15u) & ~15u;
     constexpr uint32_t kFxsaveSize = 512u;
-    constexpr uint32_t kGuestStackOffset = kFxsaveOffset + kFxsaveSize;
-    constexpr uint32_t kGuestStackSize = 0x1000u;
-    constexpr uint32_t kDataSize = kGuestStackOffset + kGuestStackSize;
+    constexpr uint32_t kDataSize = kFxsaveOffset + kFxsaveSize;
+    // 真实 ESP 减去的安全余量：harness 自己的 push/call 还会再用掉 8 字节，
+    // 0x1000（4KB）留出的余量远超这一点，确保 guest ESP 仍然明显低于（更靠栈
+    // 底）harness 调用 thunk 那一刻已经用掉的真实栈空间，不会与之重叠；同时
+    // 仍然稳妥落在线程默认栈预留范围（本 fixture 声明 SizeOfStackReserve=
+    // 1MB）之内，需要时由 Windows 的 guard page 机制自动提交增长，跟任何一次
+    // 普通、合法的深层函数调用栈增长完全同构。
+    constexpr uint32_t kGuestEspMargin = 0x1000u;
 
     const uint32_t stateVA = kImageBase + kDataVA;
     const uint32_t fxsaveVA = stateVA + kFxsaveOffset;
-    const uint32_t guestStackTopVA =
-        (stateVA + kGuestStackOffset + kGuestStackSize - 0x100u) & ~0xFu;
     const uint32_t gpr1Off = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, gpr)) + 1u * 8u;
     const uint32_t gpr4Off = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, gpr)) + 4u * 8u;
     const uint32_t extStateOff = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState));
 
-    // harness 机器码。
+    // harness 机器码：guest ESP 现在是运行时读到的真实 ESP 减去安全余量
+    // （mov eax,esp; sub eax,kGuestEspMargin; mov [state.gpr[ESP]],eax），
+    // 不再是编译期算出的 .data 里某个固定偏移。
     RealPeFixtureWriter code;
     RealPeMovAbsImm32(code, stateVA + gpr1Off, ecxValue);
     RealPeMovAbsImm32(code, stateVA + gpr1Off + 4u, 0u);
-    RealPeMovAbsImm32(code, stateVA + gpr4Off, guestStackTopVA);
+    code.u8(0x89); code.u8(0xE0);             // mov eax,esp
+    code.u8(0x2D); code.u32(kGuestEspMargin); // sub eax,kGuestEspMargin
+    RealPeMovAbsFromEax(code, stateVA + gpr4Off); // mov [state.gpr[ESP]],eax
     RealPeMovAbsImm32(code, stateVA + gpr4Off + 4u, 0u);
     RealPeMovAbsImm32(code, stateVA + extStateOff, fxsaveVA);
     RealPeMovAbsImm32(code, stateVA + extStateOff + 4u, 0u);
@@ -7021,8 +7060,7 @@ std::vector<uint8_t> BuildRealPeExceptionFixture(uint32_t ecxValue) {
     code.u8(0x8B); code.u8(0x01);             // mov eax,[ecx]
     const std::vector<uint8_t> textData = code.buf;
 
-    // .data：state（清零）+ 安全默认 FXSAVE（FCW/MXCSR 为架构默认值，其余 0）+
-    // guest 栈（清零）。
+    // .data：state（清零）+ 安全默认 FXSAVE（FCW/MXCSR 为架构默认值，其余 0）。
     RealPeFixtureWriter data;
     data.ensure(kDataSize);
     constexpr uint16_t kDefaultFcw = 0x037Fu;
@@ -7151,13 +7189,19 @@ std::vector<uint8_t> BuildRealPeExceptionFixture(uint32_t ecxValue) {
     Require(patchFileOffset + 4u <= img->rawSize, "Win32 真实 PE 异常 fixture CALL patch 越界");
     std::memcpy(img->rawData + patchFileOffset, &rel32, sizeof(rel32));
 
-    std::vector<uint8_t> finalBytes(img->rawData, img->rawData + img->rawSize);
+    RealPeFixtureBuildResult buildResult;
+    buildResult.peBytes.assign(img->rawData, img->rawData + img->rawSize);
+    buildResult.nativeInstructionRVA = result.links[0].nativeInstructionRVA;
+    buildResult.stateVA = stateVA;
+    buildResult.gpr4VA = stateVA + gpr4Off;
     parser.FreeImage(img);
-    return finalBytes;
+    return buildResult;
 }
 
 // 把 fixture 写到磁盘、用 CreateProcess 作为独立进程真正加载执行，返回
-// GetExitCodeProcess 的结果。
+// GetExitCodeProcess 的结果——仅用于 safe（不触发异常）用例；fault 用例
+// 改用下面基于调试器的 RunRealPeExceptionFixtureDebugged，不再依赖最终
+// 退出码。
 DWORD RunRealPeExceptionFixture(const std::vector<uint8_t>& peBytes, const std::string& suffix) {
     char tempDir[MAX_PATH] = {};
     Require(GetTempPathA(sizeof(tempDir), tempDir) != 0, "GetTempPathA 失败");
@@ -7189,30 +7233,211 @@ DWORD RunRealPeExceptionFixture(const std::vector<uint8_t>& peBytes, const std::
     return exitCode;
 }
 
+// fault 用例的真实证据：CreateProcess(DEBUG_ONLY_THIS_PROCESS) 把本测试自己
+// 当调试器，捕获 Windows 在搜索任何异常处理器之前就会通知调试器的
+// first-chance EXCEPTION_DEBUG_EVENT——这是故障本身最原始的证据，不掺杂
+// "没有处理器时 Windows 最终如何收尾这个异常栈环境"这一步的任何变数。
+// 捕获到之后立即 TerminateProcess，不关心、也不再对子进程最终退出码做任何
+// 断言。
+struct RealPeFaultEvidence {
+    bool observed = false;
+    bool firstChance = false;
+    DWORD exceptionCode = 0;
+    uintptr_t exceptionAddress = 0;
+    bool hasExceptionInformation = false;
+    DWORD exceptionInformation0 = 0;
+    DWORD exceptionInformation1 = 0;
+    DWORD eip = 0;
+    DWORD ecx = 0;
+    DWORD esp = 0;
+    DWORD edx = 0;
+    // harness 自己在运行时算出、写进 state.gpr[ESP] 的真实值——不是父进程能
+    // 提前预测的编译期常量（harness 读的是子进程*自己*的真实 ESP），故障发生
+    // 时直接用还没关闭的子进程句柄读回来，与 CPU 现场的 Esp 比对。
+    bool guestEspRead = false;
+    DWORD guestEsp = 0;
+};
+
+// gpr4VA 是 fixture 里 state.gpr[ESP] 在子进程内存里的真实地址（来自
+// RealPeFixtureBuildResult::gpr4VA），用来在故障发生的那一刻直接读出 harness
+// 写进去的真实 guest ESP 值。
+RealPeFaultEvidence RunRealPeExceptionFixtureDebugged(
+    const std::vector<uint8_t>& peBytes, const std::string& suffix, uint32_t gpr4VA)
+{
+    char tempDir[MAX_PATH] = {};
+    Require(GetTempPathA(sizeof(tempDir), tempDir) != 0, "GetTempPathA 失败");
+    const std::string path = std::string(tempDir) + "cs_bridge_realpe_" + suffix + ".exe";
+    {
+        HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(file != INVALID_HANDLE_VALUE, "无法创建真实 PE fixture 文件: " + path);
+        DWORD written = 0;
+        const bool ok = WriteFile(file, peBytes.data(), static_cast<DWORD>(peBytes.size()), &written, nullptr) &&
+            written == peBytes.size();
+        CloseHandle(file);
+        Require(ok, "写入真实 PE fixture 文件失败: " + path);
+    }
+
+    STARTUPINFOA startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+    const BOOL created = CreateProcessA(path.c_str(), nullptr, nullptr, nullptr, FALSE,
+        DEBUG_ONLY_THIS_PROCESS | CREATE_DEFAULT_ERROR_MODE, nullptr, nullptr, &startupInfo, &processInfo);
+    Require(created != FALSE, "CreateProcess(DEBUG_ONLY_THIS_PROCESS) 无法真正加载运行 fixture EXE: " +
+        path + " (GetLastError=" + std::to_string(GetLastError()) + ")");
+
+    RealPeFaultEvidence evidence{};
+    HANDLE mainThread = nullptr;
+    bool running = true;
+    // Windows 调试协议本身的产物，与被抽取指令的真实故障无关：任何用
+    // DEBUG_ONLY_THIS_PROCESS/DEBUG_PROCESS 附加的进程，在真正跑到自己的入口点
+    // 之前，ntdll 都会先抛一个 EXCEPTION_BREAKPOINT（loader breakpoint）通知
+    // 调试器"进程已就绪"——这是所有 Win32 调试器都必须识别并跳过（DBG_CONTINUE）
+    // 的第一个 first-chance 异常事件，不能当成 harness 自己的故障证据，否则会
+    // 把它误判成"ExceptionCode 不是预期的 EXCEPTION_ACCESS_VIOLATION"。
+    bool sawLoaderBreakpoint = false;
+    while (running) {
+        DEBUG_EVENT dbgEvent{};
+        Require(WaitForDebugEvent(&dbgEvent, 30000) != FALSE,
+            "WaitForDebugEvent 超时或失败 (GetLastError=" + std::to_string(GetLastError()) + ")");
+        DWORD continueStatus = DBG_CONTINUE;
+        switch (dbgEvent.dwDebugEventCode) {
+            case CREATE_PROCESS_DEBUG_EVENT:
+                // hThread 是本进程唯一线程、贯穿调试会话始终有效的句柄，直接留着给
+                // 后面的 GetThreadContext 用，不需要另外 OpenThread。hFile 是
+                // 调试器独占的镜像文件句柄，必须自己关掉，否则后面 DeleteFileA
+                // 会因为文件仍被占用而失败。
+                mainThread = dbgEvent.u.CreateProcessInfo.hThread;
+                if (dbgEvent.u.CreateProcessInfo.hFile) CloseHandle(dbgEvent.u.CreateProcessInfo.hFile);
+                break;
+            case LOAD_DLL_DEBUG_EVENT:
+                if (dbgEvent.u.LoadDll.hFile) CloseHandle(dbgEvent.u.LoadDll.hFile);
+                break;
+            case EXCEPTION_DEBUG_EVENT: {
+                const auto& info = dbgEvent.u.Exception;
+                if (!sawLoaderBreakpoint &&
+                    info.ExceptionRecord.ExceptionCode == static_cast<DWORD>(EXCEPTION_BREAKPOINT)) {
+                    sawLoaderBreakpoint = true;
+                    break; // continueStatus 保持 DBG_CONTINUE，不进入下面的证据采集
+                }
+                if (!evidence.observed) {
+                    evidence.observed = true;
+                    evidence.firstChance = info.dwFirstChance != 0;
+                    evidence.exceptionCode = info.ExceptionRecord.ExceptionCode;
+                    evidence.exceptionAddress =
+                        reinterpret_cast<uintptr_t>(info.ExceptionRecord.ExceptionAddress);
+                    if (info.ExceptionRecord.NumberParameters >= 2) {
+                        evidence.hasExceptionInformation = true;
+                        evidence.exceptionInformation0 =
+                            static_cast<DWORD>(info.ExceptionRecord.ExceptionInformation[0]);
+                        evidence.exceptionInformation1 =
+                            static_cast<DWORD>(info.ExceptionRecord.ExceptionInformation[1]);
+                    }
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                    Require(mainThread != nullptr && GetThreadContext(mainThread, &ctx) != FALSE,
+                        "在 first-chance 异常处 GetThreadContext 失败 (GetLastError=" +
+                        std::to_string(GetLastError()) + ")");
+                    evidence.eip = ctx.Eip;
+                    evidence.ecx = ctx.Ecx;
+                    evidence.esp = ctx.Esp;
+                    evidence.edx = ctx.Edx;
+                    DWORD guestEspValue = 0;
+                    SIZE_T bytesRead = 0;
+                    evidence.guestEspRead = ReadProcessMemory(processInfo.hProcess,
+                        reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(gpr4VA)),
+                        &guestEspValue, sizeof(guestEspValue), &bytesRead) != FALSE &&
+                        bytesRead == sizeof(guestEspValue);
+                    evidence.guestEsp = guestEspValue;
+                    // 证据已经拿到；不再需要子进程继续跑下去（也不关心它最终以哪个
+                    // NTSTATUS 退出——这正是本批要修的问题：那是"没有处理器时
+                    // Windows 如何收尾"的产物，不是故障本身的证据）。
+                    TerminateProcess(processInfo.hProcess, 0);
+                }
+                continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+                break;
+            }
+            case EXIT_PROCESS_DEBUG_EVENT:
+                running = false;
+                break;
+            default:
+                break;
+        }
+        ContinueDebugEvent(dbgEvent.dwProcessId, dbgEvent.dwThreadId, continueStatus);
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    DeleteFileA(path.c_str());
+    return evidence;
+}
+
 void TestBridgeThunkRealPeLoaderException() {
     // 注意：ecxValue 必须是子进程*自己*地址空间里有效的地址——子进程有独立
     // 的虚拟地址空间，父进程（这个测试自身）任何局部变量的地址在那边都没有
     // 意义。kRealPeSafeReadAddress 是 fixture 自己 .data 段的起始地址，在
     // 未开 ASLR 的前提下子进程加载后就是这个确定值，这里可以安全复用。
-    const std::vector<uint8_t> safeFixture =
+    const RealPeFixtureBuildResult safeFixture =
         BuildRealPeExceptionFixture(kRealPeSafeReadAddress);
-    const DWORD safeExitCode = RunRealPeExceptionFixture(safeFixture, "safe");
+    const DWORD safeExitCode = RunRealPeExceptionFixture(safeFixture.peBytes, "safe");
     Require(safeExitCode == 0x2Au,
         "Win32 真实 PE/loader 基线（安全地址）未按预期正常返回，退出码=" +
         std::to_string(safeExitCode));
     std::cout << "[bridge-thunk-realpe] Win32 真实磁盘 PE + CreateProcess 基线真实通过"
         "（独立进程正常退出，退出码=0x2A）\n";
 
-    const std::vector<uint8_t> faultFixture = BuildRealPeExceptionFixture(0);
-    const DWORD faultExitCode = RunRealPeExceptionFixture(faultFixture, "fault");
-    Require(faultExitCode == static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION),
-        "Win32 真实 PE/loader 故障用例退出码不是预期的 "
+    const RealPeFixtureBuildResult faultFixture = BuildRealPeExceptionFixture(0);
+    const RealPeFaultEvidence evidence =
+        RunRealPeExceptionFixtureDebugged(faultFixture.peBytes, "fault", faultFixture.gpr4VA);
+    Require(evidence.observed,
+        "Win32 真实 PE/loader 故障用例没有捕获到任何 first-chance 异常事件");
+    Require(evidence.firstChance,
+        "Win32 真实 PE/loader 故障用例捕获到的第一个异常事件不是 first-chance");
+    Require(evidence.exceptionCode == static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION),
+        "Win32 真实 PE/loader 故障用例 first-chance ExceptionCode 不是预期的 "
         "EXCEPTION_ACCESS_VIOLATION，实际=0x" +
-        [&]{ std::ostringstream o; o << std::hex << faultExitCode; return o.str(); }());
-    std::cout << "[bridge-thunk-realpe] Win32 真实磁盘 PE + CreateProcess 故障用例真实通过"
-        "（独立进程被 Windows 当作标准未处理异常终止，退出码=EXCEPTION_ACCESS_VIOLATION，"
-        "证明真实 PE/loader 路径下桥接 thunk 抽取指令触发的硬件异常被正确、可预期地上报，"
-        "不是挂起/立即失控崩溃/镜像被拒绝加载）\n";
+        [&]{ std::ostringstream o; o << std::hex << evidence.exceptionCode; return o.str(); }());
+    const uintptr_t expectedFaultAddress =
+        kRealPeImageBase + faultFixture.nativeInstructionRVA;
+    Require(evidence.exceptionAddress == expectedFaultAddress,
+        "Win32 真实 PE/loader 故障用例 ExceptionAddress 与 Builder 自己报告的 "
+        "nativeInstructionRVA 推出的地址不一致——说明真正触发异常的不是被抽取的 "
+        "MOV EAX,[ECX] 那条指令本身");
+    Require(evidence.eip == static_cast<DWORD>(expectedFaultAddress),
+        "Win32 真实 PE/loader 故障用例 EIP 与预期的故障地址不一致");
+    Require(evidence.ecx == 0u,
+        "Win32 真实 PE/loader 故障用例 ECX 现场不是预期的 0（MOV EAX,[ECX] 的地址操作数）");
+    Require(evidence.edx == faultFixture.stateVA,
+        "Win32 真实 PE/loader 故障用例 EDX 现场不是预期的 state 指针——hidden=EDX 时 "
+        "thunk 应该让 EDX 在被抽取指令执行期间持续指向 state");
+    // guest ESP 不是父进程能提前预测的值（它是 harness 运行时读到的*子进程自己*
+    // 的真实 ESP 减去安全余量），故障发生时直接从子进程内存里读出 harness 当时
+    // 写进 state.gpr[ESP] 的值（RunRealPeExceptionFixtureDebugged 内部
+    // ReadProcessMemory 完成，见 evidence.guestEsp），核对 CPU 现场的 Esp 与它
+    // 完全一致——即 thunk 真的把 ESP 切到了 harness 要求的那个值，不多不少。
+    Require(evidence.guestEspRead,
+        "Win32 真实 PE/loader 故障用例未能读回子进程内存里 harness 写入的 guest ESP");
+    Require(evidence.esp == evidence.guestEsp,
+        "Win32 真实 PE/loader 故障用例 CPU 现场的 Esp 与 harness 写入 state.gpr[ESP] "
+        "的值不一致——thunk 没有把 ESP 切到 harness 要求的那个真实栈地址");
+    std::cout << "[bridge-thunk-realpe] Win32 真实 PE/loader 故障用例（first-chance 证据）"
+        "真实通过：EIP=0x" << std::hex << evidence.eip << " ECX=0x" << evidence.ecx <<
+        " ESP=0x" << evidence.esp << " EDX=0x" << evidence.edx <<
+        " ExceptionInformation=[0x" << evidence.exceptionInformation0 << ",0x" <<
+        evidence.exceptionInformation1 << "]" << std::dec <<
+        "，证明真实 PE/loader 路径下桥接 thunk 抽取指令在真正的原生栈窗口内触发了"
+        "一次真正、精确定位到该指令地址的硬件访问违规，不再依赖没有处理器时 "
+        "Windows 最终如何收尾这个异常栈环境\n";
+    // EXCEPTION_ACCESS_VIOLATION 按 Windows 文档规定 NumberParameters 恒为 2：
+    // ExceptionInformation[0] 是读/写标志，[1] 是被访问的地址——fail-closed，
+    // 不满足就说明拿到的根本不是一次真正的访问违规记录，直接失败而不是跳过
+    // 这两条核对。
+    Require(evidence.hasExceptionInformation,
+        "Win32 真实 PE/loader 故障用例的 ExceptionRecord 缺少 ExceptionInformation，"
+        "不是一次标准的 EXCEPTION_ACCESS_VIOLATION 记录");
+    Require(evidence.exceptionInformation0 == 0u,
+        "Win32 真实 PE/loader 故障用例 ExceptionInformation[0] 不是预期的 0（读操作）");
+    Require(evidence.exceptionInformation1 == 0u,
+        "Win32 真实 PE/loader 故障用例 ExceptionInformation[1] 不是预期的 0（访问地址 NULL）");
 }
 #endif // defined(_M_IX86)
 

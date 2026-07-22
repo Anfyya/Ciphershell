@@ -273,3 +273,20 @@
 远端验证：本条写入后将用 ForgeAgentBot 身份直接 push 到 codex（用户本轮明确要求，因为上一次远端 CI 红了）；push 后按用户要求只查一次 CI check-runs 状态，不轮询，见后续提交记录附带的说明。
 
 如何部署更改：无需新增依赖；使用现有 VS2022/NASM 环境分别构建 x64/Win32 Release。新增 Translator::ClassifyBridgeExtendedState 是公开静态方法，不改变 Translator 既有公开接口的行为；VMInstructionBridgeBuilder::Build 新增的一致性校验只会让此前依赖该未定义行为的调用方 fail-closed，不改变任何合法输入的产出字节。新增 CTest 覆盖已包含在既有 pe_hardening_regression 目标内，无需新增 CMake target。本批不改变 VM image 格式，不改变 VM_INSTRUCTION_BRIDGE_STATE 的内存布局。
+
+[2026-07-23 03:06] 重写 TestBridgeThunkRealPeLoaderException——只改测试 fixture，不改生产 thunk
+变更摘要：本条由 Claude Sonnet 5 完成（沿用此文件的时间戳+摘要格式，不套用 [Agent/模型名]+版本号前缀）。批次 19（提交 3831388）push 后 static-gate 与 x64 均 success，Win32 job failure：ctest 里 vm_handler_synthesis 真的 FAILED（本机单独跑两次同一提交都干净通过，只有 GitHub Win32 runner 上失败），具体是批次 17 新增、批次 18/19 都没碰过的 TestBridgeThunkRealPeLoaderException——故障用例最终进程退出码是 0xC0000029（STATUS_INVALID_DISPOSITION），不是预期的 0xC0000005（EXCEPTION_ACCESS_VIOLATION）。仓库所有者复查这个 fixture 指出真正根因和修复方向：state.gpr[ESP]（BuildX86Thunk 执行被抽取指令前会把真实 ESP 切到这个值）此前指向 fixture 自己 .data 段里一块普通 4KB 缓冲区，不是被 TEB StackBase/StackLimit 覆盖、带 guard page 的真实 OS 线程栈；故障发生时 KiUserExceptionDispatcher 本身要用当前 ESP 在栈上搭建临时帧再调用异常处理链，ESP 指向的不是真实栈会让这套机制自身行为在不同 Windows 版本/安全配置下不可预期，这正是本机与 GitHub runner 结果不一致的根因，加大假栈缓冲区治标不治本。另外原本只看最终退出码，这是"没有处理器时 Windows 最终如何收尾一个异常栈环境"的产物，不是故障本身的直接证据。修复：guest ESP 改为 harness 运行时执行 mov eax,esp 读真实当前 ESP、sub eax,0x1000 留安全余量后写回 state.gpr[ESP]，不再需要 .data 里的假栈；故障证据改为 CreateProcess(DEBUG_ONLY_THIS_PROCESS) 把测试自己当调试器，WaitForDebugEvent 捕获 first-chance EXCEPTION_DEBUG_EVENT，核对 ExceptionCode/ExceptionAddress/Eip（用 Builder 自己报告的 nativeInstructionRVA 推出预期地址，不用调用方重新猜测）/Ecx/Edx/Esp（与 ReadProcessMemory 读回的 state.gpr[ESP] 真实值比对）/ExceptionInformation，不再对最终退出码做任何断言。packer/transforms/vm_instruction_bridge_builder.cpp（BuildX86Thunk/BuildX64Thunk）本批完全没有改动——问题出在测试自己构造的"guest 栈"不是真实栈，不是生产 thunk 的 ESP 切换逻辑本身有问题。
+
+涉及文件：tests/test_vm_handler_synthesis.cpp；docs/zydis_encoder_pilot.md；codex_change.log。
+
+原因：仓库所有者指出这是批次 17 遗留的测试 fixture 设计问题（guest ESP 用假栈、证据依赖最终退出码），不是本轮之前两批修的 BRIDGE_EXTENDED 生产逻辑又坏了，要求只改测试证据采集方式，不要为了这个 CI 红去改生产 thunk，也不要把 0xC0000029 加进允许结果列表或单纯扩大假栈（那治标不治本）。
+
+成功经验与证据：本机第一次跑新逻辑时，捕获到的"第一个" first-chance 异常 ExceptionCode 是 0x80000003（EXCEPTION_BREAKPOINT），断言失败；定位后确认这是 Windows 调试协议自身的产物——任何用 DEBUG_ONLY_THIS_PROCESS 附加的进程，真正跑到自己入口点之前 ntdll 都会先抛一个 loader breakpoint 通知调试器"进程已就绪"，所有 Win32 调试器都必须识别并跳过，不是 harness 自己的故障；修复为新增 sawLoaderBreakpoint 标记跳过这第一个 EXCEPTION_BREAKPOINT。修好之后本机真实捕获到的现场：EIP=0x403062 ECX=0x0 ESP=0x19ef78 EDX=0x402000 ExceptionInformation=[0x0,0x0]——ESP=0x19ef78 是典型的真实 Win32 线程栈地址（远高于镜像自身 0x400000/0x402000 区间），直接证明 guest ESP 现在真的落在 OS 分配的真实线程栈里。
+
+验证：Win32（build32）Release、/W4 /WX 全量重新构建，零警告零错误（x64 完全不受影响，改动全部在 #if defined(_M_IX86) 之内，未重新构建 x64）。test_vm_handler_synthesis.exe 单独运行 exit code 0。不与其他构建并发、单独完整跑一遍 Win32 ctest --test-dir build32 -C Release --output-on-failure --timeout 300：17/18 通过（701.42 秒，vm_per_build_similarity_gate 542.73 秒 PASS，vm_handler_synthesis 干净通过），唯一"失败"仍是 vm_native_differential 既有 TIMEOUT 120（未修改该属性）。
+
+已知缺口：批次 17/18/19 记录的已知缺口（x64 真实故障注入窗口、checked arithmetic 溢出分支、AVX 单机验证）不因本批而消失；本批修的是测试 fixture 设计问题，不重新宣称 BRIDGE_EXTENDED 100% 完成。本批未在能复现 STATUS_INVALID_DISPOSITION 的 GitHub Win32 runner 环境上直接验证过修复效果（本机从未复现过这个问题），最终确认要看远端 CI 结果。
+
+远端验证：本条写入后将用 ForgeAgentBot 身份直接 push 到 codex（用户明确要求），push 后按用户要求只查一次 CI check-runs 状态，不轮询；这次 Win32 job 是否真的变绿是验证本批修复是否真的解决 GitHub runner 上的问题的关键证据，将在后续记录中如实更新。
+
+如何部署更改：无需新增依赖；使用现有 VS2022/NASM 环境构建 Win32 Release（x64 不受影响，无需重新构建）。本批只改测试代码，不改变任何生产行为、不改变 VM image 格式、不改变 VM_INSTRUCTION_BRIDGE_STATE 的内存布局。
