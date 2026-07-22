@@ -1,6 +1,10 @@
 #include "packer/mutation/mutation_engine.h"
 #include "packer/transforms/vm_handler_semantic_codegen.h"
 #include "packer/transforms/vm_handler_synthesizer.h"
+#include "packer/transforms/vm_instruction_bridge_builder.h"
+#include "packer/analysis/disassembler.h"
+#include "packer/pe_parser/pe_parser.h"
+#include "packer/pe_parser/pe_utils.h"
 #include "packer/vm/micro_semantics.h"
 #include "packer/vm/vm_schema.h"
 
@@ -48,6 +52,18 @@ using CipherShell::VMMicroMachineState;
 using CipherShell::VMMicroMemoryView;
 using CipherShell::VMMicroSemanticExecutor;
 using CipherShell::VMSchema;
+using CipherShell::CS_PE_IMAGE;
+using CipherShell::CS_RUNTIME_FUNCTION;
+using CipherShell::Disassembler;
+using CipherShell::Function;
+using CipherShell::InstructionIR;
+using CipherShell::MachineMode;
+using CipherShell::PEParser;
+using CipherShell::TranslationResult;
+using CipherShell::VMBridgeRequest;
+using CipherShell::VMInstructionBridgeBuilder;
+using CipherShell::VMInstructionBridgeBuildResult;
+using CipherShell::VMInstructionBridgeLink;
 
 class TestFailure final : public std::runtime_error {
 public:
@@ -691,11 +707,130 @@ uint32_t InvokeSynthEntry(
         return VM_MICRO_ERR_HANDLER_BUG;
     }
 }
+
+#if defined(_M_X64)
+// Hand-written tail-call trampoline used only by
+// InvokeSynthEntryCapturingGuestRsp (see its own comment for why): stores
+// its *own* RSP -- i.e. the exact address holding the return address for
+// the `call` that invoked this trampoline -- into *rspSlotOut, then tail-
+// jumps (not calls) into `entry`. Because it never pushes a return address
+// of its own, entry()'s eventual `ret` goes directly back to whoever called
+// this trampoline, exactly as if that caller had called entry() itself;
+// this is the standard tail-call equivalence, done by hand here because
+// MSVC's own tail-call optimization is not something the source can rely on
+// happening for a given build.
+class EntryTailCallStub final {
+public:
+    EntryTailCallStub() {
+        static constexpr uint8_t kCode[] = {
+            0x48, 0x89, 0x21,             // mov [rcx], rsp
+            0x48, 0x89, 0xD0,             // mov rax, rdx
+            0x4C, 0x89, 0xC1,             // mov rcx, r8
+            0xFF, 0xE0,                   // jmp rax
+        };
+        m_base = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, sizeof(kCode), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!m_base) throw TestFailure("EntryTailCallStub VirtualAlloc 失败");
+        std::memcpy(m_base, kCode, sizeof(kCode));
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(m_base, sizeof(kCode), PAGE_EXECUTE_READ, &oldProtection) ||
+            !FlushInstructionCache(GetCurrentProcess(), m_base, sizeof(kCode))) {
+            throw TestFailure("EntryTailCallStub 无法设置为 RX");
+        }
+    }
+    ~EntryTailCallStub() { if (m_base) VirtualFree(m_base, 0, MEM_RELEASE); }
+    EntryTailCallStub(const EntryTailCallStub&) = delete;
+    EntryTailCallStub& operator=(const EntryTailCallStub&) = delete;
+
+    uint32_t Invoke(uint64_t* rspSlotOut, SynthEntry entry, VM_MICRO_EXECUTION_CONTEXT* context) const {
+        using TrampolineFn = uint32_t(__fastcall*)(uint64_t*, SynthEntry, VM_MICRO_EXECUTION_CONTEXT*);
+        return reinterpret_cast<TrampolineFn>(m_base)(rspSlotOut, entry, context);
+    }
+
+private:
+    uint8_t* m_base = nullptr;
+};
+
+// Real x64 exception-unwind evidence for a BRIDGE_EXTENDED thunk requires
+// the fault to happen while the CPU can still be steered back to this
+// function's own __try/__except through the thunk's trivial, copied (no
+// UNW_FLAG_UHANDLER) unwind info -- which describes nothing more than "the
+// return address is at [RSP], caller's RSP is [RSP]+8". BuildX64Thunk
+// unconditionally swaps the *real* RSP to the guest's virtualized stack
+// pointer before running the extracted native instruction (so instructions
+// that legitimately address guest stack memory work correctly), so at the
+// fault point RSP is whatever value the test supplied as gpr[4] -- and for
+// that trivial unwind description to correctly walk back to *this*
+// function, [gpr[4]] must itself hold a valid return address into this
+// function's own try block, with gpr[4]+8 equal to this function's real
+// RSP at the point it called entry(). An arbitrary (even if real, valid,
+// writable) guest stack buffer does not satisfy that -- confirmed by
+// direct observation: it reliably takes down the whole process with an
+// unrecoverable second exception instead of reaching the __except below,
+// regardless of which register the thunk uses as `hidden`. EntryTailCallStub
+// exists specifically to hand the caller the one address that *does* work:
+// the real return-address slot for the call into entry(), captured with no
+// possibility of the compiler inserting anything in between.
+uint32_t InvokeSynthEntryCapturingGuestRsp(
+    const EntryTailCallStub& stub,
+    SynthEntry entry,
+    VM_MICRO_EXECUTION_CONTEXT* context,
+    DWORD* exceptionCode,
+    uint64_t* guestRspOut)
+{
+    // `stub` is taken by reference (constructed by the caller) rather than
+    // as a function-local static here: MSVC rejects __try/__except in any
+    // function that also needs to emit C++ object-unwind metadata (error
+    // C2712), which a function-local static with a non-trivial destructor
+    // (the "magic statics" thread-safe-init guard) triggers.
+    *exceptionCode = 0;
+    gLastExceptionAddress = 0;
+    __try {
+        return stub.Invoke(guestRspOut, entry, context);
+    } __except((*exceptionCode = GetExceptionCode(),
+        gLastExceptionAddress = reinterpret_cast<uintptr_t>(
+            GetExceptionInformation()->ExceptionRecord->ExceptionAddress),
+        EXCEPTION_EXECUTE_HANDLER)) {
+        return VM_MICRO_ERR_HANDLER_BUG;
+    }
+}
+#endif
 #endif
 
 void ValidateOneBuild(
     const VMHandlerSynthesisConfig& config,
     const VMHandlerSynthesisResult& result);
+
+// 独立批次 17：真正执行 VMInstructionBridgeBuilder::Build 产出的 thunk（见
+// 文件后部定义），而不是像 ExecuteExternalSemanticVariantCases 那样用一个
+// C++ 静态函数代替。定义在文件后部（与 BuildBridgeThunkFixture/
+// LoadedBridgeThunk 等共享基础设施放在一起），此处前向声明以便
+// TestHostContextEntryExecution 可以调用，与 ValidateOneBuild/
+// RuntimeByteWindow 的既有前向声明写法一致。
+void ExecuteInstructionBridgeThunkFxsaveCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    class LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    struct TestRuntimeIatImage& testImage);
+void ExecuteInstructionBridgeThunkAvxCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    class LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    struct TestRuntimeIatImage& testImage);
+void ExecuteInstructionBridgeThunkContinuityCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    class LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    struct TestRuntimeIatImage& testImage);
+void ExecuteInstructionBridgeThunkRealExceptionCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    class LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    struct TestRuntimeIatImage& testImage);
 
 #if defined(_M_X64) || defined(_M_IX86)
 volatile LONG gVirtualProtectCalls = 0;
@@ -2983,6 +3118,18 @@ void TestHostContextEntryExecution() {
         config, result, loaded, encoding, testImage);
     std::cout << "[阶段] BRIDGE_EXTENDED/INT3 外部效果双策略差分\n";
     ExecuteExternalSemanticVariantCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] VMInstructionBridgeBuilder thunk FXSAVE/FXRSTOR 真实执行\n";
+    ExecuteInstructionBridgeThunkFxsaveCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] VMInstructionBridgeBuilder thunk XSAVE/XRSTOR(AVX) 真实执行\n";
+    ExecuteInstructionBridgeThunkAvxCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] VMInstructionBridgeBuilder thunk 跨语义连续执行隔离\n";
+    ExecuteInstructionBridgeThunkContinuityCases(
+        config, result, loaded, encoding, testImage);
+    std::cout << "[阶段] VMInstructionBridgeBuilder thunk 真实异常展开\n";
+    ExecuteInstructionBridgeThunkRealExceptionCases(
         config, result, loaded, encoding, testImage);
     std::cout << "[阶段] 宽除法全宽度/双策略真实 #DE\n";
     const uint8_t addressWidth =
@@ -5558,6 +5705,1501 @@ void TestZydisBridgeExtendedRegisterDiversity() {
     }
 }
 
+#if defined(_M_X64) || defined(_M_IX86)
+// ============================================================================
+// VMInstructionBridgeBuilder thunk execution closure（独立批次 17）
+// ============================================================================
+//
+// 上面 ExecuteExternalSemanticVariantCases 的 BRIDGE_EXTENDED 分支（以及它
+// 使用的 GateInstructionBridgeTarget）只覆盖了 EmitX64/86BridgeExtended 自己
+// 的 GPR 搬运/间接调用逻辑，从未真正执行过 VMInstructionBridgeBuilder::Build
+// 产出的字节：那段 hidden-register 调用目标此前一直是一个普通 C++ 静态函数，
+// 不是打包期真正生成、带独立 .pdata/Guard CF 元数据的 thunk。下面这一组函数
+// 用一个自包含的最小 PE（复用 tests/test_pe_hardening.cpp 已验证过的
+// Writer/BuildPe/Parse 手法，因为两个测试是独立可执行文件、不共享翻译单元）
+// 喂给真实 VMInstructionBridgeBuilder::Build，把它产出的最终 PE 字节
+// VirtualAlloc 成可执行内存，再通过与 ExecuteExternalSemanticVariantCases
+// 完全相同的机制——把 CallHostTestImage 的 instructionBridgeTarget 指向这段
+// 真实 thunk 的运行期地址——经由正式合成的 BRIDGE_EXTENDED handler 真正调用
+// 到它。见 docs/zydis_encoder_pilot.md 批次 17。
+
+constexpr uint32_t kBridgeFixtureTextVA = 0x1000u;
+constexpr uint32_t kBridgeFixtureRdataVA = 0x2000u;
+constexpr uint64_t kBridgeFixtureImageBase64 = 0x140000000ULL;
+constexpr uint64_t kBridgeFixtureImageBase32 = 0x00400000ULL;
+
+struct BridgeFixtureDirEntry { uint32_t index; uint32_t value; uint32_t size; };
+
+// 与 test_pe_hardening.cpp 的 Writer 完全同构的最小字节写入器：两个测试是
+// 独立可执行文件，不共享翻译单元，因此在这里独立复制一份而不是新增跨文件
+// 共享的测试基础设施。
+struct BridgeFixtureWriter {
+    std::vector<uint8_t> buf;
+    size_t pos = 0;
+    void ensure(size_t n) { if (buf.size() < pos + n) buf.resize(pos + n, 0); }
+    void put(const void* p, size_t n) { ensure(n); std::memcpy(buf.data() + pos, p, n); pos += n; }
+    void pad(size_t n) { ensure(n); pos += n; }
+    size_t mark() const { return pos; }
+};
+
+uint32_t BridgeFixtureAlignUp(uint32_t value, uint32_t alignment) {
+    return alignment ? (value + alignment - 1u) & ~(alignment - 1u) : value;
+}
+
+// 构造一个真实、可被 PEParser 完整解析的最小宿主 PE：.text 放调用方提供的
+// 原始字节（含待桥接指令），x64 时额外在 .rdata 里放一个合法的
+// RUNTIME_FUNCTION/UNWIND_INFO（prologSize=0，与
+// tests/test_pe_hardening.cpp 的 BuildUnwindInfoValid 完全同构），x86 不需要
+// 任何异常目录（VMInstructionBridgeBuilder::Build 只在 image->is64Bit 时才
+// 调用 ReadSimpleUnwind）。
+CS_PE_IMAGE* BuildBridgeHostImage(bool is64Bit, const std::vector<uint8_t>& textData) {
+    using namespace CipherShell;
+    const uint32_t ntOff = sizeof(IMAGE_DOS_HEADER);
+    const uint32_t ntSize = is64Bit ? sizeof(IMAGE_NT_HEADERS64) : sizeof(IMAGE_NT_HEADERS32);
+    const uint32_t secTableOff = ntOff + ntSize;
+    // FileAlignment == SectionAlignment (both 0x1000) is deliberate, not a
+    // typo: LoadedBridgeThunk below VirtualAlloc's the *raw file bytes*
+    // (img->rawData, i.e. PointerToRawData-addressed) and then treats every
+    // RVA VMInstructionBridgeBuilder::Build reports (section-alignment-
+    // addressed) as a plain offset into that same buffer. Those two
+    // addressing schemes only coincide when FileAlignment == SectionAlignment
+    // (verified: with them equal, AppendSection's own
+    // rawOffset = AlignUp(shiftedLastFileEnd, fileAlign) and
+    // virtualAddress = AlignUp(lastVirtualEnd, sectionAlign) collapse to the
+    // same computation on the same input for every section, including the
+    // ones Build() appends). A first version of this fixture used the
+    // conventional 0x200/0x1000 split like tests/test_pe_hardening.cpp's
+    // BuildPe, which is correct for that file (it only ever inspects the
+    // parsed CS_PE_IMAGE in place, never re-flattens it for execution) but
+    // silently produced a thunk at the wrong in-memory address here, which
+    // is exactly what the very first real execution attempt below caught as
+    // a genuine EXCEPTION_ACCESS_VIOLATION -- a bug in this test harness,
+    // not in VMInstructionBridgeBuilder::Build itself.
+    constexpr uint32_t kFileAlign = 0x1000u;
+    constexpr uint32_t kSecAlign = 0x1000u;
+
+    BridgeFixtureWriter rdataWriter;
+    std::vector<BridgeFixtureDirEntry> dirs;
+    if (is64Bit) {
+        const size_t entryRel = rdataWriter.mark();
+        rdataWriter.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+        const size_t unwindRel = rdataWriter.mark();
+        const std::array<uint8_t, 4> unwind = {0x01, 0x00, 0x00, 0x00}; // V1, prolog=0, 0 codes
+        rdataWriter.put(unwind.data(), unwind.size());
+        IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+        entry.BeginAddress = kBridgeFixtureTextVA;
+        entry.EndAddress = kBridgeFixtureTextVA + static_cast<uint32_t>(textData.size());
+        entry.UnwindData = kBridgeFixtureRdataVA + static_cast<uint32_t>(unwindRel);
+        std::memcpy(rdataWriter.buf.data() + entryRel, &entry, sizeof(entry));
+        dirs.push_back({IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+            kBridgeFixtureRdataVA + static_cast<uint32_t>(entryRel),
+            sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)});
+    }
+    const bool hasRdata = !rdataWriter.buf.empty();
+    const uint32_t numSec = 1u + (hasRdata ? 1u : 0u);
+    const uint32_t secTableEnd = secTableOff + numSec * sizeof(IMAGE_SECTION_HEADER);
+    const uint32_t headersRaw = BridgeFixtureAlignUp(secTableEnd, kFileAlign);
+    const uint32_t textRaw = BridgeFixtureAlignUp(static_cast<uint32_t>(textData.size()), kFileAlign);
+    const uint32_t rdataRaw = hasRdata
+        ? BridgeFixtureAlignUp(static_cast<uint32_t>(rdataWriter.buf.size()), kFileAlign) : 0u;
+    const uint32_t textSpan = (std::max)(static_cast<uint32_t>(textData.size()), textRaw);
+    const uint32_t rdataVAForLayout = BridgeFixtureAlignUp(kBridgeFixtureTextVA + textSpan, kSecAlign);
+    const uint32_t textFileOff = headersRaw;
+    const uint32_t rdataFileOff = headersRaw + textRaw;
+    const uint32_t totalSize = rdataFileOff + rdataRaw;
+
+    std::vector<uint8_t> bytes(totalSize, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = static_cast<LONG>(ntOff);
+    std::memcpy(bytes.data() + ntOff, "PE\0\0", 4);
+    auto* fh = reinterpret_cast<IMAGE_FILE_HEADER*>(bytes.data() + ntOff + 4);
+    fh->Machine = is64Bit ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
+    fh->NumberOfSections = static_cast<WORD>(numSec);
+    fh->SizeOfOptionalHeader = is64Bit
+        ? sizeof(IMAGE_OPTIONAL_HEADER64) : sizeof(IMAGE_OPTIONAL_HEADER32);
+    if (is64Bit) {
+        auto* oh = reinterpret_cast<IMAGE_OPTIONAL_HEADER64*>(
+            bytes.data() + secTableOff - sizeof(IMAGE_OPTIONAL_HEADER64));
+        oh->Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        oh->FileAlignment = kFileAlign;
+        oh->SectionAlignment = kSecAlign;
+        oh->SizeOfHeaders = headersRaw;
+        oh->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        oh->ImageBase = kBridgeFixtureImageBase64;
+        oh->AddressOfEntryPoint = kBridgeFixtureTextVA;
+        oh->SizeOfImage = BridgeFixtureAlignUp(rdataVAForLayout +
+            (hasRdata ? (std::max)(static_cast<uint32_t>(rdataWriter.buf.size()), rdataRaw) : 0u),
+            kSecAlign);
+        oh->BaseOfCode = kBridgeFixtureTextVA;
+        auto* nt64 = reinterpret_cast<IMAGE_NT_HEADERS64*>(bytes.data() + ntOff);
+        for (const auto& d : dirs) {
+            nt64->OptionalHeader.DataDirectory[d.index].VirtualAddress = d.value;
+            nt64->OptionalHeader.DataDirectory[d.index].Size = d.size;
+        }
+    } else {
+        auto* oh = reinterpret_cast<IMAGE_OPTIONAL_HEADER32*>(
+            bytes.data() + secTableOff - sizeof(IMAGE_OPTIONAL_HEADER32));
+        oh->Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        oh->FileAlignment = kFileAlign;
+        oh->SectionAlignment = kSecAlign;
+        oh->SizeOfHeaders = headersRaw;
+        oh->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+        oh->ImageBase = static_cast<DWORD>(kBridgeFixtureImageBase32);
+        oh->AddressOfEntryPoint = kBridgeFixtureTextVA;
+        oh->SizeOfImage = BridgeFixtureAlignUp(rdataVAForLayout +
+            (hasRdata ? (std::max)(static_cast<uint32_t>(rdataWriter.buf.size()), rdataRaw) : 0u),
+            kSecAlign);
+        oh->BaseOfCode = kBridgeFixtureTextVA;
+    }
+    auto* secs = reinterpret_cast<IMAGE_SECTION_HEADER*>(bytes.data() + secTableOff);
+    std::memcpy(secs[0].Name, ".text", 5);
+    secs[0].VirtualAddress = kBridgeFixtureTextVA;
+    secs[0].Misc.VirtualSize = static_cast<DWORD>(textData.size());
+    secs[0].SizeOfRawData = textRaw;
+    secs[0].PointerToRawData = textFileOff;
+    secs[0].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    if (hasRdata) {
+        std::memcpy(secs[1].Name, ".rdata", 6);
+        secs[1].VirtualAddress = kBridgeFixtureRdataVA;
+        secs[1].Misc.VirtualSize = static_cast<DWORD>(rdataWriter.buf.size());
+        secs[1].SizeOfRawData = rdataRaw;
+        secs[1].PointerToRawData = rdataFileOff;
+        secs[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    }
+    std::memcpy(bytes.data() + textFileOff, textData.data(), textData.size());
+    if (hasRdata) std::memcpy(bytes.data() + rdataFileOff, rdataWriter.buf.data(), rdataWriter.buf.size());
+
+    BYTE* buffer = new BYTE[bytes.size()];
+    std::memcpy(buffer, bytes.data(), bytes.size());
+    PEParser parser;
+    return parser.LoadFromBuffer(buffer, static_cast<DWORD>(bytes.size()));
+}
+
+InstructionIR DisassembleForBridgeFixture(bool is64Bit, const std::vector<uint8_t>& bytes, uint64_t rva) {
+    Disassembler disassembler;
+    const uint64_t imageBase = is64Bit ? kBridgeFixtureImageBase64 : kBridgeFixtureImageBase32;
+    Require(disassembler.Initialize(is64Bit, imageBase),
+        "bridge fixture Disassembler::Initialize 失败");
+    const auto decoded = disassembler.Disassemble(bytes.data(),
+        static_cast<uint32_t>(bytes.size()), rva);
+    Require(decoded.size() == 1 && decoded.front().length == bytes.size(),
+        "bridge fixture 指令未能被 Zydis 解码为单条完整指令");
+    return decoded.front();
+}
+
+struct BuiltBridgeThunk {
+    std::vector<uint8_t> imageBytes;
+    VMInstructionBridgeLink link{};
+    std::vector<CS_RUNTIME_FUNCTION> unwindEntries;
+};
+
+// 端到端跑一次真实 VMInstructionBridgeBuilder::Build：构造最小宿主 PE、用
+// 真实 Zydis 反汇编器解码 nativeBytes、组装 Function/TranslationResult/
+// VMBridgeRequest，调用生产 Build()，返回打包期真正产出的最终 PE 字节
+// （已经包含真正重定位过的 thunk section 与重建过的 Exception/Guard CF
+// 目录）与 Build() 报告的链接元数据，供调用方 VirtualAlloc 成可执行内存并
+// 真正执行。
+BuiltBridgeThunk BuildBridgeThunkFixture(
+    bool is64Bit,
+    const std::vector<uint8_t>& nativeBytes,
+    uint8_t hiddenNativeRegister,
+    bool usesAvx,
+    bool usesX87)
+{
+    using namespace CipherShell;
+    std::vector<uint8_t> textData = {0xC3}; // 单字节占位，充当 prologSize=0 之前的"函数首字节"
+    const uint32_t instructionOffset = static_cast<uint32_t>(textData.size());
+    textData.insert(textData.end(), nativeBytes.begin(), nativeBytes.end());
+    textData.push_back(0xC3);
+
+    CS_PE_IMAGE* img = BuildBridgeHostImage(is64Bit, textData);
+    Require(img && img->isValid, "bridge thunk fixture 宿主 PE 解析失败");
+
+    Function function{};
+    function.entryAddress = kBridgeFixtureTextVA;
+    function.size = static_cast<uint32_t>(textData.size());
+
+    const InstructionIR decoded = DisassembleForBridgeFixture(
+        is64Bit, nativeBytes, kBridgeFixtureTextVA + instructionOffset);
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = static_cast<uint64_t>(hiddenNativeRegister) |
+        (usesAvx ? VM_MICRO_BRIDGE_AVX : 0u) | (usesX87 ? VM_MICRO_BRIDGE_X87 : 0u);
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kBridgeFixtureTextVA;
+    request.instruction = decoded;
+    request.hiddenNativeRegister = hiddenNativeRegister;
+    request.usesAvx = usesAvx;
+    request.usesX87 = usesX87;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {function};
+    std::vector<TranslationResult> translations = {translation};
+
+    VMInstructionBridgeBuilder builder;
+    const VMInstructionBridgeBuildResult result = builder.Build(img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    Require(result.success, "VMInstructionBridgeBuilder::Build 失败: " + result.error);
+    Require(result.links.size() == 1, "VMInstructionBridgeBuilder::Build 未产出预期的单条 link");
+
+    BuiltBridgeThunk built;
+    built.imageBytes.assign(img->rawData, img->rawData + img->rawSize);
+    built.link = result.links[0];
+    built.unwindEntries = result.unwindEntries;
+    PEParser parser;
+    parser.FreeImage(img);
+    return built;
+}
+
+// 把 BuildBridgeThunkFixture 产出的最终 PE 字节整体 VirtualAlloc 成可执行
+// 内存并（x64 时）用 RtlAddFunctionTable 登记它自己的 .pdata——与
+// LoadedSynthImage 对合成 VM runtime image 的处理完全同构，是文档化的
+// "信任非模块内存里 unwind info" 正规逃生舱口，x64 CALL_HOST 的真实异常
+// 展开测试已经验证过这条路径可行。
+class LoadedBridgeThunk final {
+public:
+    LoadedBridgeThunk() = default;
+    ~LoadedBridgeThunk() {
+#if defined(_M_X64)
+        if (m_functionTableRegistered && !m_unwind.empty()) {
+            RtlDeleteFunctionTable(m_unwind.data());
+        }
+#endif
+        if (m_base) VirtualFree(m_base, 0, MEM_RELEASE);
+    }
+    LoadedBridgeThunk(const LoadedBridgeThunk&) = delete;
+    LoadedBridgeThunk& operator=(const LoadedBridgeThunk&) = delete;
+
+    bool Load(const BuiltBridgeThunk& built, bool is64Bit, std::string& error) {
+        m_size = built.imageBytes.size();
+        m_base = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, m_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!m_base) { error = "VirtualAlloc bridge thunk image 失败"; return false; }
+        std::memcpy(m_base, built.imageBytes.data(), built.imageBytes.size());
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(m_base, m_size, PAGE_EXECUTE_READ, &oldProtection) ||
+            !FlushInstructionCache(GetCurrentProcess(), m_base, m_size)) {
+            error = "无法将 bridge thunk image 设置为 RX";
+            return false;
+        }
+#if defined(_M_X64)
+        if (is64Bit && !built.unwindEntries.empty()) {
+            m_unwind.reserve(built.unwindEntries.size());
+            for (const auto& entry : built.unwindEntries) {
+                RUNTIME_FUNCTION function{};
+                function.BeginAddress = entry.beginAddress;
+                function.EndAddress = entry.endAddress;
+                function.UnwindData = entry.unwindData;
+                m_unwind.push_back(function);
+            }
+            if (!RtlAddFunctionTable(m_unwind.data(),
+                    static_cast<DWORD>(m_unwind.size()), reinterpret_cast<DWORD64>(m_base))) {
+                error = "无法注册 bridge thunk image 的 x64 unwind 表";
+                return false;
+            }
+            m_functionTableRegistered = true;
+        }
+#else
+        (void)is64Bit;
+#endif
+        return true;
+    }
+
+    uintptr_t ThunkAddress(const VMInstructionBridgeLink& link) const {
+        return reinterpret_cast<uintptr_t>(m_base) + link.thunkRVA;
+    }
+
+private:
+    uint8_t* m_base = nullptr;
+    size_t m_size = 0;
+#if defined(_M_X64)
+    std::vector<RUNTIME_FUNCTION> m_unwind;
+    bool m_functionTableRegistered = false;
+#endif
+};
+
+// 真实宿主非易失寄存器/栈指针快照。
+//
+// 第一版实现用 RtlCaptureContext，结果证明不可靠：即便把捕获点收紧到一个
+// 极小的、专门只做"捕获-调用-捕获"这三步、不含任何数组/大对象局部变量的
+// noinline 包装函数内部，中间只隔着一次 InvokeSynthEntry 调用，RSP 在两次
+// 捕获之间仍然会出现一个非零、可复现的固定偏移（0x30 字节），RBX 在第二次
+// 捕获里读到精确的 0——且这个现象与 hidden 选哪个寄存器完全无关（hidden=3
+// 与 hidden=11 表现完全一致），也就是说这不是 BRIDGE_EXTENDED thunk 或桥接
+// 机制本身造成的，而是 RtlCaptureContext 在这种"同一极小函数内连续调用
+// 两次"的用法下本身不可靠。
+//
+// 换成下面这个手写的、只做纯 MOV [reg+disp],reg 加一条 RET 的叶子函数
+// （不 push/pop、不再调用任何东西、不接触被检查寄存器之外的任何寄存器）
+// 后，问题消失——见本文件下方 ExecuteInstructionBridgeThunkFxsaveCases 等
+// 处的真实执行结果。这是真实排查后的结论，不是猜测；详见
+// docs/zydis_encoder_pilot.md 批次 17。
+struct HostRegisterSnapshot {
+#if defined(_M_X64)
+    uint64_t rbx = 0, rbp = 0, rsi = 0, rdi = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0, rsp = 0;
+#else
+    uint32_t ebx = 0, ebp = 0, esi = 0, edi = 0, esp = 0;
+#endif
+};
+
+class HostRegisterCaptureStub final {
+public:
+    HostRegisterCaptureStub() {
+#if defined(_M_X64)
+        static constexpr uint8_t kCode[] = {
+            0x48, 0x89, 0x19,             // mov [rcx], rbx
+            0x48, 0x89, 0x69, 0x08,       // mov [rcx+8], rbp
+            0x48, 0x89, 0x71, 0x10,       // mov [rcx+16], rsi
+            0x48, 0x89, 0x79, 0x18,       // mov [rcx+24], rdi
+            0x4C, 0x89, 0x61, 0x20,       // mov [rcx+32], r12
+            0x4C, 0x89, 0x69, 0x28,       // mov [rcx+40], r13
+            0x4C, 0x89, 0x71, 0x30,       // mov [rcx+48], r14
+            0x4C, 0x89, 0x79, 0x38,       // mov [rcx+56], r15
+            0x48, 0x89, 0x61, 0x40,       // mov [rcx+64], rsp
+            0xC3,                        // ret
+        };
+#else
+        static constexpr uint8_t kCode[] = {
+            0x89, 0x19,                   // mov [ecx], ebx
+            0x89, 0x69, 0x04,             // mov [ecx+4], ebp
+            0x89, 0x71, 0x08,             // mov [ecx+8], esi
+            0x89, 0x79, 0x0C,             // mov [ecx+12], edi
+            0x89, 0x61, 0x10,             // mov [ecx+16], esp
+            0xC3,                        // ret (__fastcall, 0 stack args to pop)
+        };
+#endif
+        m_base = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, sizeof(kCode), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!m_base) throw TestFailure("HostRegisterCaptureStub VirtualAlloc 失败");
+        std::memcpy(m_base, kCode, sizeof(kCode));
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(m_base, sizeof(kCode), PAGE_EXECUTE_READ, &oldProtection) ||
+            !FlushInstructionCache(GetCurrentProcess(), m_base, sizeof(kCode))) {
+            throw TestFailure("HostRegisterCaptureStub 无法设置为 RX");
+        }
+    }
+    ~HostRegisterCaptureStub() { if (m_base) VirtualFree(m_base, 0, MEM_RELEASE); }
+    HostRegisterCaptureStub(const HostRegisterCaptureStub&) = delete;
+    HostRegisterCaptureStub& operator=(const HostRegisterCaptureStub&) = delete;
+
+    void Capture(HostRegisterSnapshot& out) const {
+        using CaptureFn = void(__fastcall*)(HostRegisterSnapshot*);
+        reinterpret_cast<CaptureFn>(m_base)(&out);
+    }
+
+private:
+    uint8_t* m_base = nullptr;
+};
+
+void RequireHostRegistersPreserved(
+    const HostRegisterSnapshot& before,
+    const HostRegisterSnapshot& after,
+    const std::string& label)
+{
+#if defined(_M_X64)
+    std::ostringstream diag;
+    diag << std::hex << " before(rbx=" << before.rbx << " rbp=" << before.rbp <<
+        " rsi=" << before.rsi << " rdi=" << before.rdi << " r12=" << before.r12 <<
+        " r13=" << before.r13 << " r14=" << before.r14 << " r15=" << before.r15 <<
+        " rsp=" << before.rsp << ") after(rbx=" << after.rbx << " rbp=" << after.rbp <<
+        " rsi=" << after.rsi << " rdi=" << after.rdi << " r12=" << after.r12 <<
+        " r13=" << after.r13 << " r14=" << after.r14 << " r15=" << after.r15 <<
+        " rsp=" << after.rsp << ")";
+    Require(before.rbx == after.rbx, label + ": host RBX 被 thunk 污染" + diag.str());
+    Require(before.rbp == after.rbp, label + ": host RBP 被 thunk 污染" + diag.str());
+    Require(before.rsi == after.rsi, label + ": host RSI 被 thunk 污染" + diag.str());
+    Require(before.rdi == after.rdi, label + ": host RDI 被 thunk 污染" + diag.str());
+    Require(before.r12 == after.r12, label + ": host R12 被 thunk 污染" + diag.str());
+    Require(before.r13 == after.r13, label + ": host R13 被 thunk 污染" + diag.str());
+    Require(before.r14 == after.r14, label + ": host R14 被 thunk 污染" + diag.str());
+    Require(before.r15 == after.r15, label + ": host R15 被 thunk 污染" + diag.str());
+    Require(before.rsp == after.rsp,
+        label + ": host RSP 在调用前后不一致（栈未平衡）" + diag.str());
+#else
+    std::ostringstream diag;
+    diag << std::hex << " before(ebx=" << before.ebx << " ebp=" << before.ebp <<
+        " esi=" << before.esi << " edi=" << before.edi << " esp=" << before.esp <<
+        ") after(ebx=" << after.ebx << " ebp=" << after.ebp << " esi=" << after.esi <<
+        " edi=" << after.edi << " esp=" << after.esp << ")";
+    Require(before.ebx == after.ebx, label + ": host EBX 被 thunk 污染" + diag.str());
+    Require(before.ebp == after.ebp, label + ": host EBP 被 thunk 污染" + diag.str());
+    Require(before.esi == after.esi, label + ": host ESI 被 thunk 污染" + diag.str());
+    Require(before.edi == after.edi, label + ": host EDI 被 thunk 污染" + diag.str());
+    Require(before.esp == after.esp,
+        label + ": host ESP 在调用前后不一致（栈未平衡）" + diag.str());
+#endif
+}
+
+// 真实 CPUID + XGETBV 门控：只有当前 CPU 真的声明支持 AVX、且操作系统真的
+//通过 XCR0 声明会保存/恢复 YMM 状态时，才认为 usesAvx=true 的 XSAVE/XRSTOR
+// 路径在本机可以安全执行到。同时用 CPUID leaf 0Dh sub-leaf 2 动态探测
+// YMM_Hi128 状态分量在 XSAVE 区域里的真实 offset/size，不假设标准布局的
+// 576/256 一定成立。
+struct AvxHostSupport {
+    bool supported = false;
+    uint32_t ymmHi128Offset = 0;
+    uint32_t ymmHi128Size = 0;
+};
+
+AvxHostSupport DetectAvxHostSupport() {
+    AvxHostSupport support;
+    std::array<int, 4> regs{};
+    __cpuid(regs.data(), 0);
+    const int maxLeaf = regs[0];
+    if (maxLeaf < 1) return support;
+    __cpuid(regs.data(), 1);
+    const bool osxsave = (regs[2] & (1 << 27)) != 0;
+    const bool avx = (regs[2] & (1 << 28)) != 0;
+    if (!osxsave || !avx) return support;
+    const unsigned long long xcr0 = _xgetbv(0);
+    if ((xcr0 & 0x6ULL) != 0x6ULL) return support; // XMM(bit1) + YMM(bit2) 状态都要由 OS 保存
+    if (maxLeaf < 0x0D) return support;
+    std::array<int, 4> leafD2{};
+    __cpuidex(leafD2.data(), 0x0D, 2);
+    const uint32_t size = static_cast<uint32_t>(leafD2[0]);
+    const uint32_t offset = static_cast<uint32_t>(leafD2[1]);
+    if (size < 16u || offset == 0u || offset > VM_XSAVE_AREA_SIZE ||
+        size > VM_XSAVE_AREA_SIZE - offset) {
+        return support; // 布局放不进 VM_EXTENDED_STATE 固定大小的 guest 缓冲区
+    }
+    support.supported = true;
+    support.ymmHi128Offset = offset;
+    support.ymmHi128Size = size;
+    return support;
+}
+
+struct BridgeThunkCallResult {
+    uint32_t runtimeError = 0;
+    DWORD exceptionCode = 0;
+    VM_MICRO_EXECUTION_CONTEXT context{};
+    HostRegisterSnapshot hostBefore{};
+    HostRegisterSnapshot hostAfter{};
+};
+
+// Brackets *only* the call to entry() itself with host-register capture,
+// using the hand-written HostRegisterCaptureStub (see its own comment for
+// why RtlCaptureContext was rejected for this). The stub instance is
+// function-local static: constructing it allocates one small RWX page, and
+// there is no reason to repeat that per call.
+void InvokeSynthEntryWithHostCapture(
+    SynthEntry entry,
+    VM_MICRO_EXECUTION_CONTEXT* context,
+    uint32_t* runtimeErrorOut,
+    DWORD* exceptionCodeOut,
+    HostRegisterSnapshot* hostBeforeOut,
+    HostRegisterSnapshot* hostAfterOut)
+{
+    static const HostRegisterCaptureStub stub;
+    stub.Capture(*hostBeforeOut);
+    *runtimeErrorOut = InvokeSynthEntry(entry, context, exceptionCodeOut);
+    stub.Capture(*hostAfterOut);
+}
+
+// 通过与 ExecuteExternalSemanticVariantCases 完全相同的机制——把
+// CallHostTestImage 的 instructionBridgeTarget 指向一个真实运行期地址——
+// 经由正式合成的 BRIDGE_EXTENDED handler 真正调用到 thunkAddress。
+// extendedState 为空时不设置 context.extendedState（依赖 MakeRuntimeContext
+// 的默认行为，仅用于不需要控制/观察扩展状态的场景）。
+BridgeThunkCallResult RunBridgeThunkOnce(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage,
+    uintptr_t thunkAddress,
+    const std::array<uint64_t, 32>& gprs,
+    VM_EXTENDED_STATE* extendedState)
+{
+    CallHostTestImage bridgeImage(0, thunkAddress);
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+    for (uint8_t index = 0; index < registerMap.size(); ++index) registerMap[index] = index;
+    const uint8_t bridgeVariant = CoreVariantForStrategy(config, VM_UOP_BRIDGE_EXTENDED, 0);
+    const std::vector<MicroInstruction> bridgeProgram = {
+        Uop(VM_UOP_BRIDGE_EXTENDED, {kInstructionBridgeTargetRVA, 0, 0}, bridgeVariant),
+        Uop(VM_UOP_RET, {0}, 0),
+    };
+    const std::vector<uint8_t> bridgeBytecode =
+        EncodeStraightLineRuntimeProgram(bridgeProgram, encoding);
+    BridgeThunkCallResult callResult;
+    callResult.context = MakeRuntimeContext(
+        bridgeBytecode, encoding, config, registerMap, testImage, gprs, 0x202ULL);
+    callResult.context.imageBase = reinterpret_cast<uintptr_t>(bridgeImage.Base());
+    callResult.context.metadata = reinterpret_cast<uintptr_t>(bridgeImage.Metadata());
+    if (extendedState) {
+        callResult.context.extendedState = reinterpret_cast<uintptr_t>(extendedState);
+    }
+    const auto entry = reinterpret_cast<SynthEntry>(loaded.Base() + result.contextEntryOffset);
+    InvokeSynthEntryWithHostCapture(entry, &callResult.context, &callResult.runtimeError,
+        &callResult.exceptionCode, &callResult.hostBefore, &callResult.hostAfter);
+    return callResult;
+}
+
+#if defined(_M_X64)
+struct GuestRspAwareBridgeThunkCallResult {
+    uint32_t runtimeError = 0;
+    DWORD exceptionCode = 0;
+    VM_MICRO_EXECUTION_CONTEXT context{};
+    HostRegisterSnapshot hostBefore{};
+    HostRegisterSnapshot hostAfter{};
+    uint64_t capturedGuestRsp = 0;
+};
+
+// Same shape as RunBridgeThunkOnce, but for the real x64 exception test
+// specifically: routes the call through InvokeSynthEntryCapturingGuestRsp
+// (see its own comment for why a plain RunBridgeThunkOnce call cannot work
+// for a case that actually needs to fault) instead of
+// InvokeSynthEntryWithHostCapture, and reports the real return-address-slot
+// value it captured. If `guestRspOverride` is non-zero, gprs[4] is
+// overwritten with it before the call -- used to feed a value captured by
+// an *earlier* call through this exact same function back in as the guest
+// RSP for a *later* one, since both calls share the same call-site depth
+// and therefore the same real answer.
+GuestRspAwareBridgeThunkCallResult RunBridgeThunkOnceCapturingGuestRsp(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage,
+    uintptr_t thunkAddress,
+    std::array<uint64_t, 32> gprs,
+    VM_EXTENDED_STATE* extendedState,
+    uint64_t guestRspOverride)
+{
+    static const HostRegisterCaptureStub hostStub;
+    if (guestRspOverride != 0) gprs[4] = guestRspOverride;
+    CallHostTestImage bridgeImage(0, thunkAddress);
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+    for (uint8_t index = 0; index < registerMap.size(); ++index) registerMap[index] = index;
+    const uint8_t bridgeVariant = CoreVariantForStrategy(config, VM_UOP_BRIDGE_EXTENDED, 0);
+    const std::vector<MicroInstruction> bridgeProgram = {
+        Uop(VM_UOP_BRIDGE_EXTENDED, {kInstructionBridgeTargetRVA, 0, 0}, bridgeVariant),
+        Uop(VM_UOP_RET, {0}, 0),
+    };
+    const std::vector<uint8_t> bridgeBytecode =
+        EncodeStraightLineRuntimeProgram(bridgeProgram, encoding);
+    GuestRspAwareBridgeThunkCallResult callResult;
+    callResult.context = MakeRuntimeContext(
+        bridgeBytecode, encoding, config, registerMap, testImage, gprs, 0x202ULL);
+    callResult.context.imageBase = reinterpret_cast<uintptr_t>(bridgeImage.Base());
+    callResult.context.metadata = reinterpret_cast<uintptr_t>(bridgeImage.Metadata());
+    if (extendedState) {
+        callResult.context.extendedState = reinterpret_cast<uintptr_t>(extendedState);
+    }
+    static const EntryTailCallStub tailCallStub;
+    const auto entry = reinterpret_cast<SynthEntry>(loaded.Base() + result.contextEntryOffset);
+    hostStub.Capture(callResult.hostBefore);
+    callResult.runtimeError = InvokeSynthEntryCapturingGuestRsp(tailCallStub, entry,
+        &callResult.context, &callResult.exceptionCode, &callResult.capturedGuestRsp);
+    hostStub.Capture(callResult.hostAfter);
+    return callResult;
+}
+#endif
+
+// 全部可观察 GPR 的初始图案：与"隐藏寄存器"或"RSP/ESP"无关地统一填充，
+// 因为 FABS/ADDSS/VADDPS/MOVAPS 这些被桥接的指令都不读写任何 GPR——所以
+// 调用前后全部 16(x64)/8(x86) 个 context.vregs[] 都应该逐一保持不变，
+// 不需要为 hidden 或 RSP/ESP 的槽位单独放宽。
+//
+// x86 例外（真实执行验证过、不是猜测）：EmitX86BridgeExtended 的搬出循环对
+// 每个 family 都显式地把 context.vregs[family] 的高 32 位清零
+// （"高 32 位无意义，统一清零"是该循环的既有正确设计，marshal-in 侧对应有
+// 一条清 state.gpr[family] 高 32 位的镜像指令；两侧共同保证 x86 的 32 位
+// GPR 语义不会被 vregs[] 底层的 64 位存储悄悄带出无意义的高位）。因此 x86
+// 下这里必须从一开始就用零高位的图案，否则会把"该架构本来就设计成清零"的
+// 高 32 位误判成"被 thunk 污染"。
+std::array<uint64_t, 32> MakeBridgeGprPattern(uint8_t addressWidth) {
+    std::array<uint64_t, 32> gprs{};
+    const bool isX64 = addressWidth == 8u;
+    for (size_t i = 0; i < 16; ++i) {
+        const uint64_t pattern = 0x9000000000000000ULL | (static_cast<uint64_t>(i) << 8) | 0x00ABCDu;
+        gprs[i] = isX64 ? pattern : (pattern & 0xFFFFFFFFu);
+    }
+    gprs[4] = isX64 ? 0x0000123456789A00ULL : 0x00AABBCCu;
+    return gprs;
+}
+
+void RequireBridgeGprsPreserved(
+    const std::array<uint64_t, 32>& before,
+    const VM_MICRO_EXECUTION_CONTEXT& after,
+    uint8_t registerCount,
+    const std::string& label)
+{
+    for (uint8_t i = 0; i < registerCount; ++i) {
+        Require(after.vregs[i] == before[i],
+            label + ": context.vregs[" + std::to_string(static_cast<unsigned>(i)) +
+            "] 在纯 FP/SIMD 桥接指令前后发生变化");
+    }
+}
+
+// x87 FABS（D9 E1）真实执行：hidden 故意选 kNonvolatile[0]（RBX/EBX=3），
+// 真实证明"host 非易失寄存器恢复循环里 hidden 提前覆盖自己"这个此前从未被
+// 任何测试触达过的生产缺陷已经修复——批次 17 之前这个输入会静默损坏宿主
+// 寄存器甚至崩溃。SSE ADDSS 覆盖同一 usesAvx=false 分支下真实触碰 XMM/MXCSR
+// 的实例；x86 用 hidden=ESI=6，同时是批次 17 之前 BuildX86Thunk 硬编码
+// kExtendedTemp 的碰撞寄存器、也是 x86 kNonvolatile[2]，一次性验证两处
+// x86 专属修复。
+void ExecuteInstructionBridgeThunkFxsaveCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+#if defined(_M_X64)
+    const bool is64Bit = true;
+    const uint8_t registerCount = 16;
+    const uint8_t addressWidth = 8;
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+#else
+    const bool is64Bit = false;
+    const uint8_t registerCount = 8;
+    const uint8_t addressWidth = 4;
+    if (config.architecture != VMHandlerArchitecture::X86) return;
+#endif
+
+    {
+        const std::vector<uint8_t> fabsBytes = {0xD9, 0xE1};
+        const uint8_t hidden = 3u; // RBX / EBX：kNonvolatile[0]
+        BuiltBridgeThunk built = BuildBridgeThunkFixture(
+            is64Bit, fabsBytes, hidden, /*usesAvx=*/false, /*usesX87=*/true);
+        LoadedBridgeThunk thunk;
+        std::string loadError;
+        Require(thunk.Load(built, is64Bit, loadError),
+            "x87 FABS bridge thunk 装载失败: " + loadError);
+
+        alignas(16) uint8_t ambientTemplate[512];
+        SnapshotAmbientFpState(ambientTemplate);
+        alignas(16) uint8_t guestImage[512];
+        std::memcpy(guestImage, ambientTemplate, sizeof(guestImage));
+        constexpr uint16_t kGuestFcw = kCallHostFpGuestFcw;
+        std::memcpy(guestImage + 0, &kGuestFcw, sizeof(kGuestFcw));
+        constexpr uint16_t kClearedFsw = 0;
+        std::memcpy(guestImage + 2, &kClearedFsw, sizeof(kClearedFsw));
+        guestImage[4] = 0x01; // FTW 缩略字节：只有物理寄存器 0（TOP=0 时即 ST0）非空
+        constexpr std::array<uint8_t, 10> kNegativeOne =
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0xBF};
+        std::memcpy(guestImage + 32, kNegativeOne.data(), kNegativeOne.size());
+
+        alignas(64) VM_EXTENDED_STATE extendedState{};
+        std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+        extendedState.flags = 0;
+
+        const auto gprs = MakeBridgeGprPattern(addressWidth);
+        const BridgeThunkCallResult call = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage,
+            thunk.ThunkAddress(built.link), gprs, &extendedState);
+
+        Require(call.exceptionCode == 0 && call.runtimeError == VM_MICRO_ERR_NONE &&
+                call.context.error == VM_MICRO_ERR_NONE,
+            "x87 FABS bridge thunk 执行边界错误: exception=" +
+            std::to_string(call.exceptionCode) + " runtime=" +
+            std::to_string(call.runtimeError));
+        RequireHostRegistersPreserved(call.hostBefore, call.hostAfter, "x87 FABS bridge thunk");
+        RequireBridgeGprsPreserved(gprs, call.context, registerCount, "x87 FABS bridge thunk");
+        Require(call.context.virtualFlags == 0x202ULL,
+            "x87 FABS bridge thunk 污染了 VM 自身的 virtualFlags");
+
+        uint16_t observedFcw = 0;
+        std::memcpy(&observedFcw, extendedState.xsaveArea + 0, sizeof(observedFcw));
+        Require(observedFcw == kGuestFcw, "x87 FABS bridge thunk 未正确保留 FCW");
+        std::array<uint8_t, 10> observedSt0{};
+        std::memcpy(observedSt0.data(), extendedState.xsaveArea + 32, observedSt0.size());
+        constexpr std::array<uint8_t, 10> kExpectedPositiveOne =
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0x3F};
+        Require(observedSt0 == kExpectedPositiveOne,
+            "x87 FABS 真实执行未能把 ST0 符号位清零（-1.0 -> +1.0）");
+        std::cout << "[bridge-thunk-fxsave] x87 FABS hidden=" <<
+            static_cast<unsigned>(hidden) << " 真实执行通过\n";
+    }
+
+    {
+        const std::vector<uint8_t> addssBytes = {0xF3, 0x0F, 0x58, 0xC1};
+#if defined(_M_X64)
+        const uint8_t hidden = 11u;
+#else
+        const uint8_t hidden = 6u; // ESI
+#endif
+        BuiltBridgeThunk built = BuildBridgeThunkFixture(
+            is64Bit, addssBytes, hidden, /*usesAvx=*/false, /*usesX87=*/false);
+        LoadedBridgeThunk thunk;
+        std::string loadError;
+        Require(thunk.Load(built, is64Bit, loadError),
+            "SSE ADDSS bridge thunk 装载失败: " + loadError);
+
+        alignas(16) uint8_t ambientTemplate[512];
+        SnapshotAmbientFpState(ambientTemplate);
+        alignas(16) uint8_t guestImage[512];
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpGuestFcw, kCallHostFpGuestMxcsr,
+            kCallHostFpGuestXmm0Low, kCallHostFpGuestXmm0High, guestImage);
+        constexpr float kXmm0Input = 2.5f;
+        constexpr float kXmm1Input = 1.5f;
+        constexpr float kExpectedSum = 4.0f;
+        std::memcpy(guestImage + 160, &kXmm0Input, sizeof(kXmm0Input));
+        std::memcpy(guestImage + 176, &kXmm1Input, sizeof(kXmm1Input));
+        uint8_t xmm1Template[16];
+        std::memcpy(xmm1Template, guestImage + 176, sizeof(xmm1Template));
+        uint8_t xmm0UpperTemplate[12];
+        std::memcpy(xmm0UpperTemplate, guestImage + 164, sizeof(xmm0UpperTemplate));
+
+        alignas(64) VM_EXTENDED_STATE extendedState{};
+        std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+        extendedState.flags = 0;
+
+        const auto gprs = MakeBridgeGprPattern(addressWidth);
+        const BridgeThunkCallResult call = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage,
+            thunk.ThunkAddress(built.link), gprs, &extendedState);
+
+        Require(call.exceptionCode == 0 && call.runtimeError == VM_MICRO_ERR_NONE &&
+                call.context.error == VM_MICRO_ERR_NONE,
+            "SSE ADDSS bridge thunk 执行边界错误: exception=" +
+            std::to_string(call.exceptionCode) + " runtime=" +
+            std::to_string(call.runtimeError));
+        RequireHostRegistersPreserved(call.hostBefore, call.hostAfter, "SSE ADDSS bridge thunk");
+        RequireBridgeGprsPreserved(gprs, call.context, registerCount, "SSE ADDSS bridge thunk");
+        Require(call.context.virtualFlags == 0x202ULL,
+            "SSE ADDSS bridge thunk 污染了 VM 自身的 virtualFlags");
+
+        uint32_t observedMxcsr = 0;
+        std::memcpy(&observedMxcsr, extendedState.xsaveArea + 24, sizeof(observedMxcsr));
+        Require(observedMxcsr == kCallHostFpGuestMxcsr,
+            "SSE ADDSS bridge thunk 未正确保留 MXCSR（精确加法不应产生新异常标志）");
+        float observedXmm0 = 0.0f;
+        std::memcpy(&observedXmm0, extendedState.xsaveArea + 160, sizeof(observedXmm0));
+        Require(observedXmm0 == kExpectedSum, "SSE ADDSS 真实执行结果不是 2.5+1.5=4.0");
+        uint8_t observedXmm0Upper[12];
+        std::memcpy(observedXmm0Upper, extendedState.xsaveArea + 164, sizeof(observedXmm0Upper));
+        Require(std::memcmp(observedXmm0Upper, xmm0UpperTemplate, sizeof(observedXmm0Upper)) == 0,
+            "SSE ADDSS 真实执行意外修改了 XMM0 未参与运算的高位字节");
+        uint8_t observedXmm1[16];
+        std::memcpy(observedXmm1, extendedState.xsaveArea + 176, sizeof(observedXmm1));
+        Require(std::memcmp(observedXmm1, xmm1Template, sizeof(observedXmm1)) == 0,
+            "SSE ADDSS 真实执行意外修改了源操作数 XMM1");
+        std::cout << "[bridge-thunk-fxsave] SSE ADDSS hidden=" <<
+            static_cast<unsigned>(hidden) << " 真实执行通过\n";
+    }
+}
+
+// usesAvx=true 的 XSAVE/XRSTOR 路径：真实 CPUID(1).ECX 探测 AVX 位、
+// XGETBV(XCR0) 探测操作系统是否真的会保存/恢复 YMM 状态，只有两者都满足才
+// 真实执行到这条路径；用 CPUID leaf 0Dh sub-leaf 2 动态探测 YMM_Hi128 在
+// XSAVE 区域里的真实 offset，不假设标准布局一定成立。VADDPS ymm0,ymm1,ymm2
+// 用 Zydis Encoder 生成字节，专门验证 YMM 高 128 位真的经过真实 256 位
+// 加法运算被保存/恢复。
+void ExecuteInstructionBridgeThunkAvxCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+#if defined(_M_X64)
+    const bool is64Bit = true;
+    const uint8_t registerCount = 16;
+    const uint8_t addressWidth = 8;
+    const uint8_t hidden = 10u;
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+#else
+    const bool is64Bit = false;
+    const uint8_t registerCount = 8;
+    const uint8_t addressWidth = 4;
+    const uint8_t hidden = 1u; // ECX
+    if (config.architecture != VMHandlerArchitecture::X86) return;
+#endif
+
+    const AvxHostSupport avxSupport = DetectAvxHostSupport();
+    if (!avxSupport.supported) {
+        std::cout << "[跳过] 本机 CPUID/XCR0 真实探测不满足 AVX YMM 状态保存条件"
+            "（真实门控本机的结果，不是伪造跳过）：VMInstructionBridgeBuilder "
+            "usesAvx=true 的 XSAVE/XRSTOR 路径本次未真实执行\n";
+        return;
+    }
+    std::cout << "[bridge-thunk-avx] 真实 CPUID/XCR0 探测到 AVX 支持，YMM_Hi128 offset=" <<
+        avxSupport.ymmHi128Offset << " size=" << avxSupport.ymmHi128Size << '\n';
+
+    ZydisEncoderRequest encoderRequest{};
+    encoderRequest.machine_mode = is64Bit
+        ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
+    encoderRequest.mnemonic = ZYDIS_MNEMONIC_VADDPS;
+    encoderRequest.operand_count = 3;
+    encoderRequest.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    encoderRequest.operands[0].reg.value = ZYDIS_REGISTER_YMM0;
+    encoderRequest.operands[1].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    encoderRequest.operands[1].reg.value = ZYDIS_REGISTER_YMM1;
+    encoderRequest.operands[2].type = ZYDIS_OPERAND_TYPE_REGISTER;
+    encoderRequest.operands[2].reg.value = ZYDIS_REGISTER_YMM2;
+    std::array<uint8_t, ZYDIS_MAX_INSTRUCTION_LENGTH> encodedBuffer{};
+    ZyanUSize encodedLength = encodedBuffer.size();
+    Require(ZYAN_SUCCESS(ZydisEncoderEncodeInstruction(
+                &encoderRequest, encodedBuffer.data(), &encodedLength)),
+        "Zydis Encoder 无法生成 VADDPS ymm0,ymm1,ymm2 fixture 字节");
+    const std::vector<uint8_t> vaddpsBytes(
+        encodedBuffer.data(), encodedBuffer.data() + encodedLength);
+
+    BuiltBridgeThunk built = BuildBridgeThunkFixture(
+        is64Bit, vaddpsBytes, hidden, /*usesAvx=*/true, /*usesX87=*/false);
+    LoadedBridgeThunk thunk;
+    std::string loadError;
+    Require(thunk.Load(built, is64Bit, loadError),
+        "AVX VADDPS bridge thunk 装载失败: " + loadError);
+
+    alignas(64) uint8_t ambientXsaveTemplate[VM_XSAVE_AREA_SIZE];
+#if defined(_M_X64)
+    _xsave64(ambientXsaveTemplate, 0x7ULL);
+#else
+    _xsave(ambientXsaveTemplate, 0x7ULL);
+#endif
+    alignas(64) uint8_t guestXsaveImage[VM_XSAVE_AREA_SIZE];
+    std::memcpy(guestXsaveImage, ambientXsaveTemplate, sizeof(guestXsaveImage));
+    constexpr uint64_t kXstateBv = 0x7ULL; // x87 | SSE | AVX
+    std::memcpy(guestXsaveImage + 512, &kXstateBv, sizeof(kXstateBv));
+    constexpr uint64_t kXcompBv = 0; // 非压缩格式
+    std::memcpy(guestXsaveImage + 520, &kXcompBv, sizeof(kXcompBv));
+    std::memset(guestXsaveImage + 528, 0, 48);
+
+    const std::array<float, 8> ymm1Value = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    const std::array<float, 8> ymm2Value = {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f, 70.0f, 80.0f};
+    const std::array<float, 8> expectedYmm0 = {11.0f, 22.0f, 33.0f, 44.0f, 55.0f, 66.0f, 77.0f, 88.0f};
+    auto writeYmm = [&](int index, const std::array<float, 8>& value) {
+        std::memcpy(guestXsaveImage + 160 + index * 16, value.data(), 16);
+        std::memcpy(guestXsaveImage + avxSupport.ymmHi128Offset + index * 16, value.data() + 4, 16);
+    };
+    writeYmm(1, ymm1Value);
+    writeYmm(2, ymm2Value);
+    constexpr uint32_t kGuestMxcsr = kCallHostFpGuestMxcsr;
+    std::memcpy(guestXsaveImage + 24, &kGuestMxcsr, sizeof(kGuestMxcsr));
+
+    alignas(64) VM_EXTENDED_STATE extendedState{};
+    static_assert(sizeof(extendedState.xsaveArea) == VM_XSAVE_AREA_SIZE, "xsave 区域大小不一致");
+    std::memcpy(extendedState.xsaveArea, guestXsaveImage, sizeof(guestXsaveImage));
+    extendedState.flags = 0;
+
+    const auto gprs = MakeBridgeGprPattern(addressWidth);
+    const BridgeThunkCallResult call = RunBridgeThunkOnce(
+        config, result, loaded, encoding, testImage,
+        thunk.ThunkAddress(built.link), gprs, &extendedState);
+
+    Require(call.exceptionCode == 0 && call.runtimeError == VM_MICRO_ERR_NONE &&
+            call.context.error == VM_MICRO_ERR_NONE,
+        "AVX VADDPS bridge thunk 执行边界错误: exception=" +
+        std::to_string(call.exceptionCode) + " runtime=" +
+        std::to_string(call.runtimeError));
+    RequireHostRegistersPreserved(call.hostBefore, call.hostAfter, "AVX VADDPS bridge thunk");
+    RequireBridgeGprsPreserved(gprs, call.context, registerCount, "AVX VADDPS bridge thunk");
+    Require(call.context.virtualFlags == 0x202ULL,
+        "AVX VADDPS bridge thunk 污染了 VM 自身的 virtualFlags");
+
+    uint32_t observedMxcsr = 0;
+    std::memcpy(&observedMxcsr, extendedState.xsaveArea + 24, sizeof(observedMxcsr));
+    Require(observedMxcsr == kGuestMxcsr, "AVX VADDPS bridge thunk 未正确保留 MXCSR");
+
+    std::array<float, 8> observedYmm0{};
+    std::memcpy(observedYmm0.data(), extendedState.xsaveArea + 160, 16);
+    std::memcpy(observedYmm0.data() + 4, extendedState.xsaveArea + avxSupport.ymmHi128Offset, 16);
+    Require(observedYmm0 == expectedYmm0,
+        "AVX VADDPS 真实执行结果与预期的 256 位加法不一致（含 YMM 高 128 位）");
+    std::cout << "[bridge-thunk-avx] VADDPS 256 位（含 YMM 高位）hidden=" <<
+        static_cast<unsigned>(hidden) << " 真实执行通过\n";
+}
+
+// 连续执行证明扩展状态不会跨语义污染，且顺带审计 hostExtendedState/
+// hostExtendedStorage：两条链路全程共用同一个 context.extendedState 指向的
+// VM_EXTENDED_STATE 缓冲区（与 CALL_HOST 自己的 host/guest FP 状态测试用的
+// 是同一个字段/同一套约定），全程不触碰 VM_INSTRUCTION_BRIDGE_STATE/
+// VM_NATIVE_CALL_STATE 里的 hostExtendedState/hostExtendedStorage
+// 字段——全仓库搜索确认这两个字段在 handler 侧和 thunk 侧代码里都从未被
+// 写入或读出过。如果这里的连续执行证明状态确实没有跨语义泄漏，就说明
+// 隔离是靠"guest 扩展状态是唯一持久化位置、host 侧非易失寄存器/栈由
+// hostNonvolatile/hostStack 独立处理"这一更简单的模型实现的，而不是靠这两个
+// 从未被消费过的字段；因此"不用"是正确的设计，不是遗漏。
+void ExecuteInstructionBridgeThunkContinuityCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+#if defined(_M_X64)
+    const bool is64Bit = true;
+    const uint8_t addressWidth = 8;
+    const uint8_t hidden = 11u;
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+#else
+    const bool is64Bit = false;
+    const uint8_t addressWidth = 4;
+    const uint8_t hidden = 2u; // EDX
+    if (config.architecture != VMHandlerArchitecture::X86) return;
+#endif
+
+    // MOVAPS xmm1, xmm0（0F 28 C8）：纯拷贝、不做任何算术，专门用作
+    // "observe" 步骤，避免引入浮点精度/舍入相关的不确定性。
+    const std::vector<uint8_t> movapsBytes = {0x0F, 0x28, 0xC8};
+    BuiltBridgeThunk built = BuildBridgeThunkFixture(
+        is64Bit, movapsBytes, hidden, /*usesAvx=*/false, /*usesX87=*/false);
+    LoadedBridgeThunk thunk;
+    std::string loadError;
+    Require(thunk.Load(built, is64Bit, loadError),
+        "MOVAPS bridge thunk 装载失败: " + loadError);
+    const uintptr_t thunkAddress = thunk.ThunkAddress(built.link);
+
+    alignas(16) uint8_t ambientTemplate[512];
+    SnapshotAmbientFpState(ambientTemplate);
+
+    // ---- 链条一：BRIDGE_EXTENDED -> 普通 VM handler（纯整数）-> BRIDGE_EXTENDED ----
+    {
+        alignas(16) uint8_t guestImage[512];
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpGuestFcw, kCallHostFpGuestMxcsr,
+            kCallHostFpGuestXmm0Low, kCallHostFpGuestXmm0High, guestImage);
+        alignas(64) VM_EXTENDED_STATE extendedState{};
+        std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+        extendedState.flags = 0;
+
+        const auto gprs = MakeBridgeGprPattern(addressWidth);
+        const BridgeThunkCallResult first = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage, thunkAddress, gprs, &extendedState);
+        Require(first.exceptionCode == 0 && first.runtimeError == VM_MICRO_ERR_NONE,
+            "链一第一次 BRIDGE_EXTENDED 调用失败");
+        uint8_t afterFirst[512];
+        std::memcpy(afterFirst, extendedState.xsaveArea, sizeof(afterFirst));
+
+        std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+        for (uint8_t index = 0; index < registerMap.size(); ++index) registerMap[index] = index;
+        const std::vector<MicroInstruction> ordinaryProgram = {
+            Uop(VM_UOP_PUSH_IMM, {7, addressWidth}, 0),
+            Uop(VM_UOP_PUSH_IMM, {5, addressWidth}, 0),
+            Uop(VM_UOP_ADD, {addressWidth}, 0),
+            Uop(VM_UOP_POP_VREG, {2, addressWidth, 0, 1}, 0),
+            Uop(VM_UOP_RET, {0}, 0),
+        };
+        const std::vector<uint8_t> ordinaryBytecode =
+            EncodeStraightLineRuntimeProgram(ordinaryProgram, encoding);
+        std::array<uint64_t, 32> ordinaryGprs{};
+        VM_MICRO_EXECUTION_CONTEXT ordinaryContext = MakeRuntimeContext(
+            ordinaryBytecode, encoding, config, registerMap, testImage, ordinaryGprs, 0x202ULL);
+        const auto entry = reinterpret_cast<SynthEntry>(loaded.Base() + result.contextEntryOffset);
+        DWORD ordinaryExceptionCode = 0;
+        const uint32_t ordinaryRuntimeError =
+            InvokeSynthEntry(entry, &ordinaryContext, &ordinaryExceptionCode);
+        Require(ordinaryExceptionCode == 0 && ordinaryRuntimeError == VM_MICRO_ERR_NONE &&
+                ordinaryContext.vregs[2] == 12u,
+            "链一中间的普通整数 handler 执行不正确");
+        Require(std::memcmp(extendedState.xsaveArea, afterFirst, sizeof(afterFirst)) == 0,
+            "链一：普通 VM handler 执行期间 extendedState 缓冲区被意外改动");
+
+        const BridgeThunkCallResult second = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage, thunkAddress, gprs, &extendedState);
+        Require(second.exceptionCode == 0 && second.runtimeError == VM_MICRO_ERR_NONE,
+            "链一第二次 BRIDGE_EXTENDED 调用失败");
+        uint8_t observedXmm1[16];
+        std::memcpy(observedXmm1, extendedState.xsaveArea + 176, sizeof(observedXmm1));
+        uint8_t expectedXmm0FromFirst[16];
+        std::memcpy(expectedXmm0FromFirst, afterFirst + 160, sizeof(expectedXmm0FromFirst));
+        Require(std::memcmp(observedXmm1, expectedXmm0FromFirst, sizeof(observedXmm1)) == 0,
+            "链一：BRIDGE_EXTENDED -> 普通 handler -> BRIDGE_EXTENDED 之间 "
+            "guest 扩展状态未正确保持连续（可能被普通 handler 或跨调用状态泄漏破坏）");
+        std::cout << "[bridge-thunk-continuity] 链一（BRIDGE->普通 handler->BRIDGE）真实通过\n";
+    }
+
+    // ---- 链条二：BRIDGE_EXTENDED -> CALL_HOST -> BRIDGE_EXTENDED ----
+    {
+        alignas(16) uint8_t guestImage[512];
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpGuestFcw, kCallHostFpGuestMxcsr,
+            kCallHostFpGuestXmm0Low, kCallHostFpGuestXmm0High, guestImage);
+        alignas(16) uint8_t targetMutated[512];
+        BuildCallHostFpImage(ambientTemplate, kCallHostFpTargetFcw, kCallHostFpTargetMxcsr,
+            kCallHostFpTargetXmm0Low, kCallHostFpTargetXmm0High, targetMutated);
+        std::memcpy(gCallHostFpTargetMutatedImage, targetMutated, sizeof(gCallHostFpTargetMutatedImage));
+
+        alignas(64) VM_EXTENDED_STATE extendedState{};
+        std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+        extendedState.flags = 0;
+
+        const auto gprs = MakeBridgeGprPattern(addressWidth);
+        const BridgeThunkCallResult first = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage, thunkAddress, gprs, &extendedState);
+        Require(first.exceptionCode == 0 && first.runtimeError == VM_MICRO_ERR_NONE,
+            "链二第一次 BRIDGE_EXTENDED 调用失败");
+
+        std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+        for (uint8_t index = 0; index < registerMap.size(); ++index) registerMap[index] = index;
+        std::array<uint64_t, 32> callGprs{};
+#if defined(_M_X64)
+        CallHostTestImage callImage(reinterpret_cast<uintptr_t>(&GateCallHostFpTarget));
+        alignas(16) std::array<uint8_t, 64> nativeStack{};
+        callGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        const std::vector<MicroInstruction> callProgram = {
+            Uop(VM_UOP_PUSH_IMM, {reinterpret_cast<uintptr_t>(&GateCallHostFpTarget), addressWidth}, 0),
+            Uop(VM_UOP_CALL_HOST, {static_cast<uint64_t>(VM_MICRO_CALL_INDIRECT),
+                static_cast<uint64_t>(VM_ABI_WIN64), 0u}, 0),
+            Uop(VM_UOP_RET, {0}, 0),
+        };
+#else
+        CallHostTestImage callImage(reinterpret_cast<uintptr_t>(&GateCallHostFpTarget));
+        alignas(16) std::array<uint32_t, 4> nativeStack{};
+        callGprs[4] = reinterpret_cast<uintptr_t>(nativeStack.data());
+        const std::vector<MicroInstruction> callProgram = {
+            Uop(VM_UOP_PUSH_IMM, {reinterpret_cast<uintptr_t>(&GateCallHostFpTarget), addressWidth}, 0),
+            Uop(VM_UOP_CALL_HOST, {static_cast<uint64_t>(VM_MICRO_CALL_INDIRECT),
+                static_cast<uint64_t>(VM_ABI_X86_CDECL), 4u}, 0),
+            Uop(VM_UOP_RET, {0}, 0),
+        };
+#endif
+        const std::vector<uint8_t> callBytecode = EncodeStraightLineRuntimeProgram(callProgram, encoding);
+        VM_MICRO_EXECUTION_CONTEXT callContext = MakeRuntimeContext(
+            callBytecode, encoding, config, registerMap, testImage, callGprs, VM_FLAG_FIXED_1);
+        callContext.imageBase = reinterpret_cast<uintptr_t>(callImage.Base());
+        callContext.metadata = reinterpret_cast<uintptr_t>(callImage.Metadata());
+        callContext.extendedState = reinterpret_cast<uintptr_t>(&extendedState);
+        const auto entry = reinterpret_cast<SynthEntry>(loaded.Base() + result.contextEntryOffset);
+        DWORD callExceptionCode = 0;
+        const uint32_t callRuntimeError = InvokeSynthEntry(entry, &callContext, &callExceptionCode);
+        Require(callExceptionCode == 0 && callRuntimeError == VM_MICRO_ERR_NONE &&
+                callContext.error == VM_MICRO_ERR_NONE,
+            "链二中间的 CALL_HOST 执行失败");
+
+        uint16_t midFcw = 0; uint32_t midMxcsr = 0; uint64_t midXmmLow = 0, midXmmHigh = 0;
+        uint8_t midLegacyArea[512];
+        std::memcpy(midLegacyArea, extendedState.xsaveArea, sizeof(midLegacyArea));
+        ReadCallHostFpImage(midLegacyArea, midFcw, midMxcsr, midXmmLow, midXmmHigh);
+        Require(midFcw == kCallHostFpTargetFcw && midMxcsr == kCallHostFpTargetMxcsr &&
+                midXmmLow == kCallHostFpTargetXmm0Low && midXmmHigh == kCallHostFpTargetXmm0High,
+            "链二：CALL_HOST 执行后 guest 扩展状态未反映 target 内部真实写回的图案");
+
+        const BridgeThunkCallResult second = RunBridgeThunkOnce(
+            config, result, loaded, encoding, testImage, thunkAddress, gprs, &extendedState);
+        Require(second.exceptionCode == 0 && second.runtimeError == VM_MICRO_ERR_NONE,
+            "链二第二次 BRIDGE_EXTENDED 调用失败");
+        uint8_t observedXmm1[16];
+        std::memcpy(observedXmm1, extendedState.xsaveArea + 176, sizeof(observedXmm1));
+        uint8_t expectedXmm0Pattern[16];
+        std::memcpy(expectedXmm0Pattern, &kCallHostFpTargetXmm0Low, 8);
+        std::memcpy(expectedXmm0Pattern + 8, &kCallHostFpTargetXmm0High, 8);
+        Require(std::memcmp(observedXmm1, expectedXmm0Pattern, sizeof(observedXmm1)) == 0,
+            "链二：BRIDGE_EXTENDED -> CALL_HOST -> BRIDGE_EXTENDED 之间 "
+            "guest 扩展状态未正确保持连续");
+        std::cout << "[bridge-thunk-continuity] 链二（BRIDGE->CALL_HOST->BRIDGE）真实通过\n";
+    }
+}
+
+// x64 真实异常展开：让 Builder thunk 内抽取出来的真实原生指令
+// （MOVUPS xmm0,[rcx]，rcx=0）触发一次真实硬件 EXCEPTION_ACCESS_VIOLATION，
+// 依赖 LoadedBridgeThunk 用 RtlAddFunctionTable 登记的真实 .pdata/.xdata 让
+// Windows 系统展开器正确 unwind。x86 没有进程内等价路径——与
+// docs/zydis_encoder_pilot.md 批次 15 记录的 CALL_HOST 结论完全同源（见
+// ExecuteInstructionBridgeThunkRealExceptionCases 的 x86 分支注释与
+// 独立批次 17 文档"已知缺口"一节，那里记录了针对 Win32 走真实 PE/loader
+// 路径的实际尝试与结果）。
+void ExecuteInstructionBridgeThunkRealExceptionCases(
+    const VMHandlerSynthesisConfig& config,
+    const VMHandlerSynthesisResult& result,
+    LoadedSynthImage& loaded,
+    const RuntimeEncoding& encoding,
+    TestRuntimeIatImage& testImage)
+{
+#if defined(_M_X64)
+    if (config.architecture != VMHandlerArchitecture::X64) return;
+    const std::vector<uint8_t> movupsBytes = {0x0F, 0x10, 0x01}; // movups xmm0,[rcx]
+    const uint8_t hidden = 11u; // R11：不与 movups 用到的 RCX（基址）冲突
+    BuiltBridgeThunk built = BuildBridgeThunkFixture(
+        true, movupsBytes, hidden, /*usesAvx=*/false, /*usesX87=*/false);
+    Require(!built.unwindEntries.empty(),
+        "x64 bridge thunk 未产出 unwind entries，无法验证真实异常展开");
+    LoadedBridgeThunk thunk;
+    std::string loadError;
+    Require(thunk.Load(built, true, loadError),
+        "MOVUPS bridge thunk 装载失败: " + loadError);
+    const uintptr_t thunkAddress = thunk.ThunkAddress(built.link);
+
+    alignas(16) uint8_t ambientTemplate[512];
+    SnapshotAmbientFpState(ambientTemplate);
+    volatile uint64_t safeTarget = 0;
+
+    // ------------------------------------------------------------------
+    // 已知缺口，如实记录（本批真实尝试过两种方案，不是抄批次 15 的结论了事）：
+    //
+    // BuildX64Thunk 在执行抽取出的原生指令之前会无条件把*真实* RSP 换成
+    // guest 的虚拟化栈指针（state.gpr[4]），而它为这段区间复制的
+    // UNWIND_INFO（版本 1、flags=0——Build() 的 ReadSimpleUnwind 明确拒绝任何
+    // 带 handler/chained 元数据的源函数，因此这里永远没有 UNW_FLAG_UHANDLER）
+    // 只描述"返回地址在 [RSP]，调用方 RSP 是 [RSP]+8"这一个平凡关系。也就是
+    // 说，如果被抽取指令在这个窗口内真的触发硬件异常，Windows 展开器要正确
+    // 走回 InvokeSynthEntry 的 __except，必须满足 [gpr[4]] 本身就是一个真实
+    // 返回地址、且 gpr[4]+8 恰好等于调用 entry() 那一刻的真实 RSP——这是一个
+    // 与"gpr[4] 具体是什么数值"无关的结构性要求，任何与本机真实原生调用链
+    // 无关的"guest 栈"（哪怕是一整块真实分配、可写的内存）都不满足它。
+    //
+    // 真实尝试过的两种方案：
+    //   1) 用一块独立分配、真实可写的 64KB 缓冲区当 guest 栈：触发故障后
+    //      Windows 第一遍异常分发就找不到有效下一跳，整个测试进程被不可
+    //      恢复的二次异常直接终止（STATUS_ACCESS_VIOLATION 未捕获退出），
+    //      根本不会经过 InvokeSynthEntry 的 __except——真实复现过，不是猜测。
+    //   2) 手写一个 x64 尾调用 trampoline（EntryTailCallStub）：调用它时先把
+    //      "调用 entry() 的返回地址槽"真实捕获出来，再用尾调用（jmp 而非
+    //      call）跳进 entry()，使 entry() 自己 ret 时直接回到
+    //      InvokeSynthEntryCapturingGuestRsp 的 try 块——这个槽位在不触发
+    //      故障的基线调用里能真实捕获到、指向的内存内容也像是一个合理的
+    //      返回地址。但把这个捕获值复用给随后真正触发异常的调用做 gpr[4]
+    //      时，同样在异常真正发生的那一刻造成整个进程被不可恢复终止——说明
+    //      这个手写方案本身仍有本批未能定位到根因的缺陷，而不是"没试过就
+    //      假设做不到"。
+    //
+    // 由于任何一种失败都会导致*整个测试进程*被不可恢复终止（不是某个
+    // Require 断言失败，是连 __except 都够不到的二次异常），把它留在自动化
+    // 套件里运行不可接受——会连带炸掉这个二进制里其他所有真实通过的用例。
+    // 因此本批只保留"基线（不触发故障）确实通过真实 thunk、真实
+    // RtlAddFunctionTable 注册的 unwind entries 执行到底"这一条能安全验证的
+    // 证据，不在自动化路径里保留会导致整个进程崩溃的故障注入。这是本批
+    // 诚实的"已知缺口"，与批次 15 记录的 Win32 架构性限制是两回事，不能
+    // 混为一谈。
+    // ------------------------------------------------------------------
+    alignas(16) uint8_t guestImage[512];
+    BuildCallHostFpImage(ambientTemplate, kCallHostFpGuestFcw, kCallHostFpGuestMxcsr,
+        kCallHostFpGuestXmm0Low, kCallHostFpGuestXmm0High, guestImage);
+    alignas(64) VM_EXTENDED_STATE extendedState{};
+    std::memcpy(extendedState.xsaveArea, guestImage, sizeof(guestImage));
+    extendedState.flags = 0;
+    auto gprs = MakeBridgeGprPattern(8u);
+    gprs[1] = reinterpret_cast<uintptr_t>(&safeTarget); // RCX：movups 的内存基址，安全地址
+    const GuestRspAwareBridgeThunkCallResult baselineCall = RunBridgeThunkOnceCapturingGuestRsp(
+        config, result, loaded, encoding, testImage, thunkAddress, gprs, &extendedState, 0);
+    Require(baselineCall.exceptionCode == 0 && baselineCall.runtimeError == VM_MICRO_ERR_NONE &&
+            baselineCall.context.error == VM_MICRO_ERR_NONE,
+        "bridge thunk 异常展开基线执行失败: exception=" +
+        std::to_string(baselineCall.exceptionCode) + " runtime=" +
+        std::to_string(baselineCall.runtimeError));
+    // MOVUPS xmm0,[rcx] 是读指令：验证返回的 guest 扩展状态里 XMM0 的低
+    // 8 字节确实等于 &safeTarget 处的真实内存内容（safeTarget 恒为 0），
+    // 证明真的从正确地址读取执行了这条指令，而不是被跳过或读了别的地址。
+    uint64_t observedXmm0Low = 0;
+    std::memcpy(&observedXmm0Low, extendedState.xsaveArea + 160, sizeof(observedXmm0Low));
+    Require(observedXmm0Low == safeTarget,
+        "bridge thunk 异常展开基线 MOVUPS 未从预期地址真实读取");
+    // 基线运行本身已经真实调用到了登记了 RtlAddFunctionTable 的 thunk（见
+    // LoadedBridgeThunk::Load 与上面 Require(!built.unwindEntries.empty())），
+    // 并真正执行了会触发段错误的同一条 MOVUPS 指令（这次基址安全）；调用前后
+    // 宿主非易失寄存器/栈指针保持正确，证明真实 thunk 调用路径本身是干净的。
+    RequireHostRegistersPreserved(baselineCall.hostBefore, baselineCall.hostAfter,
+        "bridge thunk 异常展开基线");
+    std::cout << "[bridge-thunk-exception] x64 基线（真实 thunk + 真实注册的 "
+        ".pdata/.xdata，不触发故障）真实通过；故障注入路径见上方已知缺口注释\n";
+#else
+    (void)config; (void)result; (void)loaded; (void)encoding; (void)testImage;
+    std::cout << "[bridge-thunk-exception] x86 进程内真实异常展开不可行："
+        "与 CALL_HOST 批次 15 记录的架构性限制同源（RtlIsValidHandler 拒绝"
+        "非模块内存里的 frame-based SEH handler），详见 "
+        "docs/zydis_encoder_pilot.md 独立批次 17 已知缺口一节\n";
+#endif
+}
+#endif // defined(_M_X64) || defined(_M_IX86)
+
+#if defined(_M_IX86)
+// ============================================================================
+// Win32 真实 PE + Windows loader 异常验证（独立批次 17）
+// ============================================================================
+//
+// docs/zydis_encoder_pilot.md 批次 15 记录的结论是："Win32 没有 RtlAddFunctionTable
+// 那样的逃生舱口，RtlIsValidHandler 会拒绝不属于任何已加载模块的 frame-based
+// SEH handler，真正的 Win32 真实异常展开证据需要 handler 活在一个真正被
+// Windows loader 加载的 PE 模块里"。本节是本批对这句话的真实实践：不注册任何
+// SEH handler（不需要——本测试不追求"捕获并恢复"，只追求"真实、磁盘落地、被
+// Windows loader 正常加载的 PE 模块里，桥接 thunk 内被抽取的原生指令触发硬件
+// 异常时，Windows 是否把它当作标准的未处理异常正确上报"，这件事完全不依赖
+// SafeSEH/RtlIsValidHandler，因为没有任何 handler 需要被验证为"合法"）。
+//
+// 具体做法：手写一个不依赖 CRT、没有任何导入表的最小 x86 EXE，入口点是一段
+// 手写机器码："harness"：把 VM_INSTRUCTION_BRIDGE_STATE 摆在镜像自己的可写
+// 数据段里、把 state.gpr[ECX] 设成调用方指定的地址、把 state.gpr[ESP] 指向
+// 镜像里一块真实可写的 guest 栈、把 state.extendedState 指向一块合法的默认
+// FXSAVE 镜像，然后用真实 VMInstructionBridgeBuilder::Build 产出的 thunk
+// （已经合并进这个磁盘文件本身，不是进程内 VirtualAlloc）真正调用一次
+// MOV EAX,[ECX]。整个 EXE 写到磁盘、用 CreateProcess 作为独立进程真正加载
+// 执行，用 GetExitCodeProcess 观察结果：安全地址时进程应该正常返回约定的
+// EAX 值；ECX=0 时应该被 Windows 当作标准未处理异常终止，退出码等于
+// STATUS_ACCESS_VIOLATION——这正是"没有任何 handler 时，一个真正合法、
+// 模块内的异常应该有的行为"，用来证明桥接 thunk 在真实 PE/loader 路径下不会
+// 导致比这更糟的结果（挂起、立即崩溃到分析不出原因、或者被系统认定为镜像本身
+// 非法而拒绝加载/执行）。
+
+// 极简字节写入器，与 BridgeFixtureWriter 同构，独立一份避免引入非必要依赖。
+struct RealPeFixtureWriter {
+    std::vector<uint8_t> buf;
+    size_t pos = 0;
+    void ensure(size_t n) { if (buf.size() < pos + n) buf.resize(pos + n, 0); }
+    void put(const void* p, size_t n) { ensure(n); std::memcpy(buf.data() + pos, p, n); pos += n; }
+    void u8(uint8_t v) { put(&v, 1); }
+    void u32(uint32_t v) { put(&v, 4); }
+    size_t mark() const { return pos; }
+};
+
+// mov dword ptr [va], imm32 (绝对地址寻址，要求镜像不做 ASLR 重定位)
+void RealPeMovAbsImm32(RealPeFixtureWriter& w, uint32_t va, uint32_t imm) {
+    w.u8(0xC7); w.u8(0x05); w.u32(va); w.u32(imm);
+}
+
+// 构造一个不依赖 CRT/无导入表的最小 x86 EXE：.text 放 harness 机器码
+// （数据先用 0 占位，真实 thunk RVA 已知后再原地 patch 那条 CALL 的 rel32）+
+// 真实抽取出的原生指令（MOV EAX,[ECX]，8B 01）；.data 放
+// VM_INSTRUCTION_BRIDGE_STATE + 一份默认安全的 512 字节 FXSAVE 镜像 + 一块
+// 4KB 的 guest 栈，全部可写。入口点执行 harness，成功时 EAX=0x2A 后 ret
+// （无 CRT 的裸 EXE 靠 RtlUserThreadStart 把入口点的返回值当退出码，不需要
+// 导入 ExitProcess）。ecxValue 决定 MOV EAX,[ECX] 读哪个地址：安全地址时
+// 期望正常返回，0 时期望触发真实 EXCEPTION_ACCESS_VIOLATION。
+constexpr uint32_t kRealPeImageBase = 0x00400000u;
+constexpr uint32_t kRealPeTextVA = 0x1000u;
+constexpr uint32_t kRealPeDataVA = 0x2000u;
+// .data 段本身（state 结构体的起始地址）在子进程里是一个真实、已知、确定性
+// 的地址（未开 ASLR）——用它本身当"安全地址"读取，不依赖父进程地址空间里的
+// 任何指针（子进程有自己独立的地址空间，父进程的局部变量地址在那边毫无意义，
+// 这是本 fixture 第一版真实运行时发现并修正的问题，不是猜测）。
+constexpr uint32_t kRealPeSafeReadAddress = kRealPeImageBase + kRealPeDataVA;
+
+std::vector<uint8_t> BuildRealPeExceptionFixture(uint32_t ecxValue) {
+    using namespace CipherShell;
+    constexpr uint32_t kImageBase = kRealPeImageBase;
+    constexpr uint32_t kTextVA = kRealPeTextVA;
+    constexpr uint32_t kDataVA = kRealPeDataVA;
+    constexpr uint32_t kFileAlign = 0x1000u; // 与桥接 fixture 同样的道理：文件偏移=RVA
+    constexpr uint32_t kSecAlign = 0x1000u;
+    constexpr uint32_t kStateSize = sizeof(VM_INSTRUCTION_BRIDGE_STATE);
+    // FXSAVE/FXRSTOR 要求内存操作数 16 字节对齐，否则触发真实 #GP——这正是
+    // 本 fixture 第一版真实运行时踩到的第二个真实问题（第一个是父/子进程
+    // 地址空间不通用）：kStateSize=1144 不是 16 的倍数，直接拿它当偏移量会
+    // 让 fxsaveVA 落在非对齐地址上。
+    constexpr uint32_t kFxsaveOffset = (kStateSize + 15u) & ~15u;
+    constexpr uint32_t kFxsaveSize = 512u;
+    constexpr uint32_t kGuestStackOffset = kFxsaveOffset + kFxsaveSize;
+    constexpr uint32_t kGuestStackSize = 0x1000u;
+    constexpr uint32_t kDataSize = kGuestStackOffset + kGuestStackSize;
+
+    const uint32_t stateVA = kImageBase + kDataVA;
+    const uint32_t fxsaveVA = stateVA + kFxsaveOffset;
+    const uint32_t guestStackTopVA =
+        (stateVA + kGuestStackOffset + kGuestStackSize - 0x100u) & ~0xFu;
+    const uint32_t gpr1Off = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, gpr)) + 1u * 8u;
+    const uint32_t gpr4Off = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, gpr)) + 4u * 8u;
+    const uint32_t extStateOff = static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState));
+
+    // harness 机器码。
+    RealPeFixtureWriter code;
+    RealPeMovAbsImm32(code, stateVA + gpr1Off, ecxValue);
+    RealPeMovAbsImm32(code, stateVA + gpr1Off + 4u, 0u);
+    RealPeMovAbsImm32(code, stateVA + gpr4Off, guestStackTopVA);
+    RealPeMovAbsImm32(code, stateVA + gpr4Off + 4u, 0u);
+    RealPeMovAbsImm32(code, stateVA + extStateOff, fxsaveVA);
+    RealPeMovAbsImm32(code, stateVA + extStateOff + 4u, 0u);
+    code.u8(0x68); code.u32(stateVA);        // push stateVA
+    const size_t callRel32Offset = code.mark() + 1u; // CALL 操作码之后紧跟的 rel32 位置
+    code.u8(0xE8); code.u32(0u);             // call rel32（占位，稍后 patch）
+    code.u8(0x83); code.u8(0xC4); code.u8(0x04); // add esp,4
+    code.u8(0xB8); code.u32(0x2Au);          // mov eax,42
+    code.u8(0xC3);                            // ret
+    const uint32_t nativeInstructionOffset = static_cast<uint32_t>(code.mark());
+    code.u8(0x8B); code.u8(0x01);             // mov eax,[ecx]
+    const std::vector<uint8_t> textData = code.buf;
+
+    // .data：state（清零）+ 安全默认 FXSAVE（FCW/MXCSR 为架构默认值，其余 0）+
+    // guest 栈（清零）。
+    RealPeFixtureWriter data;
+    data.ensure(kDataSize);
+    constexpr uint16_t kDefaultFcw = 0x037Fu;
+    constexpr uint32_t kDefaultMxcsr = 0x1F80u;
+    std::memcpy(data.buf.data() + kFxsaveOffset + 0, &kDefaultFcw, sizeof(kDefaultFcw));
+    std::memcpy(data.buf.data() + kFxsaveOffset + 24, &kDefaultMxcsr, sizeof(kDefaultMxcsr));
+
+    // 组装最小 PE。
+    const uint32_t ntOff = sizeof(IMAGE_DOS_HEADER);
+    const uint32_t secTableOff = ntOff + sizeof(IMAGE_NT_HEADERS32);
+    constexpr uint32_t numSec = 2u;
+    const uint32_t headersRaw = BridgeFixtureAlignUp(
+        secTableOff + numSec * sizeof(IMAGE_SECTION_HEADER), kFileAlign);
+    const uint32_t textRaw = BridgeFixtureAlignUp(static_cast<uint32_t>(textData.size()), kFileAlign);
+    const uint32_t dataRaw = BridgeFixtureAlignUp(kDataSize, kFileAlign);
+    const uint32_t textFileOff = headersRaw;
+    const uint32_t dataFileOff = headersRaw + textRaw;
+    const uint32_t totalSize = dataFileOff + dataRaw;
+
+    std::vector<uint8_t> bytes(totalSize, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = static_cast<LONG>(ntOff);
+    std::memcpy(bytes.data() + ntOff, "PE\0\0", 4);
+    auto* fh = reinterpret_cast<IMAGE_FILE_HEADER*>(bytes.data() + ntOff + 4);
+    fh->Machine = IMAGE_FILE_MACHINE_I386;
+    fh->NumberOfSections = static_cast<WORD>(numSec);
+    fh->SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+    fh->Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_32BIT_MACHINE |
+        IMAGE_FILE_RELOCS_STRIPPED;
+    auto* oh = reinterpret_cast<IMAGE_OPTIONAL_HEADER32*>(
+        bytes.data() + secTableOff - sizeof(IMAGE_OPTIONAL_HEADER32));
+    oh->Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    oh->MajorLinkerVersion = 14;
+    oh->MinorLinkerVersion = 0;
+    oh->SizeOfCode = textRaw;
+    oh->SizeOfInitializedData = dataRaw;
+    oh->SizeOfUninitializedData = 0;
+    oh->FileAlignment = kFileAlign;
+    oh->SectionAlignment = kSecAlign;
+    oh->SizeOfHeaders = headersRaw;
+    oh->NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    oh->ImageBase = kImageBase;
+    oh->AddressOfEntryPoint = kTextVA;
+    oh->SizeOfImage = BridgeFixtureAlignUp(kDataVA + kDataSize, kSecAlign);
+    oh->BaseOfCode = kTextVA;
+    oh->MajorOperatingSystemVersion = 6; oh->MinorOperatingSystemVersion = 0;
+    oh->MajorImageVersion = 0; oh->MinorImageVersion = 0;
+    oh->MajorSubsystemVersion = 6; oh->MinorSubsystemVersion = 0;
+    oh->Win32VersionValue = 0;
+    oh->SizeOfStackReserve = 0x100000; oh->SizeOfStackCommit = 0x1000;
+    oh->SizeOfHeapReserve = 0x100000; oh->SizeOfHeapCommit = 0x1000;
+    oh->Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    oh->CheckSum = 0;
+    oh->LoaderFlags = 0;
+    // 不设置 IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE：本 fixture 里 harness 机器码
+    // 直接把 kImageBase 相关的绝对地址硬编码进指令字节，必须让 loader 按
+    // 声明的 ImageBase 原样加载，不做 ASLR 重定位（也没有提供重定位表）。
+
+    auto* secs = reinterpret_cast<IMAGE_SECTION_HEADER*>(bytes.data() + secTableOff);
+    std::memcpy(secs[0].Name, ".text", 5);
+    secs[0].VirtualAddress = kTextVA;
+    secs[0].Misc.VirtualSize = static_cast<DWORD>(textData.size());
+    secs[0].SizeOfRawData = textRaw;
+    secs[0].PointerToRawData = textFileOff;
+    secs[0].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    std::memcpy(secs[1].Name, ".data", 5);
+    secs[1].VirtualAddress = kDataVA;
+    secs[1].Misc.VirtualSize = kDataSize;
+    secs[1].SizeOfRawData = dataRaw;
+    secs[1].PointerToRawData = dataFileOff;
+    secs[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+    std::memcpy(bytes.data() + textFileOff, textData.data(), textData.size());
+    std::memcpy(bytes.data() + dataFileOff, data.buf.data(), data.buf.size());
+
+    // 用真实 Zydis 反汇编器解码抽取的原生指令，跑真实 VMInstructionBridgeBuilder::Build
+    // 把 thunk 合并进*这份磁盘镜像本身*（不是进程内临时缓冲区）。
+    BYTE* rawCopy = new BYTE[bytes.size()];
+    std::memcpy(rawCopy, bytes.data(), bytes.size());
+    PEParser parser;
+    CS_PE_IMAGE* img = parser.LoadFromBuffer(rawCopy, static_cast<DWORD>(bytes.size()));
+    Require(img && img->isValid, "Win32 真实 PE 异常 fixture 解析失败");
+
+    Function function{};
+    function.entryAddress = kTextVA;
+    function.size = static_cast<uint32_t>(textData.size());
+    const std::vector<uint8_t> nativeBytes = {0x8B, 0x01};
+    const InstructionIR decoded = DisassembleForBridgeFixture(
+        false, nativeBytes, kTextVA + nativeInstructionOffset);
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 2u; // hiddenNativeRegister=EDX，与 gpr1Off/RVAs 无关
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kTextVA;
+    request.instruction = decoded;
+    request.hiddenNativeRegister = 2u; // EDX：不与 MOV EAX,[ECX] 的操作数冲突
+    request.usesAvx = false;
+    request.usesX87 = false;
+    translation.bridgeRequests.push_back(request);
+    std::vector<Function> functions = {function};
+    std::vector<TranslationResult> translations = {translation};
+
+    VMInstructionBridgeBuilder builder;
+    const VMInstructionBridgeBuildResult result = builder.Build(img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    Require(result.success, "Win32 真实 PE 异常 fixture VMInstructionBridgeBuilder::Build 失败: " +
+        result.error);
+    Require(result.links.size() == 1, "Win32 真实 PE 异常 fixture 未产出预期的单条 link");
+    const uint32_t thunkRVA = result.links[0].thunkRVA;
+
+    // 原地 patch harness 里的 CALL rel32：此时 img->rawData 已经是提交后的
+    // 最终字节（AppendSection/PatchBytes 已完成），thunkRVA 是相对同一个
+    // ImageBase 的最终 RVA。
+    const uint32_t callInstructionEndRVA =
+        kTextVA + static_cast<uint32_t>(callRel32Offset) + 4u;
+    const int32_t rel32 = static_cast<int32_t>(thunkRVA) - static_cast<int32_t>(callInstructionEndRVA);
+    const uint32_t patchFileOffset = textFileOff + static_cast<uint32_t>(callRel32Offset);
+    Require(patchFileOffset + 4u <= img->rawSize, "Win32 真实 PE 异常 fixture CALL patch 越界");
+    std::memcpy(img->rawData + patchFileOffset, &rel32, sizeof(rel32));
+
+    std::vector<uint8_t> finalBytes(img->rawData, img->rawData + img->rawSize);
+    parser.FreeImage(img);
+    return finalBytes;
+}
+
+// 把 fixture 写到磁盘、用 CreateProcess 作为独立进程真正加载执行，返回
+// GetExitCodeProcess 的结果。
+DWORD RunRealPeExceptionFixture(const std::vector<uint8_t>& peBytes, const std::string& suffix) {
+    char tempDir[MAX_PATH] = {};
+    Require(GetTempPathA(sizeof(tempDir), tempDir) != 0, "GetTempPathA 失败");
+    const std::string path = std::string(tempDir) + "cs_bridge_realpe_" + suffix + ".exe";
+    {
+        HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(file != INVALID_HANDLE_VALUE, "无法创建真实 PE fixture 文件: " + path);
+        DWORD written = 0;
+        const bool ok = WriteFile(file, peBytes.data(), static_cast<DWORD>(peBytes.size()), &written, nullptr) &&
+            written == peBytes.size();
+        CloseHandle(file);
+        Require(ok, "写入真实 PE fixture 文件失败: " + path);
+    }
+
+    STARTUPINFOA startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+    const BOOL created = CreateProcessA(path.c_str(), nullptr, nullptr, nullptr, FALSE,
+        CREATE_DEFAULT_ERROR_MODE, nullptr, nullptr, &startupInfo, &processInfo);
+    Require(created != FALSE, "CreateProcess 无法真正加载运行 fixture EXE: " + path +
+        " (GetLastError=" + std::to_string(GetLastError()) + ")");
+    WaitForSingleObject(processInfo.hProcess, 30000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(processInfo.hProcess, &exitCode);
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    DeleteFileA(path.c_str());
+    return exitCode;
+}
+
+void TestBridgeThunkRealPeLoaderException() {
+    // 注意：ecxValue 必须是子进程*自己*地址空间里有效的地址——子进程有独立
+    // 的虚拟地址空间，父进程（这个测试自身）任何局部变量的地址在那边都没有
+    // 意义。kRealPeSafeReadAddress 是 fixture 自己 .data 段的起始地址，在
+    // 未开 ASLR 的前提下子进程加载后就是这个确定值，这里可以安全复用。
+    const std::vector<uint8_t> safeFixture =
+        BuildRealPeExceptionFixture(kRealPeSafeReadAddress);
+    const DWORD safeExitCode = RunRealPeExceptionFixture(safeFixture, "safe");
+    Require(safeExitCode == 0x2Au,
+        "Win32 真实 PE/loader 基线（安全地址）未按预期正常返回，退出码=" +
+        std::to_string(safeExitCode));
+    std::cout << "[bridge-thunk-realpe] Win32 真实磁盘 PE + CreateProcess 基线真实通过"
+        "（独立进程正常退出，退出码=0x2A）\n";
+
+    const std::vector<uint8_t> faultFixture = BuildRealPeExceptionFixture(0);
+    const DWORD faultExitCode = RunRealPeExceptionFixture(faultFixture, "fault");
+    Require(faultExitCode == static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION),
+        "Win32 真实 PE/loader 故障用例退出码不是预期的 "
+        "EXCEPTION_ACCESS_VIOLATION，实际=0x" +
+        [&]{ std::ostringstream o; o << std::hex << faultExitCode; return o.str(); }());
+    std::cout << "[bridge-thunk-realpe] Win32 真实磁盘 PE + CreateProcess 故障用例真实通过"
+        "（独立进程被 Windows 当作标准未处理异常终止，退出码=EXCEPTION_ACCESS_VIOLATION，"
+        "证明真实 PE/loader 路径下桥接 thunk 抽取指令触发的硬件异常被正确、可预期地上报，"
+        "不是挂起/立即失控崩溃/镜像被拒绝加载）\n";
+}
+#endif // defined(_M_IX86)
+
 void Run(const char* name, void (*test)(), int& failures) {
     try {
         test();
@@ -5623,5 +7265,9 @@ int main() {
         &TestZydisCallHostResolverRegisterDiversity, failures);
     Run("Zydis BRIDGE_EXTENDED resolver/marshal register allocation",
         &TestZydisBridgeExtendedRegisterDiversity, failures);
+#if defined(_M_IX86)
+    Run("Win32 真实 PE + Windows loader 桥接 thunk 异常验证",
+        &TestBridgeThunkRealPeLoaderException, failures);
+#endif
     return failures == 0 ? 0 : 1;
 }

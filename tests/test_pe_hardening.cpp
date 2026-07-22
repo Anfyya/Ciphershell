@@ -2513,6 +2513,271 @@ void TestInstructionBridgeBuilderX87Fabs() {
         /*hiddenNativeRegister=*/11u, /*usesAvx=*/false, /*usesX87=*/true);
 }
 
+// ============================================================================
+// VMInstructionBridgeBuilder::Build 事务保证 + 输入契约收紧（独立批次 17）
+// ============================================================================
+//
+// 下面几个测试专门覆盖批次 17 新增的负向路径：Build() 自身的事务保证（任何
+// 失败必须让 image/translations 完全回滚），以及收紧后的 hidden register /
+// 指令长度输入契约。全部复用与 TestInstructionBridgeBuilderX87Fabs 相同的
+// 真实 PE + 真实 Zydis 反汇编基础设施，只在这基础上有意构造非法/延迟失败的
+// 输入，而不是走查代码断言"看起来对"。见 docs/zydis_encoder_pilot.md 批次 17。
+
+struct BridgeFixture {
+    CipherShell::CS_PE_IMAGE* img = nullptr;
+    CipherShell::Function function{};
+    CipherShell::InstructionIR decoded{};
+};
+
+// 构造与 VerifyInstructionBridgeBuilds 完全相同的最小 x64 宿主镜像（真实
+// RUNTIME_FUNCTION/UNWIND_INFO，prologSize=0）与真实 Zydis 解码出的 FABS，
+// 但不预先构造 VMBridgeRequest —— 下面每个负向测试都基于 `decoded` 独立
+// 构造自己的请求，只故意破坏自己要测的那一个字段。
+BridgeFixture BuildStandardBridgeFixture() {
+    using namespace CipherShell;
+    const std::vector<uint8_t> textData = {0xC3, 0xD9, 0xE1, 0xC3};
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + static_cast<uint32_t>(textData.size());
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, textData, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+
+    BridgeFixture fixture;
+    fixture.img = img;
+    fixture.function.entryAddress = kExcTextVA;
+    fixture.function.size = static_cast<uint32_t>(textData.size());
+    fixture.decoded = DisassembleSingleInstruction({0xD9, 0xE1}, kExcTextVA + 1);
+    return fixture;
+}
+
+bool MicroInstructionEqual(const CipherShell::MicroInstruction& a, const CipherShell::MicroInstruction& b) {
+    if (a.opcode != b.opcode || a.handlerVariant != b.handlerVariant ||
+        a.operandCount != b.operandCount || a.sourceRva != b.sourceRva) return false;
+    for (size_t i = 0; i < a.operands.size(); ++i) {
+        if (a.operands[i] != b.operands[i]) return false;
+    }
+    return true;
+}
+
+// hiddenNativeRegister 必须落在该架构真实的 GPR 集合内（x64: 0..15）——这条
+// 校验在 Build() 里早已存在，但在本批之前从未有专门的负向测试驱动过它
+// （VerifyInstructionBridgeBuilds 系列全部只走合法寄存器）。
+void TestInstructionBridgeBuilderRejectsOutOfRangeHidden() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 16u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 16u; // 越过 x64 最后一个合法 GPR（0..15）
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// register 4 编码 x64 的 RSP：BuildX64Thunk 把 hidden 当作贯穿整个 thunk 的
+// state 指针使用，与 PushMemory/PopMemory/PushFlags/PopFlags/Ret 隐式依赖的
+// 真实栈指针是两个必须保持独立的角色。收紧后 Build() 必须在生成任何字节之前
+// 就 fail-closed 拒绝这个输入，而不是生成一个会在运行期破坏自己栈的 thunk。
+void TestInstructionBridgeBuilderRejectsStackPointerHidden() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 4u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 4u; // RSP
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// instruction.length 必须真的落在 rawBytes 这个固定 15 字节 std::array 里。
+// BuildX64Thunk/BuildX86Thunk 用 request.instruction.length 原样拷贝
+// rawBytes.data() 出来的字节，自己不做范围检查；收紧前一个声称长度 200 的
+// 请求会在 Build() 生成字节的过程中就读出 rawBytes 数组之外的内存
+// （未定义行为），而不是被干净地拒绝。
+void TestInstructionBridgeBuilderRejectsOversizedInstructionLength() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    InstructionIR oversized = fixture.decoded;
+    CS_TEST_CHECK(oversized.length <= oversized.rawBytes.size());
+    oversized.length = static_cast<uint8_t>(oversized.rawBytes.size() + 1u);
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 11u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = oversized;
+    request.hiddenNativeRegister = 11u;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// Build() 自身的事务保证：第一条 BRIDGE_EXTENDED 请求完全合法（会通过
+// AppendSection 把 thunk 真正写进 image，也会通过第二遍逐项校验循环直到
+// 暂存好它自己的 bytecode 改写），第二条引用的 micro-op 却根本不是
+// VM_UOP_BRIDGE_EXTENDED —— 这个失败只会在 AppendSection 已经成功提交、且
+// 第一条请求已经暂存完自己的改写之后才被发现。断言调用前后 image 逐字节相同
+// （AppendSection 的提交被完全撤销）、translations 两条指令逐字段相同
+// （第一条请求暂存的改写没有被提交）。"调用方失败后不保存文件所以没关系"
+// 这种论证不成立：这里直接检查 Build() 返回之后、调用方还没来得及做任何事之前
+// 的 image/translations 状态。
+void TestInstructionBridgeBuilderRollsBackOnLateFailure() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+
+    MicroInstruction validBridgeOp{};
+    validBridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    validBridgeOp.operandCount = 3;
+    validBridgeOp.operands[1] = 11u;
+    translation.instructions.push_back(validBridgeOp); // index 0
+
+    MicroInstruction unrelatedOp{};
+    unrelatedOp.opcode = VM_UOP_RET;
+    unrelatedOp.operandCount = 1;
+    unrelatedOp.operands[0] = 0;
+    translation.instructions.push_back(unrelatedOp); // index 1 -- 不是 BRIDGE_EXTENDED
+
+    VMBridgeRequest firstRequest{};
+    firstRequest.microOpIndex = 0;
+    firstRequest.functionRVA = kExcTextVA;
+    firstRequest.instruction = fixture.decoded;
+    firstRequest.hiddenNativeRegister = 11u;
+    translation.bridgeRequests.push_back(firstRequest);
+
+    VMBridgeRequest secondRequest{};
+    secondRequest.microOpIndex = 1; // 指向 unrelatedOp，触犯"必须引用 BRIDGE_EXTENDED"
+    secondRequest.functionRVA = kExcTextVA;
+    secondRequest.instruction = fixture.decoded;
+    secondRequest.hiddenNativeRegister = 10u;
+    translation.bridgeRequests.push_back(secondRequest);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction0 = translations[0].instructions[0];
+    const MicroInstruction beforeInstruction1 = translations[0].instructions[1];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(result.links.empty());
+    // image：AppendSection 已经真实提交过一次（两条 thunk 的 blob），必须被
+    // 完全撤销 —— 逐字节比较整份文件，不只是 section 计数。
+    CS_TEST_CHECK(fixture.img->isValid);
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    // translations：第一条请求已经在第二遍循环里通过了自己的全部校验、暂存好
+    // 了改写，仍然不能被提交。
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction0));
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[1], beforeInstruction1));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2595,6 +2860,10 @@ int main(int argc, char** argv) {
     TestSafeSEHTableMergeFailsClosedOnNoSehFlag();
     TestSafeSEHTableMergeRejectsX64Image();
     TestInstructionBridgeBuilderX87Fabs();
+    TestInstructionBridgeBuilderRejectsOutOfRangeHidden();
+    TestInstructionBridgeBuilderRejectsStackPointerHidden();
+    TestInstructionBridgeBuilderRejectsOversizedInstructionLength();
+    TestInstructionBridgeBuilderRollsBackOnLateFailure();
     CS_TEST_CHECK(argc == 2);
     TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);
     return 0;
