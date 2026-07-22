@@ -881,6 +881,27 @@ bool Translator::LowerImplicitScalar(const InstructionIR& instruction, Translati
     }
 }
 
+uint8_t Translator::SelectBridgeHiddenRegister(const InstructionIR& instruction) {
+    std::array<bool, 16> used{};
+    for (const auto& operand : instruction.operands) {
+        if (operand.type == OperandType::Register) {
+            if (operand.regInfo.registerClass == RegisterCategory::GeneralPurpose && operand.regInfo.family < 16) {
+                used[operand.regInfo.family] = true;
+            }
+        } else if (operand.type == OperandType::Memory) {
+            if (operand.memory.hasBase && operand.memory.baseInfo.family < 16) used[operand.memory.baseInfo.family] = true;
+            if (operand.memory.hasIndex && operand.memory.indexInfo.family < 16) used[operand.memory.indexInfo.family] = true;
+        }
+    }
+    static constexpr uint8_t x64Candidates[] = {11, 10, 9, 8, 2, 1, 0};
+    static constexpr uint8_t x86Candidates[] = {2, 1, 0};
+    const uint8_t* candidates = instruction.machineMode == MachineMode::X64 ? x64Candidates : x86Candidates;
+    const size_t count = instruction.machineMode == MachineMode::X64 ?
+        std::size(x64Candidates) : std::size(x86Candidates);
+    for (size_t i = 0; i < count; ++i) if (!used[candidates[i]]) return candidates[i];
+    return 0xFF;
+}
+
 bool Translator::LowerExtendedBridge(const InstructionIR& instruction, TranslationResult& result) {
     const bool x87 = instruction.instructionSet == InstructionSetClass::X87 ||
         instruction.mnemonic == InstructionMnemonic::FloatingPoint;
@@ -905,32 +926,20 @@ bool Translator::LowerExtendedBridge(const InstructionIR& instruction, Translati
         instruction.length > instruction.rawBytes.size()) {
         return FailInstruction(instruction, "extended instruction is outside safe bridge contract");
     }
-    std::array<bool, 16> used{};
     bool hasExtended = x87 || avx || instruction.instructionSet == InstructionSetClass::Sse;
     for (const auto& operand : instruction.operands) {
         if (operand.type == OperandType::Register) {
             hasExtended = hasExtended || IsExtendedRegisterClass(operand.regInfo.registerClass);
-            if (operand.regInfo.registerClass == RegisterCategory::GeneralPurpose && operand.regInfo.family < 16) {
-                if ((operand.regInfo.family == 4 || operand.regInfo.family == 5) && OperandWrites(operand.action)) {
-                    return FailInstruction(instruction, "bridge cannot write stack/frame pointer");
-                }
-                used[operand.regInfo.family] = true;
+            if (operand.regInfo.registerClass == RegisterCategory::GeneralPurpose && operand.regInfo.family < 16 &&
+                (operand.regInfo.family == 4 || operand.regInfo.family == 5) && OperandWrites(operand.action)) {
+                return FailInstruction(instruction, "bridge cannot write stack/frame pointer");
             }
-        } else if (operand.type == OperandType::Memory) {
-            if (operand.memory.hasBase && operand.memory.baseInfo.family < 16) used[operand.memory.baseInfo.family] = true;
-            if (operand.memory.hasIndex && operand.memory.indexInfo.family < 16) used[operand.memory.indexInfo.family] = true;
         } else if (operand.type == OperandType::Pointer) {
             return FailInstruction(instruction, "far pointer is not bridgeable");
         }
     }
     if (!hasExtended) return FailInstruction(instruction, "bridge contains no extended-state semantics");
-    static constexpr uint8_t x64Candidates[] = {11, 10, 9, 8, 2, 1, 0};
-    static constexpr uint8_t x86Candidates[] = {2, 1, 0};
-    const uint8_t* candidates = instruction.machineMode == MachineMode::X64 ? x64Candidates : x86Candidates;
-    const size_t count = instruction.machineMode == MachineMode::X64 ?
-        std::size(x64Candidates) : std::size(x86Candidates);
-    uint8_t hidden = 0xFF;
-    for (size_t i = 0; i < count; ++i) if (!used[candidates[i]]) { hidden = candidates[i]; break; }
+    const uint8_t hidden = SelectBridgeHiddenRegister(instruction);
     if (hidden == 0xFF) return FailInstruction(instruction, "bridge has no hidden state register");
 
     const uint32_t index = static_cast<uint32_t>(result.instructions.size());

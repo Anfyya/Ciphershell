@@ -132,6 +132,14 @@ public:
     void Fxsave(uint8_t base) { Extended(base, 0, true); }
     void Xrstor(uint8_t base) { Extended(base, 5, true); }
     void Xsave(uint8_t base) { Extended(base, 4, true); }
+    void PushReg(uint8_t reg) {
+        if (reg >= 8) U8(0x41);
+        U8(static_cast<uint8_t>(0x50u | (reg & 7u)));
+    }
+    void PopReg(uint8_t reg) {
+        if (reg >= 8) U8(0x41);
+        U8(static_cast<uint8_t>(0x58u | (reg & 7u)));
+    }
     void Ret() { U8(0xC3); }
 };
 
@@ -177,6 +185,8 @@ public:
     void Fxsave(uint8_t base) { Extended(base, 0); }
     void Xrstor(uint8_t base) { Extended(base, 5); }
     void Xsave(uint8_t base) { Extended(base, 4); }
+    void PushReg(uint8_t reg) { U8(static_cast<uint8_t>(0x50u | (reg & 7u))); }
+    void PopReg(uint8_t reg) { U8(static_cast<uint8_t>(0x58u | (reg & 7u))); }
     void Ret() { U8(0xC3); }
 };
 
@@ -220,6 +230,44 @@ void RestoreHostNonvolatile(
     }
 }
 
+// XSAVE/XRSTOR hard-wire their requested-feature bitmap to EDX:EAX -- unlike
+// every other register operand in this file, that pairing is fixed by the
+// ISA and cannot be redirected to some other scratch register. FXSAVE/
+// FXRSTOR take no such implicit operand, so only the AVX (usesAvx) path ever
+// touches EAX/EDX here. `hidden` still holds the live pointer to `state` at
+// this point in both thunk builders, and the real translator's own x86
+// candidate order (LowerExtendedBridge: {2,1,0} = {EDX,ECX,EAX}) prefers
+// EDX/EAX whenever the bridged instruction happens not to reference them --
+// which is the common case for GPR-light AVX instructions. Before this fix,
+// `MovEax(7)`/`XorEdx()` clobbered `hidden` itself whenever hidden was EAX or
+// EDX, so every GPR restore/save immediately after addressed `state` through
+// a near-null (EDX zeroed) or `[7 + offset]` (EAX overwritten) pointer
+// instead -- reachable through the production translator, not just direct
+// Builder construction, and only missed because the AVX execution test this
+// batch added first happened to hand-pick hiddenNativeRegister = ECX, the
+// one candidate this bug doesn't hit. Preserve `hidden` across the mask
+// setup with a real push/pop (safe here: this runs before the thunk ever
+// switches onto the guest stack, both on the restore side and, symmetrically,
+// after the guest stack has already been switched back on the save side).
+// See docs/zydis_encoder_pilot.md batch 18.
+template <typename Assembler>
+void EmitExtendedStateTransfer(
+    Assembler& assembler, bool restore, bool usesAvx, uint8_t hidden, uint8_t extendedTemp)
+{
+    if (!usesAvx) {
+        if (restore) assembler.Fxrstor(extendedTemp);
+        else assembler.Fxsave(extendedTemp);
+        return;
+    }
+    const bool hiddenIsMaskRegister = hidden == 0u || hidden == 2u;
+    if (hiddenIsMaskRegister) assembler.PushReg(hidden);
+    assembler.MovEax(7);
+    assembler.XorEdx();
+    if (restore) assembler.Xrstor(extendedTemp);
+    else assembler.Xsave(extendedTemp);
+    if (hiddenIsMaskRegister) assembler.PopReg(hidden);
+}
+
 BuiltThunk BuildX64Thunk(const VMBridgeRequest& request, uint8_t originalPrologSize) {
     constexpr uint8_t kRsp = 4;
     constexpr uint8_t kStateArgument = 1;
@@ -239,9 +287,7 @@ BuiltThunk BuildX64Thunk(const VMBridgeRequest& request, uint8_t originalPrologS
 
     assembler.Load(extendedTemp, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState)));
-    if (request.usesAvx) {
-        assembler.MovEax(7); assembler.XorEdx(); assembler.Xrstor(extendedTemp);
-    } else assembler.Fxrstor(extendedTemp);
+    EmitExtendedStateTransfer(assembler, /*restore=*/true, request.usesAvx, hidden, extendedTemp);
 
     for (uint8_t reg = 0; reg < 16; ++reg) {
         if (reg == hidden || reg == kRsp) continue;
@@ -271,9 +317,7 @@ BuiltThunk BuildX64Thunk(const VMBridgeRequest& request, uint8_t originalPrologS
     }
     assembler.Load(extendedTemp, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState)));
-    if (request.usesAvx) {
-        assembler.MovEax(7); assembler.XorEdx(); assembler.Xsave(extendedTemp);
-    } else assembler.Fxsave(extendedTemp);
+    EmitExtendedStateTransfer(assembler, /*restore=*/false, request.usesAvx, hidden, extendedTemp);
     RestoreHostNonvolatile(assembler, kNonvolatile, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, hostNonvolatile)));
     assembler.Ret();
@@ -312,9 +356,7 @@ BuiltThunk BuildX86Thunk(const VMBridgeRequest& request) {
     if (hidden != kInitialState) assembler.Move(hidden, kInitialState);
     assembler.Load(kExtendedTemp, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState)));
-    if (request.usesAvx) {
-        assembler.MovEax(7); assembler.XorEdx(); assembler.Xrstor(kExtendedTemp);
-    } else assembler.Fxrstor(kExtendedTemp);
+    EmitExtendedStateTransfer(assembler, /*restore=*/true, request.usesAvx, hidden, kExtendedTemp);
     for (uint8_t reg = 0; reg < 8; ++reg) {
         if (reg == hidden || reg == kEsp) continue;
         assembler.Load(reg, hidden,
@@ -341,9 +383,7 @@ BuiltThunk BuildX86Thunk(const VMBridgeRequest& request) {
     }
     assembler.Load(kExtendedTemp, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, extendedState)));
-    if (request.usesAvx) {
-        assembler.MovEax(7); assembler.XorEdx(); assembler.Xsave(kExtendedTemp);
-    } else assembler.Fxsave(kExtendedTemp);
+    EmitExtendedStateTransfer(assembler, /*restore=*/false, request.usesAvx, hidden, kExtendedTemp);
     RestoreHostNonvolatile(assembler, kNonvolatile, hidden,
         static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE, hostNonvolatile)));
     assembler.Ret();
@@ -584,6 +624,40 @@ VMInstructionBridgeBuildResult VMInstructionBridgeBuilder::Build(
                 request.instruction.length > request.instruction.rawBytes.size()) {
                 result.error = "VM_BRIDGE: extracted instruction length is invalid";
                 return result;
+            }
+            // The real translator's LowerExtendedBridge only ever offers a
+            // candidate hidden register the bridged instruction's own
+            // operands do not touch (see the `used[]` scan there), because
+            // both thunk builders skip `hidden` entirely when restoring/
+            // saving guest GPRs around the native instruction: whatever
+            // value the instruction itself reads or writes through `hidden`
+            // would otherwise be the live `state` pointer, not a guest GPR
+            // value, and any write through it would be silently lost
+            // instead of landing in state.gpr[]. That invariant has never
+            // been reachable through the production translator, which is
+            // exactly why Build() -- already hardened this batch against
+            // hiddenNativeRegister aliasing the stack pointer -- must reject
+            // it independently too rather than trust it implicitly. See
+            // docs/zydis_encoder_pilot.md batch 18.
+            for (const auto& operand : request.instruction.operands) {
+                bool aliasesHidden = false;
+                if (operand.type == OperandType::Register &&
+                    operand.regInfo.registerClass == RegisterCategory::GeneralPurpose &&
+                    operand.regInfo.family == request.hiddenNativeRegister) {
+                    aliasesHidden = true;
+                } else if (operand.type == OperandType::Memory) {
+                    aliasesHidden =
+                        (operand.memory.hasBase &&
+                            operand.memory.baseInfo.registerClass == RegisterCategory::GeneralPurpose &&
+                            operand.memory.baseInfo.family == request.hiddenNativeRegister) ||
+                        (operand.memory.hasIndex &&
+                            operand.memory.indexInfo.registerClass == RegisterCategory::GeneralPurpose &&
+                            operand.memory.indexInfo.family == request.hiddenNativeRegister);
+                }
+                if (aliasesHidden) {
+                    result.error = "VM_BRIDGE: hidden register is read or written by the bridged instruction";
+                    return result;
+                }
             }
             uint32_t blobSizeU32 = 0;
             if (!CheckedSizeToU32(blob.size(), blobSizeU32)) {

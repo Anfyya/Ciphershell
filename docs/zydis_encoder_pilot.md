@@ -3030,3 +3030,116 @@ ceiling、corpus、skip 规则均未修改。
 `ExecuteInstructionBridgeThunkRealExceptionCases`（x64）与
 `TestBridgeThunkRealPeLoaderException`（Win32 专属）。均已包含在上述 x64/
 Win32 CTest 通过范围内。
+
+## 独立批次 18：外部复查发现并修复 `BRIDGE_EXTENDED` 两个真实生产缺陷（2026-07-22）
+
+### 起点
+
+批次 17 的 `BRIDGE_EXTENDED` thunk 执行级闭环提交（`8c4eea8`）已由用户 push、
+CI（static-gate、build-and-test x64/Win32）全绿。本批起点是仓库所有者对
+`8c4eea8` 的一次独立代码复查，指出批次 17 新增的 AVX 真实执行测试
+（`ExecuteInstructionBridgeThunkAvxCases`）手工把 `hiddenNativeRegister` 分别
+指定为 `1u`（ECX，x86）/`10u`（R10，x64），而不是让真实
+`Translator::LowerExtendedBridge` 的候选选择逻辑去挑——这个手填的值恰好绕开了
+一个复查者怀疑存在、此前所有测试都没测到的真实缺陷。复查同时指出
+`VMInstructionBridgeBuilder::Build` 仍缺一项独立校验：`hidden` 是否与被桥接的
+原生指令自身的操作数冲突。本批任务是先在代码里独立核实这两条怀疑是否成立
+（不采信复查文字本身），成立的话真实修复并用真实执行证据验证，不成立的话
+如实说明为什么不是缺陷。
+
+### 核实与修复的问题
+
+1. **AVX/XSAVE 路径会用 `MovEax(7)`/`XorEdx()` 摧毁作为 `hidden` 的 EAX/EDX
+   本身（真实生产缺陷，已确认可达）。** `BuildX64Thunk`/`BuildX86Thunk` 的
+   `usesAvx=true` 分支在调用 `Xrstor`/`Xsave` 之前，无条件执行
+   `MovEax(7); XorEdx();` 把 EDX:EAX 设成 XRSTOR/XSAVE 指令架构规定的隐式
+   请求特性位图——这一步不是本仓库的设计选择，是 x86/x64 ISA 对这两条指令
+   的硬性要求，无法把它换成别的寄存器。而 `hidden` 在这一点之前已经被
+   `Move(hidden, kInitialState)` 设成指向 `state` 的活指针，并在这两条指令
+   之后继续被当作 `state` 的基址使用（恢复/保存全部 GPR、rflags、host 非易失
+   寄存器）。一旦 `hidden` 本身恰好是 EAX(0) 或 EDX(2)，`MovEax(7)`/`XorEdx()`
+   就会把这个活指针直接摧毁成 `7`/`0`，之后所有基于 `hidden` 的寻址全部指向
+   错误地址（EDX 分支是近似空指针解引用）。核实这条路径*确实*可达：
+   `Translator::LowerExtendedBridge` 的 x86 候选表是 `{2,1,0}`
+   （EDX,ECX,EAX）——只要被桥接指令本身不使用 EDX 这个极常见的情况下
+   （比如纯 XMM/YMM 操作数的 AVX 指令），真实 Translator 就会把 EDX 选成
+   `hidden`，直接撞上这个缺陷；x64 候选表 `{11,10,9,8,2,1,0}` 优先选
+   R11/R10/R9/R8，更难撞上但同样存在同一个结构性问题（如果指令占用了
+   R8-R11 全部四个）。修复：在两个汇编器上加 `PushReg`/`PopReg`
+   （`push`/`pop reg`，x64 侧补上 `REX.B` 前缀），新增
+   `EmitExtendedStateTransfer` 帮助函数——只有 AVX 分支、且仅当
+   `hidden == 0 || hidden == 2` 时，把 `hidden` 在 `MovEax`/`XorEdx` 之前
+   压栈、`Xrstor`/`Xsave` 之后弹回。这段 push/pop 落在真实宿主栈上是安全的：
+   restore 侧发生在 thunk 把 `ESP`/`RSP` 换到 guest 栈*之前*，save 侧发生在
+   换回宿主栈*之后*，两处都不会踩到 guest 栈窗口。
+2. **`VMInstructionBridgeBuilder::Build` 没有独立校验 `hidden` 是否被原生
+   指令自身的操作数占用（真实生产缺陷，已确认可达但从未被真实翻译器触发
+   过）。** `Translator::LowerExtendedBridge` 自己会扫描指令操作数构造
+   `used[]` 集合、只从里面挑没被用到的候选寄存器，所以通过真实翻译管线永远
+   不会选中一个与指令操作数冲突的 `hidden`——但这只是 Translator 一侧的
+   自律，`Build()` 从未独立执行同样的检查。两个 thunk builder 的
+   GPR 搬运循环都显式跳过 `hidden` 这个 family（`if (reg == hidden ...)
+   continue;`），如果指令本身读/写 `hidden`，它读到的会是 `state` 指针
+   （不是真实 guest GPR 值），它写的值也不会落进 `state.gpr[]`，被静默丢弃。
+   与批次 17 收紧 `hidden != RSP/ESP`、`instruction.length` 合法性的理由完全
+   一致：这条不变量目前只由 Translator 隐式保证，`Build()` 必须独立拒绝，
+   不能信任调用方。修复：在 Build() 现有的每请求校验循环里新增一段，遍历
+   `request.instruction.operands`，寄存器操作数按 `family` 比对、内存操作数
+   按 `baseInfo`/`indexInfo` 的 `family` 比对，任一命中 `hidden` 就 fail-closed
+   返回 `"hidden register is read or written by the bridged instruction"`。
+
+为避免这条检测逻辑与 Translator 里原有的选择逻辑各写一份、日后悄悄漂移，把
+`LowerExtendedBridge` 里"扫描 `used[]` + 按候选表挑第一个空闲寄存器"这段单独
+抽成 `Translator::SelectBridgeHiddenRegister(const InstructionIR&)` 静态方法
+（声明在 `translator.h`，与 `Translator` 其余公开接口并列），`LowerExtendedBridge`
+自己也改成调用它，行为完全不变，只是不再有两份重复实现。
+
+### 测试改动：不再手填"安全"寄存器，改为调用真实选择逻辑
+
+`ExecuteInstructionBridgeThunkAvxCases`（`test_vm_handler_synthesis.cpp`）原来
+分别硬编码 `hidden = 1u`（ECX，x86）/`10u`（R10，x64）——两者都不是
+`SelectBridgeHiddenRegister` 对这条零 GPR 操作数的 `VADDPS ymm0,ymm1,ymm2`
+真正会选出的第一候选（x86 应为 EDX=2，x64 应为 R11=11），这正是复查指出的
+"手填绕开缺陷"。改为：用真实 Zydis 反汇编器把 Encoder 产出的 `VADDPS` 字节解码
+成 `InstructionIR`，再调用 `Translator::SelectBridgeHiddenRegister` 拿到与生产
+路径完全一致的 `hidden`，`Require(hidden != 0xFFu, ...)` 后传给
+`BuildBridgeThunkFixture`。本批之前已有的其余 bridge 测试（FABS/ADDSS/MOVAPS/
+MOVUPS/Win32 `MOV EAX,[ECX]`）手填的 `hidden` 值全部核对过：涉及的指令要么没有
+任何 GPR 操作数、要么 `usesAvx=false`（走 FXSAVE/FXRSTOR，不touch EAX/EDX），
+不会撞上问题 1，也都不与自身操作数冲突，不会被问题 2 的新校验拒绝，无需改动。
+
+### 验证结果（本机实测，2026-07-22）
+
+x64（复用 `build`）与新建的 Win32（`build32`，同一 NASM/Python3 环境）两套
+Release、`/W4 /WX` 全量重新构建，零警告零错误。
+
+- `test_pe_hardening.exe`（两个架构，带 `vm_runtime_gate_exe` 路径参数）：
+  exit code 0，无任何 `CS_TEST_CHECK` 失败输出——含批次 17 的四个 Builder
+  负向测试与批次 16 的 FABS 正向测试，本批新增的 hidden-alias 校验不影响
+  任何既有用例。
+- `test_vm_handler_synthesis.exe`：x64 上 `Translator::SelectBridgeHiddenRegister`
+  为 `VADDPS ymm0,ymm1,ymm2` 真实选出 `hiddenNativeRegister=11`（R11，该架构
+  下不会撞上问题 1，但已确认测试真正在调用生产选择逻辑而不是手填值）；
+  **Win32 上真实选出 `hiddenNativeRegister=2`（EDX）**——正是复查怀疑、问题 1
+  实际会命中的那个场景——真实执行 `[bridge-thunk-avx] VADDPS 256 位（含 YMM
+  高位）hidden=2 真实执行通过`，直接、真实地复现并验证了这个此前被规避掉的
+  缺陷已被修复（而不是"理论上应该修好了"）。
+- 两个架构完整 `ctest --test-dir <dir> -C Release --output-on-failure
+  --timeout 300`：17/18 通过；唯一"失败"是 `vm_native_differential` 既有
+  `TIMEOUT 120` 属性（与历史批次相同的已知本机限制，未修改该属性），x64
+  `vm_per_build_similarity_gate` 464.51 秒、Win32 555.74 秒均真实 PASS，未
+  修改任何聚合阈值/单 pair ceiling/corpus/skip 规则。按既有约定直接运行
+  两个架构的 `test_vm_native_differential.exe`（绕开 ctest 的 wrapper 超时）
+  确认真实退出码 0，全部用例真实通过。
+- `vm_kernel_static_gate.py --source-root .` 本机直接运行：`[PASS]`，
+  双策略覆盖 `54/54`（本批不改任何语义迁移范围，只修 `BRIDGE_EXTENDED` 的
+  内部实现缺陷，覆盖数字不变）。
+
+### 本批改动的文件
+
+`packer/transforms/vm_instruction_bridge_builder.cpp`（`PushReg`/`PopReg`、
+`EmitExtendedStateTransfer`、hidden-alias 校验）、`packer/transforms/
+translator.h`/`translator.cpp`（新增 `Translator::SelectBridgeHiddenRegister`
+静态方法，`LowerExtendedBridge` 改为调用它）、`tests/test_vm_handler_synthesis.cpp`
+（`ExecuteInstructionBridgeThunkAvxCases` 改用真实选择逻辑；新增
+`#include "packer/transforms/translator.h"` 与 `using CipherShell::Translator;`）。

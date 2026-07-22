@@ -2,6 +2,7 @@
 #include "packer/transforms/vm_handler_semantic_codegen.h"
 #include "packer/transforms/vm_handler_synthesizer.h"
 #include "packer/transforms/vm_instruction_bridge_builder.h"
+#include "packer/transforms/translator.h"
 #include "packer/analysis/disassembler.h"
 #include "packer/pe_parser/pe_parser.h"
 #include "packer/pe_parser/pe_utils.h"
@@ -64,6 +65,7 @@ using CipherShell::VMBridgeRequest;
 using CipherShell::VMInstructionBridgeBuilder;
 using CipherShell::VMInstructionBridgeBuildResult;
 using CipherShell::VMInstructionBridgeLink;
+using CipherShell::Translator;
 
 class TestFailure final : public std::runtime_error {
 public:
@@ -6505,13 +6507,11 @@ void ExecuteInstructionBridgeThunkAvxCases(
     const bool is64Bit = true;
     const uint8_t registerCount = 16;
     const uint8_t addressWidth = 8;
-    const uint8_t hidden = 10u;
     if (config.architecture != VMHandlerArchitecture::X64) return;
 #else
     const bool is64Bit = false;
     const uint8_t registerCount = 8;
     const uint8_t addressWidth = 4;
-    const uint8_t hidden = 1u; // ECX
     if (config.architecture != VMHandlerArchitecture::X86) return;
 #endif
 
@@ -6543,6 +6543,22 @@ void ExecuteInstructionBridgeThunkAvxCases(
         "Zydis Encoder 无法生成 VADDPS ymm0,ymm1,ymm2 fixture 字节");
     const std::vector<uint8_t> vaddpsBytes(
         encodedBuffer.data(), encodedBuffer.data() + encodedLength);
+
+    // 用真实 Translator::SelectBridgeHiddenRegister 对这条已解码指令跑一遍生产
+    // 用的同一套候选选择逻辑，而不是手填一个碰巧安全的寄存器：VADDPS
+    // ymm0,ymm1,ymm2 不含任何 GPR 操作数，x86 候选顺序 {EDX,ECX,EAX} 因此会
+    // 选中排在最前的 EDX——这正是复查发现的真实生产缺陷命中的那条路径
+    // （BuildX86Thunk 的 AVX 分支此前会用 `xor edx,edx` 摧毁作为 hidden 的
+    // EDX 本身）。之前这里手填的 hidden=1u(ECX)/10u(R10) 绕开了这条真实会被
+    // 生产 Translator 选中的路径，测不到那个缺陷。见
+    // docs/zydis_encoder_pilot.md 批次 18。
+    const InstructionIR vaddpsDecoded = DisassembleForBridgeFixture(
+        is64Bit, vaddpsBytes, kBridgeFixtureTextVA + 1);
+    const uint8_t hidden = Translator::SelectBridgeHiddenRegister(vaddpsDecoded);
+    Require(hidden != 0xFFu,
+        "真实 Translator 未能为 VADDPS ymm0,ymm1,ymm2 选出 hidden 寄存器");
+    std::cout << "[bridge-thunk-avx] 真实 Translator 为 VADDPS 选出 hiddenNativeRegister=" <<
+        static_cast<unsigned>(hidden) << '\n';
 
     BuiltBridgeThunk built = BuildBridgeThunkFixture(
         is64Bit, vaddpsBytes, hidden, /*usesAvx=*/true, /*usesX87=*/false);
