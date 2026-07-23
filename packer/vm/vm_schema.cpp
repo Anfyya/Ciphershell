@@ -769,6 +769,7 @@ VMStreamValidation VMSchema::ValidateStream(
         return result;
     }
     std::vector<int32_t> entryDepth(result.decoded.size(), -1);
+    std::vector<std::vector<size_t>> successors(result.decoded.size());
     std::queue<size_t> pending;
     entryDepth[0] = 0;
     pending.push(0);
@@ -819,6 +820,7 @@ VMStreamValidation VMSchema::ValidateStream(
                 result.error = "micro branch merges incompatible operand stack depths";
                 return result;
             }
+            successors[index].push_back(found->second);
             targetQueued = true;
         }
         if (!descriptor->terminal &&
@@ -831,6 +833,7 @@ VMStreamValidation VMSchema::ValidateStream(
                 result.error = "micro fallthrough merges incompatible operand stack depths";
                 return result;
             }
+            successors[index].push_back(index + 1u);
         } else if (descriptor->branch && !descriptor->conditional && !targetQueued) {
             result.error = "unresolved micro control transfer";
             return result;
@@ -843,6 +846,45 @@ VMStreamValidation VMSchema::ValidateStream(
             return result;
         }
     }
+
+    // 反向可达性证明：仅"入口可达"不足以保证终止——一个可达节点可能落入
+    // 永不退出的循环（例如 JMP LOOP 自跳转）。这里从所有 terminal 节点出发做
+    // 反向 BFS，要求每一个可达节点都存在一条通往合法 terminal 的路径，
+    // 否则拒绝该字节码（对应 ciphershell.md §11.1 的终止性要求）。
+    std::vector<std::vector<size_t>> predecessors(result.decoded.size());
+    for (size_t i = 0; i < successors.size(); ++i) {
+        for (size_t target : successors[i]) {
+            predecessors[target].push_back(i);
+        }
+    }
+    std::vector<uint8_t> canReachTerminal(result.decoded.size(), 0);
+    std::queue<size_t> revPending;
+    for (size_t i = 0; i < result.decoded.size(); ++i) {
+        if (Lookup(result.decoded[i].instruction.opcode)->terminal) {
+            canReachTerminal[i] = 1;
+            revPending.push(i);
+        }
+    }
+    while (!revPending.empty()) {
+        const size_t index = revPending.front();
+        revPending.pop();
+        for (size_t pred : predecessors[index]) {
+            if (!canReachTerminal[pred]) {
+                canReachTerminal[pred] = 1;
+                revPending.push(pred);
+            }
+        }
+    }
+    for (size_t i = 0; i < canReachTerminal.size(); ++i) {
+        if (!canReachTerminal[i]) {
+            result.error = "micro instruction at byte " +
+                std::to_string(result.decoded[i].byteOffset) +
+                " cannot reach a terminal instruction: control flow does not "
+                "provably terminate";
+            return result;
+        }
+    }
+
     result.microOpCount = static_cast<uint32_t>(result.decoded.size());
     result.success = true;
     return result;

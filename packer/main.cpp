@@ -31,7 +31,6 @@
 #include "transforms/section_encryptor.h"
 #include "transforms/string_encryptor.h"
 #include "transforms/import_obfuscator.h"
-#include "transforms/reloc_fixer.h"
 #include "config/config_parser.h"
 #include "signature/signature_eliminator.h"
 #include "analysis/disassembler.h"
@@ -893,6 +892,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     PrintFeatureStatus("import_protection", "skipped", "disabled");
+
+    // Phase B.5: 反调试 / 反 Dump（含 nanomite）—— config_parser 完整解析这些
+    // 开关、GUI 也能正常勾选，但当前没有任何 transform 消费它们：不会注入任何
+    // 检测代码或 section 权限守卫。这些是明确规划中的 CipherShell Plus 能力，
+    // 不删除配置字段/GUI/实现目录，但在真正接入之前绝不能让用户打开开关后
+    // 却拿到一个"看起来生效、其实什么都没做"的产物，所以在此 fail-closed 拒绝，
+    // 而不是像未消费之前那样悄悄忽略。默认值已改为 false；只有用户显式打开
+    // 才会走到这里。
+    const bool antiDebugRequested = config.antiDebug.timingChecks ||
+        config.antiDebug.hardwareBPDetection || config.antiDebug.softwareBPDetection ||
+        config.antiDebug.memoryIntegrity || config.antiDebug.debuggerWindowScan ||
+        config.antiDebug.parentProcessCheck || config.antiDebug.threadHiding ||
+        config.antiDebug.kernelDebuggerCheck;
+    if (antiDebugRequested) {
+        std::cerr << "ANTI_DEBUG_REJECT module=AntiDebug"
+                  << " reason=ciphershell_plus_not_implemented" << std::endl;
+        PrintFeatureStatus("anti_debug", "rejected", "ciphershell_plus_not_implemented");
+        return 1;
+    }
+    PrintFeatureStatus("anti_debug", "skipped", "disabled");
+
+    const bool antiDumpRequested = config.antiDump.erasePEHeader ||
+        config.antiDump.sectionPermissionGuard || config.antiDump.nanomitePatches;
+    if (antiDumpRequested) {
+        std::cerr << "ANTI_DUMP_REJECT module=AntiDump"
+                  << " reason=ciphershell_plus_not_implemented" << std::endl;
+        PrintFeatureStatus("anti_dump", "rejected", "ciphershell_plus_not_implemented");
+        return 1;
+    }
+    PrintFeatureStatus("anti_dump", "skipped", "disabled");
 
     // Phase C: 先建立独立 CFG 保护计划，此时不修改原始代码。
     // 真正的本地块拷贝/分发/入口修补放在 VM 之后一次性提交，
@@ -2108,7 +2137,14 @@ int main(int argc, char* argv[]) {
         }
 
         CipherShell::EliminationConfig elimConfig;
-        sigEliminator.EliminateSignatures(image.get(), elimConfig);
+        std::string sigReason;
+        if (!sigEliminator.EliminateSignatures(image.get(), elimConfig, sigReason)) {
+            std::cerr << "SIGNATURE_ELIMINATION_FAIL module=SignatureEliminator reason="
+                      << sigReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed", sigReason);
+            return 1;
+        }
+        PrintFeatureStatus("signature_elimination", "applied");
 
         if (sigEliminator.VerifyElimination(image.get())) {
             std::cout << "  签名消除成功" << std::endl;

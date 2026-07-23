@@ -113,18 +113,33 @@ LoaderImportBuildResult LoaderImportBuilder::Build(CS_PE_IMAGE* image, const cha
         return result;
     }
 
-    uint8_t* emitted = image->rawData + append.rawOffset;
+    // 新 section 的内容一律通过 PEEmitter::PatchBytes 写入（而不是直接算
+    // image->rawData + 偏移落笔），这样任何写入越出该 section 边界的情况都会
+    // 在 PatchBytes 内部的 CheckedAdd/rawSize 校验中 fail-closed，而不是依赖
+    // 调用方手算的偏移永远正确。
+    std::string patchError;
     IMAGE_IMPORT_DESCRIPTOR loaderDescriptor{};
     loaderDescriptor.OriginalFirstThunk = append.rva + iltOffset;
     loaderDescriptor.Name = append.rva + dllNameOffset;
     loaderDescriptor.FirstThunk = append.rva + iatOffset;
-    std::memcpy(emitted + descriptors.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR),
-        &loaderDescriptor, sizeof(loaderDescriptor));
+    std::vector<uint8_t> descriptorBytes(sizeof(loaderDescriptor));
+    std::memcpy(descriptorBytes.data(), &loaderDescriptor, sizeof(loaderDescriptor));
+    const uint32_t descriptorRVA = append.rva +
+        static_cast<uint32_t>(descriptors.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+    if (!emitter.PatchBytes(descriptorRVA, descriptorBytes, &patchError)) {
+        result.error = "failed to patch loader import descriptor: " + patchError;
+        return result;
+    }
 
     for (uint32_t i = 0; i < kFunctionCount; ++i) {
         const uint64_t hintNameRVA = static_cast<uint64_t>(append.rva) + hintNameOffsets[i];
-        std::memcpy(emitted + iltOffset + i * thunkSize, &hintNameRVA, thunkSize);
-        std::memcpy(emitted + iatOffset + i * thunkSize, &hintNameRVA, thunkSize);
+        std::vector<uint8_t> thunkBytes(thunkSize);
+        std::memcpy(thunkBytes.data(), &hintNameRVA, thunkSize);
+        if (!emitter.PatchBytes(append.rva + iltOffset + i * thunkSize, thunkBytes, &patchError) ||
+            !emitter.PatchBytes(append.rva + iatOffset + i * thunkSize, thunkBytes, &patchError)) {
+            result.error = "failed to patch loader import thunk: " + patchError;
+            return result;
+        }
     }
 
     PEUtils::SetDataDirectory(image, IMAGE_DIRECTORY_ENTRY_IMPORT,

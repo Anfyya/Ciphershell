@@ -242,7 +242,8 @@ void TestSignatureEliminatorKeepsReadOnlyPermissions() {
 
     CipherShell::SignatureEliminator elim;
     CipherShell::EliminationConfig ec;
-    bool ok = elim.EliminateSignatures(image, ec);
+    std::string elimReason;
+    bool ok = elim.EliminateSignatures(image, ec, elimReason);
     CS_TEST_CHECK(ok);
 
     // NormalizePermissions 已移除：只读可执行段权限必须保持不变。

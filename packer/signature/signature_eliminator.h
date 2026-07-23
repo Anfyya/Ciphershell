@@ -71,9 +71,11 @@ public:
      * 消除已知签名
      * @param image PE 镜像
      * @param config 消除配置
-     * @return 是否成功
+     * @param reason 失败时写入具体原因，供调用方 fail-closed 上报
+     * @return 是否成功；任意声明为启用的子步骤失败即整体失败，不吞掉错误
      */
-    bool EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config);
+    bool EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config,
+        std::string& reason);
 
     /**
      * 验证消除结果

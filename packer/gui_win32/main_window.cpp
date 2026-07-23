@@ -488,7 +488,7 @@ void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
     const int halfWidth = kPageWidth / 2 - 6;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
-        L"反调试 [anti_debug]（全部真实可用，非 fail-closed）"));
+        L"反调试 [anti_debug]（CipherShell Plus，尚未实现：勾选后打包会被拒绝）"));
     y += kRowHeight;
 
     static const wchar_t* const kAntiDebugLabels[8] = {
@@ -506,11 +506,12 @@ void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
         const int row = i / 2;
         m_antiDebugChecks[i] = track(CreateCheckboxControl(
             m_hwnd, x + col * (halfWidth + 12), y + row * kRowHeight, halfWidth, kControlHeight,
-            kAntiDebugLabels[i], NextControlId(), true));
+            kAntiDebugLabels[i], NextControlId(), false));
     }
     y += 4 * kRowHeight + kGroupGap;
 
-    track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight, L"反 Dump [anti_dump]"));
+    track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
+        L"反 Dump [anti_dump]（CipherShell Plus，尚未实现：勾选后打包会被拒绝）"));
     y += kRowHeight;
     static const wchar_t* const kAntiDumpLabels[3] = {
         L"erase_pe_header（运行时擦除 PE 头）",
@@ -522,7 +523,7 @@ void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
         const int row = i / 2;
         m_antiDumpChecks[i] = track(CreateCheckboxControl(
             m_hwnd, x + col * (halfWidth + 12), y + row * kRowHeight, halfWidth, kControlHeight,
-            kAntiDumpLabels[i], NextControlId(), true));
+            kAntiDumpLabels[i], NextControlId(), false));
     }
     y += 2 * kRowHeight;
 }

@@ -358,6 +358,16 @@ bool VMMicroSemanticExecutor::ExecuteOne(
     const VMMicroExecutionOptions& options,
     std::string& error)
 {
+    // ValidateInstruction only checks `regIndex < options.registerCount`; it
+    // trusts the caller to also keep registerCount within state.gpr's actual
+    // capacity. A caller-supplied registerCount above 32 would let a
+    // schema-valid register operand pass validation and then index
+    // state.gpr[reg] out of bounds below. Every call path funnels through
+    // here, so clamp once instead of trusting each individual caller.
+    if (options.registerCount == 0 || options.registerCount > state.gpr.size()) {
+        return SetError(state, VMMicroFault::Decode,
+            "micro execution registerCount exceeds machine state capacity", error);
+    }
     std::string schemaError;
     if (!VMSchema::ValidateInstruction(instruction, options.registerCount, schemaError)) {
         return SetError(state, VMMicroFault::Decode, schemaError.c_str(), error);

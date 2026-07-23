@@ -195,3 +195,102 @@ if (function.decodedBytes != function.size) {
 - 未运行完整 ctest 套件（本次审计聚焦代码级发现，没有对全部 18 个测试目标做回归）。
 - 未在 GitHub Actions 远端 CI 上验证这两处改动（本轮未 push，按你的要求）。
 - 第 2、3 章列出的其余问题均未做任何代码改动，也就没有可供验证的编译/测试结果。
+
+---
+
+## 7. 第二轮修复记录（用户按 P0/P1/P2 圈定范围后执行，同日续）
+
+第 4 章的两处修复落地后，你直接看过本报告并给出了一份分级修复清单（P0 必须修 / P1 建议紧接着修 / P2 代码卫生），本章记录按该清单执行的结果。**本轮同样不 commit、不 push**——执行过程中发现仓库 HEAD 已经是 `8e4dc85`（提交信息"fix some bug"，包含本报告与第 4 章两处修复），这是你在上一轮会话结束后自行提交的，不是本对话内的操作；本轮新增改动全部是在这个 commit 之上的未提交工作区修改。
+
+### 7.1 P0
+
+**7.1.1【已修复】`vm_verifier`/`vm_schema.cpp` 的终止性证明补齐为真正的图算法**
+
+对应第 2.2 节。`VMSchema::ValidateStream`（`packer/vm/vm_schema.cpp`）原来只证明"入口可达"+"record 里存在至少一条 terminal 指令"，不能排除一个可达的自循环子图（如 `BRANCH` 跳回自身）通过校验。本轮在原有前向 BFS 里顺带记录了每条边（`successors`），再从所有 `terminal=true` 的指令出发做**反向 BFS**，要求每一个可达指令都必须存在到某个合法 terminal 的路径；否则报错 `"... cannot reach a terminal instruction: control flow does not provably terminate"` 并 fail-closed。这是真正的图连通性证明，不是启发式。
+
+验证：`test_vm_micro_core.exe`（含"完整架构状态差分模糊语料"这类大规模差分测试）、`test_vm_handler_synthesis.exe`、`test_vm_public_entry.exe` 全部重新编译并运行，退出码 0，无一条合法生产字节流被误判为不终止。
+
+**7.1.2【已修复】`SignatureEliminator::EliminateSignatures` 不再吞掉子步骤失败**
+
+对应附录 A 原有备注。`EliminateSignatures` 新增 `std::string& reason` 输出参数，5 个子步骤（`RandomizeSectionNames`/`ClearRichHeader`/`ClearDebugDirectory`/`ClearTimestamps`/`ClearChecksum`）中任意一个返回 `false` 就立即整体返回 `false` 并带上具体原因，不再无条件 `return true`。`main.cpp` 对应调用点现在检查返回值，失败时打印 `SIGNATURE_ELIMINATION_FAIL` 并 `PrintFeatureStatus("signature_elimination", "failed", reason)` 后 `return 1`，成功时显式 `PrintFeatureStatus("signature_elimination", "applied")`（此前这个功能完全没有 `FEATURE_STATUS` 上报）。`tests/test_fail_closed.cpp` 里的调用点同步更新签名。
+
+验证：`ciphershell_packer`/`ciphershell.exe` 增量编译零警告零错误；`test_fail_closed.exe` 退出码 0。
+
+### 7.2 P1
+
+**7.2.1【已修复】`loader_import_builder.cpp` / `import_obfuscator.cpp` / `stub_builder.cpp` 的裸指针写入统一收回 `PEEmitter`**
+
+对应 3.3 节。三个文件里原先"用 `AppendSection` 返回的 `rawOffset` 直接对 `image->rawData` 做指针运算 + `memcpy`"的写法（`loader_import_builder.cpp` 的导入描述符/ILT/IAT 写入、`import_obfuscator.cpp` 的 `GenerateFakeImports` 同类写入与 `ClearOriginalImports` 的两处 `memset`、`stub_builder.cpp::InstallFirstTlsCallback` 的 TLS 回调数组写入）全部改为 `PEEmitter::PatchBytes(rva, bytes, &error)` / `PEEmitter::FillBytes(rva, size, value, &error)`。这些新目标 RVA 都等价于"新 section 基址 + 局部偏移"，`PatchBytes` 内部会用 `CheckedAdd` + `rawSize` 边界校验再写入，越界会 fail-closed 返回错误而不是相信调用方手算的偏移永远正确——这正是 `ciphershell.md` §4.2"PEEmitter 应为唯一改 PE 入口"原则要求的形态。`import_obfuscator.cpp::ClearOriginalImports` 顺带简化：原来手写的"遍历 section 找 RVA 命中区间再转文件偏移"逻辑整段删除，直接用 `FillBytes(rva, size, 0, nullptr)`，减少了一处与 `PEUtils::RvaToOffset` 重复实现、容易第二个版本产生分歧的代码。
+
+验证：`ciphershell_packer` 增量编译零警告零错误；`test_vm_handler_synthesis.exe`、`test_vm_public_entry.exe` 重新编译运行，退出码 0（`loader_import_builder.cpp` 是 VM 保护开启时的活代码路径，这两个测试间接覆盖了它依赖的 VM 运行时导入表构建链路）。
+
+**7.2.2【已修复】`micro_semantics.cpp` 的 `registerCount` 补齐边界钳制 + 新增负向测试**
+
+对应附录 A 原有备注。`VMSchema::ValidateInstruction` 只检查"寄存器操作数 < registerCount"，本身并不知道 `VMMicroMachineState::gpr` 是固定 32 项的 `std::array`；如果调用方传入 `registerCount > 32`，一个 schema 层面"合法"的寄存器操作数会在 `ExecuteOne` 里越界访问 `gpr`。当前唯一真实调用方传的都是 32，所以不是现实可触发漏洞，但补齐防御纵深成本很低。本轮在 `VMMicroSemanticExecutor::ExecuteOne`（所有执行路径的唯一公共入口）开头加了 `if (options.registerCount == 0 || options.registerCount > state.gpr.size())` 的 fail-closed 检查。
+
+同时在 `tests/test_vm_micro_core.cpp` 新增 `TestMicroExecutorRegisterCountClamp`：用一个不涉及任何寄存器操作数的最小合法程序（`PUSH_IMM`/`DROP`/`EXIT`）分别以 `registerCount=32`（应成功）、`registerCount=0`、`registerCount=33`（均应被 executor 拒绝，`fault==VMMicroFault::Decode`）三种配置执行，并接入 `main()` 的测试列表。
+
+验证：`test_vm_micro_core.exe` 新增用例与既有 25 个用例全部通过，退出码 0。
+
+**7.2.3【已修复】`vm_handler_synthesizer.cpp` 两处 offset 加法补齐溢出前置检查**
+
+对应附录 A 原有备注。`semanticCoreOffset`/`semanticCoreVariantOffset` 与 `semanticKernelBase` 相加时，原先只有紧邻的 `semanticBodyOffset` 那一处做了"加数是否会溢出 `uint32_t`"的前置检查，这两处没有。本轮补上同款 `generated.xxxOffset > UINT32_MAX - semanticKernelBase` 检查，溢出时返回 `"semantic core evidence offset cannot be embedded"` / `"...variant evidence offset cannot be embedded"` 并 fail-closed，不再依赖"生成的偏移值量级不会大到溢出"这个隐式假设。
+
+验证：`ciphershell_packer` 增量编译零警告零错误；`test_vm_handler_synthesis.exe`（覆盖真实语义核生成）、`test_vm_public_entry.exe` 重新编译运行，退出码 0。
+
+**7.2.4【已修复】`runtime/common/vm_crypto.c` 敏感缓冲区清零改为不可被优化掉的实现**
+
+对应附录 A 原有备注。原先 5 处清零（`vm_hchacha20` 的 state、`vm_derive_record_key` 的 input、`chacha20_block` 的 initial/working、`vm_chacha20_xor` 的 keystream block、`vm_siphash24_final` 的 context）全部是普通 `buf[i] = 0` 循环，写完之后不再被读取，属于纯死存储，编译器（尤其是这些 `static` 函数被内联进调用方之后）理论上有权整段优化掉。本轮新增一个统一的 `vm_secure_zero(void* ptr, size_t size)`：Windows 下调用 `SecureZeroMemory`（系统保证不被 DSE 消除），非 Windows 回退到 `volatile` 字节指针写。五处调用点全部改为调这一个函数，不是像最初报告建议里提醒的那样"到处各写一个 volatile 循环"。`vm_crypto.c` 只被编译进 `ciphershell_packer`（打包工具本身，跑在开发者机器上），不进入随包分发的 runtime/stub，`.github/workflows/ci.yml` 里唯一真正编译 C++/C 源码的作业锁定 `windows-2022`，因此 `SecureZeroMemory` 分支足以覆盖当前实际构建环境；非 Windows 分支是面向未来可移植性的防御性实现，非当前必需但也不产生风险。
+
+验证：`ciphershell_packer` 增量编译零警告零错误；`test_vm_public_entry.exe`（含"public crypto helpers"用例）重新编译运行，退出码 0，ChaCha20/HChaCha20/SipHash 输出未受影响（清零动作本来就在输出写完之后才发生）。
+
+### 7.3 P2
+
+**7.3.1【已删除】`packer/transforms/reloc_fixer.cpp`/`.h`**
+
+对应 3.4 节。全仓库确认 `RelocFixer` 类零实例化点（`main.cpp` 里出现的"module=RelocFixer"只是一条日志标签字符串，真正生效的重定位裁剪逻辑在 `main.cpp:1736-1762`，走 `PEEmitter::RebuildBaseRelocationDirectory`，与这个类无关）。已整文件删除，`packer/CMakeLists.txt` 同步移除编译项，`main.cpp` 移除相应 `#include`。
+
+**7.3.2【已删除】`packer/pe_parser/dll_packer.cpp`/`.h`（整个 `DLLPacker` 类）**
+
+对应 3.4 节。全仓库确认零调用点（不止是"报告里点名的那几个 `return true` 桩方法"没被调用，是整个类——包括看起来实现完整的 `PackDLL`/`GenerateExportTrampolines`/`GenerateDllMainStub`——都没有任何生产代码或 GUI 引用）。已整文件删除，`packer/CMakeLists.txt` 同步移除编译项。
+
+**7.3.3【已修复】`packer/pe_parser/pe_rebuilder.cpp` 删除未被调用的旧私有重建路径**
+
+对应 3.4 节。`RebuildHeaders`/`RebuildSections`/`RebuildOverlay` 三个私有方法确认从未被唯一公开入口 `RebuildImage`（`main.cpp` 实际调用的方法）调用，`RebuildImage` 自己内联实现了等价但更简单的逻辑。删除这三个方法后，只被它们调用的 `AlignValue`/`CalculateChecksum`/`UpdateChecksum`/`GenerateRandomDWORD` 以及零调用点的 `GenerateRandomBYTE` 一并删除；`GenerateRandomName` 因为仍被活代码 `RebuildImage` 和公开方法 `GenerateRandomSectionName` 使用而保留。`PERebuilder` 类本身、`RebuildImage` 等公开方法未改动。
+
+**7.3.4【已修复】`packer/analysis/cfg_builder.cpp::CollectLoopMembers` 的自然循环边界 bug**
+
+对应 3.4 节。原实现从 back-edge 的 latch 节点反向 BFS 收集循环成员时，只在"当前节点等于 header"时跳过"把它计入循环成员"，但仍然会继续展开 header 自身的前驱节点——导致 header 之前（循环入口边之外、不属于循环体）的上游块被误判为循环成员。本轮把判断改成"一旦回溯到 header 就 `continue`"，彻底停止在 header 处的展开，这是标准 natural loop 算法要求的边界条件。该模块唯一消费者 `BogusFlowInjector` 目前仍是孤儿代码（未被 `main.cpp` 调用），本次修复不改变当前产物行为，是为分析基础设施本身的正确性负责。
+
+**7.3.5【维持现状，未改动】`opaque_predicates.cpp` 的 `BT`/`JZ` 标志位不匹配**
+
+按你的决定保留：这是未来才会正式做的控制流功能的旧原型，13 种声明谓词里只有 3 种真正产出机器码，现在花时间修补价值不大，等正式实现时整块重写。本轮未触碰该文件。
+
+### 7.4 CipherShell Plus 定位：anti_debug / anti_dump 从"默认开启的幽灵开关"改为"默认关闭 + 显式拒绝"
+
+对应 2.1 节，这是本轮改动里语义上最重要的一处。按你的决定，**不删除**任何 anti_debug/anti_dump/nanomite 相关的配置字段、GUI 页面、`stub/stage1` 实现目录——它们是明确规划中的 CipherShell Plus 能力。但修复了"默认开启却静默不生效"这个问题：
+
+1. `config/default.toml` 与 `packer/config/config_parser.h`（`AntiDebugConfigFile`/`AntiDumpConfig` 构造函数默认值）里 `[anti_debug]`/`[anti_dump]` 全部 11 个开关的默认值从 `true` 改为 `false`。
+2. `packer/gui_win32/config_model.h`（`AntiDebugOptions`/`AntiDumpOptions`）同步改为 `false`，`main_window.cpp::BuildAntiDebugDumpPage` 里两个 section 的复选框创建时初始 `checked` 状态从硬编码 `true` 改为 `false`，且两个分组标题从"反调试 [anti_debug]（**全部真实可用，非 fail-closed**）"这句**与事实相反的误导性文案**，改成"CipherShell Plus，尚未实现：勾选后打包会被拒绝"。
+3. `packer/main.cpp` 新增两段 fail-closed 拒绝逻辑，写法与已有的 `string_encryption`/`import_protection` 拒绝块完全一致：只要 `config.antiDebug`/`config.antiDump` 里任意一项被用户显式打开为 `true`，在任何 PE 修改发生之前打印 `ANTI_DEBUG_REJECT`/`ANTI_DUMP_REJECT` 到 stderr、`PrintFeatureStatus(..., "rejected", "ciphershell_plus_not_implemented")`，然后 `return 1` 终止整个构建；默认（全部关闭）时打印 `PrintFeatureStatus(..., "skipped", "disabled")`。GUI 通过子进程调用 `ciphershell.exe`，这条 stderr 信息会原样进入 GUI 的日志区域，满足"用户尝试打开就要明确告诉他"的要求。
+
+这不是给这两个功能增加了任何实际保护能力——一个默认配置打出来的产物在反调试/反 Dump 这个维度上的实际防护强度仍然是 0，和修复前一样。改变的是：以前"看起来开着、其实什么都没做、不会有任何提示"，现在"用户一旦真的想要这个保护就会被明确拒绝并告知原因"，不再有第三种"以为自己受保护、实际完全没有"的沉默状态。真正把这层保护做出来仍然是未来 CipherShell Plus 的工作量，配置字段和 GUI 骨架已经就位，等实现接入时把默认值改回 `true`、把 `main.cpp` 里的拒绝分支换成真正调用 `stub/stage1` 生成逻辑即可，不需要重新设计配置 schema。
+
+### 7.5 本轮编译与回归验证汇总
+
+- 全部改动涉及的编译目标均在 x64 Release、`/W4 /WX` 下增量编译，零警告零错误：`ciphershell_packer.vcxproj`、`ciphershell.vcxproj`（`main.cpp`）、`ciphershell_gui.vcxproj`。
+- 重新编译并运行、全部退出码 0 的测试：`test_vm_micro_core`（新增 1 个用例，共 26 个，全 PASS）、`test_vm_handler_synthesis`、`test_vm_public_entry`、`test_fail_closed`、`test_cli_options`、`test_function_discovery`、`test_pe_hardening`、`test_pe_parser`、`test_vm_decryptor_coverage`。
+- 未做的验证（如实说明）：未跑完整 ctest 套件（18 个测试目标里覆盖了 9 个与本轮改动直接相关的）；未在远端 CI 验证；未运行任何加壳产物（不在本次审计允许的验证方式范围内）；`opaque_predicates.cpp`、`bogus_flow.cpp`、`stub/stage1` 等按你的决定明确不改动的部分未做任何验证，因为没有改动。
+- `git status --short` 最终状态：`config/default.toml`、`packer/CMakeLists.txt`、`packer/analysis/cfg_builder.cpp`、`packer/config/config_parser.h`、`packer/gui_win32/{config_model.h,main_window.cpp}`、`packer/main.cpp`、`packer/pe_parser/{pe_rebuilder.cpp,pe_rebuilder.h}`、`packer/signature/{signature_eliminator.cpp,signature_eliminator.h}`、`packer/transforms/{import_obfuscator.cpp,loader_import_builder.cpp,stub_builder.cpp,vm_handler_synthesizer.cpp}`、`packer/vm/{micro_semantics.cpp,vm_schema.cpp}`、`runtime/common/vm_crypto.c`、`tests/{test_fail_closed.cpp,test_vm_micro_core.cpp}` 为 modified；`packer/pe_parser/dll_packer.{cpp,h}`、`packer/transforms/reloc_fixer.{cpp,h}` 为 deleted。全部未 add、未 commit、未 push。
+
+### 7.6 评分更新
+
+三轴评分体系不变，本轮修复对三个轴的影响并不对称——这一点本身就是"引擎质量"和"整机保护强度"要分开评估的又一个例证：
+
+| 维度 | 第 6 章原分 | 本轮后 | 说明 |
+|---|---:|---:|---|
+| VM 核心技术成熟度 | 7/10 | **7/10（不变）** | 2.2 节的 verifier 终止性理论缺口已补齐为真正的图算法证明，但这本来就是"锦上添花的第二道闸门"（第一道防线是 Translator 本身的 fail-closed 纪律，从未在实践中被触发过），且 registerCount/checked-add 这类修复都是防御纵深而非新增能力，不足以从 7 分再往上走。 |
+| 作为完整产品今天实际能提供的保护强度 | 3/10 | **3/10（不变）** | 这是最容易被误解为"已经变好"的一项，必须明确：anti_debug/anti_dump 从"静默无效"变成"显式拒绝打包"，不会让任何一个已经打出来的受保护程序多获得一分实际防护——默认配置下这两类保护今天依然是 0。护栏修的是"工程诚信"，不是"保护强度"，这条边界必须守住，不能因为改了配置默认值就报虚高的分。 |
+| 工程诚信 / fail-closed 合规度 | 6/10 | **8/10** | 本次审计里唯一违反"不静默伪造功能完成"红线的问题（2.1）已经关闭；`EliminateSignatures` 不再吞错误；`PEEmitter` 单一入口原则在三处活代码/近活代码路径上恢复。留在 6→8 而不是拉满：`section_encryptor.cpp`/`string_encryptor.cpp` 内部仍有自创弱加密算法的历史记录（3.5/附录 A，虽然功能本身被 fail-closed，不影响当前产物），且 anti_debug/anti_dump 真正实现前，"配置字段存在但功能不存在"这个状态本身仍然要求使用者读文档/看拒绝信息才能明白，不是自解释的。
+
+**结论不变，但更精确了**：第 6 章"你现在拥有一台调校得相当认真的 VM 保护引擎，但还没有一辆能开上路的车"这句话依然成立。本轮做的事情相当于——给这辆还没装完的车贴上了准确的仪表盘（不该亮的灯不再亮），但没有多装一个零件。VMProtect 版本对标不变：核心虚拟化技术大致相当于 VMProtect 2.x 中后期水准，但作为今天就能保护真实商业软件的完整产品，实际到手的保护强度仍然低于 VMProtect 1.x——这一点在反调试/反 Dump 真正实现之前不会改变。

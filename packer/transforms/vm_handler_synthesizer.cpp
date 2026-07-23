@@ -433,9 +433,23 @@ bool BuildHandler(
         handler.semanticBodyOffset =
             semanticKernelBase + generated.semanticBodyOffset;
         handler.semanticBodySize = generated.semanticBodySize;
+        // semanticCoreOffset/semanticCoreVariantOffset 与上面的 semanticBodyOffset
+        // 同属"局部偏移 + kernel 基址"的组合，同样需要在相加前证明不会溢出，
+        // 而不是依赖 generated 产出的偏移值本身永远够小。
+        if (generated.semanticCoreOffset >
+                (std::numeric_limits<uint32_t>::max)() - semanticKernelBase) {
+            error = "semantic core evidence offset cannot be embedded";
+            return false;
+        }
         handler.semanticCoreOffset =
             semanticKernelBase + generated.semanticCoreOffset;
         handler.semanticCoreSize = generated.semanticCoreSize;
+        if (generated.semanticCoreVariantSize != 0 &&
+                generated.semanticCoreVariantOffset >
+                    (std::numeric_limits<uint32_t>::max)() - semanticKernelBase) {
+            error = "semantic core variant evidence offset cannot be embedded";
+            return false;
+        }
         handler.semanticCoreVariantOffset = generated.semanticCoreVariantSize != 0
             ? semanticKernelBase + generated.semanticCoreVariantOffset : 0u;
         handler.semanticCoreVariantSize = generated.semanticCoreVariantSize;

@@ -80,23 +80,25 @@ struct ControlFlowOptions {
     static constexpr int kBogusStrength = 50;
 };
 
-// 对应 config_parser.h::AntiDebugConfigFile，全部字段真实可调。
+// 对应 config_parser.h::AntiDebugConfigFile。CipherShell Plus 能力，尚未被
+// 任何 transform 消费——main.cpp 会对任意一项 true fail-closed 拒绝出包，
+// 因此默认必须与 config_parser.h 一致保持 false。
 struct AntiDebugOptions {
-    bool timingChecks = true;
-    bool hardwareBpDetection = true;
-    bool softwareBpDetection = true;
-    bool memoryIntegrity = true;
+    bool timingChecks = false;
+    bool hardwareBpDetection = false;
+    bool softwareBpDetection = false;
+    bool memoryIntegrity = false;
     bool debuggerWindowScan = false;
-    bool parentProcessCheck = true;
-    bool threadHiding = true;
-    bool kernelDebuggerCheck = true;
+    bool parentProcessCheck = false;
+    bool threadHiding = false;
+    bool kernelDebuggerCheck = false;
 };
 
-// 对应 config_parser.h::AntiDumpConfig。
+// 对应 config_parser.h::AntiDumpConfig。同上，CipherShell Plus 尚未接入。
 struct AntiDumpOptions {
-    bool erasePeHeader = true;
-    bool sectionPermissionGuard = true;
-    bool nanomitePatches = true;
+    bool erasePeHeader = false;
+    bool sectionPermissionGuard = false;
+    bool nanomitePatches = false;
 };
 
 // 对应 config_parser.h::PerformanceConfig。

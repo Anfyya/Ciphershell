@@ -443,7 +443,9 @@ void CFGBuilder::CollectLoopMembers(ControlFlowGraph& cfg, const CFGEdge& backEd
         cfg.nodes[static_cast<size_t>(headerId)].loopMembers.push_back(headerId);
     }
 
-    // 从 latch 向前遍历，收集循环成员
+    // 从 latch 向前遍历，收集循环成员。natural loop 的定义边界就是 header：
+    // 一旦回溯到 header 本身就必须停止继续展开它的前驱，否则会连着 header
+    // 循环入口边之外的上游块（不属于循环体）也一起吞进 loopMembers。
     std::queue<uint64_t> queue;
     std::unordered_set<uint64_t> visited;
 
@@ -454,13 +456,15 @@ void CFGBuilder::CollectLoopMembers(ControlFlowGraph& cfg, const CFGEdge& backEd
         uint64_t current = queue.front();
         queue.pop();
 
-        if (current != headerId) {
-            if (headerId < cfg.nodes.size()) {
-                cfg.nodes[static_cast<size_t>(headerId)].loopMembers.push_back(current);
-            }
-            if (current < cfg.nodes.size()) {
-                cfg.nodes[static_cast<size_t>(current)].loopDepth++;
-            }
+        if (current == headerId) {
+            continue;
+        }
+
+        if (headerId < cfg.nodes.size()) {
+            cfg.nodes[static_cast<size_t>(headerId)].loopMembers.push_back(current);
+        }
+        if (current < cfg.nodes.size()) {
+            cfg.nodes[static_cast<size_t>(current)].loopDepth++;
         }
 
         for (uint64_t pred : GetPredecessors(cfg, current)) {

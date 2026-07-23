@@ -426,12 +426,20 @@ bool InstallFirstTlsCallback(
         return false;
     }
     callbackArrayRVA = append.rva;
-    uint8_t* emitted = image->rawData + append.rawOffset;
+    // 与下方 callbackField 一样统一走 PatchBytes，不再对
+    // image->rawData + append.rawOffset 直接落笔。
     const uint64_t loaderVA = imageBase + callbackRVA;
-    std::memcpy(emitted, &loaderVA, pointerSize);
+    std::vector<uint8_t> loaderVaBytes(pointerSize);
+    std::memcpy(loaderVaBytes.data(), &loaderVA, pointerSize);
+    if (!emitter.PatchBytes(append.rva, loaderVaBytes, &error)) return false;
     for (size_t i = 0; i < image->tls.callbackAddresses.size(); ++i) {
         const uint64_t callbackVA = image->tls.callbackAddresses[i];
-        std::memcpy(emitted + (i + 1u) * pointerSize, &callbackVA, pointerSize);
+        std::vector<uint8_t> callbackVaBytes(pointerSize);
+        std::memcpy(callbackVaBytes.data(), &callbackVA, pointerSize);
+        if (!emitter.PatchBytes(append.rva + static_cast<uint32_t>((i + 1u) * pointerSize),
+                callbackVaBytes, &error)) {
+            return false;
+        }
     }
 
     const uint32_t callbackFieldRVA = image->tls.directoryRVA + static_cast<uint32_t>(

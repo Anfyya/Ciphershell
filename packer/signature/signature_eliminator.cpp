@@ -59,34 +59,44 @@ std::vector<SignatureMatch> SignatureEliminator::DetectSignatures(CS_PE_IMAGE* i
     return matches;
 }
 
-bool SignatureEliminator::EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config) {
+bool SignatureEliminator::EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config,
+        std::string& reason) {
     if (!image || !image->isValid) {
+        reason = "invalid_pe_image";
         return false;
     }
 
+    // 每个子步骤的返回值都必须传播：吞掉失败会让调用方把一次不完整的签名
+    // 消除当作"成功产物"报告出去，与项目 fail-closed 原则冲突。
+
     // 随机化 section 名称
-    if (config.randomizeSectionNames) {
-        RandomizeSectionNames(image);
+    if (config.randomizeSectionNames && !RandomizeSectionNames(image)) {
+        reason = "randomize_section_names_failed";
+        return false;
     }
 
     // 清除 Rich Header
-    if (config.clearRichHeader) {
-        ClearRichHeader(image);
+    if (config.clearRichHeader && !ClearRichHeader(image)) {
+        reason = "clear_rich_header_failed";
+        return false;
     }
 
     // 清除调试目录
-    if (config.clearDebugDirectory) {
-        ClearDebugDirectory(image);
+    if (config.clearDebugDirectory && !ClearDebugDirectory(image)) {
+        reason = "clear_debug_directory_failed";
+        return false;
     }
 
     // 清除时间戳
-    if (config.randomizeTimestamps) {
-        ClearTimestamps(image);
+    if (config.randomizeTimestamps && !ClearTimestamps(image)) {
+        reason = "clear_timestamps_failed";
+        return false;
     }
 
     // 清除校验和
-    if (config.clearChecksum) {
-        ClearChecksum(image);
+    if (config.clearChecksum && !ClearChecksum(image)) {
+        reason = "clear_checksum_failed";
+        return false;
     }
 
     // 注意：不得在此统一重写 section 权限。VM metadata/bytecode/只读数据段的
