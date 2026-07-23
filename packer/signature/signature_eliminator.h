@@ -71,9 +71,11 @@ public:
      * 消除已知签名
      * @param image PE 镜像
      * @param config 消除配置
-     * @return 是否成功
+     * @param reason 失败时写入具体原因，供调用方 fail-closed 上报
+     * @return 是否成功；任意声明为启用的子步骤失败即整体失败，不吞掉错误
      */
-    bool EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config);
+    bool EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config,
+        std::string& reason);
 
     /**
      * 验证消除结果
@@ -100,7 +102,7 @@ private:
     // 辅助函数
     bool PatternMatch(const BYTE* data, DWORD size, const BYTE* pattern, DWORD patternSize);
     DWORD GenerateRandomDWORD();
-    void GenerateRandomName(char* name, DWORD length);
+    bool GenerateRandomName(char* name, DWORD length);
 
     // BUG 17 修复：支持从外部配置文件加载签名数据库
 public:

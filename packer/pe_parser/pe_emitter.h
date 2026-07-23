@@ -49,6 +49,28 @@ public:
         const char sectionName[8],
         PEAppendSectionResult* sectionResult = nullptr,
         std::string* error = nullptr);
+    // x86 only.  additionalHandlerRVAs are newly generated SEH handler entry
+    // points (already final image RVAs) that must be callable during unwind.
+    //
+    //   - No existing SafeSEH contract (LoadConfig has no valid
+    //     SEHandlerTable/SEHandlerCount): a no-op success.  Fabricating a new
+    //     SafeSEH table here would apply strict handler enumeration to
+    //     pre-existing code that was never linked with /SAFESEH, silently
+    //     invalidating its legitimate handlers.
+    //   - IMAGE_DLLCHARACTERISTICS_NO_SEH set: fail-closed.  That flag makes
+    //     RtlIsValidHandler reject every handler in this module unconditionally,
+    //     so a newly installed handler could never run.
+    //   - A valid existing table: merge, sort, and dedupe by RVA, then commit
+    //     via AppendSection + PatchBytes, exactly like RebuildGuardCFFunctionTable.
+    //   - Any other structural problem (unpatchable fields, table outside the
+    //     file, overflow): fail-closed rather than emit a runtime that Windows
+    //     would refuse to call the handler for.
+    // Calling this for a 64-bit image always fails: x64 has no SafeSEH.
+    bool RebuildSafeSEHHandlerTable(
+        const std::vector<uint32_t>& additionalHandlerRVAs,
+        const char sectionName[8],
+        PEAppendSectionResult* sectionResult = nullptr,
+        std::string* error = nullptr);
     bool RebuildBaseRelocationDirectory(
         const std::vector<CS_RELOC_ENTRY>& additionalEntries,
         const char sectionName[8],

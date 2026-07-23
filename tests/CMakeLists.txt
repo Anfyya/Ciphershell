@@ -256,6 +256,7 @@ add_executable(test_pe_hardening
 
 target_link_libraries(test_pe_hardening PRIVATE
     ciphershell_packer
+    Zydis
 )
 
 target_include_directories(test_pe_hardening PRIVATE ${CMAKE_SOURCE_DIR})
@@ -294,6 +295,30 @@ add_test(NAME vm_runtime_integrity COMMAND test_vm_runtime_integrity)
 set_tests_properties(vm_runtime_integrity PROPERTIES LABELS "vm;hard-gate")
 add_test(NAME vm_native_differential COMMAND test_vm_native_differential)
 set_tests_properties(vm_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
+add_test(NAME vm_flags_boundary_native_differential
+    COMMAND test_vm_native_differential --flags-boundary-only)
+set_tests_properties(vm_flags_boundary_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
+add_test(NAME vm_flags_lifecycle_native_differential
+    COMMAND test_vm_native_differential --flags-lifecycle-only)
+set_tests_properties(vm_flags_lifecycle_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
+add_test(NAME vm_pop_control_native_differential
+    COMMAND test_vm_native_differential --pop-control-only)
+set_tests_properties(vm_pop_control_native_differential PROPERTIES
+    LABELS "vm;hard-gate"
+    TIMEOUT 120
+)
+add_test(NAME vm_select_native_differential
+    COMMAND test_vm_native_differential --select-only)
+set_tests_properties(vm_select_native_differential PROPERTIES
     LABELS "vm;hard-gate"
     TIMEOUT 120
 )

@@ -810,6 +810,39 @@ void TestStreamVerifierFailClosed() {
         "未映射 opcode 未 fail-closed");
 }
 
+// state.gpr 是固定容量 32 的 std::array；ValidateInstruction 只检查
+// `regIndex < options.registerCount`，并不知道 gpr 的实际容量。若调用方把
+// registerCount 设成 0 或大于 32，一个 schema 层面"合法"的寄存器操作数就会
+// 在 ExecuteOne 里越界访问 state.gpr。这里验证 executor 自身会在使用
+// registerCount 之前先钳制，不依赖调用方永远传对。
+void TestMicroExecutorRegisterCountClamp() {
+    EncodedEnvironment environment = MakeEnvironment(0x85, 0x8300);
+    const std::vector<MicroInstruction> program = {
+        Uop(VM_UOP_PUSH_IMM, {1, 8}),
+        Uop(VM_UOP_DROP),
+        Uop(VM_UOP_EXIT, {0})
+    };
+    std::vector<uint8_t> memory;
+    std::string error;
+
+    environment.options.registerCount = 32;
+    VMMicroMachineState baseline{};
+    Require(ExecuteEncoded(program, environment, baseline, memory, 0, error),
+        "registerCount=32 的合法程序未能执行: " + error);
+
+    environment.options.registerCount = 0;
+    VMMicroMachineState zeroState{};
+    Require(!ExecuteEncoded(program, environment, zeroState, memory, 0, error) &&
+        zeroState.fault == VMMicroFault::Decode,
+        "registerCount=0 未被 executor 钳制拒绝");
+
+    environment.options.registerCount = 33;
+    VMMicroMachineState overflowState{};
+    Require(!ExecuteEncoded(program, environment, overflowState, memory, 0, error) &&
+        overflowState.fault == VMMicroFault::Decode,
+        "registerCount 超过 gpr 容量(32)未被 executor 钳制拒绝");
+}
+
 void TestDifferentialArchitectureState() {
     const EncodedEnvironment environment = MakeEnvironment(0x95, 0x9500);
     constexpr uint64_t memoryBase = 0x0000000140000000ULL;
@@ -3292,6 +3325,7 @@ int main() {
     Run("per-build opcode/operand 编码变异", &TestPerBuildOperandAndOpcodeVariation, failures);
     Run("per-instruction K variant selector", &TestPerInstructionVariantSelector, failures);
     Run("变长流 verifier fail-closed", &TestStreamVerifierFailClosed, failures);
+    Run("micro executor registerCount 边界钳制", &TestMicroExecutorRegisterCountClamp, failures);
     Run("完整架构状态差分模糊语料", &TestDifferentialArchitectureState, failures);
     Run("lazy flags 全消费者路径", &TestLazyFlagsAndConsumers, failures);
     Run("lazy flags overwrite/update preservation",

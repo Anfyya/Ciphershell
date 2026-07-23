@@ -294,38 +294,17 @@ bool ImportObfuscator::ClearOriginalImports(CS_PE_IMAGE* image) {
         return true;  // 没有导入表
     }
 
-    // 清空导入表内容（但保留目录项）
-    DWORD importOffset = 0;
-    for (WORD i = 0; i < image->numSections; i++) {
-        if (image->sections[i].VirtualAddress <= importDir.VirtualAddress &&
-            image->sections[i].VirtualAddress + image->sections[i].SizeOfRawData > importDir.VirtualAddress) {
-            importOffset = importDir.VirtualAddress - image->sections[i].VirtualAddress +
-                           image->sections[i].PointerToRawData;
-            break;
-        }
-    }
-
-    if (importOffset > 0 && importOffset + importDir.Size <= image->rawSize) {
-        memset(image->rawData + importOffset, 0, importDir.Size);
-    }
+    // 清空导入表内容（但保留目录项）；改走 PEEmitter::FillBytes 而不是手算
+    // section 命中区间再对 image->rawData 落笔——RVA→文件偏移与越界校验统一
+    // 由 emitter 负责，不再由每个调用方各自重算一遍。
+    PEEmitter emitter(image);
+    emitter.FillBytes(importDir.VirtualAddress, importDir.Size, 0, nullptr);
 
     // 清空 IAT 内容
     for (auto& dll : image->imports.dlls) {
-        DWORD iatOffset = 0;
-        for (WORD i = 0; i < image->numSections; i++) {
-            if (image->sections[i].VirtualAddress <= dll.firstThunkRVA &&
-                image->sections[i].VirtualAddress + image->sections[i].SizeOfRawData > dll.firstThunkRVA) {
-                iatOffset = dll.firstThunkRVA - image->sections[i].VirtualAddress +
-                            image->sections[i].PointerToRawData;
-                break;
-            }
-        }
-
-        if (iatOffset > 0) {
-            DWORD iatSize = (DWORD)dll.functions.size() * (image->is64Bit ? 8 : 4);
-            if (iatOffset + iatSize <= image->rawSize) {
-                memset(image->rawData + iatOffset, 0, iatSize);
-            }
+        const DWORD iatSize = (DWORD)dll.functions.size() * (image->is64Bit ? 8 : 4);
+        if (iatSize != 0) {
+            emitter.FillBytes(dll.firstThunkRVA, iatSize, 0, nullptr);
         }
     }
 
@@ -411,15 +390,22 @@ bool ImportObfuscator::GenerateFakeImports(CS_PE_IMAGE* image, uint32_t count) {
         return false;
     }
 
-    uint8_t* emitted = image->rawData + append.rawOffset;
+    // 新 section 的内容一律通过 PEEmitter::PatchBytes 写入，而不是直接对
+    // image->rawData + 偏移落笔，使越界写入在 PatchBytes 内部的
+    // CheckedAdd/rawSize 校验中 fail-closed，不依赖调用方手算偏移永远正确。
     IMAGE_IMPORT_DESCRIPTOR fakeDescriptor{};
     fakeDescriptor.OriginalFirstThunk = append.rva + iltOffset;
     fakeDescriptor.Name = append.rva + dllNameOffset;
     fakeDescriptor.FirstThunk = append.rva + iatOffset;
-    std::memcpy(
-        emitted + originalDescriptors.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR),
-        &fakeDescriptor,
-        sizeof(fakeDescriptor));
+    std::vector<uint8_t> fakeDescriptorBytes(sizeof(fakeDescriptor));
+    std::memcpy(fakeDescriptorBytes.data(), &fakeDescriptor, sizeof(fakeDescriptor));
+    const uint32_t fakeDescriptorRVA = append.rva +
+        static_cast<uint32_t>(originalDescriptors.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+    std::string patchError;
+    if (!emitter.PatchBytes(fakeDescriptorRVA, fakeDescriptorBytes, &patchError)) {
+        m_lastError = "failed to patch fake import descriptor: " + patchError;
+        return false;
+    }
 
     CS_IMPORT_DLL fakeDll{};
     fakeDll.dllName = "kernel32.dll";
@@ -428,8 +414,13 @@ bool ImportObfuscator::GenerateFakeImports(CS_PE_IMAGE* image, uint32_t count) {
 
     for (uint32_t i = 0; i < count; i++) {
         const uint64_t hintNameRVA = static_cast<uint64_t>(append.rva) + hintNameOffsets[i];
-        std::memcpy(emitted + iltOffset + i * thunkSize, &hintNameRVA, thunkSize);
-        std::memcpy(emitted + iatOffset + i * thunkSize, &hintNameRVA, thunkSize);
+        std::vector<uint8_t> thunkBytes(thunkSize);
+        std::memcpy(thunkBytes.data(), &hintNameRVA, thunkSize);
+        if (!emitter.PatchBytes(append.rva + iltOffset + i * thunkSize, thunkBytes, &patchError) ||
+            !emitter.PatchBytes(append.rva + iatOffset + i * thunkSize, thunkBytes, &patchError)) {
+            m_lastError = "failed to patch fake import thunk: " + patchError;
+            return false;
+        }
 
         CS_IMPORT_FUNCTION fakeFunction{};
         fakeFunction.name = kSafeKernel32FakeImports[i];

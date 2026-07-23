@@ -45,6 +45,7 @@ struct ProtectionBuildContext {
     char vmBridgeUnwindSectionName[8] = {'.','c','s','b','u','w',0,0};
     char vmGuardSectionName[8] = {'.','c','s','g','f','t',0,0};
     char vmRelocSectionName[8] = {'.','c','s','r','l','c',0,0};
+    char vmSafeSehSectionName[8] = {'.','c','s','s','e','h',0,0};
     char vmRuntimeApiSectionName[8] = {'.','c','s','v','a','p','i',0};
     char cfgCodeSectionName[8] = {'.','c','f','g','x',0,0,0};
     char cfgUnwindSectionName[8] = {'.','c','f','g','u','w',0,0};

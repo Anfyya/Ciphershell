@@ -10,14 +10,12 @@ add_library(ciphershell_packer STATIC
     pe_parser/pe_parser.cpp
     pe_parser/pe_emitter.cpp
     pe_parser/pe_rebuilder.cpp
-    pe_parser/dll_packer.cpp
 
     # 变换引擎 — Phase 1
     transforms/section_encryptor.cpp
     transforms/string_encryptor.cpp
     transforms/string_encryptor_advanced.cpp
     transforms/import_obfuscator.cpp
-    transforms/reloc_fixer.cpp
 
     # 分析引擎 — Phase 3
     analysis/instruction_ir.cpp

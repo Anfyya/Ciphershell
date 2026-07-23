@@ -62,19 +62,39 @@ constexpr std::array<uint8_t, 8> kX64BridgeUnwindInfo = {
     static_cast<uint8_t>(kX64BridgeStackSize / 8u),
     static_cast<uint8_t>(kX64BridgeStackSize / 8u >> 8u)
 };
-constexpr uint32_t kX64NativeCallStackSize = 0x608u;
-static_assert((kX64NativeCallStackSize & 0xFu) == 8u &&
-        kX64NativeCallStackSize / 8u <= 0xFFFFu,
+static_assert((kVMHandlerX64CallHostFramePlan.stackBytes & 0xFu) == 8u &&
+        kVMHandlerX64CallHostFramePlan.stackBytes / 8u <= 0xFFFFu &&
+        kVMHandlerX64CallHostFramePlan.unwindFlags <= 0x1Fu,
     "native-call Win64 frame contract changed");
-constexpr std::array<uint8_t, 8> kX64NativeCallUnwindInfo = {
-    0x01,
-    0x07,
+std::array<uint8_t, 12> BuildX64CallHostUnwindInfo(uint32_t handlerOffset) {
+    const uint16_t scaledStack = static_cast<uint16_t>(
+        kVMHandlerX64CallHostFramePlan.stackBytes / 8u);
+    return {{
+    static_cast<uint8_t>(0x01u |
+        (kVMHandlerX64CallHostFramePlan.unwindFlags << 3u)),
+    kVMHandlerX64CallHostFramePlan.prologSize,
     0x02,
     0x00,
-    0x07, 0x01,
-    static_cast<uint8_t>(kX64NativeCallStackSize / 8u),
-    static_cast<uint8_t>(kX64NativeCallStackSize / 8u >> 8u)
-};
+    kVMHandlerX64CallHostFramePlan.stackAllocationCodeOffset, 0x01,
+    static_cast<uint8_t>(scaledStack),
+    static_cast<uint8_t>(scaledStack >> 8u),
+    static_cast<uint8_t>(handlerOffset),
+    static_cast<uint8_t>(handlerOffset >> 8u),
+    static_cast<uint8_t>(handlerOffset >> 16u),
+    static_cast<uint8_t>(handlerOffset >> 24u)
+    }};
+}
+
+std::array<uint8_t, 7> BuildX64CallHostStackInstruction(
+    uint8_t opcode,
+    uint32_t stackBytes)
+{
+    return {{0x48u, 0x81u, opcode,
+        static_cast<uint8_t>(stackBytes),
+        static_cast<uint8_t>(stackBytes >> 8u),
+        static_cast<uint8_t>(stackBytes >> 16u),
+        static_cast<uint8_t>(stackBytes >> 24u)}};
+}
 constexpr std::array<uint8_t, 8> kX64CpuidUnwindInfo = {
     0x01,                               // version 1, no flags
     0x01,                               // PUSH RBX length
@@ -123,8 +143,8 @@ bool ExpectedSemanticStackFunclet(
             return true;
         case VM_UOP_CALL_HOST:
             expected.kind = VMSynthesizedUnwindKind::StackAllocation;
-            expected.stackBytes = kX64NativeCallStackSize;
-            expected.prologSize = 7u;
+            expected.stackBytes = kVMHandlerX64CallHostFramePlan.stackBytes;
+            expected.prologSize = kVMHandlerX64CallHostFramePlan.prologSize;
             return true;
         case VM_UOP_CPUID:
             expected.kind = VMSynthesizedUnwindKind::PushNonvolatile;
@@ -413,9 +433,23 @@ bool BuildHandler(
         handler.semanticBodyOffset =
             semanticKernelBase + generated.semanticBodyOffset;
         handler.semanticBodySize = generated.semanticBodySize;
+        // semanticCoreOffset/semanticCoreVariantOffset 与上面的 semanticBodyOffset
+        // 同属"局部偏移 + kernel 基址"的组合，同样需要在相加前证明不会溢出，
+        // 而不是依赖 generated 产出的偏移值本身永远够小。
+        if (generated.semanticCoreOffset >
+                (std::numeric_limits<uint32_t>::max)() - semanticKernelBase) {
+            error = "semantic core evidence offset cannot be embedded";
+            return false;
+        }
         handler.semanticCoreOffset =
             semanticKernelBase + generated.semanticCoreOffset;
         handler.semanticCoreSize = generated.semanticCoreSize;
+        if (generated.semanticCoreVariantSize != 0 &&
+                generated.semanticCoreVariantOffset >
+                    (std::numeric_limits<uint32_t>::max)() - semanticKernelBase) {
+            error = "semantic core variant evidence offset cannot be embedded";
+            return false;
+        }
         handler.semanticCoreVariantOffset = generated.semanticCoreVariantSize != 0
             ? semanticKernelBase + generated.semanticCoreVariantOffset : 0u;
         handler.semanticCoreVariantSize = generated.semanticCoreVariantSize;
@@ -459,6 +493,18 @@ bool BuildHandler(
                     return false;
             }
             handler.semanticStackFunclets.push_back(embedded);
+        }
+        if (generated.hasCallHostSehHandler) {
+            if (generated.callHostSehHandlerOffset > generated.code.size() ||
+                generated.callHostSehHandlerOffset >
+                    (std::numeric_limits<uint32_t>::max)() -
+                        semanticKernelBase) {
+                error = "CALL_HOST SEH handler offset cannot be embedded";
+                return false;
+            }
+            handler.callHostSehHandlerOffset = semanticKernelBase +
+                generated.callHostSehHandlerOffset;
+            handler.hasCallHostSehHandler = true;
         }
         code.bytes.insert(code.bytes.end(), generated.code.begin(), generated.code.end());
         handler.registerAssignment = generated.registerAssignment;
@@ -931,6 +977,18 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
         handler.storageSize = static_cast<uint32_t>(handler.plaintextBody.size());
         std::copy(handler.plaintextBody.begin(), handler.plaintextBody.end(),
             result.image.begin() + cursor);
+        if (handler.hasCallHostSehHandler) {
+            if (config.architecture != VMHandlerArchitecture::X86 ||
+                handler.semantic != VM_UOP_CALL_HOST ||
+                handler.callHostSehHandlerOffset >= handler.storageSize ||
+                handler.callHostSehHandlerOffset >
+                    (std::numeric_limits<uint32_t>::max)() - cursor) {
+                result.error = "CALL_HOST SafeSEH handler layout is invalid";
+                return result;
+            }
+            result.safeSehHandlerOffsets.push_back(
+                cursor + handler.callHostSehHandlerOffset);
+        }
         cursor += handler.storageSize;
     }
     for (auto& handler : result.junkHandlers) {
@@ -1088,6 +1146,25 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
             result.error = "handler unwind layout exceeds uint32 range";
             return result;
         }
+        std::vector<uint8_t> callHostUnwindHandler;
+        std::string callHostUnwindError;
+        if (!GenerateVMHandlerX64CallHostUnwindHandler(
+                callHostUnwindHandler, callHostUnwindError) ||
+            callHostUnwindHandler.empty() ||
+            !AlignUpChecked(static_cast<uint32_t>(result.image.size()), 16u,
+                result.callHostUnwindHandlerOffset) ||
+            callHostUnwindHandler.size() >
+                (std::numeric_limits<uint32_t>::max)() -
+                    result.callHostUnwindHandlerOffset) {
+            result.error = "CALL_HOST unwind handler generation failed: " +
+                callHostUnwindError;
+            return result;
+        }
+        result.image.resize(result.callHostUnwindHandlerOffset, 0x90);
+        result.image.insert(result.image.end(), callHostUnwindHandler.begin(),
+            callHostUnwindHandler.end());
+        const auto nativeCallUnwindInfo = BuildX64CallHostUnwindInfo(
+            result.callHostUnwindHandlerOffset);
         const auto appendUnwindInfo = [&](const auto& info,
                                           uint32_t& offset) {
             if (result.image.size() > (std::numeric_limits<uint32_t>::max)() ||
@@ -1106,12 +1183,13 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
         if (!appendUnwindInfo(kX64DirectTailUnwindInfo,
                 smallAllocUnwindOffset) ||
             !appendUnwindInfo(kX64BridgeUnwindInfo, bridgeUnwindOffset) ||
-            !appendUnwindInfo(kX64NativeCallUnwindInfo,
+            !appendUnwindInfo(nativeCallUnwindInfo,
                 nativeCallUnwindOffset) ||
             !appendUnwindInfo(kX64CpuidUnwindInfo, cpuidUnwindOffset)) {
             result.error = "handler canonical xdata layout overflows";
             return result;
         }
+        result.imageRvaPatchOffsets.push_back(nativeCallUnwindOffset + 8u);
 
         const auto appendStackFunclet = [&](const VMSynthesizedHandler& handler,
                                              const VMSynthesizedStackFunclet& funclet) {
@@ -1134,8 +1212,10 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
                 unwindOffset = bridgeUnwindOffset;
             } else if (funclet.kind ==
                            VMSynthesizedUnwindKind::StackAllocation &&
-                       funclet.stackBytes == kX64NativeCallStackSize &&
-                       funclet.prologSize == 7u &&
+                       funclet.stackBytes ==
+                           kVMHandlerX64CallHostFramePlan.stackBytes &&
+                       funclet.prologSize ==
+                           kVMHandlerX64CallHostFramePlan.prologSize &&
                        funclet.nonvolatileRegister == 0) {
                 unwindOffset = nativeCallUnwindOffset;
             } else if (funclet.kind ==
@@ -1423,13 +1503,26 @@ bool VMHandlerSynthesizer::Validate(
             encoding = HandlerUnwindEncoding::BridgeAlloc;
         } else if (funclet.kind ==
                        VMSynthesizedUnwindKind::StackAllocation &&
-                   funclet.stackBytes == kX64NativeCallStackSize) {
-            constexpr std::array<uint8_t, 7> prolog = {
-                0x48,0x81,0xEC,0x08,0x06,0x00,0x00
-            };
-            constexpr std::array<uint8_t, 7> epilog = {
-                0x48,0x81,0xC4,0x08,0x06,0x00,0x00
-            };
+                   funclet.stackBytes ==
+                       kVMHandlerX64CallHostFramePlan.stackBytes) {
+            const auto allocation = BuildX64CallHostStackInstruction(
+                0xECu, kVMHandlerX64CallHostFramePlan.stackBytes);
+            const uint32_t phase =
+                kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill;
+            std::array<uint8_t, 18> prolog{};
+            std::copy(allocation.begin(), allocation.end(), prolog.begin());
+            const std::array<uint8_t, 11> phaseInitialization = {{
+                0xC7,0x84,0x24,
+                static_cast<uint8_t>(phase),
+                static_cast<uint8_t>(phase >> 8u),
+                static_cast<uint8_t>(phase >> 16u),
+                static_cast<uint8_t>(phase >> 24u),
+                0x00,0x00,0x00,0x00
+            }};
+            std::copy(phaseInitialization.begin(), phaseInitialization.end(),
+                prolog.begin() + allocation.size());
+            const auto epilog = BuildX64CallHostStackInstruction(
+                0xC4u, kVMHandlerX64CallHostFramePlan.stackBytes);
             constexpr std::array<uint8_t, 2> call = {0xFF,0xD0};
             if (funclet.size < prolog.size() + epilog.size() + call.size() ||
                 !std::equal(prolog.begin(), prolog.end(), begin) ||
@@ -1790,6 +1883,40 @@ bool VMHandlerSynthesizer::Validate(
     }
 
     if (x64Target) {
+        std::vector<uint8_t> expectedCallHostUnwindHandler;
+        std::string callHostUnwindError;
+        if (!GenerateVMHandlerX64CallHostUnwindHandler(
+                expectedCallHostUnwindHandler, callHostUnwindError) ||
+            expectedCallHostUnwindHandler.empty() ||
+            result.callHostUnwindHandlerOffset <
+                result.encryptedHandlerOffset + result.encryptedHandlerSize ||
+            result.callHostUnwindHandlerOffset > result.image.size() ||
+            expectedCallHostUnwindHandler.size() >
+                result.image.size() - result.callHostUnwindHandlerOffset ||
+            !std::equal(expectedCallHostUnwindHandler.begin(),
+                expectedCallHostUnwindHandler.end(),
+                result.image.begin() + result.callHostUnwindHandlerOffset) ||
+            result.imageRvaPatchOffsets.size() != 1u ||
+            result.safeSehHandlerOffsets.size() != 0u) {
+            error = "x64 CALL_HOST unwind cleanup thunk is missing or non-canonical";
+            return false;
+        }
+        const uint32_t callHostRvaPatch = result.imageRvaPatchOffsets[0];
+        uint32_t storedCallHostHandlerOffset = 0;
+        if (callHostRvaPatch > result.image.size() ||
+            sizeof(uint32_t) > result.image.size() - callHostRvaPatch) {
+            error = "x64 CALL_HOST unwind-handler RVA patch is outside xdata";
+            return false;
+        }
+        std::memcpy(&storedCallHostHandlerOffset,
+            result.image.data() + callHostRvaPatch,
+            sizeof(storedCallHostHandlerOffset));
+        if (storedCallHostHandlerOffset != result.callHostUnwindHandlerOffset) {
+            error = "x64 CALL_HOST unwind-handler RVA disagrees with its thunk";
+            return false;
+        }
+        const auto expectedNativeCallUnwindInfo =
+            BuildX64CallHostUnwindInfo(result.callHostUnwindHandlerOffset);
         const size_t expectedTailCount = result.handlers.size() +
             result.junkHandlers.size();
         if (expectedTailUnwindRanges.size() != expectedTailCount ||
@@ -1834,18 +1961,36 @@ bool VMHandlerSynthesizer::Validate(
                 error = "x64 handler range lacks declared stack-funclet metadata";
                 return false;
             }
-            const auto* expectedInfo = &kX64DirectTailUnwindInfo;
-            if (expectedEncoding->second == HandlerUnwindEncoding::BridgeAlloc)
-                expectedInfo = &kX64BridgeUnwindInfo;
-            else if (expectedEncoding->second ==
-                        HandlerUnwindEncoding::NativeCallAlloc)
-                expectedInfo = &kX64NativeCallUnwindInfo;
-            else if (expectedEncoding->second == HandlerUnwindEncoding::PushRbx)
-                expectedInfo = &kX64CpuidUnwindInfo;
-            if (expectedInfo->size() >
-                    result.image.size() - unwind.unwindOffset ||
-                !std::equal(expectedInfo->begin(), expectedInfo->end(),
-                    result.image.begin() + unwind.unwindOffset) ||
+            bool canonicalUnwindInfo = false;
+            if (expectedEncoding->second == HandlerUnwindEncoding::BridgeAlloc) {
+                canonicalUnwindInfo = kX64BridgeUnwindInfo.size() <=
+                        result.image.size() - unwind.unwindOffset &&
+                    std::equal(kX64BridgeUnwindInfo.begin(),
+                        kX64BridgeUnwindInfo.end(),
+                        result.image.begin() + unwind.unwindOffset);
+            } else if (expectedEncoding->second ==
+                           HandlerUnwindEncoding::NativeCallAlloc) {
+                canonicalUnwindInfo = expectedNativeCallUnwindInfo.size() <=
+                        result.image.size() - unwind.unwindOffset &&
+                    unwind.unwindOffset + 8u == callHostRvaPatch &&
+                    std::equal(expectedNativeCallUnwindInfo.begin(),
+                        expectedNativeCallUnwindInfo.end(),
+                        result.image.begin() + unwind.unwindOffset);
+            } else if (expectedEncoding->second ==
+                           HandlerUnwindEncoding::PushRbx) {
+                canonicalUnwindInfo = kX64CpuidUnwindInfo.size() <=
+                        result.image.size() - unwind.unwindOffset &&
+                    std::equal(kX64CpuidUnwindInfo.begin(),
+                        kX64CpuidUnwindInfo.end(),
+                        result.image.begin() + unwind.unwindOffset);
+            } else {
+                canonicalUnwindInfo = kX64DirectTailUnwindInfo.size() <=
+                        result.image.size() - unwind.unwindOffset &&
+                    std::equal(kX64DirectTailUnwindInfo.begin(),
+                        kX64DirectTailUnwindInfo.end(),
+                        result.image.begin() + unwind.unwindOffset);
+            }
+            if (!canonicalUnwindInfo ||
                 !actualHandlerUnwindRanges.emplace(
                     range, expectedEncoding->second).second) {
                 error = "x64 handler funclet has non-canonical UNWIND_INFO";
@@ -1857,9 +2002,61 @@ bool VMHandlerSynthesizer::Validate(
             error = "x64 handler unwind coverage is not bidirectionally complete";
             return false;
         }
-    } else if (!result.unwindEntries.empty()) {
-        error = "x86 generated runtime unexpectedly contains x64 unwind data";
-        return false;
+    } else {
+        if (!result.unwindEntries.empty() ||
+            result.callHostUnwindHandlerOffset != 0u ||
+            !result.imageRvaPatchOffsets.empty()) {
+            error = "x86 generated runtime unexpectedly contains x64 unwind data";
+            return false;
+        }
+        // result.safeSehHandlerOffsets must be exactly the set of real (never
+        // junk -- BuildJunkHandler never assigns VM_UOP_CALL_HOST or sets
+        // hasCallHostSehHandler) handlers that declared
+        // hasCallHostSehHandler, each pointing at its own handler's real
+        // ENDBR32 entry, strictly ascending with no duplicate -- this is the
+        // exact contract PEEmitter::RebuildSafeSEHHandlerTable and the final
+        // PE builder rely on to merge a sorted, deduplicated SafeSEH table.
+        constexpr std::array<uint8_t, 4> kEndbr32 = {0xF3, 0x0F, 0x1E, 0xFB};
+        std::vector<uint32_t> expectedSafeSehOffsets;
+        for (const auto& handler : result.handlers) {
+            if (!handler.hasCallHostSehHandler) continue;
+            // result.image has already been through EncryptHandlerRegion by
+            // the time Validate() runs (Synthesize() calls Validate() after
+            // encrypting), so the ENDBR32 signature must be checked against
+            // handler.plaintextBody -- the still-unencrypted source -- not
+            // result.image.  Only the final absolute offset (storageOffset +
+            // callHostSehHandlerOffset) is a result.image/PE-relative value.
+            if (handler.semantic != VM_UOP_CALL_HOST ||
+                handler.callHostSehHandlerOffset >= handler.storageSize ||
+                handler.callHostSehHandlerOffset > handler.plaintextBody.size() ||
+                kEndbr32.size() > handler.plaintextBody.size() -
+                    handler.callHostSehHandlerOffset ||
+                handler.storageOffset >
+                    (std::numeric_limits<uint32_t>::max)() -
+                        handler.callHostSehHandlerOffset) {
+                error = "x86 CALL_HOST SafeSEH handler layout is invalid";
+                return false;
+            }
+            if (!std::equal(kEndbr32.begin(), kEndbr32.end(),
+                    handler.plaintextBody.begin() +
+                        handler.callHostSehHandlerOffset)) {
+                error = "x86 CALL_HOST SafeSEH handler does not start with ENDBR32";
+                return false;
+            }
+            const uint32_t absoluteOffset =
+                handler.storageOffset + handler.callHostSehHandlerOffset;
+            if (absoluteOffset > result.image.size()) {
+                error = "x86 CALL_HOST SafeSEH handler offset is outside the image";
+                return false;
+            }
+            expectedSafeSehOffsets.push_back(absoluteOffset);
+        }
+        std::sort(expectedSafeSehOffsets.begin(), expectedSafeSehOffsets.end());
+        if (result.safeSehHandlerOffsets != expectedSafeSehOffsets) {
+            error = "x86 safeSehHandlerOffsets does not match the declared "
+                "CALL_HOST handler set (missing, extra, unsorted, or duplicate)";
+            return false;
+        }
     }
 
     std::vector<uint8_t> expectedMapMaterial;

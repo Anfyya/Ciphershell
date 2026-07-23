@@ -1,5 +1,25 @@
 #include "vm_crypto.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+// 敏感缓冲区（密钥、密钥派生中间状态、密钥流）清零后不再被读取，属于纯死
+// 存储；普通 `buf[i] = 0` 循环没有任何编译器看得见的"可观察副作用"，尤其在
+// 这些 static 函数被内联进调用方之后，理论上整段清零都可能被死存储消除优化
+// 掉。这里统一提供一个保证不被优化掉的实现，所有调用点复用同一份，而不是
+// 各自手写一个 volatile 循环：Windows 下用系统提供的 SecureZeroMemory（内部
+// 保证不被 DSE 消除），非 Windows 退化为 volatile 字节指针写。
+static void vm_secure_zero(void* ptr, size_t size) {
+#if defined(_WIN32)
+    SecureZeroMemory(ptr, size);
+#else
+    volatile uint8_t* p = (volatile uint8_t*)ptr;
+    size_t i;
+    for (i = 0; i < size; ++i) p[i] = 0;
+#endif
+}
+
 static uint32_t load32_le(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -66,7 +86,7 @@ void vm_hchacha20(const uint8_t key[32], const uint8_t input[16], uint8_t output
     store32_le(output + 20, state[13]);
     store32_le(output + 24, state[14]);
     store32_le(output + 28, state[15]);
-    for (i = 0; i < 16; ++i) state[i] = 0;
+    vm_secure_zero(state, sizeof(state));
 }
 
 void vm_derive_record_key(
@@ -83,7 +103,7 @@ void vm_derive_record_key(
     input[14] ^= (uint8_t)(functionRva >> 16);
     input[15] ^= (uint8_t)(functionRva >> 24);
     vm_hchacha20(masterKey, input, output);
-    for (i = 0; i < 16; ++i) input[i] = 0;
+    vm_secure_zero(input, sizeof(input));
 }
 
 static void chacha20_block(
@@ -109,9 +129,9 @@ static void chacha20_block(
     for (i = 0; i < 16; ++i) {
         working[i] += initial[i];
         store32_le(output + i * 4, working[i]);
-        initial[i] = 0;
-        working[i] = 0;
     }
+    vm_secure_zero(initial, sizeof(initial));
+    vm_secure_zero(working, sizeof(working));
 }
 
 void vm_chacha20_xor(
@@ -139,7 +159,7 @@ void vm_chacha20_xor(
         blockOffset = 0;
         ++blockIndex;
     }
-    for (i = 0; i < 64; ++i) block[i] = 0;
+    vm_secure_zero(block, sizeof(block));
 }
 
 #define SIPROUND(ctx) do { \
@@ -202,9 +222,7 @@ uint64_t vm_siphash24_final(VM_SIPHASH24_CONTEXT* context) {
     SIPROUND(context);
     SIPROUND(context);
     result = context->v0 ^ context->v1 ^ context->v2 ^ context->v3;
-    context->v0 = context->v1 = context->v2 = context->v3 = 0;
-    context->tail = context->totalLength = 0;
-    context->tailLength = 0;
+    vm_secure_zero(context, sizeof(*context));
     return result;
 }
 

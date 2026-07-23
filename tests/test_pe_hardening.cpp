@@ -33,6 +33,9 @@
 #include "../packer/pe_parser/pe_emitter.h"
 #include "../packer/pe_parser/pe_utils.h"
 #include "../packer/analysis/capability_checker.h"
+#include "../packer/analysis/disassembler.h"
+#include "../packer/transforms/vm_instruction_bridge_builder.h"
+#include "../runtime/common/vm_micro_runtime_abi.h"
 
 #include <cstring>
 #include <cstdint>
@@ -390,6 +393,151 @@ void TestSafeSEHHandlerNotExecutable() {
     auto* img = Parse(lay);
     // handler 落在非可执行段 → 整个 Load Config 解析失败。
     CS_TEST_CHECK(!img->loadConfig.valid);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+// ============================================================================
+// SafeSEH 合并（PEEmitter::RebuildSafeSEHHandlerTable）
+//
+// 覆盖 CALL_HOST Win32 handler RVA 最终接入 PE 构建路径的核心契约：
+//   - 已有真实 SafeSEH 表时合并新 handler、排序、去重，并通过独立重新解析
+//     （而不仅是同一个 img 对象的内存状态）验证最终字节。
+//   - 已存在的 RVA 再次提交时不重复计入。
+//   - 原 PE 没有 SafeSEH 声明时是 no-op，不伪造契约。
+//   - 原 PE 声明 IMAGE_DLLCHARACTERISTICS_NO_SEH 时 fail-closed。
+//   - x64 image 上调用直接拒绝（x64 从不产生 Win32 SafeSEH 数据）。
+// ============================================================================
+
+CipherShell::CS_PE_IMAGE* BuildSafeSehPe(
+    const std::vector<uint32_t>& existingHandlerRvas) {
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32));  // Size
+    rd.pad(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY32, SEHandlerTable) - sizeof(DWORD));
+    const size_t sehTableRel = rd.mark();
+    rd.u32(0);  // SEHandlerTable (32-bit VA) 占位
+    rd.u32(static_cast<uint32_t>(existingHandlerRvas.size()));  // SEHandlerCount
+    const size_t tableDataOff = rd.mark();
+    for (uint32_t rva : existingHandlerRvas) rd.u32(rva);
+
+    constexpr uint32_t imageBase = 0x10000000;
+    const uint32_t tableRVA = 0x2000u + static_cast<uint32_t>(tableDataOff);
+    const uint32_t tableVA = imageBase + tableRVA;
+    std::memcpy(rd.buf.data() + sehTableRel, &tableVA, sizeof(uint32_t));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
+         sizeof(IMAGE_LOAD_CONFIG_DIRECTORY32)}
+    };
+    // .text needs to be large enough to host every existing handler RVA plus
+    // extra bytes new handler RVAs (chosen by each test) can point into.
+    auto lay = BuildPe(false, std::vector<uint8_t>(0x40, 0xCCu), rd.buf, dirs, {});
+    return Parse(lay);
+}
+
+void TestSafeSEHTableMergeAddsAndSortsNewHandler() {
+    auto* img = BuildSafeSehPe({0x1000u, 0x1006u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 2);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    // Deliberately out of order and lower than one existing entry to prove
+    // the merged table is really sorted, not just appended.
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1003u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[1] == 0x1003u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[2] == 0x1006u);
+
+    // Independent re-parse from the final raw bytes: proves the merged table
+    // was really committed to the PE image, not just reflected in the
+    // in-memory CS_LOAD_CONFIG the emitter itself maintains.
+    BYTE* reparsedBytes = new BYTE[img->rawSize];
+    std::memcpy(reparsedBytes, img->rawData, img->rawSize);
+    CipherShell::PEParser reparser;
+    auto* reparsed = reparser.LoadFromBuffer(reparsedBytes, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid && reparsed->loadConfig.valid);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[1] == 0x1003u);
+    CS_TEST_CHECK(reparsed->loadConfig.safeSEHHandlerRVAs[2] == 0x1006u);
+    reparser.FreeImage(reparsed);
+
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeDedupesExistingRva() {
+    auto* img = BuildSafeSehPe({0x1000u, 0x1002u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    // 0x1000 already exists; only 0x1004 is genuinely new.
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u, 0x1004u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 3);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[1] == 0x1002u);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[2] == 0x1004u);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeNoOriginalTableIsNoOp() {
+    // No LOAD_CONFIG directory at all: RebuildSafeSEHHandlerTable must not
+    // fabricate a SafeSEH contract the original build never declared.
+    auto lay = BuildPe(false, std::vector<uint8_t>(0x20, 0xCCu), {}, {}, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid && !img->loadConfig.valid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(ok);
+    CS_TEST_CHECK(!img->loadConfig.valid);  // still no fabricated table
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeFailsClosedOnNoSehFlag() {
+    auto* img = BuildSafeSehPe({0x1000u});
+    CS_TEST_CHECK(img && img->isValid && img->loadConfig.valid);
+    img->ntHeaders32->OptionalHeader.DllCharacteristics |=
+        IMAGE_DLLCHARACTERISTICS_NO_SEH;
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1004u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(!ok);
+    CS_TEST_CHECK(!error.empty());
+    // The original two-entry table must be left completely untouched.
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs.size() == 1);
+    CS_TEST_CHECK(img->loadConfig.safeSEHHandlerRVAs[0] == 0x1000u);
+    CipherShell::PEParser p; p.FreeImage(img);
+}
+
+void TestSafeSEHTableMergeRejectsX64Image() {
+    Writer rd;
+    const size_t lcOff = rd.mark();
+    rd.u32(sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64));
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, static_cast<uint32_t>(0x2000 + lcOff),
+         sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64)}
+    };
+    auto lay = BuildPe(true, {0xCC, 0xCC, 0xCC, 0xCC}, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+
+    CipherShell::PEEmitter emitter(img);
+    std::string error;
+    const bool ok = emitter.RebuildSafeSEHHandlerTable(
+        {0x1000u}, ".tcsseh", nullptr, &error);
+    CS_TEST_CHECK(!ok);
+    CS_TEST_CHECK(!error.empty());
     CipherShell::PEParser p; p.FreeImage(img);
 }
 
@@ -2196,6 +2344,541 @@ void TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(const char* fixturePath)
     parser.FreeImage(img);
 }
 
+// ============================================================================
+// VMInstructionBridgeBuilder（BRIDGE_EXTENDED 抽取指令 thunk 构造）
+// ============================================================================
+//
+// 这条代码路径此前完全没有专门测试覆盖：test_vm_handler_synthesis.cpp 里唯一
+// 的 BRIDGE_EXTENDED 执行证据绕开了 VMInstructionBridgeBuilder，直接用一个
+// C++ 静态函数当 hidden-register 调用目标，验证的是 EmitX64/86BridgeExtended
+// 自己的 GPR 搬运/间接调用，不是这里的 thunk 重定位 + .pdata 复制 + CFG 合并。
+// 见 docs/zydis_encoder_pilot.md 独立批次 16。
+
+constexpr uint64_t kBridgeBuilderImageBase = 0x140000000ULL;
+
+// 用真实 Zydis 反汇编器解出待桥接指令的 InstructionIR，而不是手工猜测字段——
+// 这样它与 VMInstructionBridgeBuilder::Build 自身独立反汇编校验用的是同一套
+// 真实解码，不会因为手工构造的 IR 字段偷懒而制造假阳性。
+CipherShell::InstructionIR DisassembleSingleInstruction(
+    const std::vector<uint8_t>& bytes, uint64_t va) {
+    CipherShell::Disassembler disassembler;
+    CS_TEST_CHECK(disassembler.Initialize(true, kBridgeBuilderImageBase));
+    const auto decoded = disassembler.Disassemble(bytes.data(),
+        static_cast<uint32_t>(bytes.size()), va);
+    CS_TEST_CHECK(decoded.size() == 1);
+    CS_TEST_CHECK(decoded.front().length == bytes.size());
+    return decoded.front();
+}
+
+// 构造一个装载了单条 BRIDGE_EXTENDED 请求的 CS_PE_IMAGE + Function +
+// TranslationResult，跑真实 VMInstructionBridgeBuilder::Build，并独立
+// 重新解析最终字节验证 Exception Directory 条目确实合并进了最终 PE
+// （而不仅仅是构建期在内存里自证）。extractedBytes 必须是 Zydis 能真实解码
+// 的单条指令；extractedOffsetInText 是它在 textData 里的偏移，必须
+// >= ReadSimpleUnwind 要求的 prologSize（这里固定用 BuildUnwindInfoValid()
+// 的 prologSize=0，因此任意偏移都满足）。
+void VerifyInstructionBridgeBuilds(
+    const std::vector<uint8_t>& textData,
+    uint32_t extractedOffsetInText,
+    const std::vector<uint8_t>& extractedBytes,
+    uint8_t hiddenNativeRegister,
+    bool usesAvx,
+    bool usesX87) {
+    using namespace CipherShell;
+
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + static_cast<uint32_t>(textData.size());
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, textData, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+
+    // Disassembler::Disassemble's baseAddress parameter is an RVA (checked
+    // to fit uint32_t downstream), not a full imageBase-relative VA.
+    const uint64_t extractedRVA = kExcTextVA + extractedOffsetInText;
+    const InstructionIR decoded = DisassembleSingleInstruction(extractedBytes, extractedRVA);
+
+    Function function{};
+    function.entryAddress = kExcTextVA;
+    function.size = static_cast<uint32_t>(textData.size());
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[0] = 0;
+    bridgeOp.operands[1] = static_cast<uint64_t>(hiddenNativeRegister) |
+        (usesAvx ? VM_MICRO_BRIDGE_AVX : 0u) | (usesX87 ? VM_MICRO_BRIDGE_X87 : 0u);
+    bridgeOp.operands[2] = decoded.rva;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = decoded;
+    request.hiddenNativeRegister = hiddenNativeRegister;
+    request.usesAvx = usesAvx;
+    request.usesX87 = usesX87;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {function};
+    std::vector<TranslationResult> translations = {translation};
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(result.success);
+    CS_TEST_CHECK(result.error.empty());
+    CS_TEST_CHECK(result.cfgTableVerified);
+    CS_TEST_CHECK(result.unwindVerified);
+    CS_TEST_CHECK(result.links.size() == 1);
+    CS_TEST_CHECK(result.links[0].usesAvx == usesAvx);
+    CS_TEST_CHECK(result.links[0].usesX87 == usesX87);
+    CS_TEST_CHECK(result.links[0].hiddenNativeRegister == hiddenNativeRegister);
+    CS_TEST_CHECK(result.links[0].nativeInstructionSize == extractedBytes.size());
+    CS_TEST_CHECK(result.unwindEntries.size() == 1);
+    // Build() takes `translations` by non-const reference and patches the
+    // linked MicroInstruction in place; the mutation lands in translations[0]
+    // (what Build() actually wrote through), not in the `translation` local
+    // that was copied into the vector above.
+    const MicroInstruction& patchedInstruction = translations[0].instructions[0];
+    CS_TEST_CHECK(patchedInstruction.operands[0] == result.links[0].thunkRVA);
+    CS_TEST_CHECK((patchedInstruction.operands[1] & VM_MICRO_BRIDGE_LINKED) != 0);
+    std::string schemaError;
+    CS_TEST_CHECK(VMSchema::ValidateInstruction(
+        patchedInstruction, translations[0].registerCount, schemaError));
+
+    // 独立第二条解析路径：脱离 img 内存态，重新从最终字节里 LoadFromBuffer，
+    // 确认合并进最终 PE 的 Exception Directory 条目确实可以被独立解析出来，
+    // 而不仅仅是构建期在内存里自证；同时用一个全新的 Disassembler 重新解码
+    // 重定位后的指令字节，确认它与抽取前的语义（长度/mnemonic/instruction
+    // set）完全一致——即便 VMInstructionBridgeBuilder::Build 自身已经做过一次
+    // 同样的检查，这里用独立的解码器实例和独立的 image 内存复验，不复用
+    // Build() 内部状态。
+    BYTE* reparsedBuf = new BYTE[img->rawSize];
+    std::memcpy(reparsedBuf, img->rawData, img->rawSize);
+    PEParser reparser;
+    auto* reparsed = reparser.LoadFromBuffer(reparsedBuf, img->rawSize);
+    CS_TEST_CHECK(reparsed && reparsed->isValid);
+    bool foundThunkUnwind = false;
+    for (const auto& e : reparsed->exceptions.entries) {
+        if (e.beginAddress == result.links[0].unwindBeginRVA) {
+            foundThunkUnwind = true;
+            CS_TEST_CHECK(e.endAddress == result.links[0].nativeInstructionRVA +
+                result.links[0].nativeInstructionSize);
+        }
+    }
+    CS_TEST_CHECK(foundThunkUnwind);
+
+    const uint32_t thunkFileOffset = PEUtils::RvaToOffset(reparsed, result.links[0].nativeInstructionRVA);
+    CS_TEST_CHECK(thunkFileOffset != 0 &&
+        thunkFileOffset + result.links[0].nativeInstructionSize <= reparsed->rawSize);
+    Disassembler independentDecoder;
+    CS_TEST_CHECK(independentDecoder.Initialize(true, kBridgeBuilderImageBase));
+    const auto redecoded = independentDecoder.Disassemble(
+        reparsed->rawData + thunkFileOffset, result.links[0].nativeInstructionSize,
+        result.links[0].nativeInstructionRVA);
+    CS_TEST_CHECK(redecoded.size() == 1);
+    CS_TEST_CHECK(redecoded.front().length == decoded.length);
+    CS_TEST_CHECK(redecoded.front().mnemonicText == decoded.mnemonicText);
+    CS_TEST_CHECK(redecoded.front().instructionSet == decoded.instructionSet);
+    CS_TEST_CHECK(std::memcmp(redecoded.front().rawBytes.data(), extractedBytes.data(),
+        extractedBytes.size()) == 0);
+
+    reparser.FreeImage(reparsed);
+    PEParser p; p.FreeImage(img);
+}
+
+// FABS（D9 E1）：无操作数、不读写 EFLAGS 的 x87 指令，真实覆盖
+// BuildX64Thunk 的 FXRSTOR/FXSAVE（非 AVX）分支。
+void TestInstructionBridgeBuilderX87Fabs() {
+    const std::vector<uint8_t> textData = {0xC3, 0xD9, 0xE1, 0xC3};
+    VerifyInstructionBridgeBuilds(textData, 1u, {0xD9, 0xE1},
+        /*hiddenNativeRegister=*/11u, /*usesAvx=*/false, /*usesX87=*/true);
+}
+
+// ============================================================================
+// VMInstructionBridgeBuilder::Build 事务保证 + 输入契约收紧（独立批次 17）
+// ============================================================================
+//
+// 下面几个测试专门覆盖批次 17 新增的负向路径：Build() 自身的事务保证（任何
+// 失败必须让 image/translations 完全回滚），以及收紧后的 hidden register /
+// 指令长度输入契约。全部复用与 TestInstructionBridgeBuilderX87Fabs 相同的
+// 真实 PE + 真实 Zydis 反汇编基础设施，只在这基础上有意构造非法/延迟失败的
+// 输入，而不是走查代码断言"看起来对"。见 docs/zydis_encoder_pilot.md 批次 17。
+
+struct BridgeFixture {
+    CipherShell::CS_PE_IMAGE* img = nullptr;
+    CipherShell::Function function{};
+    CipherShell::InstructionIR decoded{};
+};
+
+// 构造与 VerifyInstructionBridgeBuilds 完全相同的最小 x64 宿主镜像（真实
+// RUNTIME_FUNCTION/UNWIND_INFO，prologSize=0）与真实 Zydis 解码出的
+// `instructionBytes`，但不预先构造 VMBridgeRequest —— 下面每个负向测试都
+// 基于 `decoded` 独立构造自己的请求，只故意破坏自己要测的那一个字段。
+BridgeFixture BuildBridgeFixtureWithInstruction(const std::vector<uint8_t>& instructionBytes) {
+    using namespace CipherShell;
+    std::vector<uint8_t> textData = {0xC3};
+    const uint32_t instructionOffset = static_cast<uint32_t>(textData.size());
+    textData.insert(textData.end(), instructionBytes.begin(), instructionBytes.end());
+    textData.push_back(0xC3);
+    Writer rd;
+    const size_t entryRel = rd.mark();
+    rd.pad(sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
+    const size_t unwindRel = rd.mark();
+    auto unwind = BuildUnwindInfoValid();
+    rd.put(unwind.data(), unwind.size());
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY entry{};
+    entry.BeginAddress = kExcTextVA;
+    entry.EndAddress = kExcTextVA + static_cast<uint32_t>(textData.size());
+    entry.UnwindData = kExcRdataVA + static_cast<uint32_t>(unwindRel);
+    std::memcpy(rd.buf.data() + entryRel, &entry, sizeof(entry));
+
+    std::vector<DirEntry> dirs = {
+        {IMAGE_DIRECTORY_ENTRY_EXCEPTION, kExcRdataVA + static_cast<uint32_t>(entryRel),
+         sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)}
+    };
+    auto lay = BuildPe(true, textData, rd.buf, dirs, {});
+    auto* img = Parse(lay);
+    CS_TEST_CHECK(img && img->isValid);
+    CS_TEST_CHECK(img->exceptions.entries.size() == 1);
+
+    BridgeFixture fixture;
+    fixture.img = img;
+    fixture.function.entryAddress = kExcTextVA;
+    fixture.function.size = static_cast<uint32_t>(textData.size());
+    fixture.decoded = DisassembleSingleInstruction(instructionBytes, kExcTextVA + instructionOffset);
+    return fixture;
+}
+
+BridgeFixture BuildStandardBridgeFixture() {
+    return BuildBridgeFixtureWithInstruction({0xD9, 0xE1}); // FABS
+}
+
+bool MicroInstructionEqual(const CipherShell::MicroInstruction& a, const CipherShell::MicroInstruction& b) {
+    if (a.opcode != b.opcode || a.handlerVariant != b.handlerVariant ||
+        a.operandCount != b.operandCount || a.sourceRva != b.sourceRva) return false;
+    for (size_t i = 0; i < a.operands.size(); ++i) {
+        if (a.operands[i] != b.operands[i]) return false;
+    }
+    return true;
+}
+
+// hiddenNativeRegister 必须落在该架构真实的 GPR 集合内（x64: 0..15）——这条
+// 校验在 Build() 里早已存在，但在本批之前从未有专门的负向测试驱动过它
+// （VerifyInstructionBridgeBuilds 系列全部只走合法寄存器）。
+void TestInstructionBridgeBuilderRejectsOutOfRangeHidden() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 16u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 16u; // 越过 x64 最后一个合法 GPR（0..15）
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// register 4 编码 x64 的 RSP：BuildX64Thunk 把 hidden 当作贯穿整个 thunk 的
+// state 指针使用，与 PushMemory/PopMemory/PushFlags/PopFlags/Ret 隐式依赖的
+// 真实栈指针是两个必须保持独立的角色。收紧后 Build() 必须在生成任何字节之前
+// 就 fail-closed 拒绝这个输入，而不是生成一个会在运行期破坏自己栈的 thunk。
+void TestInstructionBridgeBuilderRejectsStackPointerHidden() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 4u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 4u; // RSP
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// instruction.length 必须真的落在 rawBytes 这个固定 15 字节 std::array 里。
+// BuildX64Thunk/BuildX86Thunk 用 request.instruction.length 原样拷贝
+// rawBytes.data() 出来的字节，自己不做范围检查；收紧前一个声称长度 200 的
+// 请求会在 Build() 生成字节的过程中就读出 rawBytes 数组之外的内存
+// （未定义行为），而不是被干净地拒绝。
+void TestInstructionBridgeBuilderRejectsOversizedInstructionLength() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    InstructionIR oversized = fixture.decoded;
+    CS_TEST_CHECK(oversized.length <= oversized.rawBytes.size());
+    oversized.length = static_cast<uint8_t>(oversized.rawBytes.size() + 1u);
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 11u;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = oversized;
+    request.hiddenNativeRegister = 11u;
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// hidden 与被桥接指令自身的操作数冲突时必须 fail-closed（批次 18 新增的
+// 校验此前没有专门的负向测试直接撞它——只验证过真实 translator 管线永远不会
+// 产出这样的输入，没有验证 Build() 自己在收到这样的输入时会不会真的拒绝）。
+// FABS 没有任何操作数，撞不出这条校验，换用 MOV EAX,[ECX]（8B 01）：EAX 是
+// 寄存器操作数（family 0，写），[ECX] 是内存操作数的 base（family 1）。
+// 两个子用例分别撞寄存器操作数分支与内存 base 分支。
+void TestInstructionBridgeBuilderRejectsHiddenAliasingOperand() {
+    using namespace CipherShell;
+    const std::vector<uint8_t> movEaxFromEcx = {0x8B, 0x01}; // mov eax,[ecx]
+
+    for (const uint8_t hidden : std::initializer_list<uint8_t>{0u, 1u}) { // 0=EAX(寄存器操作数)，1=ECX(内存 base)
+        BridgeFixture fixture = BuildBridgeFixtureWithInstruction(movEaxFromEcx);
+        std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+        const uint32_t numSectionsBefore = fixture.img->numSections;
+        const DWORD rawSizeBefore = fixture.img->rawSize;
+
+        TranslationResult translation{};
+        translation.registerCount = 32;
+        MicroInstruction bridgeOp{};
+        bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+        bridgeOp.operandCount = 3;
+        bridgeOp.operands[1] = hidden;
+        translation.instructions.push_back(bridgeOp);
+
+        VMBridgeRequest request{};
+        request.microOpIndex = 0;
+        request.functionRVA = kExcTextVA;
+        request.instruction = fixture.decoded;
+        request.hiddenNativeRegister = hidden;
+        translation.bridgeRequests.push_back(request);
+
+        std::vector<Function> functions = {fixture.function};
+        std::vector<TranslationResult> translations = {translation};
+        const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+        VMInstructionBridgeBuilder builder;
+        const auto result = builder.Build(fixture.img, functions, translations,
+            ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+        CS_TEST_CHECK(!result.success);
+        CS_TEST_CHECK(!result.error.empty());
+        CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+        CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+        CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+        CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+        PEParser p; p.FreeImage(fixture.img);
+    }
+}
+
+// request.usesAvx/usesX87 必须与 request.instruction 真实的扩展状态类别一致
+// （批次 19 新增的校验）：FABS 是真实 x87 指令，若声称 usesX87=false/
+// usesAvx=true，Build() 必须拒绝，不能顺着调用方声称的标志走进错误的
+// XRSTOR/XSAVE 分支——真实 FABS 不需要、大概率也没有对应 AVX 状态可保存。
+void TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture(); // FABS：真实 usesX87=true, usesAvx=false
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+    MicroInstruction bridgeOp{};
+    bridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    bridgeOp.operandCount = 3;
+    bridgeOp.operands[1] = 11u | VM_MICRO_BRIDGE_AVX;
+    translation.instructions.push_back(bridgeOp);
+
+    VMBridgeRequest request{};
+    request.microOpIndex = 0;
+    request.functionRVA = kExcTextVA;
+    request.instruction = fixture.decoded;
+    request.hiddenNativeRegister = 11u;
+    request.usesAvx = true;   // 谎称：真实 FABS 不是 AVX 指令
+    request.usesX87 = false;  // 谎称：真实 FABS 就是 x87 指令
+    translation.bridgeRequests.push_back(request);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction = translations[0].instructions[0];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
+// Build() 自身的事务保证：第一条 BRIDGE_EXTENDED 请求完全合法（会通过
+// AppendSection 把 thunk 真正写进 image，也会通过第二遍逐项校验循环直到
+// 暂存好它自己的 bytecode 改写），第二条引用的 micro-op 却根本不是
+// VM_UOP_BRIDGE_EXTENDED —— 这个失败只会在 AppendSection 已经成功提交、且
+// 第一条请求已经暂存完自己的改写之后才被发现。断言调用前后 image 逐字节相同
+// （AppendSection 的提交被完全撤销）、translations 两条指令逐字段相同
+// （第一条请求暂存的改写没有被提交）。"调用方失败后不保存文件所以没关系"
+// 这种论证不成立：这里直接检查 Build() 返回之后、调用方还没来得及做任何事之前
+// 的 image/translations 状态。
+void TestInstructionBridgeBuilderRollsBackOnLateFailure() {
+    using namespace CipherShell;
+    BridgeFixture fixture = BuildStandardBridgeFixture();
+    std::vector<uint8_t> snapshot(fixture.img->rawData, fixture.img->rawData + fixture.img->rawSize);
+    const uint32_t numSectionsBefore = fixture.img->numSections;
+    const DWORD rawSizeBefore = fixture.img->rawSize;
+
+    TranslationResult translation{};
+    translation.registerCount = 32;
+
+    MicroInstruction validBridgeOp{};
+    validBridgeOp.opcode = VM_UOP_BRIDGE_EXTENDED;
+    validBridgeOp.operandCount = 3;
+    validBridgeOp.operands[1] = 11u;
+    translation.instructions.push_back(validBridgeOp); // index 0
+
+    MicroInstruction unrelatedOp{};
+    unrelatedOp.opcode = VM_UOP_RET;
+    unrelatedOp.operandCount = 1;
+    unrelatedOp.operands[0] = 0;
+    translation.instructions.push_back(unrelatedOp); // index 1 -- 不是 BRIDGE_EXTENDED
+
+    VMBridgeRequest firstRequest{};
+    firstRequest.microOpIndex = 0;
+    firstRequest.functionRVA = kExcTextVA;
+    firstRequest.instruction = fixture.decoded;
+    firstRequest.hiddenNativeRegister = 11u;
+    translation.bridgeRequests.push_back(firstRequest);
+
+    VMBridgeRequest secondRequest{};
+    secondRequest.microOpIndex = 1; // 指向 unrelatedOp，触犯"必须引用 BRIDGE_EXTENDED"
+    secondRequest.functionRVA = kExcTextVA;
+    secondRequest.instruction = fixture.decoded;
+    secondRequest.hiddenNativeRegister = 10u;
+    translation.bridgeRequests.push_back(secondRequest);
+
+    std::vector<Function> functions = {fixture.function};
+    std::vector<TranslationResult> translations = {translation};
+    const MicroInstruction beforeInstruction0 = translations[0].instructions[0];
+    const MicroInstruction beforeInstruction1 = translations[0].instructions[1];
+
+    VMInstructionBridgeBuilder builder;
+    const auto result = builder.Build(fixture.img, functions, translations,
+        ".vmbrdg", ".vmbrdgx", ".vmbrdgcf");
+    CS_TEST_CHECK(!result.success);
+    CS_TEST_CHECK(!result.error.empty());
+    CS_TEST_CHECK(result.links.empty());
+    // image：AppendSection 已经真实提交过一次（两条 thunk 的 blob），必须被
+    // 完全撤销 —— 逐字节比较整份文件，不只是 section 计数。
+    CS_TEST_CHECK(fixture.img->isValid);
+    CS_TEST_CHECK(fixture.img->numSections == numSectionsBefore);
+    CS_TEST_CHECK(fixture.img->rawSize == rawSizeBefore);
+    CS_TEST_CHECK(std::memcmp(fixture.img->rawData, snapshot.data(), snapshot.size()) == 0);
+    // translations：第一条请求已经在第二遍循环里通过了自己的全部校验、暂存好
+    // 了改写，仍然不能被提交。
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[0], beforeInstruction0));
+    CS_TEST_CHECK(MicroInstructionEqual(translations[0].instructions[1], beforeInstruction1));
+
+    PEParser p; p.FreeImage(fixture.img);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2272,6 +2955,18 @@ int main(int argc, char** argv) {
     TestEmitterDynamicBaseEmptyRelocationsGetsX64Anchor();
     TestEmitterFixedBaseEmptyRelocationsMayStripDirectory();
     TestEmitterDynamicBaseAnchorFailureRollsBack();
+    TestSafeSEHTableMergeAddsAndSortsNewHandler();
+    TestSafeSEHTableMergeDedupesExistingRva();
+    TestSafeSEHTableMergeNoOriginalTableIsNoOp();
+    TestSafeSEHTableMergeFailsClosedOnNoSehFlag();
+    TestSafeSEHTableMergeRejectsX64Image();
+    TestInstructionBridgeBuilderX87Fabs();
+    TestInstructionBridgeBuilderRejectsOutOfRangeHidden();
+    TestInstructionBridgeBuilderRejectsStackPointerHidden();
+    TestInstructionBridgeBuilderRejectsOversizedInstructionLength();
+    TestInstructionBridgeBuilderRejectsHiddenAliasingOperand();
+    TestInstructionBridgeBuilderRejectsMismatchedExtendedStateClass();
+    TestInstructionBridgeBuilderRollsBackOnLateFailure();
     CS_TEST_CHECK(argc == 2);
     TestEmitterDynamicBaseEmptyRelocationsOnRealMsvcPe(argv[1]);
     return 0;

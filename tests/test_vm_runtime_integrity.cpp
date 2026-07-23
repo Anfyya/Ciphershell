@@ -619,12 +619,13 @@ void TestBuilderAndReparseIntegration() {
     const char runtimeSection[8] = {'.','t','v','m','r','t',0,0};
     const char unwindSection[8] = {'.','t','v','m','u','w',0,0};
     const char relocationSection[8] = {'.','t','v','m','r','l',0,0};
+    const char safeSehSection[8] = {'.','t','v','m','s','h',0,0};
 
     VMRuntimeBuilder builder;
     const VMRuntimeBuildResult result = builder.Build(
         &owned.image, {record}, bytecode, opcodeMap,
         0x1080u, runtimeKeyShare, config,
-        runtimeSection, unwindSection, relocationSection);
+        runtimeSection, unwindSection, relocationSection, safeSehSection);
     Require(result.success && result.executionReady &&
             result.runtimeContentVerified &&
             result.referenceRuntimeBlobFreeVerified,
@@ -731,12 +732,13 @@ void TestBuilderX86SelfBaseAndCetBalance() {
     const char runtimeSection[8] = {'.','x','v','m','r','t',0,0};
     const char unwindSection[8] = {'.','x','v','m','u','w',0,0};
     const char relocationSection[8] = {'.','x','v','m','r','l',0,0};
+    const char safeSehSection[8] = {'.','x','v','m','s','h',0,0};
 
     VMRuntimeBuilder builder;
     const VMRuntimeBuildResult result = builder.Build(
         &owned.image, {record}, bytecode, opcodeMap,
         0x1080u, runtimeKeyShare, config,
-        runtimeSection, unwindSection, relocationSection);
+        runtimeSection, unwindSection, relocationSection, safeSehSection);
     Require(result.success && result.executionReady &&
             result.architecture == VM_ARCH_X86,
         "x86 VMRuntimeBuilder integration failed: " + result.error);

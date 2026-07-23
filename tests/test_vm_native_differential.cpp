@@ -12,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -339,6 +340,114 @@ void TestZydisExplicitAluMemoryBatchNativeDifferential() {
     }
 }
 
+void TestZydisTempStackBatchNativeDifferential() {
+    const auto seed = MakeSeed(0xBAu);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "Zydis temp/stack batch disassembler initialization failed");
+
+    // NOP's production Light lowering emits STORE_TEMP, LOAD_TEMP and DROP.
+    // A scaled LEA emits DUP+ADD when its deterministic address choice takes
+    // the repeated-doubling arm. Search a bounded RVA range so the fixture
+    // proves it reached that production arm instead of synthesizing VM IR.
+    std::vector<uint8_t> bytes = {0x90};
+    if (kIs64) bytes.push_back(0x48);
+    bytes.insert(bytes.end(), {0x8D,0x04,0x48,0xC3});
+    constexpr std::array<VM_MICRO_OPCODE, 4> semantics = {
+        VM_UOP_LOAD_TEMP, VM_UOP_STORE_TEMP, VM_UOP_DUP, VM_UOP_DROP};
+    Function function{};
+    TranslationResult translation{};
+    for (uint64_t entry = 0x1000u; entry < 0x1200u; entry += 0x10u) {
+        Function candidate =
+            DecodeStandaloneFunction(disassembler, bytes, entry);
+        Translator translator;
+        TranslationResult candidateTranslation =
+            TranslateStandaloneFunction(candidate, build, translator);
+        const bool complete = std::all_of(
+            semantics.begin(), semantics.end(), [&](VM_MICRO_OPCODE semantic) {
+                return std::any_of(candidateTranslation.instructions.begin(),
+                    candidateTranslation.instructions.end(),
+                    [&](const MicroInstruction& instruction) {
+                        return instruction.opcode == semantic;
+                    });
+            });
+        if (!complete) continue;
+        function = std::move(candidate);
+        translation = std::move(candidateTranslation);
+        break;
+    }
+    Require(!translation.instructions.empty(),
+        "NOP+scaled-LEA fixture did not reach all temp/stack semantics");
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0xA11A13ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "Zydis temp/stack software IR preflight failed: " + preflight.error);
+
+    struct Coverage {
+        VM_MICRO_OPCODE semantic = VM_UOP_TRAP;
+        uint8_t variant = 0u;
+        std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+    };
+    std::vector<Coverage> coverage;
+    for (VM_MICRO_OPCODE semantic : semantics) {
+        const auto instruction = std::find_if(
+            translation.instructions.begin(), translation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == semantic;
+            });
+        Require(instruction != translation.instructions.end(),
+            "temp/stack fixture omitted a migrated semantic");
+        coverage.push_back({semantic, instruction->handlerVariant, {}});
+    }
+    const auto complete = [&] {
+        for (const Coverage& item : coverage) {
+            for (const auto& plans : item.assignments) {
+                if (plans.size() < 2u) return false;
+            }
+        }
+        return true;
+    };
+    std::vector<uint8_t> providerSeeds;
+    for (uint16_t domain = 1u;
+         domain <= 0xFFu && !complete(); ++domain) {
+        bool addsCoverage = false;
+        for (Coverage& item : coverage) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = item.semantic;
+            config.variant = item.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "temp/stack provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            if (item.assignments[strategy].size() < 2u &&
+                    item.assignments[strategy].insert(
+                        generated.registerAssignment).second) {
+                addsCoverage = true;
+            }
+        }
+        if (addsCoverage)
+            providerSeeds.push_back(static_cast<uint8_t>(domain));
+    }
+    Require(complete(),
+        "temp/stack differential lacks two register plans per K");
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis LOAD_TEMP/STORE_TEMP/DUP/DROP seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
 void TestFunctionEntryStackAndRetCleanupDifferential() {
     const auto seed = MakeSeed(0xD2);
     const HarnessBuild build = SetUpMutatedIsa(seed);
@@ -392,36 +501,64 @@ void TestMulNativeDifferentialMatchesRealCpu() {
     // 覆盖新加入的 VM_UOP_MUL 双策略业务核心(EmitBusinessCoreVariant 的
     // IMUL reg,reg 与 MUL reg 两条真实不同字节序列)：证明无论 build 的
     // seed/variant 选中哪一支策略，合成 handler 链的乘法结果都必须与
-    // 真实 CPU IMUL 逐字节一致，而不仅仅是结构层面的字节模式检查。
+    // 真实 CPU LEA 的 scaled-index arithmetic 一致，而不仅仅是结构层面的
+    // 字节模式检查。显式 two/three-operand IMUL 在 translator 中有意降低为
+    // SMUL_WIDE；VM_UOP_MUL 的真实生产入口是地址 scale 计算。
     const auto seed = MakeSeed(0xD3);
     const HarnessBuild build = SetUpMutatedIsa(seed);
 
     Disassembler disassembler;
     Require(disassembler.Initialize(kIs64), "Disassembler 初始化失败");
 
-    // imul eax, ecx ; add eax, 0 ; ret  (two-operand signed multiply).
-    // IMUL only defines CF/OF and leaves SF/ZF/AF/PF architecturally
-    // undefined, so the translator's flags-flow analysis correctly refuses
-    // to translate a terminal RET immediately after it (it cannot know
-    // what a real CPU would leave in those bits). The trailing `add eax, 0`
-    // is a value no-op that fully redefines all six status flags, closing
-    // that undefined-flags window without touching the product in eax.
-    const std::vector<uint8_t> mulBytes = {
-        0x0F, 0xAF, 0xC1, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC3};
-    // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
-    const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
-    constexpr uint64_t kEntry = 0x1000;
+    // lea rax/eax,[rax/eax+rcx/ecx*4] ; ret. EmitAddress chooses either a
+    // real VM_UOP_MUL or repeated ADDs from translator seed and instruction
+    // address. Search a small deterministic address range for the MUL arm so
+    // this fixture cannot silently stop covering the migrated semantic.
+    std::vector<uint8_t> mulBytes;
+    if (kIs64) mulBytes.push_back(0x48);
+    mulBytes.insert(mulBytes.end(), {0x8D,0x04,0x88,0xC3});
+    std::vector<uint8_t> addBytes;
+    if (kIs64) addBytes.push_back(0x48);
+    addBytes.insert(addBytes.end(), {0x01,0xC8,0xC3});
 
-    const Function mulFunction = DecodeStandaloneFunction(disassembler, mulBytes, kEntry);
-    const Function addFunction = DecodeStandaloneFunction(disassembler, addBytes, kEntry);
-
-    Translator translator;
-    const TranslationResult mulTranslation =
-        TranslateStandaloneFunction(mulFunction, build, translator);
+    Function mulFunction{};
+    TranslationResult mulTranslation{};
+    uint64_t selectedEntry = 0u;
+    for (uint64_t candidateEntry = 0x1000u;
+         candidateEntry < 0x1100u; candidateEntry += 0x10u) {
+        Function candidateFunction = DecodeStandaloneFunction(
+            disassembler, mulBytes, candidateEntry);
+        Translator candidateTranslator;
+        TranslationResult candidateTranslation =
+            TranslateStandaloneFunction(
+                candidateFunction, build, candidateTranslator);
+        const auto candidateMul = std::find_if(
+            candidateTranslation.instructions.begin(),
+            candidateTranslation.instructions.end(),
+            [](const MicroInstruction& instruction) {
+                return instruction.opcode == VM_UOP_MUL;
+            });
+        if (candidateMul == candidateTranslation.instructions.end()) continue;
+        selectedEntry = candidateEntry;
+        mulFunction = std::move(candidateFunction);
+        mulTranslation = std::move(candidateTranslation);
+        break;
+    }
+    Require(selectedEntry != 0u,
+        "scaled LEA fixture could not select the VM_UOP_MUL lowering arm");
+    const Function addFunction = DecodeStandaloneFunction(
+        disassembler, addBytes, selectedEntry);
+    const auto mulInstruction = std::find_if(
+        mulTranslation.instructions.begin(), mulTranslation.instructions.end(),
+        [](const MicroInstruction& instruction) {
+            return instruction.opcode == VM_UOP_MUL;
+        });
+    Require(mulInstruction != mulTranslation.instructions.end(),
+        "scaled LEA fixture emitted no VM_UOP_MUL instruction");
 
     VMIRModelPreflightConfig preflightConfig{};
     preflightConfig.corpusSeed = 0x5678;
-    preflightConfig.corpusCount = 8;
+    preflightConfig.corpusCount = 32;
     const auto preflight = VMIRModelPreflightVerifier::Verify(
         mulFunction, mulTranslation, build.isa.opcodeMap, build.isa.registerMap, preflightConfig);
     std::cout << "[preflight] success=" << preflight.success << " cases=" << preflight.casesExecuted
@@ -429,10 +566,44 @@ void TestMulNativeDifferentialMatchesRealCpu() {
     Require(preflight.success, "software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
         preflight.error);
 
-    RunDifferentialCase(mulFunction, mulTranslation, build, 8, true,
-        "native-vs-VM MUL(IMUL two-operand) 语义一致");
+    std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+    std::array<std::set<std::array<uint8_t, 4>>, 2>
+        assignmentsByStrategy{};
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+        config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+        config.semantic = VM_UOP_MUL;
+        config.variant = mulInstruction->handlerVariant;
+        const auto generated = GenerateVMHandlerSemanticKernel(config);
+        Require(generated.success,
+            "MUL provider-seed selection generation failed: " +
+                generated.error);
+        const uint8_t strategy = generated.semanticCoreStrategy;
+        if (assignmentsByStrategy[strategy].insert(
+                generated.registerAssignment).second &&
+                providerSeedsByStrategy[strategy].size() < 2u) {
+            providerSeedsByStrategy[strategy].push_back(
+                static_cast<uint8_t>(domain));
+        }
+        if (providerSeedsByStrategy[0].size() == 2u &&
+                providerSeedsByStrategy[1].size() == 2u) break;
+    }
+    Require(providerSeedsByStrategy[0].size() == 2u &&
+            providerSeedsByStrategy[1].size() == 2u,
+        "MUL native differential did not select two register plans per K");
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+            const std::string label =
+                "native-vs-VM Zydis MUL K=" +
+                std::to_string(strategy) + " seed " +
+                std::to_string(providerSeed);
+            RunDifferentialCase(mulFunction, mulTranslation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
+    }
     RunDifferentialCase(addFunction, mulTranslation, build, 8, false,
-        "native=ADD vs VM-bytecode=MUL 必须被判定语义分歧");
+        "native=ADD vs VM scaled-LEA MUL 必须被判定语义分歧");
 }
 
 void TestBitOperationsNativeDifferentialMatchesRealCpu() {
@@ -461,10 +632,15 @@ void TestBitOperationsNativeDifferentialMatchesRealCpu() {
     // add eax, ecx ; ret  (same shape, opposite semantics; negative control)
     const std::vector<uint8_t> addBytes = {0x01, 0xC8, 0xC3};
 
-    const struct { const std::vector<uint8_t>* bytes; uint64_t preflightSeed; const char* name; } cases[] = {
-        {&btBytes, 0xB17B17ULL, "BIT_TEST(BT)"},
-        {&btsBytes, 0xB17B18ULL, "BIT_SET(BTS)"},
-        {&btrBytes, 0xB17B19ULL, "BIT_RESET(BTR)"},
+    const struct {
+        const std::vector<uint8_t>* bytes;
+        uint64_t preflightSeed;
+        const char* name;
+        VM_MICRO_OPCODE semantic;
+    } cases[] = {
+        {&btBytes, 0xB17B17ULL, "BIT_TEST(BT)", VM_UOP_BIT_TEST},
+        {&btsBytes, 0xB17B18ULL, "BIT_SET(BTS)", VM_UOP_BIT_SET},
+        {&btrBytes, 0xB17B19ULL, "BIT_RESET(BTR)", VM_UOP_BIT_RESET},
     };
 
     for (const auto& testCase : cases) {
@@ -485,8 +661,46 @@ void TestBitOperationsNativeDifferentialMatchesRealCpu() {
             " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
             preflight.error);
 
-        RunDifferentialCase(bitFunction, bitTranslation, build, 32, true,
-            (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
+        const auto bitInstruction = std::find_if(
+            bitTranslation.instructions.begin(),
+            bitTranslation.instructions.end(),
+            [&](const MicroInstruction& instruction) {
+                return instruction.opcode == testCase.semantic;
+            });
+        Require(bitInstruction != bitTranslation.instructions.end(),
+            "bit-operation fixture omitted its migrated semantic");
+        std::array<std::set<std::array<uint8_t, 4>>, 2>
+            assignmentsByStrategy{};
+        std::vector<uint8_t> providerSeeds;
+        const auto complete = [&] {
+            return assignmentsByStrategy[0].size() >= 2u &&
+                assignmentsByStrategy[1].size() >= 2u;
+        };
+        for (uint16_t domain = 1u; domain <= 0xFFu && !complete(); ++domain) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = testCase.semantic;
+            config.variant = bitInstruction->handlerVariant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "bit-operation provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            if (assignmentsByStrategy[strategy].size() < 2u &&
+                    assignmentsByStrategy[strategy].insert(
+                        generated.registerAssignment).second) {
+                providerSeeds.push_back(static_cast<uint8_t>(domain));
+            }
+        }
+        Require(complete(),
+            "bit-operation differential lacks two plans per K");
+        for (uint8_t providerSeed : providerSeeds) {
+            const std::string label = std::string("native-vs-VM Zydis ") +
+                testCase.name + " seed " + std::to_string(providerSeed);
+            RunDifferentialCase(bitFunction, bitTranslation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
     }
 
     // 单独一个跨语义负控制：native=ADD 的求值结果绝不能被误判为与
@@ -601,6 +815,81 @@ void TestShiftOperationsNativeDifferentialMatchesRealCpu() {
             (std::string("native-vs-VM ") + testCase.name + " 语义一致").c_str());
     }
 
+    // Re-run a compact SHL+SHR chain under provider seeds selected from the
+    // published local liveness contracts. Each K must execute at least two
+    // distinct physical assignments in the isolated native worker.
+    const std::vector<uint8_t> migratedShiftBytes = {
+        0xC1,0xE0,0x05, 0xC1,0xE8,0x03,
+        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+    const Function migratedShiftFunction = DecodeStandaloneFunction(
+        disassembler, migratedShiftBytes, kEntry);
+    Translator migratedShiftTranslator;
+    const TranslationResult migratedShiftTranslation =
+        TranslateStandaloneFunction(
+            migratedShiftFunction, build, migratedShiftTranslator);
+    struct ShiftCoverage {
+        VM_MICRO_OPCODE semantic;
+        uint8_t variant;
+        std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+    };
+    std::array<ShiftCoverage, 2> shiftCoverage = {{
+        {VM_UOP_SHL, 0u, {}}, {VM_UOP_SHR, 0u, {}}}};
+    for (ShiftCoverage& coverage : shiftCoverage) {
+        const auto instruction = std::find_if(
+            migratedShiftTranslation.instructions.begin(),
+            migratedShiftTranslation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == coverage.semantic;
+            });
+        Require(instruction != migratedShiftTranslation.instructions.end(),
+            "migrated SHL/SHR fixture omitted its target semantic");
+        coverage.variant = instruction->handlerVariant;
+    }
+    const auto completeShiftCoverage = [&] {
+        for (const ShiftCoverage& coverage : shiftCoverage) {
+            for (const auto& plans : coverage.assignments) {
+                if (plans.size() < 2u) return false;
+            }
+        }
+        return true;
+    };
+    std::vector<uint8_t> migratedShiftProviderSeeds;
+    for (uint16_t domain = 1u;
+         domain <= 0xFFu && !completeShiftCoverage(); ++domain) {
+        bool addsCoverage = false;
+        for (ShiftCoverage& coverage : shiftCoverage) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = coverage.semantic;
+            config.variant = coverage.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "migrated SHL/SHR provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < coverage.assignments.size(),
+                "migrated SHL/SHR selected an unknown K strategy");
+            if (coverage.assignments[strategy].size() < 2u &&
+                    coverage.assignments[strategy].insert(
+                        generated.registerAssignment).second) {
+                addsCoverage = true;
+            }
+        }
+        if (addsCoverage)
+            migratedShiftProviderSeeds.push_back(
+                static_cast<uint8_t>(domain));
+    }
+    Require(completeShiftCoverage(),
+        "migrated SHL/SHR differential lacks two plans per K");
+    for (uint8_t providerSeed : migratedShiftProviderSeeds) {
+        const std::string label =
+            "native-vs-VM Zydis SHL/SHR seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(migratedShiftFunction, migratedShiftTranslation,
+            build, 32, true, label.c_str(), false, providerSeed);
+    }
+
     // 跨语义负控制:native=SHL 的求值结果绝不能被误判为与 VM-bytecode=SHR 一致,
     // 证明差分验证器确实在比较真实移位语义而非结构存在性。
     const Function shl4Function = DecodeStandaloneFunction(disassembler, shl4, kEntry);
@@ -650,23 +939,36 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
     // movzx eax,cl; movsx edx,cl; ret. MOVZX/MOVSX 必须保持输入 flags。
     const std::vector<uint8_t> extendBytes = {
         0x0F,0xB6,0xC1, 0x0F,0xBE,0xD1, 0xC3};
-    // mul ecx; imul ecx; add eax,0; ret. 两条 implicit multiply 分别落到
-    // UMUL_WIDE/SMUL_WIDE；末尾 ADD 关闭 MUL/IMUL 未定义状态位。
-    const std::vector<uint8_t> wideMultiplyBytes = {
-        0xF7,0xE1, 0xF7,0xE9,
-        0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
+    // x64 必须显式使用 REX.W，才能让真实 CPU 的 RDX:RAX 64 位高低半
+    // 对照迁移后的 UMUL_WIDE；末尾同宽 ADD 只关闭 MUL/IMUL 未定义 flags。
+    // Win32 保持对应的 EDX:EAX 32 位 fixture。
+    const std::vector<uint8_t> wideMultiplyBytes = kIs64
+        ? std::vector<uint8_t>{
+            0x48,0xF7,0xE1, 0x48,0xF7,0xE9,
+            0x48,0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3}
+        : std::vector<uint8_t>{
+            0xF7,0xE1, 0xF7,0xE9,
+            0x81,0xC0,0x00,0x00,0x00,0x00, 0xC3};
 
     const struct {
         const std::vector<uint8_t>* bytes;
         uint64_t preflightSeed;
         const char* label;
+        std::array<VM_MICRO_OPCODE, 6> migratedSemantics;
+        size_t migratedSemanticCount;
     } cases[] = {
         {&carryShiftBytes, 0xA701ULL,
-            "ADC/SBB/BSWAP/SAR/ROL/ROR"},
+            "ADC/SBB/BSWAP/SAR/ROL/ROR",
+            {VM_UOP_ADD_CARRY, VM_UOP_SUB_BORROW, VM_UOP_BSWAP,
+             VM_UOP_SAR, VM_UOP_ROL, VM_UOP_ROR}, 6u},
         {&extendBytes, 0xA702ULL,
-            "ZERO_EXTEND/SIGN_EXTEND"},
+            "ZERO_EXTEND/SIGN_EXTEND",
+            {VM_UOP_ZERO_EXTEND, VM_UOP_SIGN_EXTEND,
+             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 2u},
         {&wideMultiplyBytes, 0xA703ULL,
-            "UMUL_WIDE/SMUL_WIDE"},
+            "UMUL_WIDE/SMUL_WIDE",
+            {VM_UOP_SMUL_WIDE, VM_UOP_TRAP, VM_UOP_TRAP,
+             VM_UOP_TRAP, VM_UOP_TRAP, VM_UOP_TRAP}, 1u},
     };
 
     for (const auto& testCase : cases) {
@@ -684,11 +986,156 @@ void TestRemainingArithmeticFamiliesNativeDifferential() {
         Require(preflight.success,
             std::string(testCase.label) + " software IR 预检失败: " +
                 preflight.error);
-        RunDifferentialCase(function, translation, build, 32, true,
-            (std::string("native-vs-VM ") + testCase.label +
-                " 语义一致").c_str());
+        std::vector<uint8_t> providerSeeds;
+        if (testCase.migratedSemanticCount != 0u) {
+            struct Coverage {
+                VM_MICRO_OPCODE semantic = VM_UOP_TRAP;
+                uint8_t variant = 0u;
+                std::array<std::set<std::array<uint8_t, 4>>, 2> assignments{};
+            };
+            std::vector<Coverage> coverage;
+            for (size_t index = 0u;
+                 index < testCase.migratedSemanticCount; ++index) {
+                const VM_MICRO_OPCODE semantic =
+                    testCase.migratedSemantics[index];
+                const auto instruction = std::find_if(
+                    translation.instructions.begin(),
+                    translation.instructions.end(),
+                    [&](const MicroInstruction& candidate) {
+                        return candidate.opcode == semantic;
+                    });
+                Require(instruction != translation.instructions.end(),
+                    "migrated arithmetic fixture omitted its target semantic");
+                coverage.push_back({semantic, instruction->handlerVariant, {}});
+            }
+            const auto complete = [&] {
+                for (const Coverage& item : coverage) {
+                    for (const auto& plans : item.assignments) {
+                        if (plans.size() < 2u) return false;
+                    }
+                }
+                return true;
+            };
+            for (uint16_t domain = 1u;
+                 domain <= 0xFFu && !complete(); ++domain) {
+                bool addsCoverage = false;
+                for (Coverage& item : coverage) {
+                    VMHandlerSemanticCodegenConfig config{};
+                    config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+                    config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+                    config.semantic = item.semantic;
+                    config.variant = item.variant;
+                    const auto generated =
+                        GenerateVMHandlerSemanticKernel(config);
+                    Require(generated.success,
+                        "migrated arithmetic provider-seed selection failed: " +
+                            generated.error);
+                    const uint8_t strategy = generated.semanticCoreStrategy;
+                    Require(strategy < item.assignments.size(),
+                        "migrated arithmetic selected an unknown K strategy");
+                    if (item.assignments[strategy].size() < 2u &&
+                            item.assignments[strategy].insert(
+                                generated.registerAssignment).second) {
+                        addsCoverage = true;
+                    }
+                }
+                if (addsCoverage)
+                    providerSeeds.push_back(static_cast<uint8_t>(domain));
+            }
+            Require(complete(),
+                "migrated arithmetic differential lacks two plans per K");
+        } else {
+            providerSeeds.push_back(0xC7u);
+        }
+        for (uint8_t providerSeed : providerSeeds) {
+            const std::string label = std::string("native-vs-VM ") +
+                testCase.label + " seed " + std::to_string(providerSeed);
+            RunDifferentialCase(function, translation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
     }
 }
+
+#if defined(_M_X64)
+void TestX64ZydisUmulWidePerKNativeDifferential() {
+    const auto seed = MakeSeed(0xB9u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(true),
+        "x64 UMUL_WIDE per-K disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+    // mul rcx; add rax,rdx; ret. ADD consumes both halves asymmetrically:
+    // final RDX remains the hardware high half, while final RAX includes low
+    // and high, and its defined flags close MUL's undefined-flags window.
+    const std::vector<uint8_t> bytes = {
+        0x48,0xF7,0xE1,
+        0x48,0x01,0xD0,
+        0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    const auto umul = std::find_if(
+        translation.instructions.begin(), translation.instructions.end(),
+        [](const MicroInstruction& instruction) {
+            return instruction.opcode == VM_UOP_UMUL_WIDE;
+        });
+    Require(umul != translation.instructions.end(),
+        "x64 MUL fixture emitted no UMUL_WIDE instruction");
+
+    VMIRModelPreflightConfig preflightConfig{};
+    preflightConfig.corpusSeed = 0x554D554C583634ULL;
+    preflightConfig.corpusCount = 32;
+    const auto preflight = VMIRModelPreflightVerifier::Verify(
+        function, translation, build.isa.opcodeMap,
+        build.isa.registerMap, preflightConfig);
+    Require(preflight.success,
+        "x64 UMUL_WIDE per-K software IR preflight failed: " +
+            preflight.error);
+
+    std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+    std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        VMHandlerSemanticCodegenConfig config{};
+        config.architecture = VM_ARCH_X64;
+        config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+        config.semantic = VM_UOP_UMUL_WIDE;
+        config.variant = umul->handlerVariant;
+        const auto generated = GenerateVMHandlerSemanticKernel(config);
+        Require(generated.success,
+            "x64 UMUL_WIDE seed selection generation failed: " +
+                generated.error);
+        const uint8_t strategy = generated.semanticCoreStrategy;
+        Require(strategy < plansByStrategy.size(),
+            "x64 UMUL_WIDE selected an unknown K strategy");
+        if (plansByStrategy[strategy].insert(
+                generated.registerAssignment).second) {
+            providerSeedsByStrategy[strategy].push_back(
+                static_cast<uint8_t>(domain));
+        }
+        if (plansByStrategy[0].size() == 4u &&
+                plansByStrategy[1].size() == 4u) break;
+    }
+    Require(plansByStrategy[0].size() == 4u &&
+            plansByStrategy[1].size() == 4u &&
+            providerSeedsByStrategy[0].size() == 4u &&
+            providerSeedsByStrategy[1].size() == 4u,
+        "x64 UMUL_WIDE differential seeds did not cover four plans for both K values");
+
+    for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+        for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+            const std::string label =
+                "native-vs-VM x64 Zydis UMUL_WIDE low/high K=" +
+                std::to_string(strategy) + " seed " +
+                std::to_string(providerSeed);
+            RunDifferentialCase(function, translation, build, 32, true,
+                label.c_str(), false, providerSeed);
+        }
+    }
+}
+#endif
 
 #if defined(_M_IX86)
 void TestX86ZydisUmulWidePerKNativeDifferential() {
@@ -727,7 +1174,7 @@ void TestX86ZydisUmulWidePerKNativeDifferential() {
             preflight.error);
 
     std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
-    std::set<std::array<uint8_t, 4>> k1Plans;
+    std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
     for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
         VMHandlerSemanticCodegenConfig config{};
         config.architecture = VM_ARCH_X86;
@@ -739,21 +1186,19 @@ void TestX86ZydisUmulWidePerKNativeDifferential() {
             "x86 UMUL_WIDE seed selection generation failed: " +
                 generated.error);
         const uint8_t strategy = generated.semanticCoreStrategy;
-        if (strategy == 0u) {
-            if (providerSeedsByStrategy[0].size() < 2u) {
-                providerSeedsByStrategy[0].push_back(
-                    static_cast<uint8_t>(domain));
-            }
-        } else if (k1Plans.insert(generated.registerAssignment).second) {
-            providerSeedsByStrategy[1].push_back(
+        Require(strategy < plansByStrategy.size(),
+            "x86 UMUL_WIDE selected an unknown K strategy");
+        if (plansByStrategy[strategy].insert(
+                generated.registerAssignment).second) {
+            providerSeedsByStrategy[strategy].push_back(
                 static_cast<uint8_t>(domain));
         }
-        if (providerSeedsByStrategy[0].size() == 2u &&
-                k1Plans.size() == 4u) break;
+        if (plansByStrategy[0].size() == 4u &&
+                plansByStrategy[1].size() == 4u) break;
     }
-    Require(providerSeedsByStrategy[0].size() == 2u &&
+    Require(providerSeedsByStrategy[0].size() == 4u &&
             providerSeedsByStrategy[1].size() == 4u,
-        "x86 UMUL_WIDE differential seeds did not cover both K values and all K=1 plans");
+        "x86 UMUL_WIDE differential seeds did not cover four plans for both K values");
 
     for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
         for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
@@ -776,6 +1221,12 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
     // 一致)与"除零/商溢出"(两侧都应触发 #DE)两类样本。VMNativeDifferentialConfig
     // ::expectDivideFault 让验证器按样本实际结果分别核对，而不是把任何 fault
     // 都当成硬性失败。
+    //
+    // UDIV_WIDE/IDIV_WIDE 的显式除数在推广批次 8 之后有两种编码形式(直接对
+    // 寄存器 F7 /group，或经 seed-split CtxMutationScratch 地址的内存形式)，
+    // 按 K 各自独立选择；下面动态挑选 provider seed 覆盖每个 K 下两种形式各
+    // 至少一次，而不是只用单一固定 seed 验证其中一种形式，这样 #DE 差分证据
+    // 才能覆盖两种形式而不是巧合地只测到其中之一。
     const auto seed = MakeSeed(0xE4);
     const HarnessBuild build = SetUpMutatedIsa(seed);
 
@@ -818,11 +1269,62 @@ void TestWideDivideNativeDifferentialAndDivideFault() {
                 " software IR 预检失败(说明是翻译本身的问题，不是原生差分新代码的问题): " +
                 preflight.error);
 
-        RunDifferentialCase(divideFunction, divideTranslation, build, 64, true,
-            signedDivide ? "native-vs-VM IDIV_WIDE(128-bit dividend)/#DE 一致"
-                         : "native-vs-VM UDIV_WIDE(128-bit dividend)/#DE 一致",
-            /*expectDivideFault=*/true, /*providerSeedDomain=*/0xC7u,
-            /*expectBreakpointFault=*/false, /*expectedNativeFaultOffset=*/0);
+        const VM_MICRO_OPCODE wideDivideSemantic =
+            signedDivide ? VM_UOP_IDIV_WIDE : VM_UOP_UDIV_WIDE;
+        const auto divideInstruction = std::find_if(
+            divideTranslation.instructions.begin(),
+            divideTranslation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == wideDivideSemantic;
+            });
+        Require(divideInstruction != divideTranslation.instructions.end(),
+            std::string(signedDivide ? "IDIV" : "DIV") +
+                " fixture emitted no wide-divide instruction");
+
+        std::array<std::set<std::array<uint8_t, 4>>, 2> plansByStrategy{};
+        std::array<std::vector<uint8_t>, 2> providerSeedsByStrategy{};
+        for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = MakeSeed(static_cast<uint8_t>(domain));
+            config.semantic = wideDivideSemantic;
+            config.variant = divideInstruction->handlerVariant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "wide divide provider-seed selection failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < plansByStrategy.size(),
+                "wide divide selected an unknown K strategy");
+            if (plansByStrategy[strategy].size() < 2u &&
+                    plansByStrategy[strategy].insert(
+                        generated.registerAssignment).second) {
+                providerSeedsByStrategy[strategy].push_back(
+                    static_cast<uint8_t>(domain));
+            }
+            if (plansByStrategy[0].size() == 2u &&
+                    plansByStrategy[1].size() == 2u) break;
+        }
+        Require(providerSeedsByStrategy[0].size() == 2u &&
+                providerSeedsByStrategy[1].size() == 2u,
+            "wide divide differential seeds did not cover both "
+            "register-direct and memory forms for both K values");
+
+        for (uint8_t strategy = 0u; strategy < 2u; ++strategy) {
+            for (uint8_t providerSeed : providerSeedsByStrategy[strategy]) {
+                const std::string label = std::string("native-vs-VM ") +
+                    (signedDivide ? "IDIV_WIDE(128-bit dividend)/#DE K="
+                                  : "UDIV_WIDE(128-bit dividend)/#DE K=") +
+                    std::to_string(strategy) + " seed " +
+                    std::to_string(providerSeed);
+                RunDifferentialCase(divideFunction, divideTranslation, build,
+                    64, true, label.c_str(),
+                    /*expectDivideFault=*/true,
+                    /*providerSeedDomain=*/providerSeed,
+                    /*expectBreakpointFault=*/false,
+                    /*expectedNativeFaultOffset=*/0);
+            }
+        }
     }
 }
 
@@ -904,6 +1406,639 @@ void TestBranchToRetMaterializesObservableFlags() {
         TranslateStandaloneFunction(function, build, translator);
     RunDifferentialCase(function, translation, build, 32, true,
         "branch-to-RET observable flags materialization");
+}
+
+void TestZydisFlagsBoundaryNativeDifferential() {
+    const auto seed = MakeSeed(0xEAu);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "flags-boundary disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // LAHF ; SAHF ; RET is a production-translator-reachable chain for all
+    // three migrated semantics. LAHF publishes status flags into AH through
+    // FLAGS_PACK_AH, SAHF consumes that byte through FLAGS_UNPACK_AH while
+    // preserving OF and non-status architectural bits, and RET forces the
+    // final FLAGS_MATERIALIZE boundary observed by the native return frame.
+    const std::vector<uint8_t> bytes = {0x9F, 0x9E, 0xC3};
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {{
+        VM_UOP_FLAGS_MATERIALIZE,
+        VM_UOP_FLAGS_PACK_AH,
+        VM_UOP_FLAGS_UNPACK_AH,
+    }};
+    std::array<uint8_t, semantics.size()> variants{};
+    for (size_t semanticIndex = 0u;
+         semanticIndex < semantics.size(); ++semanticIndex) {
+        const auto instruction = std::find_if(
+            translation.instructions.begin(), translation.instructions.end(),
+            [&](const MicroInstruction& candidate) {
+                return candidate.opcode == semantics[semanticIndex];
+            });
+        Require(instruction != translation.instructions.end(),
+            "LAHF/SAHF/RET fixture did not reach every migrated flags "
+            "semantic through the production translator");
+        variants[semanticIndex] = instruction->handlerVariant;
+    }
+
+    // Provider seeds are selected from the actual synthesized handlers, not
+    // guessed from the seed byte. For every migrated semantic and both real K
+    // strategies, execute at least two distinct register assignments. The
+    // synthesis test separately decodes every assignment's REX/ModRM/SIB
+    // signature; this matrix supplies real CPU evidence for both K values and
+    // multiple forms without manufacturing a differential-only micro-op entry.
+    std::array<std::array<std::set<std::array<uint8_t, 4>>, 2>,
+        semantics.size()> assignments{};
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::array<uint8_t, semantics.size()> strategies{};
+        std::array<std::array<uint8_t, 4>, semantics.size()> assignments{};
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (size_t semanticIndex = 0u;
+             semanticIndex < semantics.size(); ++semanticIndex) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = semantics[semanticIndex];
+            config.variant = variants[semanticIndex];
+            const auto generated =
+                GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "flags-boundary provider-seed generation failed: " +
+                    generated.error);
+            const uint8_t strategy = generated.semanticCoreStrategy;
+            Require(strategy < 2u,
+                "flags-boundary provider seed selected an invalid K");
+            candidate.strategies[semanticIndex] = strategy;
+            candidate.assignments[semanticIndex] =
+                generated.registerAssignment;
+        }
+        candidates.push_back(candidate);
+    }
+
+    // Greedily choose the candidate that adds the most still-missing
+    // semantic/K/assignment cells. This preserves the exact structural
+    // coverage contract while avoiding redundant worker launches that can
+    // push the complete Win32 differential suite over its fixed CTest budget.
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perSemantic : assignments) {
+            for (const auto& perStrategy : perSemantic)
+                complete = complete && perStrategy.size() >= 2u;
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t semanticIndex = 0u;
+                 semanticIndex < semantics.size(); ++semanticIndex) {
+                const uint8_t strategy = candidate.strategies[semanticIndex];
+                if (assignments[semanticIndex][strategy].size() < 2u) {
+                    gain += assignments[semanticIndex][strategy].count(
+                        candidate.assignments[semanticIndex]) == 0u ? 1u : 0u;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "flags-boundary differential seed selection stalled before "
+            "covering every semantic/K/assignment cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t semanticIndex = 0u;
+             semanticIndex < semantics.size(); ++semanticIndex) {
+            const uint8_t strategy = selected.strategies[semanticIndex];
+            if (assignments[semanticIndex][strategy].size() < 2u) {
+                assignments[semanticIndex][strategy].insert(
+                    selected.assignments[semanticIndex]);
+            }
+        }
+    }
+    for (const auto& perSemantic : assignments) {
+        for (const auto& perStrategy : perSemantic) {
+            Require(perStrategy.size() >= 2u,
+                "flags-boundary differential seeds did not cover two "
+                "register assignments for each K");
+        }
+    }
+
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM LAHF/SAHF/RET flags boundary seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
+void TestZydisFlagsLifecycleNativeDifferential() {
+    const auto seed = MakeSeed(0xF2u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "flags-lifecycle disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // ADD reaches FLAGS_LAZY through the production translator. CLC/STC/CMC
+    // reach FLAGS_UPDATE in all three modes, and RET materializes the final
+    // observable flags. FLAGS_WRITE is deliberately absent: production POPF
+    // lowering remains fail-closed because privilege/trap/RF behavior is not
+    // losslessly virtualized, so manufacturing a differential-only entry
+    // would overstate the evidence boundary.
+    const std::vector<uint8_t> bytes = {
+        0x01,0xC8, // add eax,ecx
+        0xF8,      // clc
+        0xF9,      // stc
+        0xF5,      // cmc
+        0xC3,      // ret
+    };
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    struct TargetHandler {
+        VM_MICRO_OPCODE semantic = VM_UOP_FLAGS_LAZY;
+        uint8_t variant = 0u;
+        bool operator==(const TargetHandler& other) const {
+            return semantic == other.semantic && variant == other.variant;
+        }
+    };
+    std::vector<TargetHandler> targets;
+    bool sawLazy = false;
+    bool sawUpdate = false;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        if (instruction.opcode != VM_UOP_FLAGS_LAZY &&
+                instruction.opcode != VM_UOP_FLAGS_UPDATE) continue;
+        sawLazy = sawLazy || instruction.opcode == VM_UOP_FLAGS_LAZY;
+        sawUpdate = sawUpdate || instruction.opcode == VM_UOP_FLAGS_UPDATE;
+        const TargetHandler target{
+            instruction.opcode, instruction.handlerVariant};
+        if (std::find(targets.begin(), targets.end(), target) == targets.end())
+            targets.push_back(target);
+    }
+    Require(sawLazy && sawUpdate && !targets.empty(),
+        "ADD/CLC/STC/CMC/RET fixture did not reach FLAGS_LAZY and "
+        "FLAGS_UPDATE through the production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        targets.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (const TargetHandler& target : targets) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = target.semantic;
+            config.variant = target.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "flags-lifecycle provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "flags-lifecycle provider seed selected an invalid K");
+            candidate.strategies.push_back(
+                generated.semanticCoreStrategy);
+            candidate.assignments.push_back(generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perTarget : assignments) {
+            for (const auto& perStrategy : perTarget)
+                complete = complete && perStrategy.size() >= 2u;
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t targetIndex = 0u;
+                 targetIndex < targets.size(); ++targetIndex) {
+                const uint8_t strategy = candidate.strategies[targetIndex];
+                if (assignments[targetIndex][strategy].size() < 2u &&
+                        assignments[targetIndex][strategy].count(
+                            candidate.assignments[targetIndex]) == 0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "flags-lifecycle differential seed selection stalled before "
+            "covering every reached handler-variant/K/assignment cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            const uint8_t strategy = selected.strategies[targetIndex];
+            if (assignments[targetIndex][strategy].size() < 2u) {
+                assignments[targetIndex][strategy].insert(
+                    selected.assignments[targetIndex]);
+            }
+        }
+    }
+    for (const auto& perTarget : assignments) {
+        for (const auto& perStrategy : perTarget) {
+            Require(perStrategy.size() >= 2u,
+                "flags-lifecycle provider seeds did not cover two register "
+                "assignments for every reached handler variant and K");
+        }
+    }
+
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM ADD/CLC/STC/CMC/RET flags lifecycle seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 32, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
+void TestZydisPopAndControlNativeDifferential() {
+    const auto seed = MakeSeed(0xE7u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "POP/control disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // mov al,dl reaches partial-field POP_VREG; TEST/JZ reaches BRANCH_IF;
+    // the nonzero edge reaches CALL_VM and an unconditional BRANCH, while
+    // both the main body and the called body reach RET. MOV/ADD additionally
+    // cover write-all POP_VREG. Every target comes from the production
+    // translator; no isolated semantic-only differential is manufactured.
+    std::vector<uint8_t> bytes = {
+        0xEB,0x03,                         // jmp +3 -> 0x1005
+        0x01,0xC8,                         // sub: add eax,ecx
+        0xC3,                              // sub: ret
+        0x88,0xD0,                         // main: mov al,dl
+        0x85,0xC0,                         // test eax,eax
+        0x74,0x07,                         // jz  +7 -> 0x1012
+        0xE8,0xF2,0xFF,0xFF,0xFF,          // call -14 -> 0x1002
+        0xEB,0x05,                         // jmp +5 -> 0x1017
+        0xB8,0x01,0x00,0x00,0x00,          // mov eax,1
+    };
+    if constexpr (kIs64) {
+        // Native CALL leaves its return address in dead stack memory after
+        // RET, while CALL_VM deliberately uses the bounded context call
+        // stack. Overwrite that dead qword through an ordinary production
+        // STORE on both paths so the differential compares only live,
+        // architecturally retained memory effects rather than stale call
+        // machinery. No memory corpus or comparator is excluded.
+        const std::array<uint8_t, 9> clearDeadReturn = {
+            0x48,0xC7,0x44,0x24,0xF8,0x00,0x00,0x00,0x00};
+        bytes.insert(bytes.end(),
+            clearDeadReturn.begin(), clearDeadReturn.end());
+    } else {
+        const std::array<uint8_t, 8> clearDeadReturn = {
+            0xC7,0x44,0x24,0xFC,0x00,0x00,0x00,0x00};
+        bytes.insert(bytes.end(),
+            clearDeadReturn.begin(), clearDeadReturn.end());
+    }
+    bytes.push_back(0xC3);                 // ret
+    Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    // AnalyzeFunctionRange deliberately does not follow CALL targets. A real
+    // trusted function-boundary provider supplies every in-range block, so
+    // decode the local callee with the same production disassembler and add
+    // those blocks to the same trusted Function before invoking Translator.
+    const Function localCallee = DecodeStandaloneFunction(
+        disassembler, {0x01,0xC8,0xC3}, kEntry + 2u);
+    function.blocks.insert(function.blocks.end(),
+        localCallee.blocks.begin(), localCallee.blocks.end());
+    function.decodedBytes += localCallee.decodedBytes;
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    struct TargetHandler {
+        VM_MICRO_OPCODE semantic = VM_UOP_POP_VREG;
+        uint8_t variant = 0u;
+        bool operator==(const TargetHandler& other) const {
+            return semantic == other.semantic && variant == other.variant;
+        }
+    };
+    constexpr std::array<VM_MICRO_OPCODE, 5> semantics = {
+        VM_UOP_POP_VREG, VM_UOP_BRANCH, VM_UOP_BRANCH_IF,
+        VM_UOP_CALL_VM, VM_UOP_RET};
+    std::array<bool, semantics.size()> sawSemantic{};
+    std::vector<TargetHandler> targets;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        const auto found = std::find(
+            semantics.begin(), semantics.end(), instruction.opcode);
+        if (found == semantics.end()) continue;
+        sawSemantic[static_cast<size_t>(found - semantics.begin())] = true;
+        const TargetHandler target{
+            instruction.opcode, instruction.handlerVariant};
+        if (std::find(targets.begin(), targets.end(), target) == targets.end())
+            targets.push_back(target);
+    }
+    Require(std::all_of(sawSemantic.begin(), sawSemantic.end(),
+            [](bool value) { return value; }) && !targets.empty(),
+        "POP/control fixture did not reach all five target semantics through "
+        "the production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        targets.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (const TargetHandler& target : targets) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = target.semantic;
+            config.variant = target.variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "POP/control provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "POP/control provider seed selected an invalid K");
+            candidate.strategies.push_back(generated.semanticCoreStrategy);
+            candidate.assignments.push_back(generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    const auto requiredAssignments = [&](size_t targetIndex) {
+        return targets[targetIndex].semantic == VM_UOP_POP_VREG ? 4u : 2u;
+    };
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            for (const auto& perStrategy : assignments[targetIndex]) {
+                complete = complete &&
+                    perStrategy.size() >= requiredAssignments(targetIndex);
+            }
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t targetIndex = 0u;
+                 targetIndex < targets.size(); ++targetIndex) {
+                const uint8_t strategy = candidate.strategies[targetIndex];
+                const auto& covered = assignments[targetIndex][strategy];
+                if (covered.size() < requiredAssignments(targetIndex) &&
+                        covered.count(
+                            candidate.assignments[targetIndex]) == 0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "POP/control differential seed selection stalled before "
+            "covering every reached handler-variant/K/assignment/form cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t targetIndex = 0u;
+             targetIndex < targets.size(); ++targetIndex) {
+            const uint8_t strategy = selected.strategies[targetIndex];
+            auto& covered = assignments[targetIndex][strategy];
+            if (covered.size() < requiredAssignments(targetIndex))
+                covered.insert(selected.assignments[targetIndex]);
+        }
+    }
+    for (size_t targetIndex = 0u;
+         targetIndex < targets.size(); ++targetIndex) {
+        for (const auto& perStrategy : assignments[targetIndex]) {
+            Require(perStrategy.size() >= requiredAssignments(targetIndex),
+                "POP/control provider seeds did not cover the required "
+                "assignments/forms for every reached handler variant and K");
+        }
+    }
+
+    std::cout << "[pop-control-provider-seeds] count="
+              << providerSeeds.size() << '\n';
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM POP/BRANCH/BRANCH_IF/CALL_VM/RET seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 16, true,
+            label.c_str(), false, providerSeed);
+    }
+}
+
+void TestZydisSelectNativeDifferential() {
+    const auto seed = MakeSeed(0xF5u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "SELECT disassembler initialization failed");
+    constexpr uint64_t kEntry = 0x1000;
+
+    // CMP makes ZF deterministically true. CMOVNZ therefore exercises the
+    // not-selected path and CMOVZ exercises the selected path without either
+    // instruction changing flags; both lower through the production CMOV ->
+    // SELECT translator entry. The final XOR makes both selected values
+    // observable. On x64 a not-taken r32 CMOV must preserve the complete
+    // destination while a taken one writes r32 and clears its upper half, so
+    // finish with a 64-bit XOR there to keep both high-half effects visible.
+    std::vector<uint8_t> bytes = {
+        0x39,0xC9,                         // cmp ecx,ecx (ZF=1)
+        0x0F,0x45,0xC2,                    // cmovnz eax,edx (not taken)
+        0x0F,0x44,0xCA,                    // cmovz  ecx,edx (taken)
+    };
+    if constexpr (kIs64) {
+        bytes.insert(bytes.end(), {0x48,0x31,0xC8}); // xor rax,rcx
+    } else {
+        bytes.insert(bytes.end(), {0x31,0xC8});      // xor eax,ecx
+    }
+    bytes.push_back(0xC3);                         // ret
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    Translator translator;
+    const TranslationResult translation =
+        TranslateStandaloneFunction(function, build, translator);
+
+    std::vector<uint8_t> variants;
+    size_t selectCount = 0u;
+    bool sawSelected = false;
+    bool sawNotSelected = false;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        if (instruction.opcode != VM_UOP_SELECT) continue;
+        ++selectCount;
+        Require(!instruction.operands.empty(),
+            "production SELECT instruction has no condition operand");
+        sawSelected = sawSelected ||
+            instruction.operands[0] == VM_CONDITION_E;
+        sawNotSelected = sawNotSelected ||
+            instruction.operands[0] == VM_CONDITION_NE;
+        if (std::find(variants.begin(), variants.end(),
+                instruction.handlerVariant) == variants.end()) {
+            variants.push_back(instruction.handlerVariant);
+        }
+    }
+    Require(selectCount == 2u && sawSelected && sawNotSelected &&
+            !variants.empty(),
+        "CMOV fixture did not reach taken and not-taken SELECT through the "
+        "production translator");
+
+    using RegisterPlan = std::array<uint8_t, 4>;
+    std::vector<std::array<std::set<RegisterPlan>, 2>> assignments(
+        variants.size());
+    struct CandidateSeed {
+        uint8_t domain = 0u;
+        std::vector<uint8_t> strategies;
+        std::vector<RegisterPlan> assignments;
+    };
+    std::vector<CandidateSeed> candidates;
+    for (uint16_t domain = 1u; domain <= 0xFFu; ++domain) {
+        const auto candidateSeed = MakeSeed(static_cast<uint8_t>(domain));
+        CandidateSeed candidate{};
+        candidate.domain = static_cast<uint8_t>(domain);
+        for (uint8_t variant : variants) {
+            VMHandlerSemanticCodegenConfig config{};
+            config.architecture = kIs64 ? VM_ARCH_X64 : VM_ARCH_X86;
+            config.buildSeed = candidateSeed;
+            config.semantic = VM_UOP_SELECT;
+            config.variant = variant;
+            const auto generated = GenerateVMHandlerSemanticKernel(config);
+            Require(generated.success,
+                "SELECT provider-seed generation failed: " +
+                    generated.error);
+            Require(generated.semanticCoreStrategy < 2u,
+                "SELECT provider seed selected an invalid K");
+            candidate.strategies.push_back(
+                generated.semanticCoreStrategy);
+            candidate.assignments.push_back(
+                generated.registerAssignment);
+        }
+        candidates.push_back(candidate);
+    }
+
+    // Cover every SELECT-specific register plan under each real K for every
+    // handler variant actually reached by the production translation. This
+    // is deliberately selected from synthesized provider output instead of
+    // assuming a relationship between a seed-domain byte and an assignment.
+    const size_t requiredAssignments = kIs64 ? 6u : 3u;
+    std::vector<uint8_t> providerSeeds;
+    for (;;) {
+        bool complete = true;
+        for (const auto& perVariant : assignments) {
+            for (const auto& perStrategy : perVariant) {
+                complete = complete &&
+                    perStrategy.size() >= requiredAssignments;
+            }
+        }
+        if (complete) break;
+
+        size_t bestIndex = candidates.size();
+        size_t bestGain = 0u;
+        for (size_t index = 0u; index < candidates.size(); ++index) {
+            const CandidateSeed& candidate = candidates[index];
+            if (std::find(providerSeeds.begin(), providerSeeds.end(),
+                    candidate.domain) != providerSeeds.end()) continue;
+            size_t gain = 0u;
+            for (size_t variantIndex = 0u;
+                 variantIndex < variants.size(); ++variantIndex) {
+                const uint8_t strategy =
+                    candidate.strategies[variantIndex];
+                const auto& covered =
+                    assignments[variantIndex][strategy];
+                if (covered.size() < requiredAssignments &&
+                        covered.count(candidate.assignments[variantIndex]) ==
+                            0u) {
+                    ++gain;
+                }
+            }
+            if (gain > bestGain) {
+                bestGain = gain;
+                bestIndex = index;
+            }
+        }
+        Require(bestIndex != candidates.size() && bestGain != 0u,
+            "SELECT differential seed selection stalled before covering "
+            "every reached handler-variant/K/register-plan cell");
+        const CandidateSeed& selected = candidates[bestIndex];
+        providerSeeds.push_back(selected.domain);
+        for (size_t variantIndex = 0u;
+             variantIndex < variants.size(); ++variantIndex) {
+            const uint8_t strategy = selected.strategies[variantIndex];
+            auto& covered = assignments[variantIndex][strategy];
+            if (covered.size() < requiredAssignments) {
+                covered.insert(selected.assignments[variantIndex]);
+            }
+        }
+    }
+    for (const auto& perVariant : assignments) {
+        for (const auto& perStrategy : perVariant) {
+            Require(perStrategy.size() == requiredAssignments,
+                "SELECT provider seeds did not cover every register plan "
+                "for each reached handler variant and K");
+        }
+    }
+
+    std::cout << "[select-provider-seeds] count="
+              << providerSeeds.size() << '\n';
+    for (uint8_t providerSeed : providerSeeds) {
+        const std::string label =
+            "native-vs-VM SELECT taken/not-taken seed " +
+            std::to_string(providerSeed);
+        RunDifferentialCase(function, translation, build, 16, true,
+            label.c_str(), false, providerSeed);
+    }
 }
 
 void TestUndefinedFlagsReadFailsClosed() {
@@ -1018,8 +2153,9 @@ void TestCmovR32PreservesOrClearsUpperHalf() {
     Require(disassembler.Initialize(true), "Disassembler initialization failed");
     constexpr uint64_t kEntry = 0x1000;
 
-    // cmp ecx,ecx sets ZF. In 64-bit mode CMOV r32 clears RAX[63:32]
-    // regardless of whether the low-32 destination assignment is taken.
+    // cmp ecx,ecx sets ZF. In 64-bit mode a taken CMOV r32 writes the
+    // destination and clears its upper half; a not-taken CMOV leaves the
+    // complete destination unchanged.
     const std::vector<uint8_t> notTakenBytes = {
         0x39,0xC9, 0x0F,0x45,0xC2, 0xC3};
     const std::vector<uint8_t> takenBytes = {
@@ -1028,7 +2164,7 @@ void TestCmovR32PreservesOrClearsUpperHalf() {
         const std::vector<uint8_t>* bytes;
         const char* label;
     } cases[] = {
-        {&notTakenBytes, "x64 CMOV r32 not-taken clears upper RAX"},
+        {&notTakenBytes, "x64 CMOV r32 not-taken preserves full RAX"},
         {&takenBytes, "x64 CMOV r32 taken zero-extends RAX"},
     };
     for (const auto& testCase : cases) {
@@ -1057,17 +2193,42 @@ void Run(const char* name, void (*test)(), int& failures) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     int failures = 0;
 #if defined(_M_X64) || defined(_M_IX86)
+    if (argc == 2 &&
+            std::string(argv[1]) == "--flags-boundary-only") {
+        Run("Zydis FLAGS_MATERIALIZE/PACK_AH/UNPACK_AH multi-seed native differential",
+            &TestZydisFlagsBoundaryNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 &&
+            std::string(argv[1]) == "--flags-lifecycle-only") {
+        Run("Zydis FLAGS_LAZY/FLAGS_UPDATE production translator multi-seed native differential",
+            &TestZydisFlagsLifecycleNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 &&
+            std::string(argv[1]) == "--pop-control-only") {
+        Run("Zydis POP_VREG/control-flow production translator multi-seed native differential",
+            &TestZydisPopAndControlNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--select-only") {
+        Run("Zydis SELECT production translator multi-seed native differential",
+            &TestZydisSelectNativeDifferential, failures);
+        return failures == 0 ? 0 : 1;
+    }
     Run("隔离原生差分证据: 真实 CPU 与合成 handler 链一致性/分歧检测",
         &TestRealDifferentialPassAndCatchesRealMismatch, failures);
     Run("Zydis AND/OR/XOR build-seed register native differential",
         &TestZydisAluPilotNativeDifferential, failures);
     Run("Zydis ADD/SUB/NOT/NEG/LOAD/STORE build-seed native differential",
         &TestZydisExplicitAluMemoryBatchNativeDifferential, failures);
+    Run("Zydis LOAD_TEMP/STORE_TEMP/DUP/DROP build-seed native differential",
+        &TestZydisTempStackBatchNativeDifferential, failures);
     Run("函数入口 SP/栈参数/RET 清栈真实 CPU 差分",
         &TestFunctionEntryStackAndRetCleanupDifferential, failures);
     Run("branch-to-RET flags materialization",
@@ -1080,7 +2241,7 @@ int main() {
 #endif
     Run("分发表编码分化: 两套加密查表路径均由隔离原生 CPU 执行",
         &TestDispatchTableEncodingSchemesExecuteNatively, failures);
-    Run("MUL 真 K 变体: 真实 CPU IMUL 与合成 handler 链一致性/分歧检测",
+    Run("MUL 真 K 变体: 真实 CPU scaled LEA 与合成 handler 链一致性/分歧检测",
         &TestMulNativeDifferentialMatchesRealCpu, failures);
     Run("BIT_TEST/BIT_SET/BIT_RESET 真 K 变体: 真实 CPU BT/BTS/BTR 与合成 handler 链一致性/分歧检测",
         &TestBitOperationsNativeDifferentialMatchesRealCpu, failures);
@@ -1088,6 +2249,10 @@ int main() {
         &TestShiftOperationsNativeDifferentialMatchesRealCpu, failures);
     Run("剩余算术家族真 K 变体: 真实 CPU 与合成 handler 链一致性检测",
         &TestRemainingArithmeticFamiliesNativeDifferential, failures);
+#if defined(_M_X64)
+    Run("x64 Zydis UMUL_WIDE RDX:RAX per-K/multi-seed native differential",
+        &TestX64ZydisUmulWidePerKNativeDifferential, failures);
+#endif
 #if defined(_M_IX86)
     Run("x86 Zydis UMUL_WIDE per-K/multi-seed native differential",
         &TestX86ZydisUmulWidePerKNativeDifferential, failures);

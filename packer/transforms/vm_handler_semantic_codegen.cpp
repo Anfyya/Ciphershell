@@ -106,6 +106,8 @@ public:
     KeyedPermutationPlan coreSelector{};
     std::array<uint8_t, 4> registerAssignment{};
     std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
+    uint32_t callHostSehHandlerOffset = 0;
+    bool hasCallHostSehHandler = false;
 
     void FailEncoding(const std::string& error) {
         if (encodingError.empty()) encodingError = error;
@@ -157,7 +159,8 @@ ZydisEncoderOperand ZydisMemoryOperand(
     uint8_t base,
     int32_t displacement,
     uint16_t bytes,
-    uint8_t index = 0xFFu)
+    uint8_t index = 0xFFu,
+    uint8_t scale = 1u)
 {
     ZydisEncoderOperand operand{};
     operand.type = ZYDIS_OPERAND_TYPE_MEMORY;
@@ -166,13 +169,13 @@ ZydisEncoderOperand ZydisMemoryOperand(
     operand.mem.index = index == 0xFFu ? ZYDIS_REGISTER_NONE :
         ZydisRegisterEncode(
             x64 ? ZYDIS_REGCLASS_GPR64 : ZYDIS_REGCLASS_GPR32, index);
-    operand.mem.scale = index == 0xFFu ? 0u : 1u;
+    operand.mem.scale = index == 0xFFu ? 0u : scale;
     operand.mem.displacement = displacement;
     operand.mem.size = bytes;
     return operand;
 }
 
-ZydisEncoderOperand ZydisImmediateOperand(uint32_t value) {
+ZydisEncoderOperand ZydisImmediateOperand(uint64_t value) {
     ZydisEncoderOperand operand{};
     operand.type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
     operand.imm.u = value;
@@ -204,7 +207,26 @@ void EmitZydisInstruction(
     const ZyanStatus status = ZydisEncoderEncodeInstruction(
         &request, encoded.data(), &encodedSize);
     if (!ZYAN_SUCCESS(status)) {
-        c.FailEncoding("Zydis Encoder rejected a semantic instruction");
+        std::string error = "Zydis Encoder rejected semantic instruction " +
+            std::to_string(static_cast<uint32_t>(mnemonic)) +
+            " status=" + std::to_string(static_cast<uint32_t>(status)) +
+            " operands=";
+        for (size_t operandIndex = 0u;
+             operandIndex < request.operand_count; ++operandIndex) {
+            if (operandIndex != 0u) error += ',';
+            const auto& operand = request.operands[operandIndex];
+            error += std::to_string(static_cast<uint32_t>(operand.type));
+            if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                error += ":r" + std::to_string(
+                    static_cast<uint32_t>(operand.reg.value));
+            } else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                error += ":m" + std::to_string(
+                    static_cast<uint32_t>(operand.mem.base));
+            } else if (operand.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                error += ":i" + std::to_string(operand.imm.u);
+            }
+        }
+        c.FailEncoding(error);
         return;
     }
     c.bytes.insert(c.bytes.end(), encoded.begin(),
@@ -216,6 +238,50 @@ void EmitZydisMove(
 {
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
         {ZydisGprOperand(x64, destination), ZydisGprOperand(x64, source)});
+}
+
+void EmitZydisSizedMove(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t destination,
+    uint8_t source,
+    uint8_t bytes)
+{
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+        {ZydisSizedGprOperand(x64, destination, bytes),
+         ZydisSizedGprOperand(x64, source, bytes)});
+}
+
+uint64_t ZydisSignExtendImmediateBits(uint64_t immediate, uint8_t bytes) {
+    if (bytes != 1u && bytes != 2u && bytes != 4u) return immediate;
+    const uint8_t bits = static_cast<uint8_t>(bytes * 8u);
+    const uint64_t mask = (uint64_t{1} << bits) - 1u;
+    immediate &= mask;
+    if ((immediate & (uint64_t{1} << (bits - 1u))) != 0u)
+        immediate |= ~mask;
+    return immediate;
+}
+
+void EmitZydisMoveImmediate(
+    CodeBuffer& c, bool x64, uint8_t destination, uint64_t immediate)
+{
+    if (!x64) immediate = ZydisSignExtendImmediateBits(immediate, 4u);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+        {ZydisGprOperand(x64, destination),
+         ZydisImmediateOperand(immediate)});
+}
+
+void EmitZydisSizedMoveImmediate(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t destination,
+    uint8_t bytes,
+    uint64_t immediate)
+{
+    immediate = ZydisSignExtendImmediateBits(immediate, bytes);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+        {ZydisSizedGprOperand(x64, destination, bytes),
+         ZydisImmediateOperand(immediate)});
 }
 
 void EmitZydisExchange(
@@ -236,6 +302,19 @@ void EmitZydisBinary(
         {ZydisGprOperand(x64, destination), ZydisGprOperand(x64, source)});
 }
 
+void EmitZydisSizedBinary(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t destination,
+    uint8_t source,
+    uint8_t bytes)
+{
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisSizedGprOperand(x64, destination, bytes),
+         ZydisSizedGprOperand(x64, source, bytes)});
+}
+
 void EmitZydisBinaryImmediate(
     CodeBuffer& c,
     bool x64,
@@ -248,10 +327,52 @@ void EmitZydisBinaryImmediate(
          ZydisImmediateOperand(immediate)});
 }
 
+void EmitZydisSizedBinaryImmediate(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t destination,
+    uint8_t bytes,
+    uint64_t immediate)
+{
+    // Zydis models the legacy ALU immediate encodings as signed fields even
+    // when the instruction consumes their raw bits at the destination width.
+    // Sign-extend the requested bit pattern so values with bit 7/15/31 set
+    // remain representable at that exact width instead of being rejected as
+    // requiring a wider immediate.
+    immediate = ZydisSignExtendImmediateBits(immediate, bytes);
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisSizedGprOperand(x64, destination, bytes),
+         ZydisImmediateOperand(immediate)});
+}
+
 void EmitZydisUnary(
     CodeBuffer& c, bool x64, ZydisMnemonic mnemonic, uint8_t reg)
 {
     EmitZydisInstruction(c, x64, mnemonic, {ZydisGprOperand(x64, reg)});
+}
+
+void EmitZydisSizedUnary(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t reg,
+    uint8_t bytes)
+{
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisSizedGprOperand(x64, reg, bytes)});
+}
+
+void EmitZydisShiftCl(
+    CodeBuffer& c,
+    bool x64,
+    ZydisMnemonic mnemonic,
+    uint8_t reg,
+    uint8_t bytes)
+{
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisSizedGprOperand(x64, reg, bytes),
+         ZydisSizedGprOperand(x64, 1u, 1u)});
 }
 
 void EmitZydisLea(
@@ -260,12 +381,13 @@ void EmitZydisLea(
     uint8_t destination,
     uint8_t base,
     int32_t displacement,
-    uint8_t index = 0xFFu)
+    uint8_t index = 0xFFu,
+    uint8_t scale = 1u)
 {
     EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_LEA,
         {ZydisGprOperand(x64, destination),
          ZydisMemoryOperand(x64, base, displacement,
-             static_cast<uint16_t>(x64 ? 8u : 4u), index)});
+             static_cast<uint16_t>(x64 ? 8u : 4u), index, scale)});
 }
 
 void EmitZydisLoad(
@@ -308,38 +430,55 @@ constexpr uint8_t kX64BridgePrologSize = 7u;
 // copied guest stack arguments, volatile-register spills, and an aligned host
 // XSAVE/FXSAVE image.  Handler entry is RSP==8 (mod 16), so the allocation is
 // also 8 (mod 16) and every nested Win64 call is aligned.
-constexpr uint32_t kX64NativeCallStackBytes = 0x608u;
-constexpr uint8_t kX64NativeCallPrologSize = 7u;
-constexpr uint32_t kNativeCallArgumentBase = 0x20u;
-constexpr uint32_t kNativeCallTargetSpill = 0x220u;
-constexpr uint32_t kNativeCallGuestStackSpill = 0x228u;
-constexpr uint32_t kNativeCallHostExtendedSpill = 0x230u;
-constexpr uint32_t kNativeCallFlagsSpill = 0x238u;
-constexpr uint32_t kNativeCallRaxSpill = 0x240u;
-constexpr uint32_t kNativeCallRcxSpill = 0x248u;
-constexpr uint32_t kNativeCallRdxSpill = 0x250u;
-constexpr uint32_t kNativeCallR8Spill = 0x258u;
-constexpr uint32_t kNativeCallR9Spill = 0x260u;
-constexpr uint32_t kNativeCallR10Spill = 0x268u;
-constexpr uint32_t kNativeCallR11Spill = 0x270u;
-constexpr uint32_t kNativeCallGuardSpill = 0x278u;
-constexpr uint32_t kNativeCallHostExtendedBase = 0x280u;
-constexpr uint32_t kX86NativeCallStackBytes = 0x5C0u;
-constexpr uint32_t kX86NativeCallTargetSpill = 0x200u;
-constexpr uint32_t kX86NativeCallGuestStackSpill = 0x204u;
-constexpr uint32_t kX86NativeCallHostExtendedSpill = 0x208u;
-constexpr uint32_t kX86NativeCallFlagsSpill = 0x20Cu;
-constexpr uint32_t kX86NativeCallEaxSpill = 0x210u;
-constexpr uint32_t kX86NativeCallEcxSpill = 0x214u;
-constexpr uint32_t kX86NativeCallEdxSpill = 0x218u;
-constexpr uint32_t kX86NativeCallCleanupSpill = 0x21Cu;
-constexpr uint32_t kX86NativeCallGuardSpill = 0x220u;
-constexpr uint32_t kX86NativeCallOriginalEbpSpill = 0x224u;
-constexpr uint32_t kX86NativeCallOriginalEbxSpill = 0x228u;
-constexpr uint32_t kX86NativeCallOriginalEsiSpill = 0x22Cu;
-constexpr uint32_t kX86NativeCallOriginalEdiSpill = 0x230u;
-constexpr uint32_t kX86NativeCallStatusSpill = 0x234u;
-constexpr uint32_t kX86NativeCallHostExtendedBase = 0x240u;
+constexpr auto kX64CallHostFrame = kVMHandlerX64CallHostFramePlan;
+constexpr uint32_t kX64NativeCallStackBytes = kX64CallHostFrame.stackBytes;
+constexpr uint8_t kX64NativeCallPrologSize = kX64CallHostFrame.prologSize;
+constexpr uint32_t kNativeCallArgumentBase = kX64CallHostFrame.argumentBase;
+constexpr uint32_t kNativeCallTargetSpill = kX64CallHostFrame.targetSpill;
+constexpr uint32_t kNativeCallGuestStackSpill = kX64CallHostFrame.guestStackSpill;
+constexpr uint32_t kNativeCallHostExtendedSpill = kX64CallHostFrame.hostExtendedSpill;
+constexpr uint32_t kNativeCallFlagsSpill = kX64CallHostFrame.flagsSpill;
+constexpr uint32_t kNativeCallRaxSpill = kX64CallHostFrame.volatileGprSpills[0];
+constexpr uint32_t kNativeCallRcxSpill = kX64CallHostFrame.volatileGprSpills[1];
+constexpr uint32_t kNativeCallRdxSpill = kX64CallHostFrame.volatileGprSpills[2];
+constexpr uint32_t kNativeCallR8Spill = kX64CallHostFrame.volatileGprSpills[3];
+constexpr uint32_t kNativeCallR9Spill = kX64CallHostFrame.volatileGprSpills[4];
+constexpr uint32_t kNativeCallR10Spill = kX64CallHostFrame.volatileGprSpills[5];
+constexpr uint32_t kNativeCallR11Spill = kX64CallHostFrame.volatileGprSpills[6];
+constexpr uint32_t kNativeCallGuardSpill = kX64CallHostFrame.guardSpill;
+constexpr uint32_t kNativeCallHostExtendedBase = kX64CallHostFrame.hostExtendedBase;
+constexpr uint32_t kNativeCallHostExtendedModeSpill =
+    kX64CallHostFrame.hostExtendedModeSpill;
+constexpr uint32_t kNativeCallHostExtendedPhaseSpill =
+    kX64CallHostFrame.hostExtendedPhaseSpill;
+
+constexpr auto kX86CallHostFrame = kVMHandlerX86CallHostFramePlan;
+constexpr uint32_t kX86NativeCallStackBytes = kX86CallHostFrame.stackBytes;
+constexpr uint32_t kX86NativeCallTargetSpill = kX86CallHostFrame.targetSpill;
+constexpr uint32_t kX86NativeCallGuestStackSpill = kX86CallHostFrame.guestStackSpill;
+constexpr uint32_t kX86NativeCallHostExtendedSpill = kX86CallHostFrame.hostExtendedSpill;
+constexpr uint32_t kX86NativeCallFlagsSpill = kX86CallHostFrame.flagsSpill;
+constexpr uint32_t kX86NativeCallEaxSpill = kX86CallHostFrame.volatileGprSpills[0];
+constexpr uint32_t kX86NativeCallEcxSpill = kX86CallHostFrame.volatileGprSpills[1];
+constexpr uint32_t kX86NativeCallEdxSpill = kX86CallHostFrame.volatileGprSpills[2];
+constexpr uint32_t kX86NativeCallCleanupSpill = kX86CallHostFrame.cleanupSpill;
+constexpr uint32_t kX86NativeCallGuardSpill = kX86CallHostFrame.guardSpill;
+constexpr uint32_t kX86NativeCallOriginalEbpSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[0];
+constexpr uint32_t kX86NativeCallOriginalEbxSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[1];
+constexpr uint32_t kX86NativeCallOriginalEsiSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[2];
+constexpr uint32_t kX86NativeCallOriginalEdiSpill =
+    kX86CallHostFrame.originalNonvolatileSpills[3];
+constexpr uint32_t kX86NativeCallStatusSpill = kX86CallHostFrame.statusSpill;
+constexpr uint32_t kX86NativeCallHostExtendedBase = kX86CallHostFrame.hostExtendedBase;
+constexpr uint32_t kX86NativeCallHostExtendedModeSpill =
+    kX86CallHostFrame.hostExtendedModeSpill;
+constexpr uint32_t kX86NativeCallHostExtendedPhaseSpill =
+    kX86CallHostFrame.hostExtendedPhaseSpill;
+constexpr uint32_t kX86NativeCallSehRecordSpill =
+    kX86CallHostFrame.sehRecordSpill;
 constexpr uint8_t kX64CpuidPrologSize = 1u;
 constexpr uint8_t kX64RbxUnwindRegister = 3u;
 
@@ -350,10 +489,13 @@ static_assert((kX64BridgeStackBytes % 8u) == 0u &&
     "x64 bridge stack allocation no longer fits UWOP_ALLOC_LARGE");
 static_assert((kX64NativeCallStackBytes & 0xFu) == 8u &&
         kNativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
+            kNativeCallHostExtendedModeSpill &&
+        kNativeCallHostExtendedPhaseSpill + 4u <=
             kX64NativeCallStackBytes,
     "x64 native-call frame layout or alignment changed");
 static_assert(kX86NativeCallHostExtendedBase + VM_XSAVE_AREA_SIZE + 64u <=
-        kX86NativeCallStackBytes,
+        kX86NativeCallHostExtendedModeSpill &&
+        kX86NativeCallSehRecordSpill + 8u <= kX86NativeCallStackBytes,
     "x86 native-call frame layout changed");
 
 void RecordX64StackFunclet(
@@ -991,7 +1133,8 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
     bool x64,
     uint8_t variant,
     VM_MICRO_OPCODE semantic,
-    const std::array<uint8_t, 32>& buildSeed)
+    const std::array<uint8_t, 32>& buildSeed,
+    uint8_t coreStrategy)
 {
     const size_t seedOffset = static_cast<size_t>(
         buildSeed[static_cast<uint8_t>(semantic) & 31u]);
@@ -1026,6 +1169,192 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
         constexpr std::array<uint8_t, 3> pool = {0, 1, 2};
         return RotateRegisterContract(pool, seedOffset, variant);
     }
+    if (semantic == VM_UOP_BSWAP) {
+        if (x64) {
+            // R8 retains the original operand, R9 retains the width mask,
+            // R11 is the width-dispatch register, and R15 is context.  Roles
+            // are value, transform scratch, key scratch, spare.
+            constexpr std::array<uint8_t, 4> pool = {0u, 1u, 2u, 10u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // ECX belongs to width dispatch and EDI is context.  EAX/EDX plus
+        // the already handler-local EBX form the complete byte-swap pool;
+        // ESI remains excluded from this semantic.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 3u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_ZERO_EXTEND ||
+            semantic == VM_UOP_SIGN_EXTEND) {
+        if (x64) {
+            // RCX is the fixed CL count, R8 is the original operand, R9 is
+            // the destination-width mask and R15 is context.  Roles are
+            // value, mask scratch, count/sign scratch and sign scratch.
+            constexpr std::array<uint8_t, 4> pool = {0u, 10u, 2u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // ECX remains the architectural CL count and EDI remains context.
+        // EDX is dead after publishing CL; EBX is already the proven mask/
+        // sign scratch in the legacy implementation.  The third role is
+        // reused for sign scratch only after its count value is dead.
+        constexpr std::array<uint8_t, 3> pool = {0u, 3u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_SHL || semantic == VM_UOP_SHR ||
+            semantic == VM_UOP_SAR || semantic == VM_UOP_ROL ||
+            semantic == VM_UOP_ROR) {
+        if (x64) {
+            // The pre-latched operands are already persisted in context.
+            // RCX/RDX remain the count path, R9 remains the width mask, R10
+            // remains the lazy-flags auxiliary and R15 remains context.
+            // RAX plus the complete isolated-differential-tested
+            // R8/R11/R12/R13 set form this core's value/scratch contract.
+            constexpr std::array<uint8_t, 5> pool = {
+                0u, 8u, 11u, 12u, 13u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // CL is the fixed hardware count. EAX is the boundary result while
+        // EDX is available after publishing CL and EBX is the proven legacy
+        // scratch. Rotate value/accumulator/share roles only inside that set;
+        // ESI/EDI stay excluded.
+        constexpr std::array<uint8_t, 3> pool = {0u, 3u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_ROT) {
+        const bool alternate =
+            ((seedOffset + static_cast<size_t>(variant)) & 1u) != 0u;
+        if (x64) {
+            // RAX/RDX/R8 are the three popped values and R10 is the existing
+            // proven temporary. The two plans choose equivalent cycle
+            // choreographies while preserving those fixed boundary roles.
+            return alternate
+                ? std::array<uint8_t, 4>{0u, 8u, 2u, 10u}
+                : std::array<uint8_t, 4>{0u, 2u, 8u, 10u};
+        }
+        // EAX/EDX/ECX are the popped values and EBX is the third pushed
+        // result. As on x64, only the choreography changes; ESI/EDI remain
+        // outside this semantic's live register contract.
+        return alternate
+            ? std::array<uint8_t, 4>{0u, 1u, 2u, 3u}
+            : std::array<uint8_t, 4>{0u, 2u, 1u, 3u};
+    }
+    if (semantic == VM_UOP_ADD_CARRY ||
+            semantic == VM_UOP_SUB_BORROW) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        if (x64) {
+            // R10/R11 retain original a/b for the lazy-flags latch, R9 is
+            // the width mask and R15 is context. R8 remains the carry/borrow
+            // input and eventual auxiliary; RCX is dead until width reload.
+            constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+                {0u, 2u, 8u, 1u}, // fixed RAX/RDX/R8 baseline
+                {1u, 2u, 8u, 0u}, // result in RCX
+                {0u, 1u, 8u, 2u}  // b work-copy in RCX
+            }};
+            return plans[plan];
+        }
+        // EAX/EDX enter as a/b, ECX is the masked carry/borrow and EDI is
+        // context. EBX's earlier width value is dead at core entry.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 2u, 1u, 3u}, // fixed EAX/EDX/ECX baseline
+            {3u, 2u, 1u, 0u}, // result in EBX
+            {0u, 3u, 1u, 2u}  // b work-copy in EBX
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_BIT_TEST || semantic == VM_UOP_BIT_SET ||
+            semantic == VM_UOP_BIT_RESET) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if (x64) {
+            // R8 and RAX both hold original a after the pre-latch. RDX holds
+            // the raw bit index, R10 is the required auxiliary result, R9 is
+            // the live width mask and R15 is context. R11's saved b copy is
+            // already persisted and may host the alternate index.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {0u, 2u, 10u, 11u}, // fixed-register baseline
+                {8u, 2u, 10u, 11u},
+                {0u, 11u, 10u, 2u},
+                {8u, 11u, 10u, 2u}
+            }};
+            return plans[plan];
+        }
+        // EAX is a, ECX is the raw index, EDX is the published auxiliary,
+        // and EDI is context. EBX is dead after mask construction; ESI is
+        // the legacy bit-mask scratch and is therefore proven local here.
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {0u, 1u, 2u, 6u}, // fixed-register baseline
+            {3u, 1u, 2u, 6u},
+            {0u, 6u, 2u, 3u},
+            {3u, 6u, 2u, 0u}
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_LOAD_TEMP || semantic == VM_UOP_STORE_TEMP) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) & 3u;
+            // R10 is the decoded temporary-slot index and R15 is context.
+            // Roles are result/value, address, index and spare. RAX is the
+            // LOAD result/STORE input boundary; the remaining registers are
+            // dead after the preceding stack operation or operand decode.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {0u, 11u, 10u, 8u}, // fixed-register baseline
+                {8u, 11u, 10u, 0u},
+                {0u, 8u, 10u, 11u},
+                {2u, 1u, 10u, 8u}
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // ECX is the decoded slot index and EDI is context. Restrict the
+        // complete plan to caller-volatile EAX/ECX/EDX. STORE_TEMP restores
+        // ECX before its post-core high-dword clear when a plan moves index.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 2u, 1u, 0u}, // fixed-register baseline
+            {2u, 0u, 1u, 2u},
+            {0u, 1u, 2u, 0u}
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_DUP) {
+        if (x64) {
+            // RAX is the popped input and RAX/RDX are the two output
+            // boundaries. RCX is reloaded by PushTwo and R15 is context.
+            // R8/R10 are dead across this core and safely carry a copy.
+            constexpr std::array<uint8_t, 4> pool = {0u, 2u, 8u, 10u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // EAX is the input, EAX/EDX are output boundaries and ECX is reloaded
+        // by PushTwo. EBX/ESI/EDI remain outside the local contract.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_DROP) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) & 3u;
+            // RCX is the decremented slot index, R15 is context and the
+            // popped value is dead. Roles are address, index, zero, spare.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {10u, 1u, 0u, 2u}, // fixed-register baseline
+                {11u, 1u, 2u, 0u},
+                {8u, 1u, 0u, 10u},
+                {2u, 1u, 8u, 10u}
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // The authoritative depth is reloaded before the core because value
+        // decoding may have reused ECX. Only EAX/ECX/EDX participate.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {2u, 1u, 0u, 2u}, // fixed-register baseline
+            {0u, 1u, 2u, 0u},
+            {0u, 2u, 1u, 0u}
+        }};
+        return plans[plan];
+    }
     if (semantic == VM_UOP_LOAD || semantic == VM_UOP_STORE) {
         if (x64) {
             // RAX is the guest address and RDX is the STORE value. R11 is
@@ -1041,17 +1370,533 @@ std::array<uint8_t, 4> DeriveVariantRegisters(
             return {3u, 1u, 6u, 3u};
         return {6u, 3u, 1u, 6u};
     }
+    if (semantic == VM_UOP_MUL) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if ((coreStrategy & 1u) == 0u) {
+            if (x64) {
+                // Two-operand IMUL has no implicit GPR result pair.  RAX/RDX
+                // enter as a/b, while R8/R11 are dead after their lazy-flags
+                // copies were written to context.  Roles are value, source,
+                // correction scratch, spare.
+                constexpr std::array<uint8_t, 4> pool = {0u, 2u, 8u, 11u};
+                return RotateRegisterContract(
+                    pool, seedOffset, variant);
+            }
+            // X86BeginLatch made ECX dead, and the legacy MUL core already
+            // used EBX for its correction product.  ESI/EDI remain excluded.
+            constexpr std::array<uint8_t, 4> pool = {0u, 2u, 3u, 1u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        if (x64) {
+            // One-operand MUL fixes the implicit multiplicand/result in
+            // RDX:RAX.  Roles are explicit multiplier, correction scratch,
+            // spare, implicit-pair marker.  Scratch never aliases RAX/RDX,
+            // so it survives the hardware multiply.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {2u, 8u, 11u, 0u},
+                {8u, 11u, 1u, 0u},
+                {11u, 1u, 8u, 0u},
+                {1u, 8u, 11u, 0u}}};
+            return plans[plan];
+        }
+        // EDX is the legacy explicit source.  ECX and the already-proven EBX
+        // correction register are the only scratch/source alternatives that
+        // remain live-safe across MUL; ESI/EDI stay excluded.
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {2u, 3u, 1u, 0u},
+            {2u, 1u, 3u, 0u},
+            {1u, 3u, 2u, 0u},
+            {3u, 1u, 2u, 0u}}};
+        return plans[plan];
+    }
+    if (x64 && semantic == VM_UOP_UMUL_WIDE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        // The wrapper enters the core with RAX=a, R9=b, R8=copy-a and
+        // R10=copy-b after pre-latching the exact operands. RDX:RAX is the
+        // CPU-fixed result pair, R15 is the
+        // context, and every nonvolatile register stays outside the local
+        // contract.  Width dispatch has finished, so RCX/R11 are the only
+        // additional volatile registers whose previous values are dead.
+        // Role [0] is the visible MUL source or memory base; [1]/[2] name
+        // actual boundary copies or proven-dead reusable registers so the
+        // published assignment remains an auditable liveness contract; [3]
+        // selects register or
+        // memory form.  Each K retains its legacy register plan while also
+        // exposing three structurally different seed-selected forms.
+        constexpr std::array<std::array<uint8_t, 4>, 4> k0Plans = {{
+            {9u, 8u, 10u, 1u},  // MUL R9 (legacy K=0)
+            {1u, 8u, 10u, 1u},  // MOV RCX,R9; MUL RCX
+            {11u, 8u, 10u, 1u}, // MOV R11,R9; MUL R11
+            {11u, 8u, 10u, 0u}  // MUL [R11 + seed-split displacement]
+        }};
+        constexpr std::array<std::array<uint8_t, 4>, 4> k1Plans = {{
+            {10u, 8u, 11u, 1u}, // MOV R10,R9; MUL R10 (legacy K=1)
+            {1u, 8u, 10u, 1u},  // MOV RCX,R9; MUL RCX
+            {11u, 8u, 10u, 1u}, // MOV R11,R9; MUL R11
+            {1u, 8u, 10u, 0u}   // MUL [RCX + seed-split displacement]
+        }};
+        return (coreStrategy & 1u) == 0u
+            ? k0Plans[plan] : k1Plans[plan];
+    }
     if (!x64 && semantic == VM_UOP_UMUL_WIDE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if ((coreStrategy & 1u) == 0u) {
+            // K=0 is deliberately independent from K=1's seed-split address
+            // construction.  EAX remains the hardware implicit
+            // multiplicand, EBX saves a for the correction product, ECX
+            // enters as (b + key), and EDI remains the context.  The visible
+            // main-product source is either ECX directly, a proven temporary
+            // EDX/ESI copy, or the dedicated context scratch dword at +4.
+            constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+                {1u, 2u, 3u, 6u}, // MUL ECX (fixed-register baseline)
+                {2u, 1u, 3u, 6u}, // MOV EDX,ECX; MUL EDX
+                {6u, 1u, 3u, 2u}, // MOV ESI,ECX; MUL ESI
+                {1u, 2u, 3u, 0u}  // MUL [EDI+CtxMutationScratch+4]
+            }};
+            return plans[plan];
+        }
         // K=1 keeps EAX as the implicit multiplicand and EBX as the saved
         // correction operand.  Its explicit main-product source may be ESI
         // or EDX, either directly or as a seed-split scratch-memory base.
         // ECX holds (b + key); EDI remains the context throughout.
-        switch ((seedOffset + static_cast<size_t>(variant)) & 3u) {
-            case 0u: return {6u, 1u, 3u, 2u}; // MUL ESI
-            case 1u: return {2u, 1u, 3u, 6u}; // MUL EDX
-            case 2u: return {6u, 1u, 3u, 0u}; // MUL [ESI + disp32]
-            default: return {2u, 1u, 3u, 0u}; // MUL [EDX + disp32]
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {6u, 1u, 3u, 2u}, // MUL ESI
+            {2u, 1u, 3u, 6u}, // MUL EDX
+            {6u, 1u, 3u, 0u}, // MUL [ESI + disp32]
+            {2u, 1u, 3u, 0u}  // MUL [EDX + disp32]
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_PUSH_FLAGS || semantic == VM_UOP_PUSH_IMAGE_BASE) {
+        if (x64) {
+            // X64CallFlagMaterializer performs a real indirect call that, per
+            // the Win64 ABI, clobbers every volatile GPR; PUSH_IMAGE_BASE has
+            // no call but is the very first code emitted in the function
+            // body, so nothing has loaded any register besides R15/context
+            // either way. RAX is the fixed PushOne boundary; R15 is context.
+            constexpr std::array<uint8_t, 4> pool = {8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
         }
+        // The call/zero-preamble reasoning is identical on x86, restricted to
+        // the caller-volatile ECX/EDX set; EBX/ESI/EDI stay outside this
+        // semantic's proven local contract like every other x86 core here.
+        // Only role [0] (the address register) is read by the core; slots
+        // [1]/[2] are unused padding that must still be pairwise distinct to
+        // satisfy the generic "three distinct physical registers" structural
+        // invariant every published registerAssignment upholds, so EAX (never
+        // a candidate for this role) fills them.
+        constexpr std::array<uint8_t, 2> pool = {1u, 2u};
+        const uint8_t address = pool[(seedOffset + variant) % pool.size()];
+        const uint8_t other = pool[(seedOffset + variant + 1u) % pool.size()];
+        return {address, other, 0u, address};
+    }
+    if (semantic == VM_UOP_PUSH_IP) {
+        if (x64) {
+            // RAX (vip) and RDX (bytecodeBegin) are the two loaded boundary
+            // registers; RCX/R8/R9/R10/R11 are all otherwise dead before
+            // this core runs. Roles are value, source. RDX is placed right
+            // after RAX so the seed-0 rotation reproduces the legacy fixed
+            // RAX/RDX assignment byte-for-byte (see the fixed-register
+            // comparison table); every other adjacent pair still requires
+            // (and gets, via EmitZydisKeyedIpCore's move-in/move-out) an
+            // explicit boundary MOV or, for the one cyclic case, an XCHG.
+            constexpr std::array<uint8_t, 7> pool =
+                {0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // Same reasoning restricted to the caller-volatile EAX/ECX/EDX set,
+        // with EDX likewise placed right after EAX for the same seed-0
+        // byte-identity reason.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_PUSH_VREG) {
+        if (x64) {
+            // RAX is the vreg-value boundary and RCX supplies the
+            // architectural CL shift count. R10 (the vreg index) is dead
+            // once the indexed load consumes it, R11 (width) is not read
+            // again until after the core, and R9 does not yet hold the width
+            // mask -- it is computed unconditionally after the core runs --
+            // so it is also free scratch here.
+            constexpr std::array<uint8_t, 4> pool = {2u, 8u, 9u, 10u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // EAX is the value boundary and ECX supplies CL. EDX held the vreg
+        // index, but that value is already copied into ECX before the core
+        // runs, so EDX is the only proven-free scratch register here -- the
+        // build seed cannot vary this role on x86. Slots [1]/[2] are unused
+        // padding required only to satisfy the generic distinctness
+        // invariant (see the PUSH_FLAGS/PUSH_IMAGE_BASE x86 comment above).
+        return {2u, 0u, 1u, 2u};
+    }
+    if (semantic == VM_UOP_PUSH_IMM) {
+        if (x64) {
+            // RAX is the value boundary and R9 holds the width mask consumed
+            // inside the core. R11 (already-validated width) and RCX (the
+            // internal SHR count that X64MaskForWidthInR11 leaves behind)
+            // are both dead by the time the core runs.
+            constexpr std::array<uint8_t, 3> pool = {1u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // EAX is the value boundary; on x86 the width mask lives in
+        // CtxMutationScratch memory rather than a register, so both ECX (its
+        // width byte already consumed by X86BuildMaskInScratch) and EDX
+        // (never loaded before this core) are free scratch. Slots [1]/[2]
+        // are unused padding (see the PUSH_FLAGS/PUSH_IMAGE_BASE x86 comment
+        // above).
+        constexpr std::array<uint8_t, 2> pool = {1u, 2u};
+        const uint8_t scratch = pool[(seedOffset + variant) % pool.size()];
+        const uint8_t other = pool[(seedOffset + variant + 1u) % pool.size()];
+        return {scratch, other, 0u, scratch};
+    }
+    if (semantic == VM_UOP_POP_VREG) {
+        const size_t form =
+            (seedOffset + static_cast<size_t>(variant)) & 3u;
+        if (x64) {
+            // POP_VREG has no free GPR at core entry.  RAX is the masked new
+            // value, RCX is CL, RDX is the K=0 old-value/address temporary,
+            // R8 is writeAll, R9 is the width mask (and K=1 old-value/address
+            // temporary), R10 is the still-live vreg index and R11 is the
+            // inverted-mask temporary.  Therefore the first three slots are
+            // the exact K-specific live roles rather than an allocator pool;
+            // slot [3] names an already-live register and selects one of four
+            // equivalent instruction choreographies without claiming it as
+            // scratch.  The first plan preserves the legacy register form.
+            constexpr std::array<uint8_t, 4> formMarkers = {
+                8u, 1u, 10u, 9u};
+            return coreStrategy == 0u
+                ? std::array<uint8_t, 4>{0u, 2u, 11u, formMarkers[form]}
+                : std::array<uint8_t, 4>{2u, 9u, 11u, formMarkers[form]};
+        }
+        // The x86 boundary is equally saturated: EAX is the masked new
+        // value, ECX is CL, EDX is the still-live vreg index, EBX carries
+        // writeAll/inverted mask and ESI is the K=0 address/old-value or K=1
+        // candidate.  EDI remains context.  As on x64, slot [3] is only a
+        // form selector drawn from these already-live roles; no shared or
+        // inferred scratch pool is introduced.
+        constexpr std::array<uint8_t, 4> formMarkers = {1u, 2u, 3u, 6u};
+        return coreStrategy == 0u
+            ? std::array<uint8_t, 4>{0u, 6u, 3u, formMarkers[form]}
+            : std::array<uint8_t, 4>{6u, 0u, 3u, formMarkers[form]};
+    }
+    if (semantic == VM_UOP_SELECT) {
+        if (x64) {
+            // The wrapper has completed the real flag-materializer call and
+            // condition evaluation before this core begins.  It then fixes
+            // the clean 0/1 predicate in R10 and pops the two candidates into
+            // RAX/RDX.  RCX is dead after the pop-depth path; R8/R9 were not
+            // touched and R11's value-codec temporary is dead.  Keep R10 and
+            // R15/context fixed and rotate only candidate-a, candidate-b and
+            // the K=1 mask scratch.  The first plan is the exact legacy
+            // RAX/RDX/R11 role assignment.
+            constexpr std::array<uint8_t, 6> pool = {
+                0u, 2u, 11u, 1u, 8u, 9u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // Win32 enters with EAX/EDX as the candidates and ECX as the clean
+        // predicate.  The legacy K=1 core already proves EBX handler-local
+        // for this exact lifetime; ESI remains threaded ABI state and EDI is
+        // context.  Rotate the two candidates and mask scratch only within
+        // EAX/EDX/EBX, keeping ECX out of the allocation entirely.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 3u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_BRANCH || semantic == VM_UOP_BRANCH_IF ||
+            semantic == VM_UOP_CALL_VM || semantic == VM_UOP_RET) {
+        if (x64) {
+            // BRANCH: RAX=bytecodeBegin, RDX=target RVA.
+            // BRANCH_IF: the taken edge reloads the same pair after the real
+            // flag materializer/condition evaluator has completed.
+            // CALL_VM: call-depth/return-RVA state is already committed and
+            // RCX is dead before the same RAX/RDX pair is loaded.
+            // RET: only the non-top-level edge reaches this core, with
+            // RAX=return RVA and RDX=bytecodeBegin.
+            // In all four cases R15 is the sole context boundary; the full
+            // Win64 volatile set is otherwise safe for the two logical roles.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The corresponding Win32 wrappers expose the same two live values
+        // in EAX/EDX. EDI is context and EBX/ESI remain threaded ABI state;
+        // only caller-volatile EAX/EDX/ECX may host the value/source pair.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_SWAP) {
+        if (x64) {
+            // X64RequireAndPop(count=2) pops both values into RAX/RDX and
+            // leaves RCX dead (its index scratch); R8/R9/R10/R11 are never
+            // touched before or after this core. Roles are a, b.
+            constexpr std::array<uint8_t, 7> pool =
+                {0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // Same reasoning restricted to the caller-volatile EAX/ECX/EDX set.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_SMUL_WIDE || semantic == VM_UOP_UDIV_WIDE ||
+            semantic == VM_UOP_IDIV_WIDE) {
+        // R9 (x64) / ECX (x86) already holds the prepared explicit
+        // multiplier/divisor and is dead immediately after this core runs
+        // (see EmitZydisWideOperandCore). R10/R11 (x64) and EBX/ESI (x86)
+        // are both free scratch regardless of K -- R10/EBX is this
+        // semantic's pre-existing K=0 address register and R11/ESI its
+        // pre-existing K=1 one (ESI already proven safe in this exact
+        // wrapper by independent batch 2's x86 UMUL_WIDE K=1), so the
+        // K-to-address binding is kept unchanged and only the seed picks
+        // register-direct vs. that K's established memory-address form.
+        // RDX:RAX/EDX:EAX remain the untouched hardware-implicit pair
+        // either way, so #DE stays purely hardware-driven. Slots [1]/[2]
+        // are unused padding required only by the generic "three distinct
+        // physical registers" invariant.
+        //
+        // The register-direct form is `<op> sourceReg` with no address
+        // register encoded at all, so if both K=0 and K=1 resolved to
+        // register-direct for the same seed they would be byte-identical
+        // (failing the required real dual-strategy difference). Tie which
+        // *one* K is eligible for register-direct to the seed instead of
+        // deciding each K independently, so exactly one of the two K's is
+        // register-direct and the other always falls back to its
+        // (K-distinct) memory-address form.
+        const bool k0IsRegisterDirect = ((seedOffset + variant) & 1u) == 0u;
+        const bool memoryForm = (coreStrategy == 0u)
+            ? !k0IsRegisterDirect : k0IsRegisterDirect;
+        const uint8_t address = x64
+            ? (coreStrategy == 0u ? 10u : 11u)
+            : (coreStrategy == 0u ? 3u : 6u);
+        return {address, 1u, 2u, memoryForm ? 0u : 1u};
+    }
+    if (semantic == VM_UOP_FLAGS_MATERIALIZE) {
+        if (x64) {
+            // This core is the first operation in the handler. R15 is the
+            // context boundary and RDX is the prepared-call mask output; no
+            // other volatile GPR carries live state into the core. The
+            // address role may therefore use every Win64 volatile GPR,
+            // including RDX itself (MOV rdx,[rdx+disp] reads the effective
+            // address before publishing the loaded mask). R10 remains first
+            // so the zero-seed plan reproduces the old fixed-register form.
+            constexpr std::array<uint8_t, 7> pool = {
+                10u, 0u, 1u, 2u, 8u, 9u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The x86 core is likewise the first handler operation. EDI remains
+        // context; EBX/ESI remain direct-threaded ABI state. EAX/ECX/EDX are
+        // all dead on entry and EDX is only the post-core mask boundary.
+        // ECX stays first to preserve the old fixed-register byte baseline.
+        constexpr std::array<uint8_t, 3> pool = {1u, 0u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_PACK_AH) {
+        if (x64) {
+            // The real flag-materializer call has just clobbered every Win64
+            // volatile GPR, after which the wrapper loads virtualFlags only
+            // into RDX. R15/context is the sole nonvolatile boundary. The
+            // selected work/result role may use the complete volatile set;
+            // RAX remains first for the legacy fixed-register plan and is
+            // restored as the PushOne result boundary after the core.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 1u, 2u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The materializer call leaves only EDI/context and the x86 threaded
+        // ABI registers reserved; the wrapper then loads virtualFlags into
+        // EDX. EAX/ECX/EDX are therefore the complete safe work/result pool.
+        constexpr std::array<uint8_t, 3> pool = {0u, 1u, 2u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_UNPACK_AH) {
+        if (x64) {
+            // After the materializer call the wrapper reloads exactly two
+            // live values: packed AH in RAX and virtualFlags in RDX. Every
+            // other Win64 volatile GPR is dead and R15/context stays fixed.
+            // Roles are packed and flags; the RAX/RDX prefix preserves the
+            // old plan while every adjacent pair is safe via parallel moves.
+            constexpr std::array<uint8_t, 7> pool = {
+                0u, 2u, 1u, 8u, 9u, 10u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The same post-call boundary on x86 leaves packed AH in EAX and
+        // virtualFlags in EDX. Only caller-volatile EAX/EDX/ECX participate;
+        // EBX/ESI/EDI remain outside this core's liveness contract.
+        constexpr std::array<uint8_t, 3> pool = {0u, 2u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_LAZY) {
+        if (x64) {
+            // The preceding real materializer call has already clobbered the
+            // Win64 volatile set. Validation then leaves only temporary
+            // operation/width/mask values in RAX/RCX/RDX/R11, and every one
+            // is dead after the validation edge: the post-core record writer
+            // reloads every decoded operand from context. R15 alone remains
+            // live as context. Roles are keyed address and copied value; R10
+            // then RAX preserves the legacy fixed-register baseline.
+            constexpr std::array<uint8_t, 7> pool = {
+                10u, 0u, 1u, 2u, 8u, 9u, 11u};
+            return RotateRegisterContract(pool, seedOffset, variant);
+        }
+        // The cdecl materializer and validation path similarly leave only
+        // EDI/context live at core entry. EAX/ECX/EDX are all overwritten by
+        // the post-core record writer; EBX/ESI stay outside this contract.
+        // EDX/EAX keeps the old address/value byte plan first.
+        constexpr std::array<uint8_t, 3> pool = {2u, 0u, 1u};
+        return RotateRegisterContract(pool, seedOffset, variant);
+    }
+    if (semantic == VM_UOP_FLAGS_WRITE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % (x64 ? 8u : 3u);
+        if (x64) {
+            // After the real materializer call the wrapper reloads exactly
+            // old flags/mask/new value into RAX/RCX/RDX. Other Win64 volatile
+            // GPRs are dead and R15 remains context. Roles are old, mask,
+            // value, inverted-mask scratch. High-register destinations never
+            // overwrite a still-needed boundary source, so move-in is a
+            // simple set of independent copies. The first plan is the exact
+            // legacy RAX/RCX/RDX/R11 arrangement.
+            constexpr std::array<std::array<uint8_t, 4>, 8> plans = {{
+                {0u, 1u, 2u, 11u},
+                {8u, 1u, 2u, 11u},
+                {0u, 8u, 2u, 11u},
+                {0u, 1u, 8u, 11u},
+                {8u, 9u, 2u, 11u},
+                {8u, 1u, 9u, 11u},
+                {0u, 8u, 9u, 11u},
+                {8u, 9u, 10u, 11u},
+            }};
+            return plans[plan];
+        }
+        // EAX/ECX/EDX are the three live boundary values. The existing core
+        // already proves EBX handler-local as its inverted-mask scratch, so
+        // rotate only the three caller-volatile logical roles and retain EBX
+        // as scratch. The two non-baseline plans are genuine 3-cycles moved
+        // with flag-preserving XCHG sequences inside the core.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 1u, 2u, 3u},
+            {1u, 2u, 0u, 3u},
+            {2u, 0u, 1u, 3u},
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_FLAGS_UPDATE) {
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % (x64 ? 6u : 4u);
+        if (x64) {
+            // The wrapper reloads flags/mask in RAX/RDX and mode in RCX after
+            // the real materializer call. Mode stays fixed until dispatch,
+            // then dies and is not used as a scratch. Roles are flags, mask,
+            // algebra scratch, key-correction scratch; all selected high GPRs
+            // are Win64 volatile. R10/R11 preserve the old scratch plan.
+            constexpr std::array<std::array<uint8_t, 4>, 6> plans = {{
+                {0u, 2u, 10u, 11u},
+                {8u, 2u, 10u, 11u},
+                {0u, 8u, 10u, 11u},
+                {8u, 9u, 10u, 11u},
+                {9u, 8u, 10u, 11u},
+                {2u, 0u, 10u, 11u},
+            }};
+            return plans[plan];
+        }
+        // On x86 ECX is the live mode until dispatch and then becomes the
+        // exact legacy key-correction scratch. EAX/EDX carry flags/mask;
+        // EBX was already used by this core and is therefore proven local.
+        // MoveRegisterPair safely handles the swap plan without touching
+        // EFLAGS, while the other plans copy one input into EBX.
+        constexpr std::array<std::array<uint8_t, 4>, 4> plans = {{
+            {0u, 2u, 3u, 1u},
+            {3u, 2u, 0u, 1u},
+            {0u, 3u, 2u, 1u},
+            {2u, 0u, 3u, 1u},
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_CALL_HOST) {
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) % 7u;
+            // CALL_HOST enters its resolver before the native-call frame is
+            // established: RAX is the target token; R15 is the context; RSP
+            // and every Win64 nonvolatile remain live ABI state.  Validation
+            // has killed the earlier RCX/R10/R11 values, so the complete safe
+            // set is the Win64 volatile {RAX,RCX,RDX,R8,R9,R10,R11}.  Roles
+            // are resolved target, image base and call-kind discriminator;
+            // the target is always normalized back to RAX before the frame.
+            constexpr std::array<std::array<uint8_t, 4>, 7> plans = {{
+                {0u, 2u, 1u, 0u},   // legacy RAX/RDX/RCX plan
+                {8u, 9u, 10u, 8u},
+                {9u, 10u, 11u, 9u},
+                {10u, 11u, 8u, 10u},
+                {11u, 8u, 9u, 11u},
+                {1u, 8u, 2u, 1u},
+                {2u, 9u, 1u, 2u},
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // Win32 enters with EAX=target and EDI=context. EBX/ESI are the
+        // direct-threaded dispatch/VIP state and EBP/ESP still belong to the
+        // caller, leaving exactly EAX/ECX/EDX for the resolver.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 2u, 1u, 0u},
+            {1u, 2u, 0u, 1u},
+            {2u, 1u, 0u, 2u},
+        }};
+        return plans[plan];
+    }
+    if (semantic == VM_UOP_BRIDGE_EXTENDED) {
+        // BRIDGE_EXTENDED reuses this same three-role contract for two
+        // temporally disjoint phases that never need to be simultaneously
+        // live, so a single 4-wide plan can drive both:
+        //   (1) EmitZydisControlTargetCore's value/source pair (roles [0]/
+        //       [1]) resolves target=imageBase+decodedOperand before the
+        //       stack-allocated funclet exists; the result is normalized
+        //       back into RAX/EAX and immediately persisted to
+        //       CtxMutationScratch, so nothing from this phase survives.
+        //   (2) The GPR-marshal funclet that follows reuses roles [0]/[1]/
+        //       [2] for a different purpose: value, family-index and
+        //       CtxRegisterMap table-base registers used to copy all 16 (x64)
+        //       or 8 (x86) CtxVregs families through CtxRegisterMap into (and
+        //       back out of) the on-stack VM_INSTRUCTION_BRIDGE_STATE. R15/
+        //       EDI is context and RSP/nonvolatile GPRs stay excluded exactly
+        //       as in every other business core; unlike the ALU cores, R9/
+        //       R10 are not reserved for width mask or lazy-flags auxiliary
+        //       here because this semantic never dispatches width or touches
+        //       CtxLastAlu.
+        // Because phase (1)'s legacy fixed form (value=RAX,source=RDX) and
+        // phase (2)'s legacy fixed form (value=RAX,index=RCX,base=R11) need
+        // different roles [1] simultaneously, no single rotation reproduces
+        // both at once; an explicit plan table lets each legacy form be its
+        // own reachable entry instead of forcing an artificial choice.
+        if (x64) {
+            const size_t plan =
+                (seedOffset + static_cast<size_t>(variant)) % 7u;
+            constexpr std::array<std::array<uint8_t, 4>, 7> plans = {{
+                {0u, 1u, 11u, 0u},  // legacy marshal form: value/index/base
+                {0u, 2u, 11u, 0u},  // legacy resolver form: value=RAX,source=RDX
+                {8u, 9u, 10u, 8u},
+                {9u, 10u, 11u, 9u},
+                {10u, 11u, 8u, 10u},
+                {11u, 8u, 9u, 11u},
+                {1u, 2u, 8u, 1u},
+            }};
+            return plans[plan];
+        }
+        const size_t plan =
+            (seedOffset + static_cast<size_t>(variant)) % 3u;
+        // x86 only has three caller-volatile registers proven safe by this
+        // semantic's existing code (EAX/ECX/EDX); EDI is context and
+        // EBX/ESI remain the direct-threaded ABI state this semantic has
+        // never claimed, so all three roles saturate the available pool.
+        constexpr std::array<std::array<uint8_t, 4>, 3> plans = {{
+            {0u, 1u, 2u, 0u},  // legacy marshal form: value/index/base
+            {0u, 2u, 1u, 0u},  // legacy resolver form: value=EAX,source=EDX
+            {1u, 2u, 0u, 1u},
+        }};
+        return plans[plan];
     }
     std::array<uint8_t, 4> output{};
     if (x64) {
@@ -1340,15 +2185,6 @@ uint32_t CoreKey32(const CodeBuffer& c, size_t index) {
 uint32_t CoreAddressKey(const CodeBuffer& c, size_t index) {
     const uint32_t key = CoreKey32(c, index) & 0x0FFFFFFFu;
     return key != 0u ? key : 0x06D2B795u;
-}
-
-void X64BinaryImmediate32(
-    CodeBuffer& c, uint8_t group, uint8_t reg, uint32_t value)
-{
-    c.Raw({static_cast<uint8_t>(0x48u | ((reg & 8u) ? 1u : 0u)),
-        0x81, static_cast<uint8_t>(0xC0u | ((group & 7u) << 3u) |
-            (reg & 7u))});
-    c.U32(value);
 }
 
 void X86BinaryImmediate32(
@@ -1900,6 +2736,9 @@ void EmitX64ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
         (static_cast<uint64_t>(CoreKey32(c, strategy + 1u)) << 32u) |
         CoreKey32(c, strategy + 5u);
     const uint64_t key = mix(seedWord ^ 0x42535741505F5836ULL ^ strategy) | 1u;
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t transformRegister = c.registerAssignment[1];
+    const uint8_t keyRegister = c.registerAssignment[2];
     const auto reverseKey = [](uint64_t value, uint8_t bytes) {
         uint64_t reversed = 0;
         for (uint8_t index = 0; index < bytes; ++index) {
@@ -1909,18 +2748,13 @@ void EmitX64ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
         return reversed;
     };
     const auto xorKey = [&](uint8_t bytes, uint64_t value) {
-        if (bytes == 1u) {
-            c.Raw({0x34, static_cast<uint8_t>(value)});
-        } else if (bytes == 2u) {
-            c.Raw({0x66,0x35}); c.U16(static_cast<uint16_t>(value));
-        } else if (bytes == 4u) {
-            c.U8(0x35); c.U32(static_cast<uint32_t>(value));
+        if (bytes == 8u) {
+            EmitZydisMoveImmediate(c, true, keyRegister, value);
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, keyRegister);
         } else {
-            constexpr std::array<uint8_t, 4> keyRegisters = {1u, 2u, 10u, 11u};
-            const uint8_t keyRegister = keyRegisters[
-                static_cast<size_t>((value ^ (value >> 29u) ^ strategy) & 3u)];
-            X64MovImmediate(c, keyRegister, value);
-            X64BinaryRegister(c, 0x31u, 0u, keyRegister);
+            EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, bytes, value);
         }
     };
     const auto conjugate = [&](uint8_t bytes, const auto& transform) {
@@ -1933,57 +2767,59 @@ void EmitX64ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
 
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
+    if (valueRegister != 0u)
+        EmitZydisMove(c, true, valueRegister, 0u);
     X64DispatchWidth(c, 0, width);
     c.Bind(width.width1);
     conjugate(1u, [&] {
         // A byte-wide byte reversal is a rotate by one full byte.  The
         // effective count is zero, so the rotate itself preserves flags.
-        c.Raw({0xC0, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8), 0x08});
+        EmitZydisSizedBinaryImmediate(c, true,
+            strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+            valueRegister, 1u, 8u);
     });
     c.Jmp(done);
     c.Bind(width.width2);
     conjugate(2u, [&] {
-        c.Raw({0x66,0xC1,
-            static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),0x08});
+        EmitZydisSizedBinaryImmediate(c, true,
+            strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+            valueRegister, 2u, 8u);
     });
     c.Jmp(done);
     c.Bind(width.width4);
     conjugate(4u, [&] {
-        if (strategy == 0u) c.Raw({0x0F,0xC8});
-        else {
-            constexpr std::array<uint8_t, 4> scratchRegisters = {1u, 2u, 10u, 11u};
-            const uint8_t scratch = scratchRegisters[
-                static_cast<size_t>((key >> 17u) & 3u)];
-            const uint8_t moveInRex = static_cast<uint8_t>(
-                0x40u | ((scratch & 8u) ? 1u : 0u));
-            if (moveInRex != 0x40u) c.U8(moveInRex);
-            c.Raw({0x89, static_cast<uint8_t>(0xC0u | (scratch & 7u))});
-            if (scratch & 8u) c.U8(0x41);
-            c.Raw({0x0F, static_cast<uint8_t>(0xC8u + (scratch & 7u))});
-            const uint8_t moveOutRex = static_cast<uint8_t>(
-                0x40u | ((scratch & 8u) ? 4u : 0u));
-            if (moveOutRex != 0x40u) c.U8(moveOutRex);
-            c.Raw({0x89, static_cast<uint8_t>(
-                0xC0u | ((scratch & 7u) << 3u))});
+        if (strategy == 0u) {
+            EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_BSWAP,
+                valueRegister, 4u);
+        } else {
+            EmitZydisSizedMove(c, true, transformRegister,
+                valueRegister, 4u);
+            EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_BSWAP,
+                transformRegister, 4u);
+            EmitZydisSizedMove(c, true, valueRegister,
+                transformRegister, 4u);
         }
     });
     c.Jmp(done);
     c.Bind(width.width8);
     conjugate(8u, [&] {
-        if (strategy == 0u) c.Raw({0x48,0x0F,0xC8});
-        else {
-            constexpr std::array<uint8_t, 4> scratchRegisters = {1u, 2u, 10u, 11u};
-            const uint8_t scratch = scratchRegisters[
-                static_cast<size_t>((key >> 41u) & 3u)];
-            X64MovRegister(c, scratch, 0u);
-            c.Raw({static_cast<uint8_t>(0x48u | ((scratch & 8u) ? 1u : 0u)),
-                0x0F, static_cast<uint8_t>(0xC8u + (scratch & 7u))});
-            X64MovRegister(c, 0u, scratch);
+        if (strategy == 0u) {
+            EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_BSWAP,
+                valueRegister, 8u);
+        } else {
+            EmitZydisSizedMove(c, true, transformRegister,
+                valueRegister, 8u);
+            EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_BSWAP,
+                transformRegister, 8u);
+            EmitZydisSizedMove(c, true, valueRegister,
+                transformRegister, 8u);
         }
     });
     c.Jmp(done);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
+    if (valueRegister != 0u)
+        EmitZydisMove(c, true, 0u, valueRegister);
 }
 
 void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
@@ -1999,6 +2835,8 @@ void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
         CoreKey32(c, strategy + 6u);
     const uint32_t key = static_cast<uint32_t>(
         mix(seedWord ^ 0x42535741505F5833ULL ^ strategy)) | 1u;
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t transformRegister = c.registerAssignment[1];
     const auto reverseKey = [](uint32_t value, uint8_t bytes) {
         uint32_t reversed = 0;
         for (uint8_t index = 0; index < bytes; ++index) {
@@ -2008,13 +2846,8 @@ void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
         return reversed;
     };
     const auto xorKey = [&](uint8_t bytes, uint32_t value) {
-        if (bytes == 1u) {
-            c.Raw({0x34, static_cast<uint8_t>(value)});
-        } else if (bytes == 2u) {
-            c.Raw({0x66,0x35}); c.U16(static_cast<uint16_t>(value));
-        } else {
-            c.U8(0x35); c.U32(value);
-        }
+        EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, bytes, value);
     };
     const auto conjugate = [&](uint8_t bytes, const auto& transform) {
         const uint32_t widthKey = bytes == 4u
@@ -2026,79 +2859,42 @@ void EmitX86ByteSwapVariant(CodeBuffer& c, uint8_t strategy) {
 
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
+    if (valueRegister != 0u)
+        EmitZydisMove(c, false, valueRegister, 0u);
     X86DispatchWidth(c, 0, width);
     c.Bind(width.width1);
     conjugate(1u, [&] {
-        c.Raw({0xC0, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8), 0x08});
+        EmitZydisSizedBinaryImmediate(c, false,
+            strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+            valueRegister, 1u, 8u);
     });
     c.Jmp(done);
     c.Bind(width.width2);
     conjugate(2u, [&] {
-        c.Raw({0x66,0xC1,
-            static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),0x08});
+        EmitZydisSizedBinaryImmediate(c, false,
+            strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+            valueRegister, 2u, 8u);
     });
     c.Jmp(done);
     c.Bind(width.width4);
     conjugate(4u, [&] {
-        if (strategy == 0u) c.Raw({0x0F,0xC8});
-        else c.Raw({0x89,0xC2,0x0F,0xCA,0x89,0xD0});
+        if (strategy == 0u) {
+            EmitZydisSizedUnary(c, false, ZYDIS_MNEMONIC_BSWAP,
+                valueRegister, 4u);
+        } else {
+            EmitZydisSizedMove(c, false, transformRegister,
+                valueRegister, 4u);
+            EmitZydisSizedUnary(c, false, ZYDIS_MNEMONIC_BSWAP,
+                transformRegister, 4u);
+            EmitZydisSizedMove(c, false, valueRegister,
+                transformRegister, 4u);
+        }
     });
     c.Jmp(done);
     c.Bind(width.invalid); c.Raw({0x0F,0x0B});
     c.Bind(done);
-}
-
-// Two distinct x64 GPR indices from the safe local-scratch pool
-// {8,11,12,13}, seed-derived per (semantic,strategy). Excludes 0 (the
-// live shift operand), 1/2 (RCX/RDX -- the count is moved through
-// `mov rcx,rdx` and every count-consuming instruction below implicitly
-// reads CL, so RCX must stay the count register end to end), 4 (RSP), 9
-// (the width mask X64MaskForWidthInR11 computed and re-applies to the
-// result after this core returns, so it must survive the whole core body
-// unclobbered), 10 (EmitX64BinaryAlu zeroes it as "auxiliary" *before*
-// calling into this core and reads it back via X64FinishPrelatched right
-// after), and 15 (the runtime's context-pointer register -- see
-// X64LoadQ/X64LoadD's own "cannot overwrite the context register" guard;
-// every Ctx*-prefixed load/store in this file is `[r15+share...]`, not
-// `[rdi+...]`, despite what an earlier draft of this comment claimed).
-//
-// 14 is ALSO excluded, empirically: every register in the pool was
-// individually verified against the real native-differential suite
-// (test_vm_native_differential) one at a time, not just reasoned about
-// from reading the surrounding code, because the 10-exclusion above was
-// itself found that way after a first pass missed it (every corpus case
-// that exercised FLAGS_LAZY after a SHL/SHR/SAR/ROL/ROR access-violated,
-// because the core's own key scratch had clobbered what EmitX64BinaryAlu
-// still expected to be a clean zero). 8/11/12/13 each pass in isolation;
-// 14 alone reproduces the same class of FLAGS_LAZY access violation, for
-// a reason not yet root-caused (most likely some other handler or the
-// direct-threaded dispatch stub itself also treats r14 as reserved) --
-// it is excluded on that empirical evidence, not a traced justification
-// like the others. Do not add it back without either root-causing why or
-// re-running the full isolated single-register verification above.
-//
-// This is what actually changes the per-build 4-gram content of the
-// ModRM/REX bytes this core emits -- the round-keyed immediates alone
-// (already seed-derived) are exactly what the codec-similarity stage
-// strips out before measuring business_core, so on their own they cannot
-// move that number; only the *structural* bytes (which physical register
-// a given instruction touches) can.
-std::pair<uint8_t, uint8_t> DeriveShiftCoreScratchRegisters(
-    const CodeBuffer& c, VM_MICRO_OPCODE semantic, uint8_t strategy)
-{
-    static constexpr std::array<uint8_t, 4> kPool = {8u,11u,12u,13u};
-    const uint64_t domain = 0x5348495254524547ULL ^
-        (static_cast<uint64_t>(semantic) << 16u) ^
-        (static_cast<uint64_t>(strategy) << 8u);
-    const auto& round = c.coreSelector.rounds[domain % c.coreSelector.roundCount];
-    const uint64_t mixed = round.key ^ domain ^
-        (static_cast<uint64_t>(round.rotate) << 32u) ^
-        (static_cast<uint64_t>(round.encoding) << 40u);
-    const size_t first = static_cast<size_t>(mixed % kPool.size());
-    const size_t secondOffset = 1u + static_cast<size_t>(
-        (mixed >> 16u) % (kPool.size() - 1u));
-    const size_t second = (first + secondOffset) % kPool.size();
-    return {kPool[first], kPool[second]};
+    if (valueRegister != 0u)
+        EmitZydisMove(c, false, 0u, valueRegister);
 }
 
 void EmitX64ShiftRotateVariant(
@@ -2109,9 +2905,9 @@ void EmitX64ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X64DispatchWidth(c, 0, width);
-    const auto scratch = DeriveShiftCoreScratchRegisters(c, semantic, strategy);
-    const uint8_t scratchA = scratch.first;
-    const uint8_t scratchB = scratch.second;
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t scratchA = c.registerAssignment[1];
+    const uint8_t scratchB = c.registerAssignment[2];
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         const auto deriveKey = [&](size_t share) {
@@ -2130,21 +2926,6 @@ void EmitX64ShiftRotateVariant(
                  ~(semantic == VM_UOP_SAR
                     ? (uint64_t{1} << (bytes * 8u - 1u)) : 0u));
         };
-        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
-            const uint8_t modrm = static_cast<uint8_t>(
-                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
-            if (bytes == 1u) {
-                if (reg >= 8u) c.U8(0x41);
-                c.Raw({0xD2, modrm});
-            } else {
-                if (bytes == 2u) c.U8(0x66);
-                if (bytes == 8u) c.U8(static_cast<uint8_t>(
-                    0x48u | (reg >= 8u ? 1u : 0u)));
-                else if (reg >= 8u) c.U8(0x41);
-                c.Raw({0xD3, modrm});
-            }
-        };
-
         std::array<uint64_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveKey(share);
@@ -2152,27 +2933,42 @@ void EmitX64ShiftRotateVariant(
         std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
         if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
-        c.Raw({0x48,0x89,0xD1});
+        EmitZydisMove(c, true, 1u, 2u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, scratchB, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, scratchB);
+            EmitZydisMoveImmediate(c, true, scratchB, keys[share]);
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchB);
         }
-        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
-            (semantic == VM_UOP_ROL ? 0u : 1u);
-        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
-        emitClOperation(0u, valueGroup);
+        const ZydisMnemonic valueMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SAR : (semantic == VM_UOP_ROL
+                ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR);
+        const ZydisMnemonic keyMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SHR : valueMnemonic;
+        EmitZydisShiftCl(c, true, valueMnemonic, valueRegister, bytes);
 
-        X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
-        emitClOperation(scratchA, keyGroup);
+        EmitZydisMoveImmediate(c, true, scratchA, keys[shareOrder[0u]]);
+        EmitZydisShiftCl(c, true, keyMnemonic, scratchA, bytes);
         for (size_t position = 1u; position < shareOrder.size(); ++position) {
-            X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
-            emitClOperation(scratchB, keyGroup);
-            X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+            EmitZydisMoveImmediate(
+                c, true, scratchB, keys[shareOrder[position]]);
+            EmitZydisShiftCl(c, true, keyMnemonic, scratchB, bytes);
+            EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                scratchA, scratchB, bytes);
         }
-        X64BinaryRegister(c, 0x31u, 0u, scratchA);
-        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
-        else if (bytes == 4u) c.Raw({0x89,0xC0});
+        EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA, bytes);
+        if (bytes <= 2u) {
+            EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOVZX,
+                {ZydisSizedGprOperand(true, valueRegister, 4u),
+                 ZydisSizedGprOperand(true, valueRegister, bytes)});
+        } else if (bytes == 4u) {
+            EmitZydisSizedMove(
+                c, true, valueRegister, valueRegister, 4u);
+        }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, 0u, valueRegister);
         c.Jmp(done);
     };
     std::array<std::pair<CodeBuffer::Label, uint8_t>, 4> blocks = {{
@@ -2198,6 +2994,9 @@ void EmitX86ShiftRotateVariant(
     const WidthLabels width = MakeWidthLabels(c);
     const auto done = c.NewLabel();
     X86DispatchWidth(c, 0, width);
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t scratchA = c.registerAssignment[1];
+    const uint8_t scratchB = c.registerAssignment[2];
     const auto emit = [&](CodeBuffer::Label label, uint8_t bytes) {
         c.Bind(label);
         const auto deriveKey = [&](size_t share) {
@@ -2217,16 +3016,6 @@ void EmitX86ShiftRotateVariant(
                  ~(semantic == VM_UOP_SAR
                     ? (uint32_t{1} << (bytes * 8u - 1u)) : 0u));
         };
-        const auto emitClOperation = [&](uint8_t reg, uint8_t group) {
-            const uint8_t modrm = static_cast<uint8_t>(
-                0xC0u | ((group & 7u) << 3u) | (reg & 7u));
-            if (bytes == 1u) c.Raw({0xD2, modrm});
-            else {
-                if (bytes == 2u) c.U8(0x66);
-                c.Raw({0xD3, modrm});
-            }
-        };
-
         std::array<uint32_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveKey(share);
@@ -2234,26 +3023,39 @@ void EmitX86ShiftRotateVariant(
         std::array<size_t, 4> shareOrder = {{0u, 1u, 2u, 3u}};
         if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
-        c.Raw({0x89,0xD1});
+        EmitZydisMove(c, false, 1u, 2u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X86MovImmediate(c, 2u, keys[share]);
-            X86BinaryRegister(c, 0x31u, 0u, 2u);
+            EmitZydisMoveImmediate(c, false, scratchB, keys[share]);
+            EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchB);
         }
-        const uint8_t valueGroup = semantic == VM_UOP_SAR ? 7u :
-            (semantic == VM_UOP_ROL ? 0u : 1u);
-        const uint8_t keyGroup = semantic == VM_UOP_SAR ? 5u : valueGroup;
-        emitClOperation(0u, valueGroup);
+        const ZydisMnemonic valueMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SAR : (semantic == VM_UOP_ROL
+                ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR);
+        const ZydisMnemonic keyMnemonic = semantic == VM_UOP_SAR
+            ? ZYDIS_MNEMONIC_SHR : valueMnemonic;
+        EmitZydisShiftCl(c, false, valueMnemonic, valueRegister, bytes);
 
-        X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
-        emitClOperation(3u, keyGroup);
+        EmitZydisMoveImmediate(c, false, scratchA, keys[shareOrder[0u]]);
+        EmitZydisShiftCl(c, false, keyMnemonic, scratchA, bytes);
         for (size_t position = 1u; position < shareOrder.size(); ++position) {
-            X86MovImmediate(c, 2u, keys[shareOrder[position]]);
-            emitClOperation(2u, keyGroup);
-            X86BinaryRegister(c, 0x31u, 3u, 2u);
+            EmitZydisMoveImmediate(
+                c, false, scratchB, keys[shareOrder[position]]);
+            EmitZydisShiftCl(c, false, keyMnemonic, scratchB, bytes);
+            EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                scratchA, scratchB, bytes);
         }
-        X86BinaryRegister(c, 0x31u, 0u, 3u);
-        if (bytes == 1u) c.Raw({0x0F,0xB6,0xC0});
-        else if (bytes == 2u) c.Raw({0x0F,0xB7,0xC0});
+        EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA, bytes);
+        if (bytes <= 2u) {
+            EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOVZX,
+                {ZydisSizedGprOperand(false, valueRegister, 4u),
+                 ZydisSizedGprOperand(false, valueRegister, bytes)});
+        }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, 0u, valueRegister);
         c.Jmp(done);
     };
     std::array<std::pair<CodeBuffer::Label, uint8_t>, 3> blocks = {{
@@ -2272,105 +3074,95 @@ void EmitX86ShiftRotateVariant(
 }
 
 void EmitX64ExtendVariant(CodeBuffer& c, bool signExtend, uint8_t strategy) {
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t maskRegister = c.registerAssignment[1];
+    const uint8_t countRegister = c.registerAssignment[2];
+    const uint8_t signRegister = c.registerAssignment[3];
     X64LoadByte(c, 1, CtxDecodedOperands);
-    c.Raw({0xBA,0x08,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,
-           0x89,0xD1});
+    if (valueRegister != 0u)
+        EmitZydisMove(c, true, valueRegister, 0u);
+    EmitZydisSizedMoveImmediate(c, true, countRegister, 4u, 8u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_SUB,
+        countRegister, 1u, 4u);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_SHL,
+        countRegister, 4u, 3u);
+    EmitZydisSizedMove(c, true, 1u, countRegister, 4u);
     if (strategy == 0u) {
-        X64ShiftCl(c, 4, 0);
-        X64MovRegister(c, 1, 2);
-        X64ShiftCl(c, signExtend ? 7u : 5u, 0);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL,
+            valueRegister, 8u);
+        EmitZydisMove(c, true, 1u, countRegister);
+        EmitZydisShiftCl(c, true,
+            signExtend ? ZYDIS_MNEMONIC_SAR : ZYDIS_MNEMONIC_SHR,
+            valueRegister, 8u);
     } else if (!signExtend) {
-        c.Raw({0x49,0xC7,0xC2,0xFF,0xFF,0xFF,0xFF});
-        X64ShiftCl(c, 5, 10); X64BinaryRegister(c, 0x21, 0, 10);
+        EmitZydisMoveImmediate(c, true, maskRegister, UINT64_MAX);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHR,
+            maskRegister, 8u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_AND,
+            valueRegister, maskRegister);
     } else {
-        c.Raw({0x49,0xC7,0xC2,0xFF,0xFF,0xFF,0xFF});
-        X64ShiftCl(c, 5, 10); X64BinaryRegister(c, 0x21, 0, 10);
-        c.Raw({0x49,0xBB,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80});
-        X64ShiftCl(c, 5, 11); X64BinaryRegister(c, 0x31, 0, 11);
-        X64BinaryRegister(c, 0x29, 0, 11);
+        EmitZydisMoveImmediate(c, true, maskRegister, UINT64_MAX);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHR,
+            maskRegister, 8u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_AND,
+            valueRegister, maskRegister);
+        EmitZydisMoveImmediate(c, true, signRegister,
+            UINT64_C(0x8000000000000000));
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHR,
+            signRegister, 8u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+            valueRegister, signRegister);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_SUB,
+            valueRegister, signRegister);
     }
+    if (valueRegister != 0u)
+        EmitZydisMove(c, true, 0u, valueRegister);
 }
 
 void EmitX86ExtendVariant(CodeBuffer& c, bool signExtend, uint8_t strategy) {
+    const uint8_t valueRegister = c.registerAssignment[0];
+    const uint8_t maskRegister = c.registerAssignment[1];
+    const uint8_t countAndSignRegister = c.registerAssignment[2];
     X86LoadByte(c, 1, CtxDecodedOperands);
-    c.Raw({0xBA,0x04,0x00,0x00,0x00,0x29,0xCA,0xC1,0xE2,0x03,
-           0x89,0xD1});
+    if (valueRegister != 0u)
+        EmitZydisMove(c, false, valueRegister, 0u);
+    EmitZydisSizedMoveImmediate(
+        c, false, countAndSignRegister, 4u, 4u);
+    EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_SUB,
+        countAndSignRegister, 1u, 4u);
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_SHL,
+        countAndSignRegister, 4u, 3u);
+    EmitZydisSizedMove(c, false, 1u, countAndSignRegister, 4u);
     if (strategy == 0u) {
-        c.Raw({0xD3,0xE0,0x89,0xD1,static_cast<uint8_t>(0xD3),
-               static_cast<uint8_t>(signExtend ? 0xF8 : 0xE8)});
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL,
+            valueRegister, 4u);
+        EmitZydisSizedMove(c, false, 1u, countAndSignRegister, 4u);
+        EmitZydisShiftCl(c, false,
+            signExtend ? ZYDIS_MNEMONIC_SAR : ZYDIS_MNEMONIC_SHR,
+            valueRegister, 4u);
     } else if (!signExtend) {
-        c.Raw({0xBB,0xFF,0xFF,0xFF,0xFF,0xD3,0xEB,0x21,0xD8});
+        EmitZydisMoveImmediate(c, false, maskRegister, UINT32_MAX);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHR,
+            maskRegister, 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_AND,
+            valueRegister, maskRegister);
     } else {
-        c.Raw({0xBB,0xFF,0xFF,0xFF,0xFF,0xD3,0xEB,0x21,0xD8,
-               0xBB,0x00,0x00,0x00,0x80,0xD3,0xEB,0x31,0xD8,0x29,0xD8});
+        EmitZydisMoveImmediate(c, false, maskRegister, UINT32_MAX);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHR,
+            maskRegister, 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_AND,
+            valueRegister, maskRegister);
+        EmitZydisMoveImmediate(c, false, countAndSignRegister,
+            UINT32_C(0x80000000));
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHR,
+            countAndSignRegister, 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, countAndSignRegister);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_SUB,
+            valueRegister, countAndSignRegister);
     }
-}
-
-void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
-    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
-    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
-    if (strategy == 0u) {
-        const auto merge = c.NewLabel();
-        const auto done = c.NewLabel();
-        X64LoadD(c, 8, CtxDecodedOperands + 24u);
-        c.Raw({0x45,0x85,0xC0}); c.Jcc(JccE, merge);
-        c.Jmp(done);
-        c.Bind(merge);
-        X64LoadD(c, 1, CtxDecodedOperands + 16u);
-        X64ShiftCl(c, 4, 0);
-        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
-        c.Raw({0x49,0xF7,0xD3});
-        c.Raw({0x4B,0x8D,0x94,0xD7}); c.U32(CtxVregs + address0);
-        X64BinaryImmediate32(c, 0u, 2u, address1);
-        c.Raw({0x48,0x8B,0x92}); c.U32(0u - (address0 + address1));
-        X64BinaryRegister(c, 0x21, 2, 11);
-        X64BinaryRegister(c, 0x09, 0, 2);
-        c.Bind(done);
-    } else {
-        X64LoadD(c, 1, CtxDecodedOperands + 16u);
-        X64MovRegister(c, 2, 0); X64ShiftCl(c, 4, 2);
-        X64MovRegister(c, 11, 9); X64ShiftCl(c, 4, 11);
-        c.Raw({0x49,0xF7,0xD3});
-        c.Raw({0x4F,0x8D,0x8C,0xD7}); c.U32(CtxVregs + address0);
-        X64BinaryImmediate32(c, 0u, 9u, address1);
-        c.Raw({0x4D,0x8B,0x89}); c.U32(0u - (address0 + address1));
-        X64BinaryRegister(c, 0x21, 9, 11);
-        X64BinaryRegister(c, 0x09, 2, 9);
-        X64LoadD(c, 8, CtxDecodedOperands + 24u);
-        c.Raw({0x45,0x85,0xC0,0x48,0x0F,0x44,0xC2});
-    }
-}
-
-void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
-    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
-    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
-    if (strategy == 0u) {
-        const auto merge = c.NewLabel();
-        const auto done = c.NewLabel();
-        X86LoadD(c, 3, CtxDecodedOperands + 24u);
-        c.Raw({0x85,0xDB}); c.Jcc(JccE, merge); c.Jmp(done);
-        c.Bind(merge);
-        X86LoadD(c, 1, CtxDecodedOperands + 16u);
-        c.Raw({0xD3,0xE0});
-        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        c.Raw({0x8D,0xB4,0xD7}); c.U32(CtxVregs + address0);
-        X86BinaryImmediate32(c, 0u, 6u, address1);
-        c.Raw({0x8B,0xB6}); c.U32(0u - (address0 + address1));
-        c.Raw({0x21,0xDE,0x09,0xF0});
-        c.Bind(done);
-    } else {
-        X86LoadD(c, 1, CtxDecodedOperands + 16u);
-        c.Raw({0x89,0xC6,0xD3,0xE6});
-        X86LoadD(c, 3, CtxMutationScratch); c.Raw({0xD3,0xE3,0xF7,0xD3});
-        c.Raw({0x8D,0x84,0xD7}); c.U32(CtxVregs + address0);
-        X86BinaryImmediate32(c, 0u, 0u, address1);
-        c.Raw({0x8B,0x80}); c.U32(0u - (address0 + address1));
-        c.Raw({0x21,0xD8,0x09,0xC6});
-        X86LoadD(c, 0, CtxMutationScratch + 4u);
-        c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
-        X86LoadD(c, 3, CtxDecodedOperands + 24u);
-        c.Raw({0x85,0xDB,0x0F,0x44,0xC6});
-    }
+    if (valueRegister != 0u)
+        EmitZydisMove(c, false, 0u, valueRegister);
 }
 
 void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
@@ -2464,58 +3256,63 @@ void EmitX86MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
     c.Bind(done);
 }
 
-void EmitX64CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
+void EmitZydisCallTargetCore(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t strategy)
+{
+    // The resolver is deliberately complete before CALL_HOST establishes its
+    // native frame.  Seed-selected roles therefore affect only volatile GPR
+    // REX/ModRM/SIB bytes and cannot drift the stack allocation or unwind
+    // record.  DeriveVariantRegisters supplies the architecture-specific
+    // liveness proof; this routine always returns the resolved target in the
+    // fixed RAX/EAX wrapper boundary.
+    const uint8_t target = c.registerAssignment[0];
+    const uint8_t imageBase = c.registerAssignment[1];
+    const uint8_t callKind = c.registerAssignment[2];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t pointerBytes = x64 ? 8u : 4u;
     const auto nativeRva = c.NewLabel();
     const auto importSlot = c.NewLabel();
     const auto indirect = c.NewLabel();
     const auto done = c.NewLabel();
-    X64LoadD(c, 1, CtxDecodedOperands);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
-    c.Raw({0x0F,0x0B});
+    if (target != 0u) EmitZydisMove(c, x64, target, 0u);
+    EmitZydisLoad(c, x64, callKind, context,
+        static_cast<int32_t>(CtxDecodedOperands), 4u);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_NATIVE_RVA);
+    c.Jcc(JccE, nativeRva);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_IMPORT_SLOT);
+    c.Jcc(JccE, importSlot);
+    EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        callKind, 4u, VM_MICRO_CALL_INDIRECT);
+    c.Jcc(JccE, indirect);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_UD2, {});
     c.Bind(nativeRva);
-    X64LoadQ(c, 2, CtxImageBase);
-    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-    else c.Raw({0x48,0x8D,0x04,0x10});
+    EmitZydisLoad(c, x64, imageBase, context,
+        static_cast<int32_t>(CtxImageBase), pointerBytes);
+    if (strategy == 0u)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, target, imageBase);
+    else
+        EmitZydisLea(c, x64, target, target, 0, imageBase);
     c.Jmp(done);
     c.Bind(importSlot);
-    X64LoadQ(c, 2, CtxImageBase);
-    if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-    else c.Raw({0x48,0x8D,0x04,0x10});
-    c.Raw({0x48,0x8B,0x00});
+    EmitZydisLoad(c, x64, imageBase, context,
+        static_cast<int32_t>(CtxImageBase), pointerBytes);
+    if (strategy == 0u)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, target, imageBase);
+    else
+        EmitZydisLea(c, x64, target, target, 0, imageBase);
+    EmitZydisLoad(c, x64, target, target, 0, pointerBytes);
     c.Jmp(done);
     c.Bind(indirect);
-    if (strategy == 0u) X64MovRegister(c, 0, 0);
-    else c.Raw({0x48,0x8D,0x40,0x00});
+    if (strategy == 0u)
+        EmitZydisMove(c, x64, target, target);
+    else
+        EmitZydisLea(c, x64, target, target, 0);
     c.Bind(done);
-}
-
-void EmitX86CallTargetVariant(CodeBuffer& c, uint8_t strategy) {
-    const auto nativeRva = c.NewLabel();
-    const auto importSlot = c.NewLabel();
-    const auto indirect = c.NewLabel();
-    const auto done = c.NewLabel();
-    X86LoadD(c, 1, CtxDecodedOperands);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_NATIVE_RVA}); c.Jcc(JccE, nativeRva);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_IMPORT_SLOT}); c.Jcc(JccE, importSlot);
-    c.Raw({0x83,0xF9,VM_MICRO_CALL_INDIRECT}); c.Jcc(JccE, indirect);
-    c.Raw({0x0F,0x0B});
-    c.Bind(nativeRva);
-    X86LoadD(c, 2, CtxImageBase);
-    if (strategy == 0u) c.Raw({0x01,0xD0});
-    else c.Raw({0x8D,0x04,0x10});
-    c.Jmp(done);
-    c.Bind(importSlot);
-    X86LoadD(c, 2, CtxImageBase);
-    if (strategy == 0u) c.Raw({0x01,0xD0});
-    else c.Raw({0x8D,0x04,0x10});
-    c.Raw({0x8B,0x00});
-    c.Jmp(done);
-    c.Bind(indirect);
-    if (strategy == 0u) X86MovRegister(c, 0, 0);
-    else c.Raw({0x8D,0x40,0x00});
-    c.Bind(done);
+    if (target != 0u) EmitZydisMove(c, x64, 0u, target);
 }
 
 struct ZydisAluRegisterPlan {
@@ -2553,46 +3350,6 @@ void FinishZydisAluRegisters(
     CodeBuffer& c, bool x64, const ZydisAluRegisterPlan& plan)
 {
     if (plan.value != 0u) EmitZydisMove(c, x64, 0u, plan.value);
-}
-
-void EmitKeyedAddSubCore(
-    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
-{
-    const uint32_t k0 = CoreKey32(c, strategy + 0u);
-    const uint32_t k1 = CoreKey32(c, strategy + 3u);
-    const uint32_t k2 = CoreKey32(c, strategy + 5u);
-    if (x64) {
-        X64BinaryImmediate32(c, 0u, 0u, k0);
-        X64BinaryImmediate32(c, 5u, 0u, k1);
-        X64BinaryImmediate32(c, 0u, 0u, k2);
-        if (!subtract) {
-            if (strategy == 0u) X64BinaryRegister(c, 0x01, 0, 2);
-            else c.Raw({0x48,0x8D,0x04,0x10});
-        } else if (strategy == 0u) {
-            X64BinaryRegister(c, 0x29, 0, 2);
-        } else {
-            c.Raw({0x48,0xF7,0xDA});
-            X64BinaryRegister(c, 0x01, 0, 2);
-        }
-        X64BinaryImmediate32(c, 5u, 0u, k2);
-        X64BinaryImmediate32(c, 0u, 0u, k1);
-        X64BinaryImmediate32(c, 5u, 0u, k0);
-    } else {
-        X86BinaryImmediate32(c, 0u, 0u, k0);
-        X86BinaryImmediate32(c, 5u, 0u, k1);
-        X86BinaryImmediate32(c, 0u, 0u, k2);
-        if (!subtract) {
-            if (strategy == 0u) c.Raw({0x01,0xD0});
-            else c.Raw({0x8D,0x04,0x10});
-        } else if (strategy == 0u) {
-            c.Raw({0x29,0xD0});
-        } else {
-            c.Raw({0xF7,0xDA,0x01,0xD0});
-        }
-        X86BinaryImmediate32(c, 5u, 0u, k2);
-        X86BinaryImmediate32(c, 0u, 0u, k1);
-        X86BinaryImmediate32(c, 5u, 0u, k0);
-    }
 }
 
 void EmitZydisKeyedAddSubCore(
@@ -2657,26 +3414,109 @@ void EmitKeyedCopyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const std::array<uint32_t, 3> keys = {
         CoreKey32(c, strategy + 0u), CoreKey32(c, strategy + 2u),
         CoreKey32(c, strategy + 7u)};
-    if (x64) {
-        for (uint32_t key : keys) X64BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) X64MovRegister(c, 2, 0);
-        else c.Raw({0x48,0x8D,0x10});
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-            X64BinaryImmediate32(c, 6u, 0u, *it);
-            X64BinaryImmediate32(c, 6u, 2u, *it);
+    const uint8_t source = c.registerAssignment[0];
+    const uint8_t destination = c.registerAssignment[1];
+    if (source != 0u) EmitZydisMove(c, x64, source, 0u);
+    for (uint32_t key : keys) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, source, key);
+    }
+    if (strategy == 0u) {
+        EmitZydisMove(c, x64, destination, source);
+    } else {
+        EmitZydisLea(c, x64, destination, source, 0);
+    }
+    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, source, *it);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, destination, *it);
+    }
+    if (source != 0u) EmitZydisMove(c, x64, 0u, source);
+    if (destination != 2u) EmitZydisMove(c, x64, 2u, destination);
+}
+
+void EmitZydisTempCore(
+    CodeBuffer& c, bool x64, bool store, uint8_t strategy)
+{
+    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
+    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t address = c.registerAssignment[1];
+    const uint8_t index = c.registerAssignment[2];
+    const uint8_t boundaryIndex = x64 ? 10u : 1u;
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+
+    if (index != boundaryIndex)
+        EmitZydisMove(c, x64, index, boundaryIndex);
+    if (store && value != 0u)
+        EmitZydisMove(c, x64, value, 0u);
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxTemps + k0), index, 8u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, address, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k3);
+    const int32_t displacement = static_cast<int32_t>(
+        0u - (k0 + k1 - k2 + k3));
+    if (store) {
+        EmitZydisStore(c, x64, address, displacement,
+            value, nativeBytes);
+        // The x86 post-core path clears the high dword using ECX as its
+        // original slot index, so restore that boundary when it was moved.
+        if (!x64 && index != 1u)
+            EmitZydisMove(c, false, 1u, index);
+    } else {
+        EmitZydisLoad(c, x64, value, address,
+            displacement, nativeBytes);
+        if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+    }
+}
+
+void EmitZydisDropCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t key = CoreAddressKey(c, strategy + 3u);
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t index = c.registerAssignment[1];
+    const uint8_t zero = c.registerAssignment[2];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t boundaryIndex = 1u;
+    if (!x64) X86LoadD(c, boundaryIndex, CtxValueDepth);
+    if (index != boundaryIndex)
+        EmitZydisMove(c, x64, index, boundaryIndex);
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxValues + key), index, 8u);
+    const int32_t displacement = static_cast<int32_t>(0u - key);
+    if (strategy == 0u) {
+        // A 32-bit self-XOR zero-extends on x64 and preserves the legacy
+        // no-REX.W fixed byte baseline while still clearing the full source.
+        EmitZydisSizedBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, zero, zero, 4u);
+        EmitZydisStore(c, x64, address, displacement,
+            zero, static_cast<uint8_t>(x64 ? 8u : 4u));
+        if (!x64) {
+            EmitZydisStore(c, false, address,
+                displacement + 4, zero, 4u);
         }
     } else {
-        for (uint32_t key : keys) X86BinaryImmediate32(c, 6u, 0u, key);
-        if (strategy == 0u) c.Raw({0x89,0xC2});
-        else c.Raw({0x8D,0x10});
-        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-            X86BinaryImmediate32(c, 6u, 0u, *it);
-            X86BinaryImmediate32(c, 6u, 2u, *it);
+        EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(x64, address, displacement,
+                 static_cast<uint16_t>(x64 ? 8u : 4u)),
+             ZydisImmediateOperand(0u)});
+        if (!x64) {
+            EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+                {ZydisMemoryOperand(false, address,
+                     displacement + 4, 4u),
+                 ZydisImmediateOperand(0u)});
         }
     }
 }
 
-void EmitKeyedContextCopy(
+void EmitZydisKeyedContextCopy(
     CodeBuffer& c,
     bool x64,
     uint32_t sourceOffset,
@@ -2686,82 +3526,630 @@ void EmitKeyedContextCopy(
 {
     const uint32_t sourceKey = CoreAddressKey(c, keyIndex);
     const uint32_t destinationKey = CoreAddressKey(c, keyIndex + 3u);
-    if (x64) {
-        c.Raw({0x4D,0x8D,0x97}); c.U32(sourceOffset + sourceKey);
-        if (nativeWidth) c.Raw({0x49,0x8B,0x82});
-        else c.Raw({0x41,0x8B,0x82});
-        c.U32(0u - sourceKey);
-        c.Raw({0x4D,0x8D,0x97}); c.U32(destinationOffset + destinationKey);
-        if (nativeWidth) c.Raw({0x49,0x89,0x82});
-        else c.Raw({0x41,0x89,0x82});
-        c.U32(0u - destinationKey);
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t value = c.registerAssignment[1];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t bytes = nativeWidth && x64 ? 8u : 4u;
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(sourceOffset + sourceKey));
+    EmitZydisLoad(c, x64, value, address,
+        static_cast<int32_t>(0u - sourceKey), bytes);
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(destinationOffset + destinationKey));
+    EmitZydisStore(c, x64, address,
+        static_cast<int32_t>(0u - destinationKey), value, bytes);
+}
+
+void EmitZydisContextLoadCore(
+    CodeBuffer& c,
+    bool x64,
+    uint32_t contextOffset,
+    uint8_t strategy,
+    bool extendedCorrection)
+{
+    // PUSH_FLAGS (extendedCorrection=false) and PUSH_IMAGE_BASE
+    // (extendedCorrection=true) share the same "LEA a keyed context address,
+    // then load the native-width value" shape; they only differ in how many
+    // extra keyed ADD/SUB correction steps run on the address register
+    // before the load. The address register is the only role that varies
+    // (see DeriveVariantRegisters); the final value always lands in the
+    // fixed RAX/EAX PushOne boundary.
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t bytes = x64 ? 8u : 4u;
+    uint32_t total;
+    if (extendedCorrection) {
+        const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
+        const uint32_t k1 = CoreAddressKey(c, strategy + 3u);
+        const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+        const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+        EmitZydisLea(c, x64, address, context,
+            static_cast<int32_t>(contextOffset + k0));
+        EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+        EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_SUB, address, k2);
+        EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, address, k3);
+        total = k0 + k1 - k2 + k3;
     } else {
-        c.Raw({0x8D,0x97}); c.U32(sourceOffset + sourceKey);
-        c.Raw({0x8B,0x82}); c.U32(0u - sourceKey);
-        c.Raw({0x8D,0x97}); c.U32(destinationOffset + destinationKey);
-        c.Raw({0x89,0x82}); c.U32(0u - destinationKey);
+        const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+        const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+        EmitZydisLea(c, x64, address, context,
+            static_cast<int32_t>(contextOffset + k0));
+        total = k0;
+        if (strategy != 0u) {
+            EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+            total += k1;
+        }
+    }
+    EmitZydisLoad(c, x64, 0u, address,
+        static_cast<int32_t>(0u - total), bytes);
+}
+
+void EmitZydisKeyedIpCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // Only two logical values exist (vip and bytecodeBegin); the build seed
+    // picks which physical registers host them (DeriveVariantRegisters),
+    // with move-in/move-out around the fixed RAX/RDX (EAX/EDX) load and
+    // PushOne boundaries -- the same pattern EmitKeyedCopyCore uses for DUP.
+    const uint32_t key = CoreKey32(c, strategy + 2u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t source = c.registerAssignment[1];
+    // value/source are always distinct (see DeriveVariantRegisters). A naive
+    // pair of sequential MOVs corrupts data in the one case where the two
+    // roles are exactly swapped -- value==2 (bytecodeBegin's boundary
+    // register) and source==0 (vip's boundary register) -- because writing
+    // `value` first destroys bytecodeBegin before source can read it, while
+    // writing `source` first destroys vip before value can read it. Detect
+    // that cyclic case and use one flag-preserving XCHG instead; every other
+    // combination is safe with a plain ordered pair of MOVs (value's move
+    // only ever needs to run before source's move when value's target is
+    // register 2, so read from a register whose original content has
+    // already been captured).
+    if (value == 2u && source == 0u) {
+        EmitZydisExchange(c, x64, 0u, 2u);
+    } else if (value == 2u) {
+        if (source != 2u) EmitZydisMove(c, x64, source, 2u);
+        if (value != 0u) EmitZydisMove(c, x64, value, 0u);
+    } else {
+        if (value != 0u) EmitZydisMove(c, x64, value, 0u);
+        if (source != 2u) EmitZydisMove(c, x64, source, 2u);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, value, source);
+    } else {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NEG, source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, source);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+}
+
+void EmitZydisPushVregCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // RAX/EAX (the vreg value) and CL (the shift count) are fixed hardware
+    // boundaries the surrounding wrapper already established; only the
+    // scratch register that carries the two keyed shifted-key values varies
+    // (see DeriveVariantRegisters).
+    const uint32_t key0 = CoreKey32(c, strategy + 1u);
+    const uint32_t key1 = CoreKey32(c, strategy + 5u);
+    const uint8_t scratch = c.registerAssignment[0];
+    const uint8_t bytes = x64 ? 8u : 4u;
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, 0u, key0);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, 0u, key1);
+    if (x64 && strategy != 0u) {
+        // 32-bit XOR zero-extends the full 64-bit scratch register, matching
+        // the original fixed-R10 SHRD-with-a-zero-source identity for SHR.
+        EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR, scratch, scratch, 4u);
+        EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_SHRD,
+            {ZydisGprOperand(true, 0u), ZydisGprOperand(true, scratch),
+             ZydisSizedGprOperand(true, 1u, 1u)});
+    } else {
+        EmitZydisShiftCl(c, x64, ZYDIS_MNEMONIC_SHR, 0u, bytes);
+    }
+    const std::array<uint32_t, 2> reversedKeys = {key1, key0};
+    for (uint32_t key : reversedKeys) {
+        EmitZydisMoveImmediate(c, x64, scratch, key);
+        EmitZydisShiftCl(c, x64, ZYDIS_MNEMONIC_SHR, scratch, bytes);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, 0u, scratch);
     }
 }
 
-void EmitKeyedPushIpCore(CodeBuffer& c, bool x64, uint8_t strategy) {
-    const uint32_t key = CoreKey32(c, strategy + 2u);
-    if (x64) {
-        X64BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) X64BinaryRegister(c, 0x29, 0, 2);
-        else {
-            X64UnaryGroup(c, 3u, 2u);
-            X64BinaryRegister(c, 0x01, 0, 2);
+void EmitZydisPushImmCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // RAX/EAX (the immediate value) is the fixed boundary. x64 masks with
+    // the R9 width-mask register directly; x86 has no spare width-mask
+    // register at this point in the wrapper, so it masks against the
+    // CtxMutationScratch dword the wrapper already published. Only the
+    // scratch register carrying the two shifted-key values varies (see
+    // DeriveVariantRegisters).
+    const uint32_t key0 = CoreKey32(c, strategy + 2u);
+    const uint32_t key1 = CoreKey32(c, strategy + 7u);
+    const uint8_t scratch = c.registerAssignment[0];
+    const uint8_t context = x64 ? 15u : 7u;
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, 0u, key0);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, 0u, key1);
+    const auto maskAgainst = [&](uint8_t reg) {
+        if (x64) {
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_AND, reg, 9u);
+        } else {
+            EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_AND,
+                {ZydisGprOperand(false, reg),
+                 ZydisMemoryOperand(false, context,
+                     static_cast<int32_t>(CtxMutationScratch), 4u)});
         }
-        X64BinaryImmediate32(c, 5u, 0u, key);
-    } else {
-        X86BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) c.Raw({0x29,0xD0});
-        else c.Raw({0xF7,0xDA,0x01,0xD0});
-        X86BinaryImmediate32(c, 5u, 0u, key);
+    };
+    maskAgainst(0u);
+    const std::array<uint32_t, 2> reversedKeys = {key1, key0};
+    for (uint32_t key : reversedKeys) {
+        EmitZydisMoveImmediate(c, x64, scratch, key);
+        maskAgainst(scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, 0u, scratch);
     }
+}
+
+// POP_VREG has no spare register on either architecture. Its Zydis lowering
+// keeps the exact live K-specific roles and varies only equivalent forms;
+// registerAssignment[3] is a form marker, not a scratch allocation. Encoder
+// failure is terminal and there is no Raw-byte fallback for this core.
+uint8_t PopVregInstructionForm(bool x64, uint8_t marker) {
+    if (x64) {
+        if (marker == 8u) return 0u;
+        if (marker == 1u) return 1u;
+        if (marker == 10u) return 2u;
+        return 3u;
+    }
+    if (marker == 1u) return 0u;
+    if (marker == 2u) return 1u;
+    if (marker == 3u) return 2u;
+    return 3u;
+}
+
+void EmitZydisPopVregPerturbation(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t value,
+    uint8_t form,
+    uint32_t key)
+{
+    const uint32_t secondaryKey = static_cast<uint32_t>(
+        ((key << 13u) | (key >> 19u)) ^ 0x35A7C19Bu) & 0x7FFFFFFFu;
+    switch (form) {
+        case 0u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_XOR, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_XOR, value, key);
+            break;
+        case 1u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+            break;
+        case 2u:
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+            EmitZydisBinaryImmediate(
+                c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+            break;
+        default: {
+            const uint8_t count = static_cast<uint8_t>(
+                key % static_cast<uint32_t>(x64 ? 63u : 31u) + 1u);
+            EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ROL,
+                value, static_cast<uint8_t>(x64 ? 8u : 4u), count);
+            EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ROR,
+                value, static_cast<uint8_t>(x64 ? 8u : 4u), count);
+            break;
+        }
+    }
+    // Even two unrelated builds can legitimately select the same structural
+    // form. Carry a second reversible keyed pair in every form so that such a
+    // collision cannot recreate the previous POP_VREG single-pair Dice
+    // regression by differing only in one address displacement/count byte.
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+        value, secondaryKey != 0u ? secondaryKey : 0x35A7C19Bu);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+        value, secondaryKey != 0u ? secondaryKey : 0x35A7C19Bu);
+}
+
+void EmitZydisPopVregComplement(
+    CodeBuffer& c, bool x64, uint8_t mask, uint8_t form)
+{
+    if ((form & 1u) == 0u) {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, mask);
+    } else {
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR,
+            mask, static_cast<uint8_t>(x64 ? 8u : 4u), UINT64_MAX);
+    }
+}
+
+void EmitZydisPopVregMerge(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t result,
+    uint8_t oldValue,
+    uint8_t invertedMask,
+    uint8_t form)
+{
+    if ((form & 2u) == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            oldValue, invertedMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR,
+            result, oldValue);
+        return;
+    }
+    // The shifted result contains bits only inside the selected field mask,
+    // so this XOR/AND/XOR blend is algebraically identical to AND/OR and
+    // needs no additional scratch register.
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, oldValue, result);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+        oldValue, invertedMask);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, result, oldValue);
+}
+
+void EmitX64PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
+    const uint8_t form = PopVregInstructionForm(
+        true, c.registerAssignment[3]);
+    const uint32_t perturbationKey =
+        CoreKey32(c, strategy + 9u + form);
+    if (strategy == 0u) {
+        const auto merge = c.NewLabel();
+        const auto done = c.NewLabel();
+        EmitZydisLoad(c, true, 8u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_TEST, 8u, 8u);
+        c.Jcc(JccE, merge);
+        c.Jmp(done);
+        c.Bind(merge);
+        EmitZydisLoad(c, true, 1u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 0u, 8u);
+        EmitZydisPopVregPerturbation(
+            c, true, 0u, form, perturbationKey);
+        EmitZydisMove(c, true, 11u, 9u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 11u, 8u);
+        EmitZydisPopVregComplement(c, true, 11u, form);
+        EmitZydisLea(c, true, 2u, 15u,
+            static_cast<int32_t>(CtxVregs + address0), 10u, 8u);
+        EmitZydisBinaryImmediate(
+            c, true, ZYDIS_MNEMONIC_ADD, 2u, address1);
+        EmitZydisLoad(c, true, 2u, 2u,
+            static_cast<int32_t>(0u - (address0 + address1)), 8u);
+        EmitZydisPopVregMerge(c, true, 0u, 2u, 11u, form);
+        c.Bind(done);
+    } else {
+        EmitZydisLoad(c, true, 1u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisMove(c, true, 2u, 0u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 2u, 8u);
+        EmitZydisPopVregPerturbation(
+            c, true, 2u, form, perturbationKey);
+        EmitZydisMove(c, true, 11u, 9u);
+        EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 11u, 8u);
+        EmitZydisPopVregComplement(c, true, 11u, form);
+        EmitZydisLea(c, true, 9u, 15u,
+            static_cast<int32_t>(CtxVregs + address0), 10u, 8u);
+        EmitZydisBinaryImmediate(
+            c, true, ZYDIS_MNEMONIC_ADD, 9u, address1);
+        EmitZydisLoad(c, true, 9u, 9u,
+            static_cast<int32_t>(0u - (address0 + address1)), 8u);
+        EmitZydisPopVregMerge(c, true, 2u, 9u, 11u, form);
+        EmitZydisLoad(c, true, 8u, 15u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_TEST, 8u, 8u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_CMOVZ, 0u, 2u);
+    }
+}
+
+void EmitX86PopVregVariant(CodeBuffer& c, uint8_t strategy) {
+    const uint32_t address0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t address1 = CoreAddressKey(c, strategy + 5u);
+    const uint8_t form = PopVregInstructionForm(
+        false, c.registerAssignment[3]);
+    const uint32_t perturbationKey =
+        CoreKey32(c, strategy + 9u + form);
+    if (strategy == 0u) {
+        const auto merge = c.NewLabel();
+        const auto done = c.NewLabel();
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_TEST, 3u, 3u);
+        c.Jcc(JccE, merge); c.Jmp(done);
+        c.Bind(merge);
+        EmitZydisLoad(c, false, 1u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 0u, 4u);
+        EmitZydisPopVregPerturbation(
+            c, false, 0u, form, perturbationKey);
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxMutationScratch), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 3u, 4u);
+        EmitZydisPopVregComplement(c, false, 3u, form);
+        EmitZydisLea(c, false, 6u, 7u,
+            static_cast<int32_t>(CtxVregs + address0), 2u, 8u);
+        EmitZydisBinaryImmediate(
+            c, false, ZYDIS_MNEMONIC_ADD, 6u, address1);
+        EmitZydisLoad(c, false, 6u, 6u,
+            static_cast<int32_t>(0u - (address0 + address1)), 4u);
+        EmitZydisPopVregMerge(c, false, 0u, 6u, 3u, form);
+        c.Bind(done);
+    } else {
+        EmitZydisLoad(c, false, 1u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 16u), 4u);
+        EmitZydisMove(c, false, 6u, 0u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 6u, 4u);
+        EmitZydisPopVregPerturbation(
+            c, false, 6u, form, perturbationKey);
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxMutationScratch), 4u);
+        EmitZydisShiftCl(c, false, ZYDIS_MNEMONIC_SHL, 3u, 4u);
+        EmitZydisPopVregComplement(c, false, 3u, form);
+        EmitZydisLea(c, false, 0u, 7u,
+            static_cast<int32_t>(CtxVregs + address0), 2u, 8u);
+        EmitZydisBinaryImmediate(
+            c, false, ZYDIS_MNEMONIC_ADD, 0u, address1);
+        EmitZydisLoad(c, false, 0u, 0u,
+            static_cast<int32_t>(0u - (address0 + address1)), 4u);
+        EmitZydisPopVregMerge(c, false, 6u, 0u, 3u, form);
+        EmitZydisLoad(c, false, 0u, 7u,
+            static_cast<int32_t>(CtxMutationScratch + 4u), 4u);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_AND,
+            {ZydisGprOperand(false, 0u),
+             ZydisMemoryOperand(false, 7u,
+                 static_cast<int32_t>(CtxMutationScratch), 4u)});
+        EmitZydisLoad(c, false, 3u, 7u,
+            static_cast<int32_t>(CtxDecodedOperands + 24u), 4u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_TEST, 3u, 3u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_CMOVZ, 0u, 6u);
+    }
+}
+
+// Copies srcA's content into destA and srcB's content into destB, where
+// destA/destB (each distinct) may overlap with srcA/srcB (each distinct) in
+// any way, including the one case that is a genuine data-dependency cycle (a
+// full swap of the two source registers). This is the general 2-element
+// parallel-move primitive the move-in/move-out steps of both
+// EmitZydisKeyedIpCore-style boundary handling and EmitZydisKeyedSwapCore
+// need; it emits the smallest correct instruction sequence with no third
+// scratch register and is a no-op when the destinations already hold the
+// right values.
+void MoveRegisterPair(
+    CodeBuffer& c,
+    bool x64,
+    uint8_t destA,
+    uint8_t destB,
+    uint8_t srcA,
+    uint8_t srcB)
+{
+    if (destA == srcA && destB == srcB) return;
+    if (destA == srcB && destB == srcA) {
+        EmitZydisExchange(c, x64, srcA, srcB);
+        return;
+    }
+    if (destA == srcB) {
+        // Writing destA first would destroy srcB's data before it can be
+        // copied to destB, so capture destB first.
+        if (destB != srcB) EmitZydisMove(c, x64, destB, srcB);
+        if (destA != srcA) EmitZydisMove(c, x64, destA, srcA);
+        return;
+    }
+    if (destA != srcA) EmitZydisMove(c, x64, destA, srcA);
+    if (destB != srcB) EmitZydisMove(c, x64, destB, srcB);
+}
+
+void EmitZydisControlTargetCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    // Each of BRANCH, the taken BRANCH_IF edge, CALL_VM and the non-top RET
+    // edge enters with the two target components in RAX/RDX (EAX/EDX). The
+    // semantic-specific liveness proof in DeriveVariantRegisters supplies a
+    // safe adjacent value/source pair; this helper only encodes the common
+    // target-add algebra and does not alter labels, call-depth state, flags,
+    // unwind metadata, or the wrapper-owned context lifetime.
+    const uint32_t k0 = CoreKey32(c, strategy + 0u);
+    const uint32_t k1 = CoreKey32(c, strategy + 3u);
+    const uint32_t k2 = CoreKey32(c, strategy + 5u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t source = c.registerAssignment[1];
+    MoveRegisterPair(c, x64, value, source, 0u, 2u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k0);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k2);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, source);
+    } else {
+        EmitZydisLea(c, x64, value, value, 0, source);
+    }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, k0);
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
 }
 
 void EmitKeyedSwapCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // SWAP pops both values into the fixed RAX/RDX (EAX/EDX) boundary and
+    // pushes the result from the same pair; DeriveVariantRegisters supplies
+    // which physical registers actually host the two values during the
+    // core (roles a, b), free from that fixed boundary via
+    // MoveRegisterPair. When a==0 and b==2 (the legacy fixed baseline) both
+    // MoveRegisterPair calls are no-ops, reproducing the original bytes
+    // exactly.
     const uint32_t key = CoreKey32(c, strategy + 4u);
-    if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x48,0x92});
-        else c.Raw({0x48,0x31,0xD0,0x48,0x31,0xC2,0x48,0x31,0xD0});
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
+    const uint8_t a = c.registerAssignment[0];
+    const uint8_t b = c.registerAssignment[1];
+    MoveRegisterPair(c, x64, a, b, 0u, 2u);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, a, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, b, key);
+    if (strategy == 0u) {
+        EmitZydisExchange(c, x64, a, b);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.U8(0x92);
-        else c.Raw({0x31,0xD0,0x31,0xC2,0x31,0xD0});
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, a, b);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, b, a);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, a, b);
     }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, a, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, b, key);
+    MoveRegisterPair(c, x64, 0u, 2u, a, b);
+}
+
+void EmitZydisFlagsMaterializeCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    // The core prepares the requested flags mask in the fixed RDX/EDX call
+    // boundary. Only the keyed address role varies; R15/EDI remains context.
+    const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
+    const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
+    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
+    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
+    const uint8_t address = c.registerAssignment[0];
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+    EmitZydisLea(c, x64, address, context,
+        static_cast<int32_t>(CtxDecodedOperands + k0));
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k1);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, address, k2);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, address, k3);
+    EmitZydisLoad(c, x64, 2u, address,
+        static_cast<int32_t>(0u - (k0 + k1 - k2 + k3)), nativeBytes);
+}
+
+void EmitZydisFlagsPackAhCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
+        VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+    const uint32_t rawKey = CoreKey32(c, strategy + 2u);
+    uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
+    if (packedKey == 0u) {
+        packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
+            (rawKey % 5u == 1u) ? 2u :
+            (rawKey % 5u == 2u) ? 4u :
+            (rawKey % 5u == 3u) ? 6u : 7u);
+    }
+    const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
+    const uint32_t rotatedMask = strategy == 0u
+        ? ((packedMask >> rotation) | (packedMask << (32u - rotation)))
+        : ((packedMask << rotation) | (packedMask >> (32u - rotation)));
+    const uint8_t value = c.registerAssignment[0];
+
+    // virtualFlags enters in RDX/EDX. All arithmetic intentionally stays
+    // 32-bit: architectural status bits live in the low dword and every
+    // 32-bit write zero-extends on x64 just like the previous fixed-EAX code.
+    if (value != 2u) EmitZydisSizedMove(c, x64, value, 2u, 4u);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, value, 4u, packedKey);
+    EmitZydisSizedBinaryImmediate(c, x64,
+        strategy == 0u ? ZYDIS_MNEMONIC_ROR : ZYDIS_MNEMONIC_ROL,
+        value, 4u, rotation);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_AND, value, 4u, rotatedMask);
+    EmitZydisSizedBinaryImmediate(c, x64,
+        strategy == 0u ? ZYDIS_MNEMONIC_ROL : ZYDIS_MNEMONIC_ROR,
+        value, 4u, rotation);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, value, 4u, packedKey);
+    EmitZydisSizedBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_OR, value, 4u, 0x02u);
+    if (value != 0u) EmitZydisSizedMove(c, x64, 0u, value, 4u);
+}
+
+void EmitZydisFlagsUnpackAhCore(
+    CodeBuffer& c, bool x64, uint8_t strategy)
+{
+    constexpr uint32_t statusMask = VM_FLAG_SF | VM_FLAG_ZF |
+        VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
+    const uint32_t key = CoreKey32(c, strategy + 6u);
+    const uint8_t packed = c.registerAssignment[0];
+    const uint8_t flags = c.registerAssignment[1];
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+
+    // The wrapper publishes packed AH in RAX/EAX and virtualFlags in RDX/EDX.
+    // Parallel move-in handles every seed-selected adjacent pair, including
+    // the exact swapped pair, without a hidden scratch register.
+    MoveRegisterPair(c, x64, packed, flags, 0u, 2u);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, packed, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, key);
+    if (strategy == 0u) {
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            flags, nativeBytes, x64
+                ? ZydisSignExtendImmediateBits(
+                    ~static_cast<uint32_t>(statusMask), 4u)
+                : ~static_cast<uint32_t>(statusMask));
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            packed, 4u, statusMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, flags, packed);
+    } else {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, packed, flags);
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_AND,
+            packed, 4u, statusMask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, flags, packed);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, key);
+    if (flags != 2u) EmitZydisMove(c, x64, 2u, flags);
 }
 
 void EmitKeyedRotateStackCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 6u);
+    const bool alternate = c.registerAssignment[1] != 2u;
     if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        X64BinaryImmediate32(c, 6u, 8u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 8u, key);
         if (strategy == 0u) {
-            X64MovRegister(c, 10u, 0u); X64MovRegister(c, 0u, 2u);
-            X64MovRegister(c, 2u, 8u); X64MovRegister(c, 8u, 10u);
-        } else c.Raw({0x48,0x92,0x49,0x87,0xD0});
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        X64BinaryImmediate32(c, 6u, 8u, key);
+            const uint8_t temporary = c.registerAssignment[3];
+            if (!alternate) {
+                EmitZydisMove(c, true, temporary, 0u);
+                EmitZydisMove(c, true, 0u, 2u);
+                EmitZydisMove(c, true, 2u, 8u);
+                EmitZydisMove(c, true, 8u, temporary);
+            } else {
+                EmitZydisMove(c, true, temporary, 8u);
+                EmitZydisMove(c, true, 8u, 0u);
+                EmitZydisMove(c, true, 0u, 2u);
+                EmitZydisMove(c, true, 2u, temporary);
+            }
+        } else if (!alternate) {
+            EmitZydisExchange(c, true, 0u, 2u);
+            EmitZydisExchange(c, true, 2u, 8u);
+        } else {
+            EmitZydisExchange(c, true, 0u, 8u);
+            EmitZydisExchange(c, true, 0u, 2u);
+        }
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 8u, key);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        X86BinaryImmediate32(c, 6u, 1u, key);
-        if (strategy == 0u) c.Raw({0x89,0xC3,0x89,0xD0,0x89,0xCA});
-        else c.Raw({0x92,0x87,0xCA,0x89,0xCB});
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        X86BinaryImmediate32(c, 6u, 3u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 1u, key);
+        if (strategy == 0u && !alternate) {
+            EmitZydisMove(c, false, 3u, 0u);
+            EmitZydisMove(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 2u, 1u);
+        } else if (strategy == 0u) {
+            EmitZydisMove(c, false, 3u, 0u);
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 2u, 1u);
+        } else if (!alternate) {
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisExchange(c, false, 2u, 1u);
+            EmitZydisMove(c, false, 3u, 1u);
+        } else {
+            EmitZydisExchange(c, false, 0u, 1u);
+            EmitZydisExchange(c, false, 0u, 2u);
+            EmitZydisMove(c, false, 3u, 1u);
+        }
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 0u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 2u, key);
+        EmitZydisBinaryImmediate(c, false, ZYDIS_MNEMONIC_XOR, 3u, key);
     }
 }
 
@@ -2769,33 +4157,137 @@ void EmitKeyedCarryCore(
     CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
 {
     const uint32_t key = CoreKey32(c, strategy + 1u);
-    if (x64) {
-        X64BinaryImmediate32(c, 0u, 0u, key);
-        if (!subtract) {
-            if (strategy == 0u) {
-                X64BinaryRegister(c, 0x01, 0u, 2u);
-                X64BinaryRegister(c, 0x01, 0u, 8u);
-            } else {
-                X64BinaryRegister(c, 0x01, 0u, 8u);
-                X64BinaryRegister(c, 0x01, 0u, 2u);
-            }
-        } else if (strategy == 0u) {
-            X64BinaryRegister(c, 0x29, 0u, 2u);
-            X64BinaryRegister(c, 0x29, 0u, 8u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t source = c.registerAssignment[1];
+    const uint8_t carry = c.registerAssignment[2];
+    if (source != 2u) EmitZydisMove(c, x64, source, 2u);
+    if (value != 0u) EmitZydisMove(c, x64, value, 0u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+    if (!subtract) {
+        if (strategy == 0u) {
+            EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, source);
+            EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, carry);
         } else {
-            X64BinaryRegister(c, 0x01, 2u, 8u);
-            X64BinaryRegister(c, 0x29, 0u, 2u);
+            EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, carry);
+            EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, value, source);
         }
-        X64BinaryImmediate32(c, 5u, 0u, key);
+    } else if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, value, source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, value, carry);
     } else {
-        X86BinaryImmediate32(c, 0u, 0u, key);
-        if (!subtract) {
-            if (strategy == 0u) c.Raw({0x01,0xD0,0x01,0xC8});
-            else c.Raw({0x01,0xC8,0x01,0xD0});
-        } else if (strategy == 0u) c.Raw({0x29,0xD0,0x29,0xC8});
-        else c.Raw({0x01,0xCA,0x29,0xD0});
-        X86BinaryImmediate32(c, 5u, 0u, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD, source, carry);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, value, source);
     }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_SUB, value, key);
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+}
+
+void EmitZydisBitOperationCore(
+    CodeBuffer& c,
+    bool x64,
+    VM_MICRO_OPCODE semantic,
+    uint8_t strategy)
+{
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t index = c.registerAssignment[1];
+    const uint8_t auxiliary = c.registerAssignment[2];
+    const uint8_t spare = c.registerAssignment[3];
+    const ZydisMnemonic nativeMnemonic = semantic == VM_UOP_BIT_TEST
+        ? ZYDIS_MNEMONIC_BT : (semantic == VM_UOP_BIT_SET
+            ? ZYDIS_MNEMONIC_BTS : ZYDIS_MNEMONIC_BTR);
+
+    if (x64) {
+        // Convert operand bytes to the architectural bit-index mask, then
+        // reduce the raw RDX index in its seed-selected register.
+        X64LoadByte(c, 1u, CtxDecodedOperands);
+        EmitZydisSizedBinaryImmediate(
+            c, true, ZYDIS_MNEMONIC_SHL, 1u, 4u, 3u);
+        EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_DEC, 1u, 4u);
+        if (index != 2u) EmitZydisMove(c, true, index, 2u);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_AND, index, 1u);
+
+        const bool fixedBaseline = value == 0u && index == 2u &&
+            auxiliary == 10u && spare == 11u;
+        if (strategy == 0u) {
+            // R8 is the pre-latched original a. R10 is deliberately retained
+            // as the published old-bit auxiliary in every plan.
+            EmitZydisMove(c, true, auxiliary, 8u);
+            EmitZydisMove(c, true, 1u, index);
+            EmitZydisShiftCl(
+                c, true, ZYDIS_MNEMONIC_SHR, auxiliary, 8u);
+            EmitZydisBinaryImmediate(
+                c, true, ZYDIS_MNEMONIC_AND, auxiliary, 1u);
+            if (semantic == VM_UOP_BIT_TEST) {
+                if (fixedBaseline) EmitZydisMove(c, true, 0u, 8u);
+            } else if (fixedBaseline) {
+                EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 1u);
+                EmitZydisShiftCl(c, true, ZYDIS_MNEMONIC_SHL, 0u, 8u);
+                if (semantic == VM_UOP_BIT_RESET)
+                    EmitZydisUnary(c, true, ZYDIS_MNEMONIC_NOT, 0u);
+                EmitZydisBinary(c, true,
+                    semantic == VM_UOP_BIT_SET
+                        ? ZYDIS_MNEMONIC_OR : ZYDIS_MNEMONIC_AND,
+                    0u, 8u);
+            } else {
+                EmitZydisSizedMoveImmediate(c, true, spare, 4u, 1u);
+                EmitZydisShiftCl(
+                    c, true, ZYDIS_MNEMONIC_SHL, spare, 8u);
+                if (semantic == VM_UOP_BIT_RESET)
+                    EmitZydisUnary(c, true, ZYDIS_MNEMONIC_NOT, spare);
+                EmitZydisBinary(c, true,
+                    semantic == VM_UOP_BIT_SET
+                        ? ZYDIS_MNEMONIC_OR : ZYDIS_MNEMONIC_AND,
+                    value, spare);
+            }
+        } else {
+            if (fixedBaseline) EmitZydisMove(c, true, 0u, 8u);
+            EmitZydisBinary(c, true, nativeMnemonic, value, index);
+            EmitZydisSizedUnary(
+                c, true, ZYDIS_MNEMONIC_SETB, auxiliary, 1u);
+        }
+        if (!fixedBaseline && value != 0u)
+            EmitZydisMove(c, true, 0u, value);
+        return;
+    }
+
+    X86LoadD(c, 1u, RECORD_OFFSET(CtxLastAlu, b));
+    if (index != 1u) EmitZydisMove(c, false, index, 1u);
+    X86LoadByte(c, 2u, CtxDecodedOperands);
+    EmitZydisSizedBinaryImmediate(
+        c, false, ZYDIS_MNEMONIC_SHL, 2u, 4u, 3u);
+    EmitZydisSizedUnary(c, false, ZYDIS_MNEMONIC_DEC, 2u, 4u);
+    EmitZydisBinary(c, false, ZYDIS_MNEMONIC_AND, index, 2u);
+    X86LoadD(c, 0u, RECORD_OFFSET(CtxLastAlu, a));
+    if (value != 0u) EmitZydisMove(c, false, value, 0u);
+    if (strategy == 0u) {
+        EmitZydisMove(c, false, auxiliary, value);
+        if (index != 1u) EmitZydisMove(c, false, 1u, index);
+        EmitZydisShiftCl(
+            c, false, ZYDIS_MNEMONIC_SHR, auxiliary, 4u);
+        EmitZydisBinaryImmediate(
+            c, false, ZYDIS_MNEMONIC_AND, auxiliary, 1u);
+        if (semantic != VM_UOP_BIT_TEST) {
+            EmitZydisMoveImmediate(c, false, spare, 1u);
+            EmitZydisShiftCl(
+                c, false, ZYDIS_MNEMONIC_SHL, spare, 4u);
+            if (semantic == VM_UOP_BIT_RESET)
+                EmitZydisUnary(c, false, ZYDIS_MNEMONIC_NOT, spare);
+            EmitZydisBinary(c, false,
+                semantic == VM_UOP_BIT_SET
+                    ? ZYDIS_MNEMONIC_OR : ZYDIS_MNEMONIC_AND,
+                value, spare);
+        }
+    } else {
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            auxiliary, auxiliary);
+        EmitZydisBinary(c, false, nativeMnemonic, value, index);
+        EmitZydisSizedUnary(
+            c, false, ZYDIS_MNEMONIC_SETB, auxiliary, 1u);
+    }
+    if (value != 0u) EmitZydisMove(c, false, 0u, value);
+    X86StoreD(c, CtxMutationScratch + 4u, auxiliary);
 }
 
 void EmitKeyedBitwiseCore(
@@ -2865,21 +4357,52 @@ void EmitKeyedUnaryCore(
 
 void EmitKeyedMultiplyCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 7u);
-    if (x64) {
-        X64MovImmediate(c, 8u, key);
-        X64MultiplyRegister(c, 8u, 2u);
-        X64BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) X64MultiplyRegister(c, 0u, 2u);
-        else c.Raw({0x48,0xF7,0xE2});
-        X64BinaryRegister(c, 0x29u, 0u, 8u);
-    } else {
-        X86MovImmediate(c, 3u, key);
-        c.Raw({0x0F,0xAF,0xDA});
-        X86BinaryImmediate32(c, 0u, 0u, key);
-        if (strategy == 0u) c.Raw({0x0F,0xAF,0xC2});
-        else c.Raw({0xF7,0xE2});
-        X86BinaryRegister(c, 0x29u, 0u, 3u);
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t nativeBytes = x64 ? 8u : 4u;
+    if (strategy == 0u) {
+        const uint8_t value = c.registerAssignment[0];
+        const uint8_t source = c.registerAssignment[1];
+        const uint8_t correction = c.registerAssignment[2];
+        // The original operands were persisted before entering this core.
+        // Reload only when a seed-selected role is not already in its legacy
+        // boundary register; this preserves the fixed RAX/RDX byte baseline.
+        if (value != 0u) {
+            EmitZydisLoad(c, x64, value, context,
+                static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, a)),
+                nativeBytes);
+        }
+        if (source != 2u) {
+            EmitZydisLoad(c, x64, source, context,
+                static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, b)),
+                nativeBytes);
+        }
+        EmitZydisMoveImmediate(c, x64, correction, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL,
+            correction, source);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_ADD, value, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL, value, source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            value, correction);
+        if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+        return;
     }
+
+    // One-operand MUL retains its architectural RDX:RAX/EDX:EAX pair.  Only
+    // the visible multiplier and a correction register that survives MUL are
+    // seed-selected.  The contract guarantees neither aliases the other and
+    // the correction register never aliases the implicit pair.
+    const uint8_t source = c.registerAssignment[0];
+    const uint8_t correction = c.registerAssignment[1];
+    if (source != 2u) {
+        EmitZydisLoad(c, x64, source, context,
+            static_cast<int32_t>(RECORD_OFFSET(CtxLastAlu, b)), nativeBytes);
+    }
+    EmitZydisMoveImmediate(c, x64, correction, key);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_IMUL, correction, source);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_ADD, 0u, key);
+    EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_MUL, source);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, 0u, correction);
 }
 
 void EmitKeyedLogicalShiftCore(
@@ -2903,70 +4426,74 @@ void EmitKeyedLogicalShiftCore(
     if (strategy != 0u) std::reverse(shareOrder.begin(), shareOrder.end());
 
     if (x64) {
-        // See DeriveShiftCoreScratchRegisters (used by the SAR/ROL/ROR core
-        // right below): same pool, same exclusions (0/1/2/4/7/9 stay live
-        // across the whole EmitX64BinaryAlu-latched core body), same reason
-        // -- register choice, not the already-keyed immediates, is what
-        // moves this core's 4-gram content once value_codec strips the
-        // immediates back out.
-        const auto scratch = DeriveShiftCoreScratchRegisters(
-            c, shiftRight ? VM_UOP_SHR : VM_UOP_SHL, strategy);
-        const uint8_t scratchA = scratch.first;
-        const uint8_t scratchB = scratch.second;
+        const uint8_t valueRegister = c.registerAssignment[0];
+        const uint8_t scratchA = c.registerAssignment[1];
+        const uint8_t scratchB = c.registerAssignment[2];
         std::array<uint64_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             keys[share] = deriveShare(share);
         }
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X64MovImmediate(c, scratchA, keys[share]);
-            X64BinaryRegister(c, 0x31u, 0u, scratchA);
+            EmitZydisMoveImmediate(c, true, scratchA, keys[share]);
+            EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchA);
         }
-        c.Raw({0x48,0x89,0xD1});
+        EmitZydisMove(c, true, 1u, 2u);
         // scratchB <- r9 (the width mask X64MaskForWidthInR11 already
         // computed and left live in r9 for this whole core, same as
         // EmitX64ShiftRotateVariant's sibling core above): all-ones only
         // for width 8, so (sar 63)&32 is 32 only there, and |31 turns that
         // into the exact 5-bit/6-bit shift-count mask this build needs.
-        X64MovRegister(c, scratchB, 9u);
-        X64ShiftImmediate(c, 7u, scratchB, 0x3F);
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x48u | ((scratchB & 8u) ? 1u : 0u));
-            c.Raw({rex, 0x83, static_cast<uint8_t>(
-                0xE0u | (scratchB & 7u)), 0x20});
-        }
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x48u | ((scratchB & 8u) ? 1u : 0u));
-            c.Raw({rex, 0x83, static_cast<uint8_t>(
-                0xC8u | (scratchB & 7u)), 0x1F});
-        }
-        {
-            const uint8_t rex = static_cast<uint8_t>(
-                0x40u | ((scratchB & 8u) ? 0x04u : 0u));
-            c.Raw({rex, 0x20, static_cast<uint8_t>(
-                0xC1u | ((scratchB & 7u) << 3u))});
-        }
+        EmitZydisMove(c, true, scratchB, 9u);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_SAR,
+            scratchB, 8u, 0x3Fu);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_AND,
+            scratchB, 8u, 0x20u);
+        EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_OR,
+            scratchB, 8u, 0x1Fu);
+        EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_AND,
+            1u, scratchB, 1u);
 
         const auto shiftShares = [&] {
-            X64MovImmediate(c, scratchA, keys[shareOrder[0u]]);
-            X64ShiftCl(c, shiftRight ? 5u : 4u, scratchA);
+            EmitZydisMoveImmediate(
+                c, true, scratchA, keys[shareOrder[0u]]);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                scratchA, 8u);
             for (size_t position = 1u;
                  position < shareOrder.size(); ++position) {
-                X64MovImmediate(c, scratchB, keys[shareOrder[position]]);
-                X64ShiftCl(c, shiftRight ? 5u : 4u, scratchB);
-                X64BinaryRegister(c, 0x31u, scratchA, scratchB);
+                EmitZydisMoveImmediate(
+                    c, true, scratchB, keys[shareOrder[position]]);
+                EmitZydisShiftCl(c, true,
+                    shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                    scratchB, 8u);
+                EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+                    scratchA, scratchB);
             }
         };
         if (strategy == 0u) {
-            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 8u);
             shiftShares();
         } else {
             shiftShares();
-            X64ShiftCl(c, shiftRight ? 5u : 4u, 0u);
+            EmitZydisShiftCl(c, true,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 8u);
         }
-        X64BinaryRegister(c, 0x31u, 0u, scratchA);
+        EmitZydisBinary(c, true, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, true, 0u, valueRegister);
     } else {
+        const uint8_t valueRegister = c.registerAssignment[0];
+        const uint8_t scratchA = c.registerAssignment[1];
+        const uint8_t scratchB = c.registerAssignment[2];
+        const bool publishCountEarly =
+            valueRegister == 2u || scratchA == 2u;
         std::array<uint32_t, 4> keys{};
         for (size_t share = 0u; share < keys.size(); ++share) {
             const uint64_t mixed = deriveShare(share);
@@ -2975,109 +4502,355 @@ void EmitKeyedLogicalShiftCore(
             else key |= uint32_t{1};
             keys[share] = key;
         }
+        if (publishCountEarly)
+            EmitZydisSizedMove(c, false, 1u, 2u, 1u);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, valueRegister, 0u);
         for (const size_t share : shareOrder) {
-            X86MovImmediate(c, 3u, keys[share]);
-            X86BinaryRegister(c, 0x31u, 0u, 3u);
+            EmitZydisMoveImmediate(c, false, scratchA, keys[share]);
+            EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                valueRegister, scratchA);
         }
-        c.Raw({0x88,0xD1,0x80,0xE1,0x1F});
+        if (!publishCountEarly)
+            EmitZydisSizedMove(c, false, 1u, 2u, 1u);
+        EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_AND,
+            1u, 1u, 0x1Fu);
 
-        const auto shiftRegister = [&](uint8_t reg) {
-            c.Raw({0xD3, static_cast<uint8_t>(0xC0u |
-                ((shiftRight ? 5u : 4u) << 3u) | (reg & 7u))});
-        };
         const auto shiftShares = [&] {
-            X86MovImmediate(c, 3u, keys[shareOrder[0u]]);
-            shiftRegister(3u);
+            EmitZydisMoveImmediate(
+                c, false, scratchA, keys[shareOrder[0u]]);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                scratchA, 4u);
             for (size_t position = 1u;
                  position < shareOrder.size(); ++position) {
-                X86MovImmediate(c, 2u, keys[shareOrder[position]]);
-                shiftRegister(2u);
-                X86BinaryRegister(c, 0x31u, 3u, 2u);
+                EmitZydisMoveImmediate(
+                    c, false, scratchB, keys[shareOrder[position]]);
+                EmitZydisShiftCl(c, false,
+                    shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                    scratchB, 4u);
+                EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+                    scratchA, scratchB);
             }
         };
         if (strategy == 0u) {
-            shiftRegister(0u);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 4u);
             shiftShares();
         } else {
             shiftShares();
-            shiftRegister(0u);
+            EmitZydisShiftCl(c, false,
+                shiftRight ? ZYDIS_MNEMONIC_SHR : ZYDIS_MNEMONIC_SHL,
+                valueRegister, 4u);
         }
-        X86BinaryRegister(c, 0x31u, 0u, 3u);
+        EmitZydisBinary(c, false, ZYDIS_MNEMONIC_XOR,
+            valueRegister, scratchA);
+        if (valueRegister != 0u)
+            EmitZydisMove(c, false, 0u, valueRegister);
     }
 }
 
-void EmitKeyedFlagsWriteCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+void MoveFlagsWriteInputs(CodeBuffer& c, bool x64) {
+    const uint8_t oldFlags = c.registerAssignment[0];
+    const uint8_t mask = c.registerAssignment[1];
+    const uint8_t value = c.registerAssignment[2];
+    if (x64) {
+        // DeriveVariantRegisters publishes only the fixed source itself or a
+        // distinct high volatile destination for each role. Consequently no
+        // copy can overwrite another still-live RAX/RCX/RDX source.
+        if (oldFlags != 0u) EmitZydisMove(c, true, oldFlags, 0u);
+        if (mask != 1u) EmitZydisMove(c, true, mask, 1u);
+        if (value != 2u) EmitZydisMove(c, true, value, 2u);
+        return;
+    }
+    if (oldFlags == 0u && mask == 1u && value == 2u) return;
+    if (oldFlags == 1u && mask == 2u && value == 0u) {
+        EmitZydisExchange(c, false, 0u, 1u);
+        EmitZydisExchange(c, false, 0u, 2u);
+        return;
+    }
+    if (oldFlags == 2u && mask == 0u && value == 1u) {
+        EmitZydisExchange(c, false, 0u, 2u);
+        EmitZydisExchange(c, false, 0u, 1u);
+        return;
+    }
+    c.FailEncoding("FLAGS_WRITE received an invalid x86 register plan");
+}
+
+void EmitZydisFlagsWriteCore(CodeBuffer& c, bool x64, uint8_t strategy) {
     const uint32_t key = CoreKey32(c, strategy + 2u);
-    if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) {
-            X64MovRegister(c, 11u, 1u); X64UnaryGroup(c, 2u, 11u);
-            X64BinaryRegister(c, 0x21u, 0u, 11u);
-            X64BinaryRegister(c, 0x21u, 2u, 1u);
-            X64BinaryRegister(c, 0x09u, 0u, 2u);
-        } else {
-            X64BinaryRegister(c, 0x31u, 2u, 0u);
-            X64BinaryRegister(c, 0x21u, 2u, 1u);
-            X64BinaryRegister(c, 0x31u, 0u, 2u);
-        }
-        X64BinaryImmediate32(c, 6u, 0u, key);
+    const uint8_t oldFlags = c.registerAssignment[0];
+    const uint8_t mask = c.registerAssignment[1];
+    const uint8_t value = c.registerAssignment[2];
+    const uint8_t scratch = c.registerAssignment[3];
+    MoveFlagsWriteInputs(c, x64);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, oldFlags, key);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, value, key);
+    if (strategy == 0u) {
+        EmitZydisMove(c, x64, scratch, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, oldFlags, scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, value, mask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, oldFlags, value);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x89,0xCB,0xF7,0xD3,0x21,0xD8,
-                                   0x21,0xCA,0x09,0xD0});
-        else c.Raw({0x31,0xC2,0x21,0xCA,0x31,0xD0});
-        X86BinaryImmediate32(c, 6u, 0u, key);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, value, oldFlags);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, value, mask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, oldFlags, value);
     }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, oldFlags, key);
+    if (oldFlags != 0u) EmitZydisMove(c, x64, 0u, oldFlags);
 }
 
-void EmitKeyedSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+void EmitZydisFlagsUpdateCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const uint32_t modeKey = CoreAddressKey(c, strategy + 1u);
+    const uint32_t dataKey = CoreKey32(c, strategy + 5u);
+    const uint8_t flags = c.registerAssignment[0];
+    const uint8_t mask = c.registerAssignment[1];
+    const uint8_t scratchA = c.registerAssignment[2];
+    const uint8_t scratchB = c.registerAssignment[3];
+    const uint8_t mode = 1u;
+    const auto clear = c.NewLabel();
+    const auto set = c.NewLabel();
+    const auto done = c.NewLabel();
+
+    // RAX/EAX and RDX/EDX are the fixed wrapper inputs. XCHG in the one swap
+    // plan preserves EFLAGS, so the keyed mode dispatch observes exactly the
+    // same validation state as the previous fixed-register implementation.
+    MoveRegisterPair(c, x64, flags, mask, 0u, 2u);
+    EmitZydisLea(c, x64, mode, mode, static_cast<int32_t>(modeKey));
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        mode, modeKey + VM_FLAG_UPDATE_CLEAR);
+    c.Jcc(JccE, clear);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP,
+        mode, modeKey + VM_FLAG_UPDATE_SET);
+    c.Jcc(JccE, set);
+
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, dataKey);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, flags, mask);
+    } else {
+        EmitZydisMove(c, x64, scratchA, flags);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, scratchA, mask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, flags, mask);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB, flags, scratchA);
+    }
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, dataKey);
+    c.Jmp(done);
+
+    c.Bind(clear);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, dataKey);
+    if (strategy == 0u) {
+        EmitZydisMove(c, x64, scratchA, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, scratchA);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, flags, scratchA);
+    } else {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, flags);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, flags, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, flags);
+        EmitZydisMove(c, x64, scratchA, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, scratchA);
+    }
+    EmitZydisMoveImmediate(c, x64, scratchB, dataKey);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, scratchB, scratchA);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, flags, scratchB);
+    c.Jmp(done);
+
+    c.Bind(set);
+    EmitZydisBinaryImmediate(c, x64, ZYDIS_MNEMONIC_XOR, flags, dataKey);
+    if (strategy == 0u) {
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR, flags, mask);
+        EmitZydisMove(c, x64, scratchA, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, scratchA);
+    } else {
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, flags);
+        EmitZydisMove(c, x64, scratchA, mask);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, scratchA);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, flags, scratchA);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, flags);
+    }
+    EmitZydisMoveImmediate(c, x64, scratchB, dataKey);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND, scratchB, scratchA);
+    EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR, flags, scratchB);
+    c.Bind(done);
+    if (flags != 0u) EmitZydisMove(c, x64, 0u, flags);
+}
+
+void EmitZydisPushConditionCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // X64EvaluateCondition/X86EvaluateCondition (unmigrated control-dispatch
+    // infrastructure -- out of this batch's scope) already resolve the
+    // branch condition to a clean 0/1 in the fixed RAX/EAX boundary before
+    // this core runs. That evaluator's own RCX/RDX (EDX) scratch is dead by
+    // the time it returns, and R8/R9/R10/R11 (x64) were never touched by
+    // either it or the preceding X64CallFlagMaterializer/
+    // X86CallFlagMaterializer real call (which, per the Win64/cdecl ABI,
+    // already clobbers every volatile GPR it doesn't explicitly preserve).
+    // The seed picks which physical register performs the keyed
+    // add/sub + compare + SETcc identity before the result moves back to
+    // the fixed PushOne boundary.
+    const uint32_t key = CoreAddressKey(c, strategy + 1u);
+    const uint8_t value = c.registerAssignment[0];
+    const uint8_t bytes = x64 ? 8u : 4u;
+    if (value != 0u) EmitZydisMove(c, x64, value, 0u);
+    if (strategy == 0u) {
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_ADD, value, bytes, key);
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_CMP, value, bytes, key + 1u);
+    } else {
+        EmitZydisSizedBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_SUB, value, bytes, key);
+        // 1u - key intentionally wraps (uint32_t arithmetic): the CMP must
+        // consume the exact same 32-bit bit pattern the original hand
+        // written 0x81 /7 imm32 encoding did, which the CPU sign-extends to
+        // the full destination width. ZydisSignExtendImmediateBits only
+        // sign-extends its *bytes* argument when bytes is 1/2/4 -- for an
+        // 8-byte (x64) destination it is a no-op, because every other
+        // caller of EmitZydisSizedBinaryImmediate with bytes=8 always
+        // passes an already-small non-negative value where that no-op is
+        // correct. Explicitly sign-extend from the low 32 bits first so the
+        // wrapped pattern is preserved either way (redundant, still
+        // correct, for the bytes=4 x86 path).
+        EmitZydisSizedBinaryImmediate(c, x64, ZYDIS_MNEMONIC_CMP, value,
+            bytes, ZydisSignExtendImmediateBits(1u - key, 4u));
+    }
+    EmitZydisSizedUnary(c, x64, ZYDIS_MNEMONIC_SETZ, value, 1u);
+    EmitZydisInstruction(c, x64, ZYDIS_MNEMONIC_MOVZX,
+        {ZydisSizedGprOperand(x64, value, bytes),
+         ZydisSizedGprOperand(x64, value, 1u)});
+    if (value != 0u) EmitZydisMove(c, x64, 0u, value);
+}
+
+void EmitZydisSelectCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    // The wrapper materializes the VM status flags and resolves the requested
+    // condition to a clean 0/1 before entering this core.  Consequently the
+    // core consumes only the fixed predicate register (R10/ECX) and never
+    // relies on host EFLAGS left by the evaluator.  Candidate values arrive
+    // in RAX/RDX (EAX/EDX); the SELECT-specific liveness contract supplies
+    // seed-selected candidate/scratch roles without touching context, stack,
+    // funclet metadata or the virtual/pending flags lifetime.
     const uint32_t key = CoreKey32(c, strategy + 4u);
-    if (x64) {
-        X64BinaryImmediate32(c, 6u, 0u, key);
-        X64BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x45,0x85,0xD2,0x48,0x0F,0x45,0xC2});
-        else {
-            X64MovRegister(c, 11u, 10u); X64UnaryGroup(c, 3u, 11u);
-            X64BinaryRegister(c, 0x31u, 2u, 0u);
-            X64BinaryRegister(c, 0x21u, 2u, 11u);
-            X64BinaryRegister(c, 0x31u, 0u, 2u);
-        }
-        X64BinaryImmediate32(c, 6u, 0u, key);
+    const uint8_t candidateA = c.registerAssignment[0];
+    const uint8_t candidateB = c.registerAssignment[1];
+    const uint8_t scratch = c.registerAssignment[2];
+    const uint8_t predicate = x64 ? 10u : 1u;
+    MoveRegisterPair(c, x64, candidateA, candidateB, 0u, 2u);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateA, key);
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateB, key);
+    if (strategy == 0u) {
+        // The historical x64 form deliberately tested r10d rather than r10;
+        // the predicate is 0/1 either way, but retaining the 32-bit form
+        // preserves its representative fixed-plan encoding.
+        EmitZydisSizedBinary(c, x64, ZYDIS_MNEMONIC_TEST,
+            predicate, predicate, 4u);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_CMOVNZ, candidateA, candidateB);
     } else {
-        X86BinaryImmediate32(c, 6u, 0u, key);
-        X86BinaryImmediate32(c, 6u, 2u, key);
-        if (strategy == 0u) c.Raw({0x85,0xC9,0x0F,0x45,0xC2});
-        else c.Raw({0x89,0xCB,0xF7,0xDB,0x31,0xC2,0x21,0xDA,0x31,0xD0});
-        X86BinaryImmediate32(c, 6u, 0u, key);
+        EmitZydisMove(c, x64, scratch, predicate);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NEG, scratch);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, candidateB, candidateA);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_AND, candidateB, scratch);
+        EmitZydisBinary(
+            c, x64, ZYDIS_MNEMONIC_XOR, candidateA, candidateB);
     }
+    EmitZydisBinaryImmediate(
+        c, x64, ZYDIS_MNEMONIC_XOR, candidateA, key);
+    if (candidateA != 0u) EmitZydisMove(c, x64, 0u, candidateA);
 }
 
-void EmitX64SeedAddressedWideOperation(
+void EmitZydisWideOperandCore(
     CodeBuffer& c,
-    uint8_t group,
+    bool x64,
+    ZydisMnemonic mnemonic,
     uint8_t strategy,
     size_t keyIndex)
 {
-    // The real multiplier/divisor is materialized in the execution-context
-    // scratch slot and consumed directly by the hardware wide operation.  The
-    // build seed splits that slot's effective address between LEA and the
-    // memory operand displacement; neither half can be removed or changed
-    // without changing the value consumed by IMUL/DIV/IDIV.  LEA and MOV do
-    // not alter flags, while the one-operand F7 form retains the full
-    // RDX:RAX result and native #DE behaviour.
+    // R9 (x64) / ECX (x86) already holds the exact multiplier/divisor value
+    // the surrounding wide-multiply/divide wrapper prepared before this core
+    // runs (EmitX64WideMultiply/EmitX64WideDivide or their x86
+    // equivalents), and it is dead immediately afterward -- every width
+    // branch unconditionally reloads/overwrites it while rebuilding the
+    // width mask. The seed picks between applying the hardware wide
+    // operation directly to that register, or spilling it through a
+    // seed-split CtxMutationScratch effective address using the K-selected
+    // address register this semantic already established (R10/EBX for
+    // K=0, R11/ESI for K=1) -- the same explicit-operand/hardware-implicit-
+    // pair contract as independent batch 2 (x86 UMUL_WIDE K=1). RDX:RAX
+    // (EDX:EAX) remain the untouched hardware-implicit pair either way, so
+    // divide-by-zero and quotient-overflow #DE stay purely hardware-driven
+    // regardless of which form the seed selects.
+    const uint8_t sourceReg = x64 ? 9u : 1u;
+    const uint8_t addressReg = c.registerAssignment[0];
+    const bool memoryForm = c.registerAssignment[3] == 0u;
+    if (!memoryForm) {
+        // A bare `<op> sourceReg` carries no build-seed-dependent bytes at
+        // all, so two different builds that both land on register-direct
+        // for the same K would be byte-identical -- failing the required
+        // real per-build difference for that (semantic,K). Bracket the
+        // operation with a self-cancelling double keyed XOR (the same
+        // reversible-perturbation idiom used elsewhere in this file, e.g.
+        // PUSH_VREG/PUSH_IMM's keyed XOR pairs) so the register-direct form
+        // also carries a real per-build immediate without changing the
+        // value the hardware operation consumes.
+        const uint32_t registerKey = CoreKey32(c, keyIndex + strategy);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, sourceReg, registerKey);
+        EmitZydisBinaryImmediate(
+            c, x64, ZYDIS_MNEMONIC_XOR, sourceReg, registerKey);
+        EmitZydisUnary(c, x64, mnemonic, sourceReg);
+        return;
+    }
     const uint32_t key = CoreAddressKey(c, keyIndex + strategy);
-    const uint8_t address = strategy == 0u ? 10u : 11u;
-    c.Raw({0x4D, 0x8D, static_cast<uint8_t>(
-        0x80u | ((address & 7u) << 3u) | 7u)});
-    c.U32(CtxMutationScratch + key);              // lea address,[r15+slot+key]
-    c.Raw({0x4D, 0x89, static_cast<uint8_t>(
-        0x80u | (1u << 3u) | (address & 7u))});
-    c.U32(0u - key);                              // mov [address-key],r9
-    c.Raw({0x49, 0xF7, static_cast<uint8_t>(
-        0x80u | ((group & 7u) << 3u) | (address & 7u))});
-    c.U32(0u - key);                              // F7 /group [address-key]
+    const uint8_t context = x64 ? 15u : 7u;
+    const uint8_t bytes = x64 ? 8u : 4u;
+    EmitZydisLea(c, x64, addressReg, context,
+        static_cast<int32_t>(CtxMutationScratch + key));
+    EmitZydisStore(c, x64, addressReg, static_cast<int32_t>(0u - key),
+        sourceReg, bytes);
+    EmitZydisInstruction(c, x64, mnemonic,
+        {ZydisMemoryOperand(x64, addressReg,
+             static_cast<int32_t>(0u - key), bytes)});
+}
+
+void EmitZydisX64UmulWideCore(CodeBuffer& c, uint8_t strategy) {
+    // RAX is the hardware-fixed multiplicand and RDX:RAX is the hardware-
+    // fixed high:low output pair.  Only the explicit multiplier form varies.
+    // R9 contains b; the wrapper has already pre-latched a/b. R8 keeps the
+    // legacy a copy. R10 enters as a b copy and the legacy K=1 form may use
+    // that same value as its explicit multiplier without changing it. The
+    // memory plans use only RCX/R11, whose width-
+    // dispatch values are dead on entry to the selected width branch.
+    const uint8_t multiplier = c.registerAssignment[0];
+    const bool memoryForm = c.registerAssignment[3] == 0u;
+    if (memoryForm) {
+        const uint32_t key = CoreAddressKey(c, strategy + 11u);
+        EmitZydisLea(c, true, multiplier, 15u,
+            static_cast<int32_t>(CtxMutationScratch + key));
+        EmitZydisStore(c, true, multiplier,
+            static_cast<int32_t>(0u - key), 9u, 8u);
+        EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MUL,
+            {ZydisMemoryOperand(true, multiplier,
+                static_cast<int32_t>(0u - key), 8u)});
+        return;
+    }
+
+    // A bare register MUL contains no seed-dependent byte when two builds
+    // choose the same plan.  The reversible keyed pair keeps those builds
+    // distinct without changing b.  Copying after the pair preserves the
+    // legacy K=0 `mul r9` and K=1 `mov r10,r9; mul r10` byte sequences as
+    // exact suffixes of their fixed-register plans.
+    const uint32_t key = CoreKey32(c, strategy + 11u);
+    EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 9u, key);
+    EmitZydisBinaryImmediate(c, true, ZYDIS_MNEMONIC_XOR, 9u, key);
+    if (multiplier != 9u)
+        EmitZydisMove(c, true, multiplier, 9u);
+    EmitZydisUnary(c, true, ZYDIS_MNEMONIC_MUL, multiplier);
 }
 
 bool EmitBusinessCoreVariant(
@@ -3105,94 +4878,32 @@ bool EmitBusinessCoreVariant(
     };
     if (x64) {
         switch (semantic) {
-            case VM_UOP_PUSH_FLAGS: {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-                c.Raw({0x4D,0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
-                if (strategy != 0u) X64BinaryImmediate32(c, 0u, 10u, k1);
-                c.Raw({0x49,0x8B,0x82});
-                c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
+            case VM_UOP_PUSH_FLAGS:
+                EmitZydisContextLoadCore(
+                    c, true, CtxVirtualFlags, strategy, false);
                 return true;
-            }
             case VM_UOP_PUSH_IP:
-                EmitKeyedPushIpCore(c, true, strategy);
+                EmitZydisKeyedIpCore(c, true, strategy);
                 return true;
             case VM_UOP_PUSH_IMAGE_BASE:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 3u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxImageBase + k0);
-                    X64BinaryImmediate32(c, 0u, 10u, k1);
-                    X64BinaryImmediate32(c, 5u, 10u, k2);
-                    X64BinaryImmediate32(c, 0u, 10u, k3);
-                    c.Raw({0x49,0x8B,0x82});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisContextLoadCore(
+                    c, true, CtxImageBase, strategy, true);
                 return true;
             case VM_UOP_PUSH_VREG:
-                {
-                    const std::array<uint32_t, 2> keys = {
-                        CoreKey32(c, strategy + 1u),
-                        CoreKey32(c, strategy + 5u)};
-                    for (uint32_t key : keys)
-                        X64BinaryImmediate32(c, 6u, 0u, key);
-                    if (strategy == 0u) X64ShiftCl(c, 5, 0);
-                    else c.Raw({0x45,0x31,0xD2,0x4C,0x0F,0xAD,0xD0});
-                    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-                        X64MovImmediate(c, 10u, *it);
-                        X64ShiftCl(c, 5u, 10u);
-                        X64BinaryRegister(c, 0x31, 0u, 10u);
-                    }
-                }
+                EmitZydisPushVregCore(c, true, strategy);
                 return true;
             case VM_UOP_PUSH_IMM:
-                {
-                    const std::array<uint32_t, 2> keys = {
-                        CoreKey32(c, strategy + 2u),
-                        CoreKey32(c, strategy + 7u)};
-                    for (uint32_t key : keys)
-                        X64BinaryImmediate32(c, 6u, 0u, key);
-                    X64BinaryRegister(c, 0x21, 0, 9);
-                    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-                        X64MovImmediate(c, 10u, *it);
-                        X64BinaryRegister(c, 0x21, 10u, 9u);
-                        X64BinaryRegister(c, 0x31, 0u, 10u);
-                    }
-                }
+                EmitZydisPushImmCore(c, true, strategy);
                 return true;
             case VM_UOP_POP_VREG:
                 if (strategy == 0u) EmitX64PopVregVariant(c, 0u);
                 else EmitX64PopVregVariant(c, 1u);
                 return true;
             case VM_UOP_LOAD_TEMP:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
-                    X64BinaryImmediate32(c, 0u, 11u, k1);
-                    X64BinaryImmediate32(c, 5u, 11u, k2);
-                    X64BinaryImmediate32(c, 0u, 11u, k3);
-                    c.Raw({0x49,0x8B,0x83});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisTempCore(c, true, false, strategy);
                 return true;
             case VM_UOP_STORE_TEMP:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4F,0x8D,0x9C,0xD7}); c.U32(CtxTemps + k0);
-                    X64BinaryImmediate32(c, 0u, 11u, k1);
-                    X64BinaryImmediate32(c, 5u, 11u, k2);
-                    X64BinaryImmediate32(c, 0u, 11u, k3);
-                    c.Raw({0x49,0x89,0x83});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisTempCore(c, true, true, strategy);
                 return true;
             case VM_UOP_DUP:
                 EmitKeyedCopyCore(c, true, strategy);
@@ -3207,18 +4918,7 @@ bool EmitBusinessCoreVariant(
                 // DROP owns the now-unused value-stack slot. Scrubbing that
                 // physical slot is part of the semantic state transition, so
                 // both K variants are real equivalent memory lowerings.
-                {
-                    const uint32_t key = CoreAddressKey(c, strategy + 3u);
-                    // r10 = &ctx.values[rcx] + key.  The SIB index is RCX,
-                    // so REX.X must remain clear (0x4D, not 0x4F/r9).
-                    c.Raw({0x4D,0x8D,0x94,0xCF}); c.U32(CtxValues + key);
-                    if (strategy == 0u) {
-                        c.Raw({0x31,0xC0,0x49,0x89,0x82});
-                        c.U32(0u - key);
-                    } else {
-                        c.Raw({0x49,0xC7,0x82}); c.U32(0u - key); c.U32(0u);
-                    }
-                }
+                EmitZydisDropCore(c, true, strategy);
                 return true;
             case VM_UOP_LOAD:
                 if (strategy == 0u) EmitX64MemoryVariant(c, false, 0u);
@@ -3267,91 +4967,23 @@ bool EmitBusinessCoreVariant(
                 EmitKeyedMultiplyCore(c, true, strategy);
                 return true;
             case VM_UOP_BIT_TEST:
-                // Common to both strategies: reduce the raw bit-index operand
-                // (rdx) modulo the operand width in bits.
-                X64LoadByte(c, 1, CtxDecodedOperands);
-                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
-                X64BinaryRegister(c, 0x21, 2, 1);
-                if (strategy == 0u) {
-                    // strategy 0: manual shift-and-mask against the saved
-                    // pre-core copy of a (r8).
-                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
-                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
-                    c.Raw({0x49,0x83,0xE2,0x01});
-                    X64MovRegister(c, 0, 8);
-                } else {
-                    // strategy 1: native BT — CF *is* the tested bit by
-                    // hardware definition; BT never modifies its r/m operand.
-                    X64MovRegister(c, 0, 8);
-                    c.Raw({0x48,0x0F,0xA3,0xD0});
-                    c.Raw({0x41,0x0F,0x92,0xC2});
-                }
+                EmitZydisBitOperationCore(c, true, semantic, strategy);
                 return true;
             case VM_UOP_BIT_SET:
-                X64LoadByte(c, 1, CtxDecodedOperands);
-                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
-                X64BinaryRegister(c, 0x21, 2, 1);
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
-                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
-                    c.Raw({0x49,0x83,0xE2,0x01});
-                    c.Raw({0xB8,0x01,0x00,0x00,0x00}); // mov eax,1
-                    c.Raw({0x48,0xD3,0xE0});           // shl rax,cl
-                    X64BinaryRegister(c, 0x09, 0, 8);
-                } else {
-                    // strategy 1: native BTS sets the bit and reports the old
-                    // value in CF in the same instruction.
-                    X64MovRegister(c, 0, 8);
-                    c.Raw({0x48,0x0F,0xAB,0xD0});
-                    c.Raw({0x41,0x0F,0x92,0xC2});
-                }
+                EmitZydisBitOperationCore(c, true, semantic, strategy);
                 return true;
             case VM_UOP_BIT_RESET:
-                X64LoadByte(c, 1, CtxDecodedOperands);
-                c.Raw({0xC1,0xE1,0x03,0xFF,0xC9});
-                X64BinaryRegister(c, 0x21, 2, 1);
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 8); X64MovRegister(c, 1, 2);
-                    c.Raw({0x49,0xD3,0xEA});           // shr r10,cl
-                    c.Raw({0x49,0x83,0xE2,0x01});
-                    c.Raw({0xB8,0x01,0x00,0x00,0x00}); // mov eax,1
-                    c.Raw({0x48,0xD3,0xE0});           // shl rax,cl
-                    c.Raw({0x48,0xF7,0xD0});           // not rax
-                    X64BinaryRegister(c, 0x21, 0, 8);
-                } else {
-                    // strategy 1: native BTR resets the bit and reports the
-                    // old value in CF in the same instruction.
-                    X64MovRegister(c, 0, 8);
-                    c.Raw({0x48,0x0F,0xB3,0xD0});
-                    c.Raw({0x41,0x0F,0x92,0xC2});
-                }
+                EmitZydisBitOperationCore(c, true, semantic, strategy);
                 return true;
             case VM_UOP_SHL: {
+                // Key-share linearization uses the local value/scratch
+                // assignment; strategy chooses which equivalent order runs.
                 EmitKeyedLogicalShiftCore(c, true, false, strategy);
                 return true;
-                // strategy 0: native SHL rax,cl.
-                // strategy 1: SHLD rax, r10(=0), cl — a zero source makes shld
-                //   pull zeroes into the top, so dst = dst<<cl ≡ SHL.  r10 is
-                //   zeroed by the binary-ALU prologue (auxiliary=0) and shld
-                //   leaves its source untouched, so auxiliary stays 0.
-                //
-                // x86 masks the shift count to 5 bits for 1/2/4-byte operands
-                // and 6 bits for 8-byte.  The width mask r9 is all-ones ONLY for
-                // width 8, so (sar r9,63) & 32 is 32 for width 8 and 0 otherwise;
-                // OR 31 yields exactly the 5/6-bit count mask with no width
-                // branch.  Pre-masking cl that way lets a single 64-bit
-                // shl/shld cover every width (operand is zero-extended; the outer
-                // `and rax,r9` trims to width).  This is label-free — every byte
-                // is a fixed Raw — so the variant kernel validator's isolated
-                // re-emission matches the inline bytes exactly.
             }
             case VM_UOP_SHR: {
                 EmitKeyedLogicalShiftCore(c, true, true, strategy);
                 return true;
-                // Same count pre-mask as SHL.
-                // strategy 0: native SHR rax,cl.
-                // strategy 1: SHRD rax, r10(=0), cl pulls zeroes into the bottom
-                //   so dst = dst>>cl ≡ SHR.
             }
             case VM_UOP_SAR:
                 if (strategy == 0u) EmitX64ShiftRotateVariant(c, semantic, 0u);
@@ -3378,202 +5010,88 @@ bool EmitBusinessCoreVariant(
                 else EmitX64ExtendVariant(c, true, 1u);
                 return true;
             case VM_UOP_UMUL_WIDE:
-                if (strategy == 0u) c.Raw({0x49,0xF7,0xE1});
-                else c.Raw({0x4D,0x89,0xCA,0x49,0xF7,0xE2});
+                EmitZydisX64UmulWideCore(c, strategy);
                 return true;
             case VM_UOP_SMUL_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 5u, strategy, 2u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_IMUL, strategy, 2u);
                 return true;
             case VM_UOP_UDIV_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 6u, strategy, 4u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_DIV, strategy, 4u);
                 return true;
             case VM_UOP_IDIV_WIDE:
-                EmitX64SeedAddressedWideOperation(c, 7u, strategy, 6u);
+                EmitZydisWideOperandCore(
+                    c, true, ZYDIS_MNEMONIC_IDIV, strategy, 6u);
                 return true;
             case VM_UOP_FLAGS_LAZY:
                 for (uint8_t field : coreOrder(6u)) {
                     const uint32_t offset = field < 5u
                         ? static_cast<uint32_t>(field) * 8u : 40u;
-                    EmitKeyedContextCopy(c, true,
+                    EmitZydisKeyedContextCopy(c, true,
                         CtxLastAlu + offset, CtxPendingFlags + offset,
                         field < 5u, static_cast<size_t>(field) + strategy);
                 }
                 return true;
             case VM_UOP_FLAGS_MATERIALIZE:
-                {
-                    const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-                    const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-                    const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                    const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                    c.Raw({0x4D,0x8D,0x97}); c.U32(CtxDecodedOperands + k0);
-                    X64BinaryImmediate32(c, 0u, 10u, k1);
-                    X64BinaryImmediate32(c, 5u, 10u, k2);
-                    X64BinaryImmediate32(c, 0u, 10u, k3);
-                    c.Raw({0x49,0x8B,0x92});
-                    c.U32(0u - (k0 + k1 - k2 + k3));
-                }
+                EmitZydisFlagsMaterializeCore(c, true, strategy);
                 return true;
             case VM_UOP_FLAGS_WRITE:
-                EmitKeyedFlagsWriteCore(c, true, strategy);
+                EmitZydisFlagsWriteCore(c, true, strategy);
                 return true;
             case VM_UOP_FLAGS_UPDATE: {
-                const uint32_t modeKey = CoreAddressKey(c, strategy + 1u);
-                const uint32_t dataKey = CoreKey32(c, strategy + 5u);
-                const auto clear = c.NewLabel();
-                const auto set = c.NewLabel();
-                const auto done = c.NewLabel();
-
-                // RCX is dead after the mode decision.  Compare an affine,
-                // seed-keyed representation so the real clear/set/toggle
-                // control edge depends on this build's core selector.
-                c.Raw({0x48,0x8D,0x89}); c.U32(modeKey);
-                c.Raw({0x48,0x81,0xF9});
-                c.U32(modeKey + VM_FLAG_UPDATE_CLEAR); c.Jcc(JccE, clear);
-                c.Raw({0x48,0x81,0xF9});
-                c.U32(modeKey + VM_FLAG_UPDATE_SET); c.Jcc(JccE, set);
-
-                // Toggle in a keyed representation.  Strategy 1 lowers the
-                // actual XOR as (union - intersection), whose operands already
-                // contain the seed key.
-                X64BinaryImmediate32(c, 6u, 0u, dataKey);
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x31, 0, 2);
-                } else {
-                    X64MovRegister(c, 10, 0);
-                    X64BinaryRegister(c, 0x21, 10, 2);
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    X64BinaryRegister(c, 0x29, 0, 10);
-                }
-                X64BinaryImmediate32(c, 6u, 0u, dataKey);
-                c.Jmp(done);
-
-                c.Bind(clear);
-                // (a & ~mask) = ((a^K) & ~mask) ^ (K & ~mask).
-                X64BinaryImmediate32(c, 6u, 0u, dataKey);
-                if (strategy == 0u) {
-                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
-                    X64BinaryRegister(c, 0x21, 0, 10);
-                } else {
-                    X64UnaryGroup(c, 2u, 0u);
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    X64UnaryGroup(c, 2u, 0u);
-                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
-                }
-                X64MovImmediate(c, 11, dataKey);
-                X64BinaryRegister(c, 0x21, 11, 10);
-                X64BinaryRegister(c, 0x31, 0, 11);
-                c.Jmp(done);
-
-                c.Bind(set);
-                // (a | mask) = ((a^K) | mask) ^ (K & ~mask).
-                X64BinaryImmediate32(c, 6u, 0u, dataKey);
-                if (strategy == 0u) {
-                    X64BinaryRegister(c, 0x09, 0, 2);
-                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
-                } else {
-                    X64UnaryGroup(c, 2u, 0u);
-                    X64MovRegister(c, 10, 2); X64UnaryGroup(c, 2u, 10u);
-                    X64BinaryRegister(c, 0x21, 0, 10);
-                    X64UnaryGroup(c, 2u, 0u);
-                }
-                X64MovImmediate(c, 11, dataKey);
-                X64BinaryRegister(c, 0x21, 11, 10);
-                X64BinaryRegister(c, 0x31, 0, 11);
-                c.Bind(done);
+                EmitZydisFlagsUpdateCore(c, true, strategy);
                 return true;
             }
             case VM_UOP_FLAGS_PACK_AH: {
-                constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
-                    VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
-                const uint32_t rawKey = CoreKey32(c, strategy + 2u);
-                uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
-                if (packedKey == 0u)
-                    packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
-                        (rawKey % 5u == 1u) ? 2u :
-                        (rawKey % 5u == 2u) ? 4u :
-                        (rawKey % 5u == 3u) ? 6u : 7u);
-                const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
-                const uint32_t rotatedMask = strategy == 0u
-                    ? ((packedMask >> rotation) |
-                        (packedMask << (32u - rotation)))
-                    : ((packedMask << rotation) |
-                        (packedMask >> (32u - rotation)));
-
-                // Rotate an encoded flags value and its live mask together,
-                // apply the real selection in that domain, then rotate/decode.
-                c.Raw({0x89,0xD0});
-                X86BinaryImmediate32(c, 6u, 0u, packedKey);
-                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
-                    rotation, 0x25});
-                c.U32(rotatedMask);
-                c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
-                    rotation});
-                X86BinaryImmediate32(c, 6u, 0u, packedKey);
-                c.Raw({0x83,0xC8,0x02});
+                EmitZydisFlagsPackAhCore(c, true, strategy);
                 return true;
             }
             case VM_UOP_FLAGS_UNPACK_AH: {
-                const uint32_t key = CoreKey32(c, strategy + 6u);
-                // Both selectable values use the same seed representation;
-                // masked selection therefore produces an encoded result that
-                // is decoded only after the real flags transformation.
-                X64BinaryImmediate32(c, 6u, 0u, key);
-                X64BinaryImmediate32(c, 6u, 2u, key);
-                if (strategy == 0u) {
-                    c.Raw({0x48,0x81,0xE2});
-                    c.U32(~static_cast<uint32_t>(
-                        VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
-                    X64BinaryRegister(c, 0x09, 2, 0);
-                } else {
-                    X64BinaryRegister(c, 0x31, 0, 2);
-                    c.Raw({0x25,0xD5,0x00,0x00,0x00});
-                    X64BinaryRegister(c, 0x31, 2, 0);
-                }
-                X64BinaryImmediate32(c, 6u, 2u, key);
+                EmitZydisFlagsUnpackAhCore(c, true, strategy);
                 return true;
             }
-            case VM_UOP_PUSH_CONDITION: {
-                // X64EvaluateCondition supplies exactly 0 or 1.  Normalize it
-                // through a seed-shifted predicate rather than decorating an
-                // already-computed result: (condition +/- key) is compared
-                // with the correspondingly shifted representation of true.
-                const uint32_t key = CoreAddressKey(c, strategy + 1u);
-                if (strategy == 0u) {
-                    X64BinaryImmediate32(c, 0u, 0u, key);
-                    X64BinaryImmediate32(c, 7u, 0u, key + 1u);
-                } else {
-                    X64BinaryImmediate32(c, 5u, 0u, key);
-                    X64BinaryImmediate32(c, 7u, 0u, 1u - key);
-                }
-                c.Raw({0x0F,0x94,0xC0,0x0F,0xB6,0xC0});
+            case VM_UOP_PUSH_CONDITION:
+                EmitZydisPushConditionCore(c, true, strategy);
                 return true;
-            }
             case VM_UOP_SELECT:
-                EmitKeyedSelectCore(c, true, strategy);
+                EmitZydisSelectCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_BRANCH_IF:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_CALL_VM:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_CALL_HOST:
-                if (strategy == 0u) EmitX64CallTargetVariant(c, 0u);
-                else EmitX64CallTargetVariant(c, 1u);
+                EmitZydisCallTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_RET:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_BRIDGE_EXTENDED:
-                EmitKeyedAddSubCore(c, true, false, strategy);
+                // Shares EmitZydisControlTargetCore with BRANCH/BRANCH_IF/
+                // CALL_VM/RET: identical value/source-in-RAX/RDX keyed-add
+                // shape used here to resolve target=imageBase+decodedOperand
+                // before the marshal funclet. DeriveVariantRegisters supplies
+                // BRIDGE_EXTENDED's own liveness-derived roles [0]/[1]; this
+                // does not change BRANCH/BRANCH_IF/CALL_VM/RET's behavior.
+                EmitZydisControlTargetCore(c, true, strategy);
                 return true;
             case VM_UOP_INT3:
-                if (strategy == 0u) c.U8(0xCC);
-                else c.Raw({0xCD,0x03});
+                // INT3 takes no operands, so there is no register role to
+                // vary; the two K strategies are already the complete real
+                // dual-encoding (short INT3 vs. two-byte INT imm8) and the
+                // Zydis output is byte-identical to the previous hand-written
+                // form on both paths.
+                if (strategy == 0u)
+                    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_INT3, {});
+                else
+                    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_INT,
+                        {ZydisImmediateOperand(3u)});
                 return true;
             default:
                 return false;
@@ -3581,92 +5099,32 @@ bool EmitBusinessCoreVariant(
     }
 
     switch (semantic) {
-        case VM_UOP_PUSH_FLAGS: {
-            const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-            const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-            c.Raw({0x8D,0x97}); c.U32(CtxVirtualFlags + k0);
-            if (strategy != 0u) X86BinaryImmediate32(c, 0u, 2u, k1);
-            c.Raw({0x8B,0x82});
-            c.U32(0u - k0 - (strategy != 0u ? k1 : 0u));
+        case VM_UOP_PUSH_FLAGS:
+            EmitZydisContextLoadCore(
+                c, false, CtxVirtualFlags, strategy, false);
             return true;
-        }
         case VM_UOP_PUSH_IP:
-            EmitKeyedPushIpCore(c, false, strategy);
+            EmitZydisKeyedIpCore(c, false, strategy);
             return true;
         case VM_UOP_PUSH_IMAGE_BASE:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 3u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x97}); c.U32(CtxImageBase + k0);
-                X86BinaryImmediate32(c, 0u, 2u, k1);
-                X86BinaryImmediate32(c, 5u, 2u, k2);
-                X86BinaryImmediate32(c, 0u, 2u, k3);
-                c.Raw({0x8B,0x82});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisContextLoadCore(
+                c, false, CtxImageBase, strategy, true);
             return true;
         case VM_UOP_PUSH_VREG:
-            {
-                const std::array<uint32_t, 2> keys = {
-                    CoreKey32(c, strategy + 1u),
-                    CoreKey32(c, strategy + 5u)};
-                for (uint32_t key : keys)
-                    X86BinaryImmediate32(c, 6u, 0u, key);
-                c.Raw({0xD3,0xE8});
-                for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-                    X86MovImmediate(c, 2u, *it);
-                    c.Raw({0xD3,0xEA,0x31,0xD0});
-                }
-            }
+            EmitZydisPushVregCore(c, false, strategy);
             return true;
         case VM_UOP_PUSH_IMM:
-            {
-                const std::array<uint32_t, 2> keys = {
-                    CoreKey32(c, strategy + 2u),
-                    CoreKey32(c, strategy + 7u)};
-                for (uint32_t key : keys)
-                    X86BinaryImmediate32(c, 6u, 0u, key);
-                c.Raw({0x23,0x87}); c.U32(CtxMutationScratch);
-                for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
-                    X86MovImmediate(c, 2u, *it);
-                    c.Raw({0x23,0x97}); c.U32(CtxMutationScratch);
-                    c.Raw({0x31,0xD0});
-                }
-            }
+            EmitZydisPushImmCore(c, false, strategy);
             return true;
         case VM_UOP_POP_VREG:
             if (strategy == 0u) EmitX86PopVregVariant(c, 0u);
             else EmitX86PopVregVariant(c, 1u);
             return true;
         case VM_UOP_LOAD_TEMP:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
-                X86BinaryImmediate32(c, 0u, 2u, k1);
-                X86BinaryImmediate32(c, 5u, 2u, k2);
-                X86BinaryImmediate32(c, 0u, 2u, k3);
-                c.Raw({0x8B,0x82});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisTempCore(c, false, false, strategy);
             return true;
         case VM_UOP_STORE_TEMP:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 0u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 4u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxTemps + k0);
-                X86BinaryImmediate32(c, 0u, 2u, k1);
-                X86BinaryImmediate32(c, 5u, 2u, k2);
-                X86BinaryImmediate32(c, 0u, 2u, k3);
-                c.Raw({0x89,0x82});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisTempCore(c, false, true, strategy);
             return true;
         case VM_UOP_DUP:
             EmitKeyedCopyCore(c, false, strategy);
@@ -3680,21 +5138,7 @@ bool EmitBusinessCoreVariant(
         case VM_UOP_DROP:
             // ECX is the decremented value depth from X86RequireAndPop. Both
             // variants scrub the complete eight-byte physical VM stack slot.
-            {
-                const uint32_t key = CoreAddressKey(c, strategy + 3u);
-                // Value decoding may use ECX as a permutation scratch after
-                // X86RequireAndPop stored the decremented depth. Reload the
-                // authoritative depth before using it as the slot index.
-                X86LoadD(c, 1u, CtxValueDepth);
-                c.Raw({0x8D,0x94,0xCF}); c.U32(CtxValues + key);
-                if (strategy == 0u) {
-                    c.Raw({0x31,0xC0,0x89,0x82}); c.U32(0u - key);
-                    c.Raw({0x89,0x82}); c.U32(4u - key);
-                } else {
-                    c.Raw({0xC7,0x82}); c.U32(0u - key); c.U32(0u);
-                    c.Raw({0xC7,0x82}); c.U32(4u - key); c.U32(0u);
-                }
-            }
+            EmitZydisDropCore(c, false, strategy);
             return true;
         case VM_UOP_LOAD:
             if (strategy == 0u) EmitX86MemoryVariant(c, false, 0u);
@@ -3738,74 +5182,22 @@ bool EmitBusinessCoreVariant(
             EmitKeyedMultiplyCore(c, false, strategy);
             return true;
         case VM_UOP_BIT_TEST:
-            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
-            X86LoadByte(c, 2, CtxDecodedOperands);
-            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
-            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
-            if (strategy == 0u) {
-                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
-            } else {
-                // strategy 1: native BT — CF is the tested bit; the r/m
-                // operand (eax) is left unmodified by BT.
-                c.Raw({0x31,0xD2});
-                c.Raw({0x0F,0xA3,0xC8});
-                c.Raw({0x0F,0x92,0xC2});
-            }
-            X86StoreD(c, CtxMutationScratch + 4u, 2);
+            EmitZydisBitOperationCore(c, false, semantic, strategy);
             return true;
         case VM_UOP_BIT_SET:
-            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
-            X86LoadByte(c, 2, CtxDecodedOperands);
-            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
-            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
-            if (strategy == 0u) {
-                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
-                c.Raw({0xBE,0x01,0x00,0x00,0x00,0xD3,0xE6});
-                c.Raw({0x09,0xF0});
-            } else {
-                // strategy 1: native BTS sets the bit and reports the old
-                // value in CF in the same instruction.
-                c.Raw({0x31,0xD2});
-                c.Raw({0x0F,0xAB,0xC8});
-                c.Raw({0x0F,0x92,0xC2});
-            }
-            X86StoreD(c, CtxMutationScratch + 4u, 2);
+            EmitZydisBitOperationCore(c, false, semantic, strategy);
             return true;
         case VM_UOP_BIT_RESET:
-            X86LoadD(c, 1, RECORD_OFFSET(CtxLastAlu, b));
-            X86LoadByte(c, 2, CtxDecodedOperands);
-            c.Raw({0xC1,0xE2,0x03,0x4A,0x21,0xD1});
-            X86LoadD(c, 0, RECORD_OFFSET(CtxLastAlu, a));
-            if (strategy == 0u) {
-                c.Raw({0x89,0xC2,0xD3,0xEA,0x83,0xE2,0x01});
-                c.Raw({0xBE,0x01,0x00,0x00,0x00,0xD3,0xE6});
-                c.Raw({0xF7,0xD6,0x21,0xF0});
-            } else {
-                // strategy 1: native BTR resets the bit and reports the old
-                // value in CF in the same instruction.
-                c.Raw({0x31,0xD2});
-                c.Raw({0x0F,0xB3,0xC8});
-                c.Raw({0x0F,0x92,0xC2});
-            }
-            X86StoreD(c, CtxMutationScratch + 4u, 2);
+            EmitZydisBitOperationCore(c, false, semantic, strategy);
             return true;
         case VM_UOP_SHL: {
+            // The helper publishes CL before any seed-selected EDX overwrite.
             EmitKeyedLogicalShiftCore(c, false, false, strategy);
             return true;
-            // strategy 0: native SHL eax,cl.  strategy 1: SHLD eax,ebx(=0),cl ≡
-            //   SHL (zero source pulls zeroes into the top).  32-bit mode has no
-            //   8-byte operand, so every width (1/2/4) masks the count to 5
-            //   bits; a single `and cl,31` then one 32-bit shl/shld covers all
-            //   widths (operand zero-extended, outer `and eax,[scratch]` trims
-            //   to width).  Label-free so the validator's isolated re-emission
-            //   matches byte-for-byte.  ebx is free across EmitX86BinaryAlu.
         }
         case VM_UOP_SHR: {
             EmitKeyedLogicalShiftCore(c, false, true, strategy);
             return true;
-            // Same count pre-mask as SHL.
-            // strategy 0: native SHR eax,cl.  strategy 1: SHRD eax,ebx(=0),cl ≡
-            //   SHR (zero source pulls zeroes into the bottom).
         }
         case VM_UOP_SAR:
             if (strategy == 0u) EmitX86ShiftRotateVariant(c, semantic, 0u);
@@ -3842,9 +5234,26 @@ bool EmitBusinessCoreVariant(
             c.Raw({0x0F,0x92,0x87});              // keyed-add carry
             c.U32(CtxMutationScratch);
             if (strategy == 0u) {
-                // Keep K=0 byte-for-byte unchanged.  This is the control arm
-                // for the K=1 explicit-source diversification below.
-                c.Raw({0xF7,0xE1});
+                // K=0 keeps the EDX:EAX implicit result pair fixed but
+                // independently diversifies the explicit multiplier.  The
+                // memory plan uses a dedicated dword; +0 remains the keyed
+                // carry byte.  Every form is Encoder-only and fail-closed.
+                const uint8_t multiplier = c.registerAssignment[0];
+                const bool memorySource = c.registerAssignment[3] == 0u;
+                if (memorySource) {
+                    EmitZydisStore(c, false, 7u,
+                        static_cast<int32_t>(CtxMutationScratch + 4u),
+                        1u, 4u);
+                    EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MUL,
+                        {ZydisMemoryOperand(false, 7u,
+                            static_cast<int32_t>(
+                                CtxMutationScratch + 4u), 4u)});
+                } else {
+                    if (multiplier != 1u)
+                        EmitZydisMove(c, false, multiplier, 1u);
+                    EmitZydisUnary(
+                        c, false, ZYDIS_MNEMONIC_MUL, multiplier);
+                }
             } else {
                 const uint8_t multiplier = c.registerAssignment[0];
                 const bool memorySource = c.registerAssignment[3] == 0u;
@@ -3875,185 +5284,90 @@ bool EmitBusinessCoreVariant(
             return true;
         }
         case VM_UOP_SMUL_WIDE:
-            if (strategy == 0u) c.Raw({0xF7,0xE9});
-            else c.Raw({0x89,0xCB,0xF7,0xEB});
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_IMUL, strategy, 2u);
             return true;
-        case VM_UOP_UDIV_WIDE: {
-            // Spill the actual divisor through a seed-split effective address
-            // and make that memory operand the source of DIV.  Zero divisors
-            // and quotient overflow therefore still fault in the hardware DIV
-            // itself with the original EDX:EAX dividend.
-            const uint32_t key = CoreAddressKey(c, strategy + 4u);
-            const uint32_t slot = strategy == 0u ? 0u : 4u;
-            if (strategy == 0u) {
-                c.Raw({0x8D,0x9F}); c.U32(CtxMutationScratch + slot + key);
-                c.Raw({0x89,0x8B}); c.U32(0u - key);
-                c.Raw({0xF7,0xB3}); c.U32(0u - key);
-            } else {
-                c.Raw({0x8D,0xB7}); c.U32(CtxMutationScratch + slot + key);
-                c.Raw({0x89,0x8E}); c.U32(0u - key);
-                c.Raw({0xF7,0xB6}); c.U32(0u - key);
-            }
+        case VM_UOP_UDIV_WIDE:
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_DIV, strategy, 4u);
             return true;
-        }
         case VM_UOP_IDIV_WIDE:
-            if (strategy == 0u) c.Raw({0xF7,0xF9});
-            else c.Raw({0x89,0xCB,0xF7,0xFB});
+            EmitZydisWideOperandCore(
+                c, false, ZYDIS_MNEMONIC_IDIV, strategy, 6u);
             return true;
         case VM_UOP_FLAGS_LAZY:
             for (uint8_t field : coreOrder(static_cast<uint8_t>(
                     sizeof(VM_LAZY_FLAGS_RECORD) / 4u))) {
                 const uint32_t offset = static_cast<uint32_t>(field) * 4u;
-                EmitKeyedContextCopy(c, false,
+                EmitZydisKeyedContextCopy(c, false,
                     CtxLastAlu + offset, CtxPendingFlags + offset,
                     false, static_cast<size_t>(field) + strategy);
             }
             return true;
         case VM_UOP_FLAGS_MATERIALIZE:
-            {
-                const uint32_t k0 = CoreAddressKey(c, strategy + 1u);
-                const uint32_t k1 = CoreAddressKey(c, strategy + 5u);
-                const uint32_t k2 = CoreAddressKey(c, strategy + 6u);
-                const uint32_t k3 = CoreAddressKey(c, strategy + 7u);
-                c.Raw({0x8D,0x8F}); c.U32(CtxDecodedOperands + k0);
-                X86BinaryImmediate32(c, 0u, 1u, k1);
-                X86BinaryImmediate32(c, 5u, 1u, k2);
-                X86BinaryImmediate32(c, 0u, 1u, k3);
-                c.Raw({0x8B,0x91});
-                c.U32(0u - (k0 + k1 - k2 + k3));
-            }
+            EmitZydisFlagsMaterializeCore(c, false, strategy);
             return true;
         case VM_UOP_FLAGS_WRITE:
-            EmitKeyedFlagsWriteCore(c, false, strategy);
+            EmitZydisFlagsWriteCore(c, false, strategy);
             return true;
         case VM_UOP_FLAGS_UPDATE: {
-            const uint32_t modeKey = CoreAddressKey(c, strategy + 1u);
-            const uint32_t dataKey = CoreKey32(c, strategy + 5u);
-            const auto clear = c.NewLabel();
-            const auto set = c.NewLabel();
-            const auto done = c.NewLabel();
-            c.Raw({0x8D,0x89}); c.U32(modeKey);
-            c.Raw({0x81,0xF9});
-            c.U32(modeKey + VM_FLAG_UPDATE_CLEAR); c.Jcc(JccE, clear);
-            c.Raw({0x81,0xF9});
-            c.U32(modeKey + VM_FLAG_UPDATE_SET); c.Jcc(JccE, set);
-
-            X86BinaryImmediate32(c, 6u, 0u, dataKey);
-            if (strategy == 0u) {
-                c.Raw({0x31,0xD0});
-            } else {
-                X86MovRegister(c, 3u, 0u);
-                X86BinaryRegister(c, 0x21u, 3u, 2u);
-                X86BinaryRegister(c, 0x09u, 0u, 2u);
-                X86BinaryRegister(c, 0x29u, 0u, 3u);
-            }
-            X86BinaryImmediate32(c, 6u, 0u, dataKey);
-            c.Jmp(done);
-
-            c.Bind(clear);
-            X86BinaryImmediate32(c, 6u, 0u, dataKey);
-            if (strategy == 0u) {
-                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
-                X86BinaryRegister(c, 0x21u, 0u, 3u);
-            } else {
-                X86UnaryGroup(c, 2u, 0u);
-                X86BinaryRegister(c, 0x09u, 0u, 2u);
-                X86UnaryGroup(c, 2u, 0u);
-                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
-            }
-            X86MovImmediate(c, 1u, dataKey);
-            X86BinaryRegister(c, 0x21u, 1u, 3u);
-            X86BinaryRegister(c, 0x31u, 0u, 1u);
-            c.Jmp(done);
-
-            c.Bind(set);
-            X86BinaryImmediate32(c, 6u, 0u, dataKey);
-            if (strategy == 0u) {
-                X86BinaryRegister(c, 0x09u, 0u, 2u);
-                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
-            } else {
-                X86UnaryGroup(c, 2u, 0u);
-                X86MovRegister(c, 3u, 2u); X86UnaryGroup(c, 2u, 3u);
-                X86BinaryRegister(c, 0x21u, 0u, 3u);
-                X86UnaryGroup(c, 2u, 0u);
-            }
-            X86MovImmediate(c, 1u, dataKey);
-            X86BinaryRegister(c, 0x21u, 1u, 3u);
-            X86BinaryRegister(c, 0x31u, 0u, 1u);
-            c.Bind(done);
+            EmitZydisFlagsUpdateCore(c, false, strategy);
             return true;
         }
         case VM_UOP_FLAGS_PACK_AH: {
-            constexpr uint32_t packedMask = VM_FLAG_SF | VM_FLAG_ZF |
-                VM_FLAG_AF | VM_FLAG_PF | VM_FLAG_CF;
-            const uint32_t rawKey = CoreKey32(c, strategy + 2u);
-            uint32_t packedKey = CoreKey32(c, strategy + 6u) & packedMask;
-            if (packedKey == 0u)
-                packedKey = 1u << ((rawKey % 5u == 0u) ? 0u :
-                    (rawKey % 5u == 1u) ? 2u :
-                    (rawKey % 5u == 2u) ? 4u :
-                    (rawKey % 5u == 3u) ? 6u : 7u);
-            const uint8_t rotation = static_cast<uint8_t>(1u + rawKey % 31u);
-            const uint32_t rotatedMask = strategy == 0u
-                ? ((packedMask >> rotation) |
-                    (packedMask << (32u - rotation)))
-                : ((packedMask << rotation) |
-                    (packedMask >> (32u - rotation)));
-            c.Raw({0x89,0xD0});
-            X86BinaryImmediate32(c, 6u, 0u, packedKey);
-            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC8 : 0xC0),
-                rotation, 0x25});
-            c.U32(rotatedMask);
-            c.Raw({0xC1, static_cast<uint8_t>(strategy == 0u ? 0xC0 : 0xC8),
-                rotation});
-            X86BinaryImmediate32(c, 6u, 0u, packedKey);
-            c.Raw({0x83,0xC8,0x02});
+            EmitZydisFlagsPackAhCore(c, false, strategy);
             return true;
         }
         case VM_UOP_FLAGS_UNPACK_AH: {
-            // Uniform XOR conjugation commutes with the masked bit-select:
-            // status bits come from EAX, every other bit remains from EDX.
-            const uint32_t key = CoreKey32(c, strategy + 6u);
-            X86BinaryImmediate32(c, 6u, 0u, key);
-            X86BinaryImmediate32(c, 6u, 2u, key);
-            if (strategy == 0u) {
-                c.Raw({0x81,0xE2});
-                c.U32(~static_cast<uint32_t>(
-                    VM_FLAG_SF|VM_FLAG_ZF|VM_FLAG_AF|VM_FLAG_PF|VM_FLAG_CF));
-                c.Raw({0x25,0xD5,0x00,0x00,0x00,0x09,0xC2});
-            } else c.Raw({0x31,0xD0,0x25,0xD5,0x00,0x00,0x00,0x31,0xC2});
-            X86BinaryImmediate32(c, 6u, 2u, key);
+            EmitZydisFlagsUnpackAhCore(c, false, strategy);
             return true;
         }
         case VM_UOP_PUSH_CONDITION:
-            if (strategy == 0u) c.Raw({0x83,0xE0,0x01});
-            else c.Raw({0x85,0xC0,0x0F,0x95,0xC0,0x0F,0xB6,0xC0});
+            // The previous x86 form (AND eax,1 / TEST+SETNE) carried no
+            // build-seed-dependent bytes at all, unlike the x64 side's
+            // keyed add/sub+CMP+SETcc identity. Migrating to the same keyed
+            // formula as x64 (see EmitZydisPushConditionCore) both closes
+            // that diversity gap and lets x86 share the identical, already
+            // logically-reviewed transform instead of maintaining a second
+            // one.
+            EmitZydisPushConditionCore(c, false, strategy);
             return true;
         case VM_UOP_SELECT:
-            EmitKeyedSelectCore(c, false, strategy);
+            EmitZydisSelectCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_BRANCH_IF:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_CALL_VM:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_CALL_HOST:
-            if (strategy == 0u) EmitX86CallTargetVariant(c, 0u);
-            else EmitX86CallTargetVariant(c, 1u);
+            EmitZydisCallTargetCore(c, false, strategy);
             return true;
         case VM_UOP_RET:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_BRIDGE_EXTENDED:
-            EmitKeyedAddSubCore(c, false, false, strategy);
+            // See the x64 branch above: BRIDGE_EXTENDED was the last
+            // remaining caller of the legacy hand-written
+            // EmitKeyedAddSubCore helper; every other former user
+            // (BRANCH/BRANCH_IF/CALL_VM/RET/CALL_HOST) already migrated to
+            // this Zydis-based core, so EmitKeyedAddSubCore and its
+            // X64BinaryImmediate32 helper were removed as dead code once
+            // this call site switched too.
+            EmitZydisControlTargetCore(c, false, strategy);
             return true;
         case VM_UOP_INT3:
-            if (strategy == 0u) c.U8(0xCC);
-            else c.Raw({0xCD,0x03});
+            // See the x64 branch above: INT3 has no operands, so there is no
+            // register role to vary.
+            if (strategy == 0u)
+                EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_INT3, {});
+            else
+                EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_INT,
+                    {ZydisImmediateOperand(3u)});
             return true;
         default:
             return false;
@@ -4096,7 +5410,8 @@ bool ValidateBusinessCoreStrategyReemission(
         CodeBuffer code;
         ConfigurePermutationPlans(code, config);
         code.registerAssignment = DeriveVariantRegisters(
-            x64, config.variant, config.semantic, config.buildSeed);
+            x64, config.variant, config.semantic, config.buildSeed,
+            strategy);
         if (!EmitBusinessCoreVariant(code, x64, config.semantic, strategy)) {
             error = "business core strategy could not be re-emitted";
             return false;
@@ -5546,7 +6861,15 @@ void EmitX64WideMultiply(
 {
     X64RequireAndPop(c, 2, stackFailure); X64ValidateWidth(c, 0, widthFailure);
     X64MaskForWidthInR11(c); X64Binary(c, 0x21, 0, 9); X64Binary(c, 0x21, 2, 9);
-    X64Move(c, 8, 0); X64Move(c, 11, 2); X64Move(c, 9, 2);
+    // Pre-latch the original masked operands before width dispatch can reuse
+    // R11 or a seed-selected source form can reuse another volatile GPR. The
+    // old post-core R11 latch silently recorded the operand width as b; the
+    // split begin/finish lifetime also remains correct for signed narrow
+    // products whose explicit multiplier is sign-extended inside the branch.
+    X64ClearLastAlu(c);
+    X64StoreQ(c, RECORD_OFFSET(CtxLastAlu, a), 0);
+    X64StoreQ(c, RECORD_OFFSET(CtxLastAlu, b), 2);
+    X64Move(c, 8, 0); X64Move(c, 10, 2); X64Move(c, 9, 2);
     const WidthLabels width = MakeWidthLabels(c); const auto product = c.NewLabel();
     const auto split = c.NewLabel(); const auto finish = c.NewLabel();
     X64DispatchWidth(c, 0, width);
@@ -5575,7 +6898,7 @@ void EmitX64WideMultiply(
     c.Bind(product); c.Bind(split);
     c.Bind(finish);
     X64LoadByte(c, 1, CtxDecodedOperands);
-    X64Latch(c, 8, 11, 0, 2, 1); X64PushTwo(c, 0, 2, stackFailure);
+    X64FinishPrelatched(c, 0, 2, 1); X64PushTwo(c, 0, 2, stackFailure);
 }
 
 void EmitX64WideDivide(
@@ -6309,6 +7632,7 @@ void EmitX64CallHost(
     const auto guestSaved = c.NewLabel();
     const auto restoreHostFx = c.NewLabel();
     const auto hostRestored = c.NewLabel();
+    const auto hostModeReady = c.NewLabel();
     const auto materializerFailure = c.NewLabel();
     const auto leave = c.NewLabel();
     const auto leaveFlags = c.NewLabel();
@@ -6316,7 +7640,25 @@ void EmitX64CallHost(
     const auto finished = c.NewLabel();
 
     const size_t funcletBegin = c.bytes.size();
-    c.Raw({0x48,0x81,0xEC}); c.U32(kX64NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_SUB,
+        4u, 8u, kX64CallHostFrame.stackBytes);
+    const size_t allocationCodeOffset = c.bytes.size() - funcletBegin;
+    if (allocationCodeOffset != kX64CallHostFrame.stackAllocationCodeOffset)
+        c.FailEncoding("x64 CALL_HOST stack allocation disagrees with its frame plan");
+    // Keep phase initialization inside SizeOfProlog.  No UHANDLER is exposed
+    // while this slot still contains caller-stack data, closing the
+    // asynchronous-exception window immediately after SUB RSP.
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
+    const size_t emittedPrologSize = c.bytes.size() - funcletBegin;
+    if (emittedPrologSize != kX64CallHostFrame.prologSize)
+        c.FailEncoding("x64 CALL_HOST prolog disagrees with its frame plan");
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedModeSpill), 4u),
+         ZydisImmediateOperand(0u)});
     X64StoreStackQ(c, kNativeCallTargetSpill, 0);
     X64StoreStackQ(c, kNativeCallGuestStackSpill, 10);
     c.Raw({0x31,0xC0}); X64StoreStackQ(c, kNativeCallGuardSpill, 0);
@@ -6358,6 +7700,21 @@ void EmitX64CallHost(
     c.Jmp(hostSaved);
     c.Bind(saveHostFx); c.Raw({0x49,0x0F,0xAE,0x02});
     c.Bind(hostSaved);
+    // Arm phase-two unwind cleanup only after a complete host save.  Mode and
+    // phase live outside the maximum aligned XSAVE image and are part of the
+    // same shared frame plan consumed by the UHANDLER xdata builder.
+    X64LoadQ(c, 11, CtxExtendedState);
+    EmitZydisLoad(c, true, 0u, 11u,
+        static_cast<int32_t>(extendedFlags), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, hostModeReady);
+    EmitZydisMoveImmediate(c, true, 0u, 1u);
+    c.Bind(hostModeReady);
+    X64StoreStackD(c, kNativeCallHostExtendedModeSpill, 0u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(1u)});
 
     // Copy only the statically declared stack-argument window.  Byte loops
     // avoid clobbering RSI/RDI, which remain nonvolatile at every unwind point.
@@ -6439,6 +7796,10 @@ void EmitX64CallHost(
     c.Jmp(hostRestored);
     c.Bind(restoreHostFx); c.Raw({0x49,0x0F,0xAE,0x0A});
     c.Bind(hostRestored);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 4u,
+             static_cast<int32_t>(kNativeCallHostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
 
     c.Raw({0x4C,0x8D,0x94,0x24}); c.U32(kNativeCallArgumentBase);
     X64LoadStackQ(c, 11, kNativeCallGuestStackSpill);
@@ -6462,10 +7823,11 @@ void EmitX64CallHost(
     c.Bind(cfgFailure);
     c.Raw({0x41,0xBB,0x02,0x00,0x00,0x00});
     c.Bind(leave);
-    c.Raw({0x48,0x81,0xC4}); c.U32(kX64NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        4u, 8u, kX64CallHostFrame.stackBytes);
     RecordX64StackFunclet(c, funcletBegin,
         VMHandlerSemanticUnwindKind::StackAllocation,
-        kX64NativeCallStackBytes, kX64NativeCallPrologSize);
+        kX64CallHostFrame.stackBytes, kX64CallHostFrame.prologSize);
     c.Raw({0x45,0x85,0xDB}); c.Jcc(JccE, finished);
     c.Raw({0x41,0x83,0xFB,0x01}); c.Jcc(JccE, leaveFlags);
     c.Jmp(leaveNative);
@@ -6506,6 +7868,86 @@ void X86StoreMappedVregFromFrame(
     X86LoadFrameD(c, 0, frameDisplacement);
     X86StoreIndexedDVariant(c, CtxVregs, 1, 0);
     c.Raw({0xC7,0x84,0xCF}); c.U32(CtxVregs + 4u); c.U32(0);
+}
+
+void EmitX86CallHostSehRegistration(CodeBuffer& c) {
+    constexpr uint32_t kContextFlagsOffset = 0u;
+    constexpr uint32_t kContextExtendedRegistersOffset = 204u;
+    constexpr uint32_t kContextFloatingPointFlag = 0x08u;
+    constexpr uint32_t kContextExtendedRegistersFlag = 0x20u;
+    constexpr uint32_t kContextXStateFlag = 0x40u;
+    constexpr uint32_t kFxSaveBytes = 512u;
+    const auto setup = c.NewLabel();
+    const auto notUnwinding = c.NewLabel();
+    const auto restoreFx = c.NewLabel();
+    const auto restored = c.NewLabel();
+
+    // CALL skips over the inline handler; its return address is therefore the
+    // exact position-independent handler pointer stored in the registration
+    // record.  The handler participates only in phase-two unwind. Search
+    // phase must leave the guest exception context untouched so a continuable
+    // exception can resume correctly.
+    c.Call(setup);
+    if (c.hasCallHostSehHandler) {
+        c.FailEncoding("x86 CALL_HOST emitted more than one SEH handler");
+    } else {
+        c.callHostSehHandlerOffset = static_cast<uint32_t>(c.bytes.size());
+        c.hasCallHostSehHandler = true;
+    }
+    EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_ENDBR32, {});
+    c.Raw({0x8B,0x44,0x24,0x04});                 // eax = ExceptionRecord
+    c.Raw({0xF7,0x40,0x04}); c.U32(0x06u);       // UNWINDING | EXIT_UNWIND
+    c.Jcc(JccE, notUnwinding);
+    c.Raw({0x8B,0x54,0x24,0x08});                 // edx = registration record
+    c.Raw({0x81,0xEA}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0x83,0xBA}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U8(0x00);
+    c.Jcc(JccE, notUnwinding);
+    c.Raw({0x8B,0x8A}); c.U32(kX86NativeCallHostExtendedSpill);
+    c.Raw({0x83,0xBA}); c.U32(kX86NativeCallHostExtendedModeSpill); c.U8(0x00);
+    c.Jcc(JccE, restoreFx);
+    c.Raw({0xB8,0x07,0x00,0x00,0x00,0x31,0xD2,0x0F,0xAE,0x29});
+    c.Jmp(restored);
+    c.Bind(restoreFx);
+    c.Raw({0x0F,0xAE,0x09});                      // fxrstor [ecx]
+    c.Bind(restored);
+    // The dispatcher may later restore ContextRecord while transferring to an
+    // outer handler.  Publish the same host FXSAVE image there, select the
+    // ExtendedRegisters representation, and suppress both the stale FSAVE
+    // view and guest XSTATE image.  ESI/EDI are preserved across this handler
+    // call exactly as required by the Win32 ABI.
+    c.Raw({0x8B,0x54,0x24,0x08});
+    c.Raw({0x81,0xEA}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0xC7,0x82}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
+    c.Raw({0x56,0x57});                            // push esi; push edi
+    c.Raw({0x8B,0xB2}); c.U32(kX86NativeCallHostExtendedSpill);
+    c.Raw({0x8B,0x7C,0x24,0x14});                 // edi = ContextRecord
+    c.Raw({0x8B,0x87}); c.U32(kContextFlagsOffset);
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_AND,
+        0u, 4u, ~static_cast<uint64_t>(
+            kContextFloatingPointFlag | kContextXStateFlag));
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_OR,
+        0u, 4u, kContextExtendedRegistersFlag);
+    c.Raw({0x89,0x87}); c.U32(kContextFlagsOffset);
+    c.Raw({0x81,0xC7}); c.U32(kContextExtendedRegistersOffset);
+    EmitZydisSizedMoveImmediate(c, false, 1u, 4u,
+        kFxSaveBytes / sizeof(uint32_t));
+    c.Raw({0xFC,0xF3,0xA5});                      // cld; rep movsd
+    c.Raw({0x5F,0x5E});                            // pop edi; pop esi
+    c.Bind(notUnwinding);
+    c.Raw({0xB8,0x01,0x00,0x00,0x00,0xC3});      // ContinueSearch
+
+    c.Bind(setup);
+    c.U8(0x58);                                   // eax = inline handler
+    X86StoreFrameD(c, kX86NativeCallSehRecordSpill + 4u, 0u);
+    c.Raw({0x64,0xA1,0x00,0x00,0x00,0x00});      // eax = fs:[0]
+    X86StoreFrameD(c, kX86NativeCallSehRecordSpill, 0u);
+    c.Raw({0x8D,0x85}); c.U32(kX86NativeCallSehRecordSpill);
+    c.Raw({0x64,0xA3,0x00,0x00,0x00,0x00});      // fs:[0] = record
+}
+
+void RemoveX86CallHostSehRegistration(CodeBuffer& c) {
+    X86LoadFrameD(c, 0u, kX86NativeCallSehRecordSpill);
+    c.Raw({0x64,0xA3,0x00,0x00,0x00,0x00});
 }
 
 void EmitX86CallHost(
@@ -6566,6 +8008,7 @@ void EmitX86CallHost(
     const auto guestSaved = c.NewLabel();
     const auto restoreHostFx = c.NewLabel();
     const auto hostRestored = c.NewLabel();
+    const auto hostModeReady = c.NewLabel();
     const auto skipWriteback = c.NewLabel();
     const auto materializerFailure = c.NewLabel();
     const auto leave = c.NewLabel();
@@ -6573,15 +8016,19 @@ void EmitX86CallHost(
     const auto leaveNative = c.NewLabel();
     const auto finished = c.NewLabel();
 
-    c.Raw({0x81,0xEC}); c.U32(kX86NativeCallStackBytes);
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_SUB,
+        4u, 4u, kX86CallHostFrame.stackBytes);
     // Save the direct-threaded ABI and establish a frame base that every x86
     // calling convention in the explicit CALL_HOST contract must preserve.
     c.Raw({0x89,0xAC,0x24}); c.U32(kX86NativeCallOriginalEbpSpill);
     c.Raw({0x89,0xE5});
+    X86StoreFrameD(c, kX86NativeCallTargetSpill, 0);
     X86StoreFrameD(c, kX86NativeCallOriginalEbxSpill, 3);
     X86StoreFrameD(c, kX86NativeCallOriginalEsiSpill, 6);
     X86StoreFrameD(c, kX86NativeCallOriginalEdiSpill, 7);
-    X86StoreFrameD(c, kX86NativeCallTargetSpill, 0);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedModeSpill); c.U32(0u);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
+    EmitX86CallHostSehRegistration(c);
     X86LoadD(c, 0, CtxMutationScratch + 4u);
     X86StoreFrameD(c, kX86NativeCallGuestStackSpill, 0);
     c.Raw({0x31,0xC0});
@@ -6620,6 +8067,15 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
     c.Raw({0x0F,0xAE,0x00});
     c.Bind(hostSaved);
+    X86LoadD(c, 2, CtxExtendedState);
+    EmitZydisLoad(c, false, 0u, 2u,
+        static_cast<int32_t>(extendedFlags), 4u);
+    EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, hostModeReady);
+    EmitZydisMoveImmediate(c, false, 0u, 1u);
+    c.Bind(hostModeReady);
+    X86StoreFrameD(c, kX86NativeCallHostExtendedModeSpill, 0u);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(1u);
 
     // ESI/EDI are temporarily used only for the copy and are restored before
     // any external call, preserving the direct-threaded EBX/ESI/EDI contract.
@@ -6630,6 +8086,16 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
     X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
 
+    // GuardCF check is an ordinary external call and may legally clobber the
+    // floating/SIMD environment.  Run it while the handler host state is
+    // active, then restore the guest state immediately before the real
+    // target.  The old order exposed guard-clobbered state to the guest.
+    X86LoadFrameD(c, 0, kX86NativeCallGuardSpill);
+    c.Raw({0x85,0xC0}); c.Jcc(JccE, guardComplete);
+    X86LoadFrameD(c, 1, kX86NativeCallTargetSpill);
+    c.Raw({0xFF,0xD0});
+    c.Bind(guardComplete);
+
     X86LoadD(c, 0, CtxExtendedState);
     c.Raw({0x8B,0x88}); c.U32(extendedFlags);
     c.Raw({0x85,0xC9}); c.Jcc(JccE, restoreGuestFx);
@@ -6639,12 +8105,6 @@ void EmitX86CallHost(
     c.Bind(restoreGuestFx);
     X86LoadD(c, 0, CtxExtendedState); c.Raw({0x0F,0xAE,0x08});
     c.Bind(guestRestored);
-
-    X86LoadFrameD(c, 0, kX86NativeCallGuardSpill);
-    c.Raw({0x85,0xC0}); c.Jcc(JccE, guardComplete);
-    X86LoadFrameD(c, 1, kX86NativeCallTargetSpill);
-    c.Raw({0xFF,0xD0});
-    c.Bind(guardComplete);
 
     // Stage guest volatile inputs in locals so register-map lookups cannot
     // overwrite another input immediately before the native call.
@@ -6704,6 +8164,7 @@ void EmitX86CallHost(
     X86LoadFrameD(c, 0, kX86NativeCallHostExtendedSpill);
     c.Raw({0x0F,0xAE,0x08});
     c.Bind(hostRestored);
+    c.Raw({0xC7,0x85}); c.U32(kX86NativeCallHostExtendedPhaseSpill); c.U32(0u);
 
     X86LoadD(c, 1, CtxDecodedOperands + 16u);
     c.Raw({0x89,0xEE});
@@ -6732,12 +8193,15 @@ void EmitX86CallHost(
     c.Bind(cfgFailure);
     c.Raw({0xC7,0x85}); c.U32(kX86NativeCallStatusSpill); c.U32(2u);
     c.Bind(leave);
+    RemoveX86CallHostSehRegistration(c);
     X86LoadFrameD(c, 0, kX86NativeCallStatusSpill);
     X86LoadFrameD(c, 3, kX86NativeCallOriginalEbxSpill);
     X86LoadFrameD(c, 6, kX86NativeCallOriginalEsiSpill);
     X86LoadFrameD(c, 7, kX86NativeCallOriginalEdiSpill);
     X86LoadFrameD(c, 2, kX86NativeCallOriginalEbpSpill);
-    c.Raw({0x89,0xEC,0x89,0xD5,0x81,0xC4}); c.U32(kX86NativeCallStackBytes);
+    c.Raw({0x89,0xEC,0x89,0xD5});
+    EmitZydisSizedBinaryImmediate(c, false, ZYDIS_MNEMONIC_ADD,
+        4u, 4u, kX86CallHostFrame.stackBytes);
     c.Raw({0x85,0xC0}); c.Jcc(JccE, finished);
     c.Raw({0x83,0xF8,0x01}); c.Jcc(JccE, leaveFlags);
     c.Jmp(leaveNative);
@@ -6757,20 +8221,39 @@ void EmitX64BridgeExtended(
     constexpr uint32_t stateBase = kX64BridgeStateBase;
     constexpr uint32_t allocation = kX64BridgeStackBytes;
     (void)flagsFailure;
+    // Roles for the GPR-marshal funclet below only: [0]=value (the GPR
+    // being transferred to/from the on-stack state), [1]=index (the
+    // CtxRegisterMap family lookup destination), [2]=base (the
+    // CtxRegisterMap pointer, live across all 16 iterations of both
+    // loops). DeriveVariantRegisters documents why these may be any
+    // pairwise-distinct Win64-volatile GPRs.
+    const uint8_t val = c.registerAssignment[0];
+    const uint8_t ix = c.registerAssignment[1];
+    const uint8_t bp = c.registerAssignment[2];
     X64LoadD(c,0,CtxDecodedOperands+8u); c.Raw({0xA9}); c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);
     c.Jcc(JccNE,rangeFailure);
     X64LoadQ(c,0,CtxImageBase); X64LoadD(c,2,CtxDecodedOperands);
     EmitTrackedBusinessCoreVariant(c, true, VM_UOP_BRIDGE_EXTENDED,
         coreStrategy, coreVariantOffset, coreVariantSize);
     X64StoreQ(c,CtxMutationScratch,0);
-    X64LoadQ(c,11,CtxRegisterMap); c.Raw({0x4D,0x85,0xDB}); c.Jcc(JccE,rangeFailure);
+    X64LoadQ(c,bp,CtxRegisterMap);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, bp, bp, 8u);
+    c.Jcc(JccE,rangeFailure);
     const size_t funcletBegin = c.bytes.size();
     c.Raw({0x48,0x81,0xEC}); c.U32(allocation);
     for(uint8_t family=0;family<16;++family){
-        c.Raw({0x41,0x0F,0xB6,0x4B,family});
-        X64LoadIndexedQ(c,0,1,CtxVregs);
-        X64StoreStackQ(c,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u,0);
+        EmitZydisLoad(c, true, ix, bp, family, 1u);
+        X64LoadIndexedQ(c,val,ix,CtxVregs);
+        X64StoreStackQ(c,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u,val);
     }
+    // VM_INSTRUCTION_BRIDGE_STATE.rflags is seeded with the fixed
+    // architectural constant 0x00000202 (reserved bit 1 + IF), never from
+    // VM arithmetic/lazy-flags state -- kept as a literal c.Raw MOV/store
+    // pair (not parameterized by val) because
+    // tests/scripts/vm_kernel_static_gate.py's
+    // arithmetic_flags_bridge_closure_gate asserts this exact byte sequence
+    // as positive evidence that no VM flag state can leak into the bridged
+    // native instruction; see docs/zydis_encoder_pilot.md batch 16.
     c.Raw({0xB8,0x02,0x02,0x00,0x00});
     X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,rflags),0);
     X64LoadQ(c,0,CtxMutationScratch); X64StoreStackQ(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,target),0);
@@ -6781,10 +8264,11 @@ void EmitX64BridgeExtended(
     c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK}); X64StoreStackD(c,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
     X64LoadStackQ(c,0,stateBase+offsetof(VM_INSTRUCTION_BRIDGE_STATE,target));
     c.Raw({0x48,0x8D,0x8C,0x24}); c.U32(stateBase); c.Raw({0xFF,0xD0});
-    X64LoadQ(c,11,CtxRegisterMap);
+    X64LoadQ(c,bp,CtxRegisterMap);
     for(uint8_t family=0;family<16;++family){
-        X64LoadStackQ(c,0,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u);
-        c.Raw({0x41,0x0F,0xB6,0x4B,family}); X64StoreIndexedQ(c,CtxVregs,1,0);
+        X64LoadStackQ(c,val,stateBase+static_cast<uint32_t>(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr))+family*8u);
+        EmitZydisLoad(c, true, ix, bp, family, 1u);
+        X64StoreIndexedQ(c,CtxVregs,ix,val);
     }
     c.Raw({0x48,0x81,0xC4}); c.U32(allocation);
     RecordX64StackFunclet(c, funcletBegin,
@@ -6802,18 +8286,33 @@ void EmitX86BridgeExtended(
 {
     constexpr uint32_t allocation=sizeof(VM_INSTRUCTION_BRIDGE_STATE);
     (void)flagsFailure;
+    // Same three marshal-only roles as the x64 form above: [0]=value,
+    // [1]=index, [2]=base (CtxRegisterMap pointer).
+    const uint8_t val = c.registerAssignment[0];
+    const uint8_t ix = c.registerAssignment[1];
+    const uint8_t bp = c.registerAssignment[2];
     X86LoadD(c,0,CtxDecodedOperands+8u);c.Raw({0xA9});c.U32(~VM_MICRO_BRIDGE_KNOWN_MASK);c.Jcc(JccNE,rangeFailure);
     X86LoadD(c,0,CtxImageBase);X86LoadD(c,2,CtxDecodedOperands);
     EmitTrackedBusinessCoreVariant(c, false, VM_UOP_BRIDGE_EXTENDED,
         coreStrategy, coreVariantOffset, coreVariantSize);
     X86StoreD(c,CtxMutationScratch,0);
-    X86LoadD(c,2,CtxRegisterMap);c.Raw({0x85,0xD2});c.Jcc(JccE,rangeFailure);
+    X86LoadD(c,bp,CtxRegisterMap);
+    EmitZydisSizedBinary(c, false, ZYDIS_MNEMONIC_TEST, bp, bp, 4u);
+    c.Jcc(JccE,rangeFailure);
     c.Raw({0x81,0xEC});c.U32(allocation);
     for(uint8_t family=0;family<8;++family){
-        c.Raw({0x0F,0xB6,0x4A,family});X86LoadIndexedD(c,0,CtxVregs);
-        X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u,0);
-        c.Raw({0xC7,0x84,0x24});c.U32(offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u+4u);c.U32(0);
+        EmitZydisLoad(c, false, ix, bp, family, 1u);
+        X86LoadIndexedDVariant(c,val,ix,CtxVregs);
+        X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u,val);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(false, 4u /* ESP */, static_cast<int32_t>(
+                 offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u+4u), 4u),
+             ZydisImmediateOperand(0u)});
     }
+    // See the x64 form above: rflags stays a literal fixed-constant MOV/store
+    // pair, not parameterized by val, because the static gate's
+    // arithmetic_flags_bridge_closure_gate matches this exact byte sequence
+    // as evidence that VM flag state cannot reach the bridged instruction.
     c.Raw({0xB8,0x02,0x02,0x00,0x00});X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,rflags),0);
     X86LoadD(c,0,CtxMutationScratch);X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,target),0);
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,guardTarget),0);
@@ -6822,11 +8321,15 @@ void EmitX86BridgeExtended(
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,extendedStateFlags),2);c.Raw({0x83,0xE0,VM_MICRO_BRIDGE_HIDDEN_REGISTER_MASK});
     X86StoreStackD(c,offsetof(VM_INSTRUCTION_BRIDGE_STATE,hiddenRegister),0);
     X86LoadStackD(c,0,offsetof(VM_INSTRUCTION_BRIDGE_STATE,target));c.Raw({0x54,0xFF,0xD0,0x83,0xC4,0x04});
-    X86LoadD(c,2,CtxRegisterMap);
+    X86LoadD(c,bp,CtxRegisterMap);
     for(uint8_t family=0;family<8;++family){
-        X86LoadStackD(c,0,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u);
-        c.Raw({0x0F,0xB6,0x4A,family});X86StoreIndexedD(c,CtxVregs,0);
-        c.Raw({0xC7,0x84,0xCF});c.U32(CtxVregs+4u);c.U32(0);
+        X86LoadStackD(c,val,offsetof(VM_INSTRUCTION_BRIDGE_STATE,gpr)+family*8u);
+        EmitZydisLoad(c, false, ix, bp, family, 1u);
+        X86StoreIndexedDVariant(c,CtxVregs,ix,val);
+        EmitZydisInstruction(c, false, ZYDIS_MNEMONIC_MOV,
+            {ZydisMemoryOperand(false, 7u /* EDI: context */,
+                 static_cast<int32_t>(CtxVregs+4u), 4u, ix, 8u),
+             ZydisImmediateOperand(0u)});
     }
     c.Raw({0x81,0xC4});c.U32(allocation);
 }
@@ -6890,6 +8393,119 @@ void EmitX86SpecialSemantic(
 
 } // namespace
 
+bool GenerateVMHandlerX64CallHostUnwindHandler(
+    std::vector<uint8_t>& code,
+    std::string& error)
+{
+    constexpr uint32_t kContextFlagsOffset = 0x30u;
+    constexpr uint32_t kContextMxCsrOffset = 0x34u;
+    constexpr uint32_t kContextFltSaveOffset = 0x100u;
+    constexpr uint32_t kContextFloatingPointFlag = 0x08u;
+    constexpr uint32_t kContextXStateFlag = 0x40u;
+    constexpr uint32_t kFxSaveBytes = 512u;
+    // Zydis's XRSTOR operand definition declares a nominal 576-byte memory
+    // operand (the 512-byte legacy FXSAVE-compatible region plus the
+    // always-present 64-byte XSAVE header); this is a fixed encoder
+    // disambiguation value, not the full VM_XSAVE_AREA_SIZE reservation
+    // (which additionally covers AVX YMM state written/read at runtime
+    // according to XCR0/the requested feature mask in EDX:EAX, independent
+    // of this operand-size field). Verified against Zydis's own
+    // decode->request round trip for `xrstor [r10]`; FXRSTOR has no XSAVE
+    // header and keeps the plain 512-byte legacy size.
+    constexpr uint32_t kXsaveOperandBytes = 576u;
+
+    code.clear();
+    error.clear();
+    CodeBuffer c;
+    const auto notArmed = c.NewLabel();
+    const auto restoreFx = c.NewLabel();
+    const auto restored = c.NewLabel();
+    const auto copyLegacyState = c.NewLabel();
+    const auto finish = c.NewLabel();
+
+    // UNW_FLAG_UHANDLER ABI:
+    //   RCX = ExceptionRecord, RDX = EstablisherFrame,
+    //   R8  = dispatcher CONTEXT, R9 = DispatcherContext.
+    // Only volatile registers are borrowed.  R9 is repurposed as the stable
+    // frame base before XRSTOR consumes EDX as the high feature mask.
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_ENDBR64, {});
+    EmitZydisLoad(c, true, 0u, 2u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, notArmed);
+    EmitZydisMove(c, true, 9u, 2u);
+    EmitZydisLoad(c, true, 10u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedSpill), 8u);
+    EmitZydisLoad(c, true, 0u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedModeSpill), 4u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_TEST, 0u, 0u, 4u);
+    c.Jcc(JccE, restoreFx);
+    EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 7u);
+    EmitZydisSizedBinary(c, true, ZYDIS_MNEMONIC_XOR, 2u, 2u, 4u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_XRSTOR,
+        {ZydisMemoryOperand(true, 10u, 0, kXsaveOperandBytes)});
+    c.Jmp(restored);
+    c.Bind(restoreFx);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_FXRSTOR,
+        {ZydisMemoryOperand(true, 10u, 0, kFxSaveBytes)});
+    c.Bind(restored);
+
+    // A later RtlRestoreContext would otherwise reinstall the guest legacy
+    // FP/SIMD state captured at the fault.  Copy the architecturally defined
+    // 512-byte FXSAVE prefix into CONTEXT.FltSave and publish its MXCSR.
+    EmitZydisLea(c, true, 11u, 8u,
+        static_cast<int32_t>(kContextFltSaveOffset));
+    EmitZydisSizedMoveImmediate(c, true, 1u, 4u,
+        kFxSaveBytes / sizeof(uint64_t));
+    c.Bind(copyLegacyState);
+    EmitZydisLoad(c, true, 0u, 10u, 0, 8u);
+    EmitZydisStore(c, true, 11u, 0, 0u, 8u);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        10u, 8u, sizeof(uint64_t));
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_ADD,
+        11u, 8u, sizeof(uint64_t));
+    EmitZydisSizedUnary(c, true, ZYDIS_MNEMONIC_DEC, 1u, 4u);
+    c.Jcc(JccNE, copyLegacyState);
+
+    EmitZydisLoad(c, true, 10u, 9u,
+        static_cast<int32_t>(
+            kVMHandlerX64CallHostFramePlan.hostExtendedSpill), 8u);
+    EmitZydisLoad(c, true, 0u, 10u, 0x18, 4u);
+    EmitZydisStore(c, true, 8u,
+        static_cast<int32_t>(kContextMxCsrOffset), 0u, 4u);
+    // Clear CONTEXT_XSTATE so a later RtlRestoreContext cannot prefer a
+    // stale guest AVX/YMM XSTATE record over the host FltSave image just
+    // written above, and force-set CONTEXT_FLOATING_POINT so that image is
+    // guaranteed to be the one actually restored, independent of whatever
+    // the original faulting CONTEXT happened to declare.
+    EmitZydisLoad(c, true, 0u, 8u,
+        static_cast<int32_t>(kContextFlagsOffset), 4u);
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_AND,
+        0u, 4u, ~static_cast<uint64_t>(kContextXStateFlag));
+    EmitZydisSizedBinaryImmediate(c, true, ZYDIS_MNEMONIC_OR,
+        0u, 4u, kContextFloatingPointFlag);
+    EmitZydisStore(c, true, 8u,
+        static_cast<int32_t>(kContextFlagsOffset), 0u, 4u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_MOV,
+        {ZydisMemoryOperand(true, 9u,
+             static_cast<int32_t>(
+                 kVMHandlerX64CallHostFramePlan.hostExtendedPhaseSpill), 4u),
+         ZydisImmediateOperand(0u)});
+    c.Jmp(finish);
+
+    c.Bind(notArmed);
+    c.Bind(finish);
+    EmitZydisSizedMoveImmediate(c, true, 0u, 4u, 1u);
+    EmitZydisInstruction(c, true, ZYDIS_MNEMONIC_RET, {});
+
+    if (!c.Resolve(error)) return false;
+    code = std::move(c.bytes);
+    return true;
+}
+
 VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const VMHandlerSemanticCodegenConfig& config)
 {
@@ -6920,8 +8536,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
 
     CodeBuffer code;
     ConfigurePermutationPlans(code, config);
+    result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
     result.registerAssignment = DeriveVariantRegisters(
-        x64, config.variant, config.semantic, config.buildSeed);
+        x64, config.variant, config.semantic, config.buildSeed,
+        result.semanticCoreStrategy);
     code.registerAssignment = result.registerAssignment;
     result.variantPrefixOffset = static_cast<uint32_t>(code.bytes.size());
     result.variantPrefixSize = static_cast<uint32_t>(code.bytes.size()) -
@@ -6939,7 +8557,6 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const SemanticMutationPlan outputPlan = DeriveSemanticMutationPlan(
         config, 0x4F55545055545041ULL);
     result.semanticInputStrategy = inputPlan.strategy;
-    result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
     result.semanticResultStrategy = outputPlan.strategy;
     result.semanticInputPathOffset = static_cast<uint32_t>(code.bytes.size());
     result.semanticInputPathSize = static_cast<uint32_t>(code.bytes.size()) -
@@ -7185,6 +8802,8 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     result.stackPushes = descriptor->stackPushes;
     result.decodedOperandCount = descriptor->operandCount;
     result.stackFunclets = std::move(code.stackFunclets);
+    result.callHostSehHandlerOffset = code.callHostSehHandlerOffset;
+    result.hasCallHostSehHandler = code.hasCallHostSehHandler;
     result.valueCodecRanges.reserve(code.valueCodecRanges.size());
     for (const auto& range : code.valueCodecRanges)
         result.valueCodecRanges.push_back({range.first, range.second});
@@ -7258,8 +8877,10 @@ bool ValidateVMHandlerSemanticVariantKernel(
         error = "semantic input/core/result evidence is outside semanticBody";
         return false;
     }
+    const uint8_t expectedCoreStrategy = DeriveBusinessCoreStrategy(config);
     const std::array<uint8_t, 4> expectedRegisters = DeriveVariantRegisters(
-        x64, config.variant, config.semantic, config.buildSeed);
+        x64, config.variant, config.semantic, config.buildSeed,
+        expectedCoreStrategy);
     if (result.registerAssignment != expectedRegisters) {
         error = "published register allocation does not match variant/seed";
         return false;
@@ -7276,12 +8897,52 @@ bool ValidateVMHandlerSemanticVariantKernel(
              config.semantic == VM_UOP_STORE);
         const bool x86UmulWideContract = !x64 &&
             config.semantic == VM_UOP_UMUL_WIDE;
+        const bool x86MultiplyContract = !x64 &&
+            config.semantic == VM_UOP_MUL;
+        const bool x86SizedAluContract = !x64 &&
+            (config.semantic == VM_UOP_BSWAP ||
+             config.semantic == VM_UOP_ZERO_EXTEND ||
+             config.semantic == VM_UOP_SIGN_EXTEND);
+        const bool shiftContract = config.semantic == VM_UOP_SHL ||
+            config.semantic == VM_UOP_SHR || config.semantic == VM_UOP_SAR ||
+            config.semantic == VM_UOP_ROL || config.semantic == VM_UOP_ROR;
+        const bool x86RotateStackContract = !x64 &&
+            config.semantic == VM_UOP_ROT;
+        const bool x86CarryContract = !x64 &&
+            (config.semantic == VM_UOP_ADD_CARRY ||
+             config.semantic == VM_UOP_SUB_BORROW);
+        const bool x86BitContract = !x64 &&
+            (config.semantic == VM_UOP_BIT_TEST ||
+             config.semantic == VM_UOP_BIT_SET ||
+             config.semantic == VM_UOP_BIT_RESET);
+        const bool x86WideOperandContract = !x64 &&
+            (config.semantic == VM_UOP_SMUL_WIDE ||
+             config.semantic == VM_UOP_UDIV_WIDE ||
+             config.semantic == VM_UOP_IDIV_WIDE);
+        const bool x86FlagsMutationContract = !x64 &&
+            (config.semantic == VM_UOP_FLAGS_WRITE ||
+             config.semantic == VM_UOP_FLAGS_UPDATE);
+        const bool x86PopVregContract = !x64 &&
+            config.semantic == VM_UOP_POP_VREG;
+        const bool x86SelectContract = !x64 &&
+            config.semantic == VM_UOP_SELECT;
         const bool valid = x64
             ? (reg == 0 || reg == 1 || reg == 2 ||
-               reg == 8 || reg == 9 || reg == 10 || reg == 11)
-            : (reg <= 2 || (x86MemoryContract &&
+               reg == 8 || reg == 9 || reg == 10 || reg == 11 ||
+               (shiftContract && (reg == 12 || reg == 13)))
+             : (reg <= 2 || (x86MemoryContract &&
                 (reg == 3 || reg == 6)) ||
-                (x86UmulWideContract && (reg == 3 || reg == 6)));
+                (x86MultiplyContract && reg == 3) ||
+                (x86SizedAluContract && reg == 3) ||
+                (shiftContract && reg == 3) ||
+                (x86RotateStackContract && reg == 3) ||
+                (x86CarryContract && reg == 3) ||
+                (x86BitContract && (reg == 3 || reg == 6)) ||
+                (x86UmulWideContract && (reg == 3 || reg == 6)) ||
+                (x86WideOperandContract && (reg == 3 || reg == 6)) ||
+                (x86FlagsMutationContract && reg == 3) ||
+                (x86PopVregContract && (reg == 3 || reg == 6)) ||
+                (x86SelectContract && reg == 3));
         if (!valid) {
             error = "variant register allocation violates its liveness contract";
             return false;
@@ -7291,6 +8952,21 @@ bool ValidateVMHandlerSemanticVariantKernel(
     const VMOpcodeDescriptor* descriptor = VMSchema::Lookup(config.semantic);
     if (!descriptor) {
         error = "semantic data-path descriptor is missing";
+        return false;
+    }
+    const bool expectsCallHostSeh = !x64 && config.semantic == VM_UOP_CALL_HOST;
+    constexpr std::array<uint8_t, 4> kEndbr32 = {0xF3,0x0F,0x1E,0xFB};
+    if (result.hasCallHostSehHandler != expectsCallHostSeh ||
+        (!expectsCallHostSeh && result.callHostSehHandlerOffset != 0u) ||
+        (expectsCallHostSeh &&
+         (!rangeValid(result.callHostSehHandlerOffset,
+              static_cast<uint32_t>(kEndbr32.size())) ||
+          !rangeInside(result.semanticCoreOffset, result.semanticCoreSize,
+              result.callHostSehHandlerOffset,
+              static_cast<uint32_t>(kEndbr32.size())) ||
+          !std::equal(kEndbr32.begin(), kEndbr32.end(),
+              result.code.begin() + result.callHostSehHandlerOffset)))) {
+        error = "x86 CALL_HOST SEH handler metadata is missing or non-canonical";
         return false;
     }
     VMHandlerSemanticStackFunclet expectedFunclet{};
@@ -7348,12 +9024,28 @@ bool ValidateVMHandlerSemanticVariantKernel(
         } else if (funclet.kind ==
                        VMHandlerSemanticUnwindKind::StackAllocation &&
                    funclet.stackBytes == kX64NativeCallStackBytes) {
-            constexpr std::array<uint8_t, 7> prolog = {
-                0x48,0x81,0xEC,0x08,0x06,0x00,0x00
-            };
-            constexpr std::array<uint8_t, 7> epilog = {
-                0x48,0x81,0xC4,0x08,0x06,0x00,0x00
-            };
+            const uint32_t stackBytes = kX64CallHostFrame.stackBytes;
+            const uint32_t phase = kX64CallHostFrame.hostExtendedPhaseSpill;
+            const std::array<uint8_t, 18> prolog = {{
+                0x48,0x81,0xEC,
+                static_cast<uint8_t>(stackBytes),
+                static_cast<uint8_t>(stackBytes >> 8u),
+                static_cast<uint8_t>(stackBytes >> 16u),
+                static_cast<uint8_t>(stackBytes >> 24u),
+                0xC7,0x84,0x24,
+                static_cast<uint8_t>(phase),
+                static_cast<uint8_t>(phase >> 8u),
+                static_cast<uint8_t>(phase >> 16u),
+                static_cast<uint8_t>(phase >> 24u),
+                0x00,0x00,0x00,0x00
+            }};
+            const std::array<uint8_t, 7> epilog = {{
+                0x48,0x81,0xC4,
+                static_cast<uint8_t>(stackBytes),
+                static_cast<uint8_t>(stackBytes >> 8u),
+                static_cast<uint8_t>(stackBytes >> 16u),
+                static_cast<uint8_t>(stackBytes >> 24u)
+            }};
             constexpr std::array<uint8_t, 2> call = {0xFF,0xD0};
             if (funclet.size < prolog.size() + epilog.size() + call.size() ||
                 !std::equal(prolog.begin(), prolog.end(), begin) ||
@@ -7381,7 +9073,6 @@ bool ValidateVMHandlerSemanticVariantKernel(
         config, 0x494E505554504154ULL);
     const SemanticMutationPlan expectedOutputPlan = DeriveSemanticMutationPlan(
         config, 0x4F55545055545041ULL);
-    const uint8_t expectedCoreStrategy = DeriveBusinessCoreStrategy(config);
     if (result.semanticInputStrategy != expectedInputPlan.strategy ||
         result.semanticCoreStrategy != expectedCoreStrategy ||
         result.semanticResultStrategy != expectedOutputPlan.strategy) {

@@ -158,15 +158,19 @@ struct AntiDebugConfigFile {
     bool threadHiding;
     bool kernelDebuggerCheck;
 
+    // CipherShell Plus（反调试）尚未被任何 transform 消费——main.cpp 目前
+    // 对这些开关 fail-closed 拒绝而不是静默打出一个"看起来开了其实没生效"的
+    // 产物，所以默认必须是 false。等真正实现后再把默认值和 main.cpp 的拒绝
+    // 逻辑一起换成 applied。
     AntiDebugConfigFile() :
-        timingChecks(true),
-        hardwareBPDetection(true),
-        softwareBPDetection(true),
-        memoryIntegrity(true),
+        timingChecks(false),
+        hardwareBPDetection(false),
+        softwareBPDetection(false),
+        memoryIntegrity(false),
         debuggerWindowScan(false),
-        parentProcessCheck(true),
-        threadHiding(true),
-        kernelDebuggerCheck(true) {}
+        parentProcessCheck(false),
+        threadHiding(false),
+        kernelDebuggerCheck(false) {}
 };
 
 struct AntiDumpConfig {
@@ -174,10 +178,11 @@ struct AntiDumpConfig {
     bool sectionPermissionGuard;
     bool nanomitePatches;
 
+    // 同上：CipherShell Plus（反 Dump/nanomite）尚未接入，默认必须是 false。
     AntiDumpConfig() :
-        erasePEHeader(true),
-        sectionPermissionGuard(true),
-        nanomitePatches(true) {}
+        erasePEHeader(false),
+        sectionPermissionGuard(false),
+        nanomitePatches(false) {}
 };
 
 struct PerformanceConfig {

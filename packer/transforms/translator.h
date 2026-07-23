@@ -278,6 +278,29 @@ public:
     void SetRegisterMap(const std::unordered_map<uint8_t, uint8_t>& registerMap);
     const std::vector<TranslationFailure>& GetLastFailures() const;
 
+    // Reproduces LowerExtendedBridge's own hidden-register candidate scan
+    // (used-register set from the instruction's operands, then first free
+    // entry in the machine-mode candidate list) as a standalone, callable
+    // function. Exists so callers that need the exact register the
+    // production translator would pick for a given bridged instruction --
+    // tests included -- call the real selection logic instead of
+    // re-deriving or hand-picking a value that happens to dodge whatever bug
+    // is being tested. Returns 0xFF if no candidate is free, matching
+    // LowerExtendedBridge's own failure case. See
+    // docs/zydis_encoder_pilot.md batch 18.
+    static uint8_t SelectBridgeHiddenRegister(const InstructionIR& instruction);
+
+    // Reproduces LowerExtendedBridge's own x87/AVX classification of a
+    // bridged instruction (the same `x87`/`avx` locals it derives before
+    // ever constructing a VMBridgeRequest) as a standalone, callable
+    // function, so a caller that already has an InstructionIR -- including
+    // VMInstructionBridgeBuilder::Build itself, independently verifying a
+    // caller-supplied VMBridgeRequest.usesAvx/usesX87 rather than trusting
+    // it -- gets the exact same classification the production translator
+    // would have produced. See docs/zydis_encoder_pilot.md batch 19.
+    static void ClassifyBridgeExtendedState(
+        const InstructionIR& instruction, bool& usesX87, bool& usesAvx);
+
 private:
     struct BranchFixup {
         size_t microOpIndex = 0;

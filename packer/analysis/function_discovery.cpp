@@ -351,6 +351,16 @@ FunctionDiscoveryResult FunctionDiscovery::Discover(
                 result.issues.push_back({entry.beginAddress, disassembler.GetLastError()});
                 continue;
             }
+            // Mirrors the same rule applied to the recursive/heuristic path below:
+            // a .pdata-declared range can still contain bytes the worklist walk
+            // never reached (an inline jump table, padding, or a second entry
+            // point). Any such gap must reject the candidate rather than let a
+            // downstream patcher destroy unverified bytes as if they were code.
+            if (function.decodedBytes != function.size) {
+                result.issues.push_back({entry.beginAddress,
+                    "pdata-bounded function range contains undecoded gaps and is not safe to destroy"});
+                continue;
+            }
             function.boundaryTrusted = true;
             function.discoverySource = "pdata";
             result.functions.push_back(std::move(function));

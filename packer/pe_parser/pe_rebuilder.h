@@ -111,20 +111,8 @@ public:
     bool SetEntryPoint(CS_PE_IMAGE* image, DWORD newEntryPoint);
 
 private:
-    // 重建各个组件
-    bool RebuildHeaders(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config);
-    bool RebuildSections(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config);
-    bool RebuildOverlay(BYTE* output, CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config);
-
     // 辅助函数
-    DWORD AlignValue(DWORD value, DWORD alignment);
     void GenerateRandomName(char* name, DWORD length);
-    DWORD CalculateChecksum(BYTE* data, DWORD size);
-    bool UpdateChecksum(BYTE* peData, DWORD actualFileSize);
-
-    // 随机数生成
-    DWORD GenerateRandomDWORD();
-    BYTE GenerateRandomBYTE();
 };
 
 } // namespace CipherShell

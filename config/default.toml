@@ -66,20 +66,23 @@ target_functions = []
 enabled = false
 strength = 50
 
+# CipherShell Plus：anti_debug/anti_dump 尚未被任何 transform 消费，main.cpp
+# 会对这里任何一项 true 都 fail-closed 拒绝出包，而不是静默打出一个反调试/反
+# Dump 其实完全没生效的产物。默认必须全部保持 false；正式实现前不要打开。
 [anti_debug]
-timing_checks = true
-hardware_bp_detection = true
-software_bp_detection = true
-memory_integrity = true
+timing_checks = false
+hardware_bp_detection = false
+software_bp_detection = false
+memory_integrity = false
 debugger_window_scan = false
-parent_process_check = true
-thread_hiding = true
-kernel_debugger_check = true
+parent_process_check = false
+thread_hiding = false
+kernel_debugger_check = false
 
 [anti_dump]
-erase_pe_header = true
-section_permission_guard = true
-nanomite_patches = true
+erase_pe_header = false
+section_permission_guard = false
+nanomite_patches = false
 
 [performance]
 auto_hotspot_analysis = true

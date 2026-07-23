@@ -1270,6 +1270,7 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     const char sectionName[8],
     const char unwindSectionName[8],
     const char relocationSectionName[8],
+    const char safeSehSectionName[8],
     const VMRuntimeTraceBinding* traceBinding)
 {
     VMRuntimeBuildResult result{};
@@ -1747,6 +1748,46 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
         return result;
     }
     std::copy(runtime.bytes.begin(), runtime.bytes.end(), blob.begin());
+    // The CALL_HOST UNW_FLAG_UHANDLER thunk (x64) and every inline SafeSEH
+    // registration handler (x86) are embedded inside the synthesized image at
+    // a placeholder *offset*.  Rebase them by this runtime's actual section
+    // RVA exactly once, here, before the blob is committed to the image so
+    // every later digest/verification path observes the final value.
+    if (image->is64Bit) {
+        if (synthesized.imageRvaPatchOffsets.size() != 1u ||
+            synthesized.callHostUnwindHandlerOffset == 0 ||
+            synthesized.callHostUnwindHandlerOffset >= runtime.bytes.size()) {
+            result.error = "VM_RUNTIME: x64 CALL_HOST unwind-handler RVA patch metadata is invalid";
+            return result;
+        }
+        const uint32_t patchOffset = synthesized.imageRvaPatchOffsets[0];
+        if (!RangeValid(patchOffset, sizeof(uint32_t), blob.size())) {
+            result.error = "VM_RUNTIME: x64 CALL_HOST unwind-handler RVA patch is outside the emitted section";
+            return result;
+        }
+        if (synthesized.callHostUnwindHandlerOffset >
+                (std::numeric_limits<uint32_t>::max)() - appended.rva) {
+            result.error = "VM_RUNTIME: x64 CALL_HOST unwind-handler RVA overflows";
+            return result;
+        }
+        const uint32_t finalHandlerRVA = appended.rva + synthesized.callHostUnwindHandlerOffset;
+        std::memcpy(blob.data() + patchOffset, &finalHandlerRVA, sizeof(finalHandlerRVA));
+        result.callHostUnwindHandlerRVA = finalHandlerRVA;
+    } else {
+        if (!synthesized.imageRvaPatchOffsets.empty()) {
+            result.error = "VM_RUNTIME: x86 runtime unexpectedly declares x64 unwind-handler RVA metadata";
+            return result;
+        }
+        result.safeSehHandlerRVAs.reserve(synthesized.safeSehHandlerOffsets.size());
+        for (uint32_t offset : synthesized.safeSehHandlerOffsets) {
+            if (offset >= runtime.bytes.size() ||
+                offset > (std::numeric_limits<uint32_t>::max)() - appended.rva) {
+                result.error = "VM_RUNTIME: x86 CALL_HOST SafeSEH handler offset is invalid";
+                return result;
+            }
+            result.safeSehHandlerRVAs.push_back(appended.rva + offset);
+        }
+    }
     for (const auto& patch : imageBasePatches) {
         if (!RangeValid(patch.immediateOffset, sizeof(uint32_t), blob.size()) ||
             patch.anchorOffset > (std::numeric_limits<uint32_t>::max)() - appended.rva) {
@@ -1830,6 +1871,20 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
             result.error = "VM_RUNTIME: unable to rebuild x64 exception directory: " + result.error;
             return result;
         }
+    } else if (!result.safeSehHandlerRVAs.empty()) {
+        if (!safeSehSectionName) {
+            result.error = "VM_RUNTIME: x86 SafeSEH section name is missing";
+            return result;
+        }
+        // A no-op success (target had no pre-existing SafeSEH contract) and a
+        // real merge both report success here; safeSehMerged only records
+        // that this step ran without a fail-closed rejection.
+        if (!emitter.RebuildSafeSEHHandlerTable(result.safeSehHandlerRVAs,
+                safeSehSectionName, nullptr, &result.error)) {
+            result.error = "VM_RUNTIME: unable to merge x86 SafeSEH handler table: " + result.error;
+            return result;
+        }
+        result.safeSehMerged = true;
     }
 
     result.sectionRawOffset = image->sections[appended.sectionIndex].PointerToRawData;
