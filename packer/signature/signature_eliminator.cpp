@@ -3,12 +3,21 @@
  */
 
 #include "signature_eliminator.h"
-#include <bcrypt.h>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <sstream>
+// 与 protection_build_context.cpp / section_encryptor.cpp / string_encryptor.cpp /
+// vm_section_emitter.cpp 统一：BCryptGenRandom 是 Windows-only API，非 Windows
+// 平台改用 std::random_device，不能无条件 #include <bcrypt.h>（该头文件在非
+// Windows 平台根本不存在，会导致整个目标编译失败）。
+#ifdef _WIN32
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <random>
+#endif
 
 namespace CipherShell {
 
@@ -350,10 +359,21 @@ bool SignatureEliminator::GenerateRandomName(char* name, DWORD length) {
     // BUG 18 修复：生成随机名称后自检，确保不匹配已知签名
     const int maxRetries = 10;
     for (int retry = 0; retry < maxRetries; retry++) {
+#ifdef _WIN32
         if (BCryptGenRandom(nullptr, entropy.data(), static_cast<ULONG>(length),
                 BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
             return false;
         }
+#else
+        try {
+            std::random_device source;
+            for (DWORD i = 0; i < length; i++) {
+                entropy[i] = static_cast<BYTE>(source());
+            }
+        } catch (...) {
+            return false;
+        }
+#endif
         for (DWORD i = 0; i < length; i++) {
             name[i] = charset[entropy[i] % charsetSize];
         }

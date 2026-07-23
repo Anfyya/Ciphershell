@@ -294,3 +294,17 @@ if (function.decodedBytes != function.size) {
 | 工程诚信 / fail-closed 合规度 | 6/10 | **8/10** | 本次审计里唯一违反"不静默伪造功能完成"红线的问题（2.1）已经关闭；`EliminateSignatures` 不再吞错误；`PEEmitter` 单一入口原则在三处活代码/近活代码路径上恢复。留在 6→8 而不是拉满：`section_encryptor.cpp`/`string_encryptor.cpp` 内部仍有自创弱加密算法的历史记录（3.5/附录 A，虽然功能本身被 fail-closed，不影响当前产物），且 anti_debug/anti_dump 真正实现前，"配置字段存在但功能不存在"这个状态本身仍然要求使用者读文档/看拒绝信息才能明白，不是自解释的。
 
 **结论不变，但更精确了**：第 6 章"你现在拥有一台调校得相当认真的 VM 保护引擎，但还没有一辆能开上路的车"这句话依然成立。本轮做的事情相当于——给这辆还没装完的车贴上了准确的仪表盘（不该亮的灯不再亮），但没有多装一个零件。VMProtect 版本对标不变：核心虚拟化技术大致相当于 VMProtect 2.x 中后期水准，但作为今天就能保护真实商业软件的完整产品，实际到手的保护强度仍然低于 VMProtect 1.x——这一点在反调试/反 Dump 真正实现之前不会改变。
+
+---
+
+## 8. 第二轮修复引入的回归（用户自行发现，本报告原未记录）
+
+**问题**：第 4.2 节的修复（`signature_eliminator.cpp` 的 `GenerateRandomName` 从 `rand()` 换成 `BCryptGenRandom`）当时只关注了"随机源够不够强"，没有注意到项目对 Windows-only API 有一条已经用两轮修复才建立起来的强制约定：任何 `BCryptGenRandom`/`<bcrypt.h>` 之类的 Windows-only 依赖，都必须用 `#ifdef _WIN32` 隔离，非 Windows 分支用 `std::random_device` 提供等价实现，而不是无条件 `#include <bcrypt.h>`。当时的修复漏掉了这一步，导致非 Windows 编译（`CMakeLists.txt` 第 49-52 行注释明确写着"GCC/Clang — 用于 Linux 编译验证"，`packer` 子目录本身也是无条件 `add_subdirectory`，不受 `WIN32` 门槛限制）重新失败。这是用户自己发现的问题，本报告此前没有记录，特此补上。
+
+**根因确认**：全仓库 grep `BCryptGenRandom`/`<bcrypt.h>` 命中 5 个文件。其中 4 个（`protection_build_context.cpp`、`section_encryptor.cpp`、`string_encryptor.cpp`、`vm_section_emitter.cpp`）都已经是正确写法——`#ifdef _WIN32 / #include <bcrypt.h> + 真实调用 / #else / #include <random> + std::random_device 调用 / #endif`，在 include 和调用点两处都做了平台隔离。只有 `signature_eliminator.cpp`（本次审计第 4.2 节改的那处）是唯一一个只加了 Windows 分支、没加对应 `#else` 分支的文件。
+
+**修复**：完全比照另外 4 个文件已经验证过的写法：
+1. `#include <bcrypt.h>` 改为 `#ifdef _WIN32 / #include <bcrypt.h> + #pragma comment(lib, "bcrypt.lib") / #else / #include <random> / #endif`。
+2. `GenerateRandomName` 内部生成熵的那一步，改为 `#ifdef _WIN32` 分支走 `BCryptGenRandom`（失败即 `return false`），`#else` 分支用 `std::random_device`（构造失败可能抛异常，`try/catch` 后 `return false`，与另外 4 个文件的异常处理方式一致）填充同一个 `entropy` 缓冲区，再走原有的字符集映射与签名自检逻辑。
+
+**验证**：`ciphershell_packer.vcxproj`/`ciphershell.vcxproj` 在 x64 Release、`/W4 /WX` 下增量编译零警告零错误；`test_fail_closed.exe` 退出码 0。**未能验证的部分，如实说明**：本次运行环境是原生 Windows（PowerShell/Git-Bash），没有可用的 Linux/交叉编译工具链（无 WSL、无 g++/clang 目标），无法在本次会话里实际跑一遍 `cmake --build build_linux` 来端到端复现"之前确实编译失败、现在确实编译成功"。修复方式是逐字符比对另外 4 个已经在用、大概率已被验证过的同类实现得出的，不是猜测，但建议你在自己的 Linux/WSL 环境里跑一次 `build_linux` 确认。
