@@ -100,7 +100,7 @@ private:
     // 辅助函数
     bool PatternMatch(const BYTE* data, DWORD size, const BYTE* pattern, DWORD patternSize);
     DWORD GenerateRandomDWORD();
-    void GenerateRandomName(char* name, DWORD length);
+    bool GenerateRandomName(char* name, DWORD length);
 
     // BUG 17 修复：支持从外部配置文件加载签名数据库
 public:

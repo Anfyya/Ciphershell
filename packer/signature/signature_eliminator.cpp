@@ -3,6 +3,7 @@
  */
 
 #include "signature_eliminator.h"
+#include <bcrypt.h>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -245,7 +246,9 @@ bool SignatureEliminator::RandomizeSectionNames(CS_PE_IMAGE* image) {
 
         // 生成随机名称
         char newName[8];
-        GenerateRandomName(newName, 8);
+        if (!GenerateRandomName(newName, 8)) {
+            return false;
+        }
         memcpy(image->sections[i].Name, newName, 8);
     }
 
@@ -325,23 +328,34 @@ DWORD SignatureEliminator::GenerateRandomDWORD() {
     return ((DWORD)rand() << 16) | (DWORD)rand();
 }
 
-void SignatureEliminator::GenerateRandomName(char* name, DWORD length) {
+bool SignatureEliminator::GenerateRandomName(char* name, DWORD length) {
     const char charset[] = "abcdefghijklmnopqrstuvwxyz";
+    const size_t charsetSize = sizeof(charset) - 1;
 
+    // 原实现用 libc rand()（构造函数里 time(nullptr) 播种，state 空间小、
+    // 按秒计时可被大致推算）生成 section 名。section 名不是保密边界，但
+    // protection_build_context.cpp 里已经确立"随机性来自 BCryptGenRandom，
+    // 熵源不可用就 fail-closed"的方针，这里改用同一个 API 保持一致。
+    std::vector<BYTE> entropy(length);
     // BUG 18 修复：生成随机名称后自检，确保不匹配已知签名
     const int maxRetries = 10;
     for (int retry = 0; retry < maxRetries; retry++) {
+        if (BCryptGenRandom(nullptr, entropy.data(), static_cast<ULONG>(length),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+            return false;
+        }
         for (DWORD i = 0; i < length; i++) {
-            name[i] = charset[rand() % (sizeof(charset) - 1)];
+            name[i] = charset[entropy[i] % charsetSize];
         }
 
         // 自检：确保生成的名称不匹配已知壳的 section 名
         if (VerifyNoSignatureMatch((const BYTE*)name, length)) {
-            return;  // 通过自检，可以使用
+            return true;  // 通过自检，可以使用
         }
         // 未通过自检，重新生成
     }
     // 超过重试次数，使用最后生成的名称（极低概率到这里）
+    return true;
 }
 
 // BUG 17 修复：从外部文件加载签名数据库
