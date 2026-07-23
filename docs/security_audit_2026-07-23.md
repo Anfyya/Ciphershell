@@ -308,3 +308,35 @@ if (function.decodedBytes != function.size) {
 2. `GenerateRandomName` 内部生成熵的那一步，改为 `#ifdef _WIN32` 分支走 `BCryptGenRandom`（失败即 `return false`），`#else` 分支用 `std::random_device`（构造失败可能抛异常，`try/catch` 后 `return false`，与另外 4 个文件的异常处理方式一致）填充同一个 `entropy` 缓冲区，再走原有的字符集映射与签名自检逻辑。
 
 **验证**：`ciphershell_packer.vcxproj`/`ciphershell.vcxproj` 在 x64 Release、`/W4 /WX` 下增量编译零警告零错误；`test_fail_closed.exe` 退出码 0。**未能验证的部分，如实说明**：本次运行环境是原生 Windows（PowerShell/Git-Bash），没有可用的 Linux/交叉编译工具链（无 WSL、无 g++/clang 目标），无法在本次会话里实际跑一遍 `cmake --build build_linux` 来端到端复现"之前确实编译失败、现在确实编译成功"。修复方式是逐字符比对另外 4 个已经在用、大概率已被验证过的同类实现得出的，不是猜测，但建议你在自己的 Linux/WSL 环境里跑一次 `build_linux` 确认。
+
+---
+
+## 9. 第三轮：清理剩余"死代码但藏着真 bug"的隐患 + 状态核实
+
+你这轮提出的 5 项里，4 项（`vm_verifier.cpp` 可达性证明、`loader_import_builder.cpp` 绕开 `PEEmitter`、`reloc_fixer.cpp` 删除、`pe_rebuilder.cpp` 未用私有方法删除）在本对话第 7 章（7.1.1、7.2.1、7.3.1、7.3.3）已经做完，逐项重新核实过仍然生效（`reloc_fixer.cpp`/`dll_packer.cpp` 确认已不存在于工作区，`vm_schema.cpp` 里 `"cannot reach a terminal instruction"` 校验仍在，`loader_import_builder.cpp` 仍在用 `PatchBytes`），不是本轮重复劳动，只是当时报告章节编号和你手上参照的版本对不上。真正新做的是第 5 项。
+
+**9.1【已删除】`stub/stage1/runtime_stub.cpp`**
+
+对应 3.4 节最后一条。全仓库确认这个文件只被 `stub/CMakeLists.txt` 第 15-21 行定义的 `stage1_runtime` 静态库目标引用，没有任何 `.h` 头文件、没有任何其它 `.cpp` 包含它、没有任何 `target_link_libraries` 链接 `stage1_runtime` 这个目标本身——是审计报告自己定性为"被放弃的早期原型"的孤儿文件，且自身还有真实缺陷（滚动 XOR 只用了 32 字节密钥里的 4 字节、`StubData` 偏移硬编码 `0x1000`、在无 IAT 的 shellcode 设计前提下却直接调用需要真实导入表的 `VirtualProtect`/`GetModuleHandle`）。已整文件删除，`stub/CMakeLists.txt` 里 `stage1_runtime` 的源文件列表同步移除这一项；`api_resolver.cpp`/`anti_debug.cpp`/`anti_debug_advanced.cpp`/`implicit_response.cpp` 四个文件按你此前"CipherShell Plus 相关实现目录不删"的决定原样保留。
+
+**验证**：重新跑 `cmake` 配置（源文件列表变了）零警告；`stage1_runtime.vcxproj`（x64 Release）增量编译零警告零错误；顺带重建 `ciphershell.vcxproj` 确认 CMake 重新配置没有影响其它目标，同样零警告零错误。
+
+**未做的验证（如实说明）**：`stage1_runtime` 本身不被任何东西链接，所以这次编译验证只能证明"删除后这 4 个文件自己还能独立编译成静态库"，不能证明任何运行时行为——这和它删除前的状态一致，删除本身不改变任何可观察行为。
+
+---
+
+## 10. 第七章引入的真实 CI 回归，已定位并修复
+
+`bb983af` push 到远端后 GitHub Actions 报红（`build-and-test (x64)`/`build-and-test (Win32)` 均在"运行全部测试 (ctest)"步骤失败；`static-gate` 通过）。本仓库是公开仓库，Actions 的 run/job/step 状态可通过 GitHub REST API 匿名读取，但 `logs`/`artifacts` 下载端点都要求鉴权（分别返回 `403 Must have admin rights`、`401 Requires authentication`），本次会话没有可用的 token，无法直接拉到远端 ctest 的原始输出。改为在本地用和 CI 完全相同的命令（`ctest --test-dir build -C Release --output-on-failure --timeout 300`）对同一份 `build/` 复现。
+
+**根因（真实回归，由第 7.4 节改动引入）**：`tests/samples/vm_similarity_gate_sample.toml`（`vm_per_build_similarity_gate` 测试用的样例配置，文件头注释写明"Same as config/default.toml except..."）里的 `[anti_debug]`/`[anti_dump]` 段仍是旧的全 `true`，这个文件在第 7.4 节改 `default.toml` 默认值时被漏掉了。以前这些字段没人消费所以无所谓，第 7.4 节给 `main.cpp` 加上 fail-closed 拒绝之后，这个测试样例一跑就先被 `ANTI_DEBUG_REJECT` 拦下来，`vm_per_build_similarity_gate` 直接失败——这是本报告第 7.4 节自己改动的直接连带后果，不是它本身有 bug，只是改默认值时没有同步搜一遍"谁还在用旧默认值当输入"。
+
+**修复**：把 `tests/samples/vm_similarity_gate_sample.toml` 与 `config/full_example.toml`（同样残留旧默认值，虽然当前没有测试直接引用它，但作为对外文档配置一并改掉，避免用户抄它踩同一个坑）里的 `[anti_debug]`/`[anti_dump]` 全部改成 `false`，和 `default.toml` 对齐。
+
+**验证**：`ctest --test-dir build -C Release -R vm_per_build_similarity_gate --timeout 900`（该测试注册时 `TIMEOUT` 属性就是 900 秒，CMakeLists 注释写明"Four full pack-and-run builds take 6-8 minutes"），修复前必然因 `ANTI_DEBUG_REJECT` 秒挂，修复后完整跑完 **435.54 秒，`Passed`**。
+
+**顺带排查、确认与本次改动无关的另外两项本地失败（如实记录，未改动任何代码）**：
+- `vm_kernel_static_gate`：本地失败原因是 `tests/scripts/vm_kernel_static_gate.py` 用 `shutil.which("cmake", ...)` 找 cmake，而本次会话的 Git-Bash 环境没有把 `cmake` 加进 `PATH`（本会话全程用绝对路径 `/c/Program Files/CMake/bin/cmake.exe` 调用）。把 cmake 目录临时加进 `PATH` 后单独重跑，`Passed`（36.82 秒）。GitHub Actions 的 `windows-2022` runner 默认在 `PATH` 里带 cmake（`ci.yml` 里直接裸调 `cmake -S . -B build` 就成功过），这一项基本可以确定是本地会话环境的假阴性，不是代码问题，未做任何改动。
+- `vm_native_differential`：`CMakeLists.txt` 给它注册的 `TIMEOUT` 是 120 秒；不管是和其它 17 个测试一起跑还是单独重跑，本地都卡在 **120.04 秒**（超时线上）。本轮（包括第 7、8、9 章）没有改动任何这个测试覆盖的代码路径（Translator/合成 handler 的 SHL/SHR/ADC/SBB/BSWAP 等差分逻辑）。这更像是这台机器跑这个测试本来就贴着 120 秒的预算边缘，是否在 CI runner 上也会超时无法在本地确认。按项目"不悄悄放宽门禁"的原则，没有在不确定归因的情况下调整这个 `TIMEOUT`，如实记录，留给你视 CI 上是否复现来决定要不要给这个测试单独加预算。
+
+**当前状态**：`config/full_example.toml`、`tests/samples/vm_similarity_gate_sample.toml` 为本轮新增的 modified 文件，尚未 commit。

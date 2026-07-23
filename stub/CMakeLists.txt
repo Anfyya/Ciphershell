@@ -17,7 +17,6 @@ add_library(stage1_runtime STATIC
     stage1/anti_debug.cpp
     stage1/anti_debug_advanced.cpp
     stage1/implicit_response.cpp
-    stage1/runtime_stub.cpp
 )
 
 # 包含目录
