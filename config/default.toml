@@ -2,14 +2,14 @@
 
 [global]
 protection_level = 3
-strip_debug_info = true
-strip_rich_header = true
-strip_timestamps = true
-randomize_section_names = true
+strip_debug_info = true        # 清零 Debug DataDirectory 引用；不擦除失去引用的原始载荷
+strip_rich_header = true       # 检测到 Rich 时清零整个 DOS stub/Rich 扫描区
+strip_timestamps = true        # 仅将 COFF FileHeader.TimeDateStamp 归零
+randomize_section_names = true # 随机化除严格 .rsrc/.reloc 外的 section 名
 
 [vm]
 enabled = false
-strength = 80
+strength = 80                 # 当前仅解析/往返；生产 Handler 尚未消费
 target_functions = []
 target_rvas = []
 register_count = 24
@@ -86,4 +86,4 @@ nanomite_patches = false
 
 [performance]
 auto_hotspot_analysis = true
-max_vm_overhead_ratio = 15.0
+max_vm_overhead_ratio = 15.0 # 仅解析/往返；当前尚未参与生产判定

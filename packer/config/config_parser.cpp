@@ -10,8 +10,11 @@
 #include <cctype>
 #include <regex>
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <set>
+#include <stdexcept>
 
 namespace CipherShell {
 
@@ -21,6 +24,23 @@ namespace CipherShell {
 
 ConfigParser::ConfigParser() {}
 ConfigParser::~ConfigParser() {}
+
+bool HasAnyAntiDebugRequest(const AntiDebugConfigFile& config) {
+    return config.timingChecks ||
+        config.hardwareBPDetection ||
+        config.softwareBPDetection ||
+        config.memoryIntegrity ||
+        config.debuggerWindowScan ||
+        config.parentProcessCheck ||
+        config.threadHiding ||
+        config.kernelDebuggerCheck;
+}
+
+bool HasAnyAntiDumpRequest(const AntiDumpConfig& config) {
+    return config.erasePEHeader ||
+        config.sectionPermissionGuard ||
+        config.nanomitePatches;
+}
 
 // ============================================================================
 // 公共接口
@@ -58,18 +78,20 @@ CipherShellConfig ConfigParser::LoadFromString(const std::string& content) {
     m_warnings.clear();
 
     if (!ValidateProductionSyntax(content)) return config;
+    const std::string canonicalContent = StripComments(content);
 
-    // 解析各个配置段
-    ParseGlobalSection(content, config.global);
-    ParseVMSection(content, config.vm);
-    ParseStringEncryptionSection(content, config.stringEncryption);
-    ParseImportProtectionSection(content, config.importProtection);
-    ParseSectionEncryptionSection(content, config.sectionEncryption);
-    ParseControlFlowSection(content, config.controlFlow);
-    ParseAntiDebugSection(content, config.antiDebug);
-    ParseAntiDumpSection(content, config.antiDump);
-    ParsePerformanceSection(content, config.performance);
-    ParseFunctionOverrides(content, config.functionOverrides);
+    // 所有 Parse* 只消费去除注释后的同一份规范文本。否则注释中的同名键
+    // 可能被 regex_search 先命中，使可见配置与实际生效值发生串线。
+    ParseGlobalSection(canonicalContent, config.global);
+    ParseVMSection(canonicalContent, config.vm);
+    ParseStringEncryptionSection(canonicalContent, config.stringEncryption);
+    ParseImportProtectionSection(canonicalContent, config.importProtection);
+    ParseSectionEncryptionSection(canonicalContent, config.sectionEncryption);
+    ParseControlFlowSection(canonicalContent, config.controlFlow);
+    ParseAntiDebugSection(canonicalContent, config.antiDebug);
+    ParseAntiDumpSection(canonicalContent, config.antiDump);
+    ParsePerformanceSection(canonicalContent, config.performance);
+    ParseFunctionOverrides(canonicalContent, config.functionOverrides);
 
     return config;
 }
@@ -85,17 +107,17 @@ bool ConfigParser::GenerateDefaultConfig(const std::string& filePath) {
 
 [global]
 protection_level = 3              # 全局默认保护等级 1-5
-strip_debug_info = true           # 删除所有调试信息
-strip_rich_header = true          # 删除 Rich Header（编译器指纹）
-strip_timestamps = true           # 时间戳归零
-randomize_section_names = true    # Section 名称随机化
+strip_debug_info = true           # 清零 Debug DataDirectory 引用；不擦除失去引用的原始载荷
+strip_rich_header = true          # 检测到 Rich 时清零整个 DOS stub/Rich 扫描区
+strip_timestamps = true           # COFF FileHeader.TimeDateStamp 归零
+randomize_section_names = true    # 随机化除严格 .rsrc/.reloc 外的 Section 名称
 
 [vm]
 enabled = false                   # 显式功能开关；L1-L5 只提供未显式设置时的 preset
-strength = 80
-target_functions = []             # 按导出名或 sub_RVA 通配选择
-target_rvas = []                  # 按函数入口 RVA 精确选择
-register_count = 24               # 虚拟寄存器数量（16-64）
+strength = 80                    # 当前仅解析/往返；生产 Handler 尚未消费
+target_functions = []             # 与 target_rvas 均空时自动筛选 VM 安全函数；非空时按名称通配选择
+target_rvas = []                  # 与 target_functions 均空时自动筛选；非空时按入口 RVA 精确选择
+register_count = 24               # 虚拟寄存器数量（16-32）
 stack_size = 0x20000              # 虚拟栈大小
 opcode_randomization = true       # 每次构建生成完整 opcode permutation
 handler_mutation = true           # 生产构建默认启用 handler 入口布局与执行路径变异
@@ -150,23 +172,26 @@ enabled = false
 strength = 50
 
 [anti_debug]
-timing_checks = true              # 时序检测
-hardware_bp_detection = true      # 硬件断点检测
-software_bp_detection = true      # INT3 / 0xCC 扫描
-memory_integrity = true           # 代码完整性校验
-debugger_window_scan = false      # 扫描调试器窗口类名（可选，易被绕过）
-parent_process_check = true       # 父进程检测
-thread_hiding = true              # NtSetInformationThread HideFromDebugger
-kernel_debugger_check = true      # 内核调试器检测
+# CipherShell Plus 反调试尚未接入 transform/runtime；显式开启会在任何 PE 修改前
+# 被 fail-closed 拒绝。以下项目仅保留可编辑配置契约，默认不得声称已生效。
+timing_checks = false             # 未实现：时序检测
+hardware_bp_detection = false     # 未实现：硬件断点检测
+software_bp_detection = false     # 未实现：INT3 / 0xCC 扫描
+memory_integrity = false          # 未实现：运行时代码完整性校验
+debugger_window_scan = false      # 未实现：调试器窗口类名扫描
+parent_process_check = false      # 未实现：父进程检测
+thread_hiding = false             # 未实现：NtSetInformationThread HideFromDebugger
+kernel_debugger_check = false     # 未实现：内核调试器检测
 
 [anti_dump]
-erase_pe_header = true            # 运行时擦除 PE 头
-section_permission_guard = true   # 动态权限管理
-nanomite_patches = true           # INT3 Nanomite 技术
+# CipherShell Plus 反 Dump/nanomite 尚未接入生产闭环；显式开启同样会 fail-closed 拒绝。
+erase_pe_header = false           # 未实现：运行时擦除 PE 头
+section_permission_guard = false  # 未实现：运行时 section 权限守卫
+nanomite_patches = false          # 未实现：INT3 Nanomite 运行时闭环
 
 [performance]
 auto_hotspot_analysis = true      # 自动分析热点函数并降低其保护等级
-max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自动降级）
+max_vm_overhead_ratio = 15.0      # 仅解析/往返；当前尚未参与生产判定
 )";
 
     file.close();
@@ -178,7 +203,15 @@ max_vm_overhead_ratio = 15.0      # VM 执行最大允许倍率（超过则自�
 // ============================================================================
 
 bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
-    enum class ValueKind { Boolean, Integer, Number, String, StringArray, UintArray };
+    enum class ValueKind {
+        Boolean,
+        Integer,
+        HexOrDecimalInteger,
+        Number,
+        String,
+        StringArray,
+        UintArray
+    };
     using KeySchema = std::map<std::string, ValueKind>;
     static const std::map<std::string, KeySchema> schema = {
         {"global", {
@@ -191,7 +224,8 @@ bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
         {"vm", {
             {"enabled", ValueKind::Boolean}, {"strength", ValueKind::Integer},
             {"target_functions", ValueKind::StringArray}, {"target_rvas", ValueKind::UintArray},
-            {"register_count", ValueKind::Integer}, {"stack_size", ValueKind::Integer},
+            {"register_count", ValueKind::Integer},
+            {"stack_size", ValueKind::HexOrDecimalInteger},
             {"opcode_randomization", ValueKind::Boolean}, {"handler_mutation", ValueKind::Boolean},
             {"bytecode_encryption", ValueKind::Boolean}, {"native_body_policy", ValueKind::String},
             {"x86_call_abi", ValueKind::String}, {"embed_junk_handlers", ValueKind::Boolean},
@@ -241,7 +275,9 @@ bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
     const std::regex sectionPattern(R"(^\[([A-Za-z0-9_.]+)\]$)");
     const std::regex keyPattern(R"(^([A-Za-z0-9_]+)\s*=\s*(.+)$)");
     const std::regex booleanPattern(R"(^(true|false)$)");
-    const std::regex integerPattern(R"(^(0x[0-9A-Fa-f]+|[0-9]+)$)");
+    const std::regex integerPattern(R"(^[0-9]+$)");
+    const std::regex hexOrDecimalIntegerPattern(
+        R"(^(0x[0-9A-Fa-f]+|[0-9]+)$)");
     const std::regex numberPattern(R"(^([0-9]+(\.[0-9]+)?|\.[0-9]+)$)");
     const std::regex stringPattern(R"RE(^"[^"\r\n]*"$)RE");
     const std::regex stringArrayPattern(
@@ -303,11 +339,47 @@ bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
                 currentSection + "]." + key;
             return false;
         }
+        auto validInteger = [](const std::string& text, int base) {
+            try {
+                size_t consumed = 0;
+                const unsigned long long parsed =
+                    std::stoull(text, &consumed, base);
+                return consumed == text.size() &&
+                    parsed <= static_cast<unsigned long long>(
+                        (std::numeric_limits<int>::max)());
+            } catch (...) {
+                return false;
+            }
+        };
         bool valid = false;
         switch (keyIt->second) {
             case ValueKind::Boolean: valid = std::regex_match(value, booleanPattern); break;
-            case ValueKind::Integer: valid = std::regex_match(value, integerPattern); break;
-            case ValueKind::Number: valid = std::regex_match(value, numberPattern); break;
+            case ValueKind::Integer:
+                valid = std::regex_match(value, integerPattern) &&
+                    validInteger(value, 10);
+                break;
+            case ValueKind::HexOrDecimalInteger: {
+                const bool isHex = value.size() > 2 && value[0] == '0' &&
+                    (value[1] == 'x' || value[1] == 'X');
+                valid = std::regex_match(
+                            value, hexOrDecimalIntegerPattern) &&
+                    validInteger(value, isHex ? 16 : 10);
+                break;
+            }
+            case ValueKind::Number:
+                valid = std::regex_match(value, numberPattern);
+                if (valid) {
+                    try {
+                        size_t consumed = 0;
+                        const double parsed =
+                            std::stod(value, &consumed);
+                        valid = consumed == value.size() &&
+                            std::isfinite(parsed);
+                    } catch (...) {
+                        valid = false;
+                    }
+                }
+                break;
             case ValueKind::String: valid = std::regex_match(value, stringPattern); break;
             case ValueKind::StringArray: valid = std::regex_match(value, stringArrayPattern); break;
             case ValueKind::UintArray: valid = std::regex_match(value, uintArrayPattern); break;
@@ -322,217 +394,207 @@ bool ConfigParser::ValidateProductionSyntax(const std::string& content) {
 }
 
 void ConfigParser::ParseGlobalSection(const std::string& content, GlobalConfig& config) {
-    std::string section = ExtractSection(content, "global");
+    const std::string section = ExtractSection(content, "global");
     if (section.empty()) return;
 
-    // 解析各个配置项
-    std::regex regex_protection(R"(protection_level\s*=\s*(\d+))");
-    std::regex regex_debug(R"(strip_debug_info\s*=\s*(true|false))");
-    std::regex regex_rich(R"(strip_rich_header\s*=\s*(true|false))");
-    std::regex regex_timestamps(R"(strip_timestamps\s*=\s*(true|false))");
-    std::regex regex_sections(R"(randomize_section_names\s*=\s*(true|false))");
-    std::regex regex_antidebug(R"RE(anti_debug_mode\s*=\s*"([^"]+)")RE");
-    std::regex regex_strings(R"(string_encryption\s*=\s*(true|false))");
-    std::regex regex_imports(R"(import_obfuscation\s*=\s*(true|false))");
-    std::regex regex_resources(R"(resource_encryption\s*=\s*(true|false))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_protection)) config.protectionLevel = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_debug)) config.stripDebugInfo = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_rich)) config.stripRichHeader = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_timestamps)) config.stripTimestamps = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_sections)) config.randomizeSections = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_antidebug)) config.antiDebugMode = match[1];
-    if (std::regex_search(section, match, regex_strings)) {
-        config.stringEncryption = ParseBool(match[1]);
-        m_warnings.push_back("[global].string_encryption is deprecated; use [string_encryption].enabled instead");
+    std::string value;
+    if (FindValue(section, "protection_level", value)) {
+        config.protectionLevel = ParseInt(value);
+        config.protectionLevelSet = true;
     }
-    if (std::regex_search(section, match, regex_imports)) {
-        config.importObfuscation = ParseBool(match[1]);
-        m_warnings.push_back("[global].import_obfuscation is deprecated; use [import_protection].enabled instead");
-    }
-    if (std::regex_search(section, match, regex_resources)) {
-        config.resourceEncryption = ParseBool(match[1]);
-        m_warnings.push_back("[global].resource_encryption is deprecated; use [section_encryption].resources when available");
-    }
+    if (FindValue(section, "strip_debug_info", value))
+        config.stripDebugInfo = ParseBool(value);
+    if (FindValue(section, "strip_rich_header", value))
+        config.stripRichHeader = ParseBool(value);
+    if (FindValue(section, "strip_timestamps", value))
+        config.stripTimestamps = ParseBool(value);
+    if (FindValue(section, "randomize_section_names", value))
+        config.randomizeSections = ParseBool(value);
 }
 
 void ConfigParser::ParseVMSection(const std::string& content, VMConfig& config) {
-    std::string section = ExtractSection(content, "vm");
+    const std::string section = ExtractSection(content, "vm");
     if (section.empty()) return;
 
-    std::regex regex_reg(R"(register_count\s*=\s*(\d+))");
-    std::regex regex_stack(R"(stack_size\s*=\s*(0x[0-9a-fA-F]+|\d+))");
-    std::regex regex_opcode_randomization(R"RE(opcode_randomization\s*=\s*(true|false))RE");
-    std::regex regex_mutation(R"(handler_mutation\s*=\s*(true|false))");
-    std::regex regex_encrypt(R"RE(bytecode_encryption\s*=\s*(true|false))RE");
-    std::regex regex_native_body(R"RE(native_body_policy\s*=\s*"([^"]+)")RE");
-    std::regex regex_x86_call_abi(R"RE(x86_call_abi\s*=\s*"([^"]+)")RE");
-    std::regex regex_junk(R"(embed_junk_handlers\s*=\s*(true|false))");
-    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
-    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
-    std::regex regex_targets(R"RE(target_functions\s*=\s*(\[[^\]]*\]))RE");
-    std::regex regex_target_rvas(R"RE(target_rvas\s*=\s*(\[[^\]]*\]))RE");
-    std::regex regex_simd_bridge(R"(simd_bridge\s*=\s*(true|false))");
-    std::regex regex_x87_bridge(R"(x87_bridge\s*=\s*(true|false))");
-    std::regex regex_variant_group_count(R"(variant_group_count\s*=\s*(\d+))");
-    std::regex regex_variant_group_max(R"(variant_group_max\s*=\s*(\d+))");
-    std::regex regex_variant_group_functions_per_group(
-        R"(variant_group_functions_per_group\s*=\s*(\d+))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_reg)) config.registerCount = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_stack)) config.stackSize = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_opcode_randomization)) config.opcodeRandomization = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_mutation)) config.handlerMutation = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_encrypt)) config.bytecodeEncryption = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_native_body)) config.nativeBodyPolicy = match[1];
-    if (std::regex_search(section, match, regex_x86_call_abi)) config.x86CallAbi = match[1];
-    if (std::regex_search(section, match, regex_junk)) config.embedJunkHandlers = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
-    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_targets)) config.targetFunctions = ParseStringArray(match[1]);
-    if (std::regex_search(section, match, regex_target_rvas)) config.targetRVAs = ParseUint32Array(match[1]);
-    if (std::regex_search(section, match, regex_simd_bridge)) config.simdBridge = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_x87_bridge)) config.x87Bridge = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_variant_group_count))
-        config.variantGroupCount = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_variant_group_max))
-        config.variantGroupMax = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_variant_group_functions_per_group))
-        config.variantGroupFunctionsPerGroup = ParseInt(match[1]);
+    std::string value;
+    if (FindValue(section, "register_count", value))
+        config.registerCount = ParseInt(value);
+    if (FindValue(section, "stack_size", value))
+        config.stackSize = ParseInt(value);
+    if (FindValue(section, "opcode_randomization", value))
+        config.opcodeRandomization = ParseBool(value);
+    if (FindValue(section, "handler_mutation", value))
+        config.handlerMutation = ParseBool(value);
+    if (FindValue(section, "bytecode_encryption", value))
+        config.bytecodeEncryption = ParseBool(value);
+    if (FindValue(section, "native_body_policy", value))
+        config.nativeBodyPolicy = ParseString(value);
+    if (FindValue(section, "x86_call_abi", value))
+        config.x86CallAbi = ParseString(value);
+    if (FindValue(section, "embed_junk_handlers", value))
+        config.embedJunkHandlers = ParseBool(value);
+    if (FindValue(section, "enabled", value)) {
+        config.enabled = ParseBool(value);
+        config.enabledSet = true;
+    }
+    if (FindValue(section, "strength", value))
+        config.strength = ParseInt(value);
+    if (FindValue(section, "target_functions", value))
+        config.targetFunctions = ParseStringArray(value);
+    if (FindValue(section, "target_rvas", value))
+        config.targetRVAs = ParseUint32Array(value);
+    if (FindValue(section, "simd_bridge", value))
+        config.simdBridge = ParseBool(value);
+    if (FindValue(section, "x87_bridge", value))
+        config.x87Bridge = ParseBool(value);
+    if (FindValue(section, "variant_group_count", value))
+        config.variantGroupCount = ParseInt(value);
+    if (FindValue(section, "variant_group_max", value))
+        config.variantGroupMax = ParseInt(value);
+    if (FindValue(section, "variant_group_functions_per_group", value))
+        config.variantGroupFunctionsPerGroup = ParseInt(value);
 }
 
 void ConfigParser::ParseStringEncryptionSection(const std::string& content, StringEncryptionConfig& config) {
-    std::string section = ExtractSection(content, "string_encryption");
+    const std::string section = ExtractSection(content, "string_encryption");
     if (section.empty()) return;
 
-    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
-    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
-    std::regex regex_mode(R"RE(mode\s*=\s*"([^"]+)")RE");
-    std::regex regex_ascii(R"(ascii\s*=\s*(true|false))");
-    std::regex regex_utf16(R"(utf16\s*=\s*(true|false))");
-    std::regex regex_resources(R"(resources\s*=\s*(true|false))");
-    std::regex regex_clear(R"(clear_after_use\s*=\s*(true|false))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
-    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_mode)) config.mode = match[1];
-    if (std::regex_search(section, match, regex_ascii)) config.ascii = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_utf16)) config.utf16 = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_resources)) config.resources = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_clear)) config.clearAfterUse = ParseBool(match[1]);
+    std::string value;
+    if (FindValue(section, "enabled", value)) {
+        config.enabled = ParseBool(value);
+        config.enabledSet = true;
+    }
+    if (FindValue(section, "strength", value))
+        config.strength = ParseInt(value);
+    if (FindValue(section, "mode", value))
+        config.mode = ParseString(value);
+    if (FindValue(section, "ascii", value))
+        config.ascii = ParseBool(value);
+    if (FindValue(section, "utf16", value))
+        config.utf16 = ParseBool(value);
+    if (FindValue(section, "resources", value))
+        config.resources = ParseBool(value);
+    if (FindValue(section, "clear_after_use", value))
+        config.clearAfterUse = ParseBool(value);
 }
 
 void ConfigParser::ParseImportProtectionSection(const std::string& content, ImportProtectionConfig& config) {
-    std::string section = ExtractSection(content, "import_protection");
-    std::string legacySection = ExtractSection(content, "import_obfuscation");
-    if (section.empty() && !legacySection.empty()) {
-        section = legacySection;
-        m_warnings.push_back("[import_obfuscation] is deprecated; use [import_protection] instead");
-    }
+    const std::string section = ExtractSection(content, "import_protection");
     if (section.empty()) return;
 
-    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
-    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
-    std::smatch match;
-    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
-    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+    std::string value;
+    if (FindValue(section, "enabled", value)) {
+        config.enabled = ParseBool(value);
+        config.enabledSet = true;
+    }
+    if (FindValue(section, "strength", value))
+        config.strength = ParseInt(value);
 }
 
 void ConfigParser::ParseSectionEncryptionSection(const std::string& content, SectionEncryptionConfig& config) {
-    std::string section = ExtractSection(content, "section_encryption");
+    const std::string section = ExtractSection(content, "section_encryption");
     if (section.empty()) return;
 
-    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
-    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
-    std::regex regex_mode(R"RE(mode\s*=\s*"([^"]+)")RE");
-    std::smatch match;
-    if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
-    if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
-    if (std::regex_search(section, match, regex_mode)) config.mode = match[1];
+    std::string value;
+    if (FindValue(section, "enabled", value)) {
+        config.enabled = ParseBool(value);
+        config.enabledSet = true;
+    }
+    if (FindValue(section, "strength", value))
+        config.strength = ParseInt(value);
+    if (FindValue(section, "mode", value))
+        config.mode = ParseString(value);
 }
-void ConfigParser::ParseControlFlowSection(const std::string& content, ControlFlowConfigFile& config) {
-    std::string section = ExtractSection(content, "control_flow");
-    std::string flattening = ExtractSection(content, "control_flow.flattening");
-    std::string bogus = ExtractSection(content, "control_flow.bogus");
 
-    std::regex regex_enabled(R"(enabled\s*=\s*(true|false))");
-    std::regex regex_strength(R"(strength\s*=\s*(\d+))");
-    std::regex regex_targets(R"RE(target_functions\s*=\s*(\[[^\]]*\]))RE");
-    std::smatch match;
+void ConfigParser::ParseControlFlowSection(const std::string& content, ControlFlowConfigFile& config) {
+    const std::string section = ExtractSection(content, "control_flow");
+    const std::string flattening =
+        ExtractSection(content, "control_flow.flattening");
+    const std::string bogus =
+        ExtractSection(content, "control_flow.bogus");
+    std::string value;
 
     if (!section.empty()) {
-        if (std::regex_search(section, match, regex_enabled)) { config.enabled = ParseBool(match[1]); config.enabledSet = true; }
-        if (std::regex_search(section, match, regex_strength)) config.strength = ParseInt(match[1]);
+        if (FindValue(section, "enabled", value)) {
+            config.enabled = ParseBool(value);
+            config.enabledSet = true;
+        }
+        if (FindValue(section, "strength", value))
+            config.strength = ParseInt(value);
     }
     if (!flattening.empty()) {
-        if (std::regex_search(flattening, match, regex_enabled)) { config.flatteningEnabled = ParseBool(match[1]); config.flatteningEnabledSet = true; }
-        if (std::regex_search(flattening, match, regex_strength)) config.flatteningStrength = ParseInt(match[1]);
-        if (std::regex_search(flattening, match, regex_targets)) config.flatteningTargets = ParseStringArray(match[1]);
+        if (FindValue(flattening, "enabled", value)) {
+            config.flatteningEnabled = ParseBool(value);
+            config.flatteningEnabledSet = true;
+        }
+        if (FindValue(flattening, "strength", value))
+            config.flatteningStrength = ParseInt(value);
+        if (FindValue(flattening, "target_functions", value))
+            config.flatteningTargets = ParseStringArray(value);
     }
     if (!bogus.empty()) {
-        if (std::regex_search(bogus, match, regex_enabled)) { config.bogusEnabled = ParseBool(match[1]); config.bogusEnabledSet = true; }
-        if (std::regex_search(bogus, match, regex_strength)) config.bogusStrength = ParseInt(match[1]);
+        if (FindValue(bogus, "enabled", value)) {
+            config.bogusEnabled = ParseBool(value);
+            config.bogusEnabledSet = true;
+        }
+        if (FindValue(bogus, "strength", value))
+            config.bogusStrength = ParseInt(value);
     }
 }
+
 void ConfigParser::ParseAntiDebugSection(const std::string& content, AntiDebugConfigFile& config) {
-    std::string section = ExtractSection(content, "anti_debug");
+    const std::string section = ExtractSection(content, "anti_debug");
     if (section.empty()) return;
 
-    std::regex regex_timing(R"(timing_checks\s*=\s*(true|false))");
-    std::regex regex_hwbp(R"(hardware_bp_detection\s*=\s*(true|false))");
-    std::regex regex_swbp(R"(software_bp_detection\s*=\s*(true|false))");
-    std::regex regex_mem(R"(memory_integrity\s*=\s*(true|false))");
-    std::regex regex_window(R"(debugger_window_scan\s*=\s*(true|false))");
-    std::regex regex_parent(R"(parent_process_check\s*=\s*(true|false))");
-    std::regex regex_thread(R"(thread_hiding\s*=\s*(true|false))");
-    std::regex regex_kernel(R"(kernel_debugger_check\s*=\s*(true|false))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_timing)) config.timingChecks = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_hwbp)) config.hardwareBPDetection = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_swbp)) config.softwareBPDetection = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_mem)) config.memoryIntegrity = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_window)) config.debuggerWindowScan = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_parent)) config.parentProcessCheck = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_thread)) config.threadHiding = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_kernel)) config.kernelDebuggerCheck = ParseBool(match[1]);
+    std::string value;
+    if (FindValue(section, "timing_checks", value))
+        config.timingChecks = ParseBool(value);
+    if (FindValue(section, "hardware_bp_detection", value))
+        config.hardwareBPDetection = ParseBool(value);
+    if (FindValue(section, "software_bp_detection", value))
+        config.softwareBPDetection = ParseBool(value);
+    if (FindValue(section, "memory_integrity", value))
+        config.memoryIntegrity = ParseBool(value);
+    if (FindValue(section, "debugger_window_scan", value))
+        config.debuggerWindowScan = ParseBool(value);
+    if (FindValue(section, "parent_process_check", value))
+        config.parentProcessCheck = ParseBool(value);
+    if (FindValue(section, "thread_hiding", value))
+        config.threadHiding = ParseBool(value);
+    if (FindValue(section, "kernel_debugger_check", value))
+        config.kernelDebuggerCheck = ParseBool(value);
 }
 
 void ConfigParser::ParseAntiDumpSection(const std::string& content, AntiDumpConfig& config) {
-    std::string section = ExtractSection(content, "anti_dump");
+    const std::string section = ExtractSection(content, "anti_dump");
     if (section.empty()) return;
 
-    std::regex regex_header(R"(erase_pe_header\s*=\s*(true|false))");
-    std::regex regex_perm(R"(section_permission_guard\s*=\s*(true|false))");
-    std::regex regex_nano(R"(nanomite_patches\s*=\s*(true|false))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_header)) config.erasePEHeader = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_perm)) config.sectionPermissionGuard = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_nano)) config.nanomitePatches = ParseBool(match[1]);
+    std::string value;
+    if (FindValue(section, "erase_pe_header", value))
+        config.erasePEHeader = ParseBool(value);
+    if (FindValue(section, "section_permission_guard", value))
+        config.sectionPermissionGuard = ParseBool(value);
+    if (FindValue(section, "nanomite_patches", value))
+        config.nanomitePatches = ParseBool(value);
 }
 
 void ConfigParser::ParsePerformanceSection(const std::string& content, PerformanceConfig& config) {
-    std::string section = ExtractSection(content, "performance");
+    const std::string section = ExtractSection(content, "performance");
     if (section.empty()) return;
 
-    std::regex regex_hotspot(R"(auto_hotspot_analysis\s*=\s*(true|false))");
-    std::regex regex_ratio(R"(max_vm_overhead_ratio\s*=\s*([\d.]+))");
-
-    std::smatch match;
-    if (std::regex_search(section, match, regex_hotspot)) config.autoHotspotAnalysis = ParseBool(match[1]);
-    if (std::regex_search(section, match, regex_ratio)) config.maxVMOverheadRatio = ParseDouble(match[1]);
+    std::string value;
+    if (FindValue(section, "auto_hotspot_analysis", value))
+        config.autoHotspotAnalysis = ParseBool(value);
+    if (FindValue(section, "max_vm_overhead_ratio", value))
+        config.maxVMOverheadRatio = ParseDouble(value);
 }
 
 void ConfigParser::ParseFunctionOverrides(const std::string& content, std::vector<FunctionOverride>& overrides) {
-    const std::string marker = "[[function_overrides]]";
+    (void)content;
     overrides.clear();
-    if (content.find(marker) != std::string::npos) {
-        m_lastError = "[[function_overrides]] is not part of the production schema; use [vm].target_functions/target_rvas";
-    }
+    // ValidateProductionSyntax 已按整行 section 语法拒绝
+    // [[function_overrides]]。这里不能再做裸 substring 搜索，否则合法目标
+    // 字符串里的同名文本会被误判成 section。
 }
 // ============================================================================
 // 辅助函数
@@ -545,21 +607,68 @@ std::string ConfigParser::Trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
-std::string ConfigParser::ExtractSection(const std::string& content, const std::string& sectionName) {
-    // 查找 [sectionName]
-    std::string header = "[" + sectionName + "]";
-    size_t start = content.find(header);
-    if (start == std::string::npos) return "";
-
-    start += header.length();
-
-    // 查找下一个 [ 开头（下一个 section）
-    size_t end = content.find("\n[", start);
-    if (end == std::string::npos) {
-        end = content.length();
+std::string ConfigParser::StripComments(const std::string& content) {
+    std::istringstream lines(content);
+    std::string line;
+    std::string result;
+    while (std::getline(lines, line)) {
+        bool quoted = false;
+        size_t comment = std::string::npos;
+        for (size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '"') quoted = !quoted;
+            else if (line[i] == '#' && !quoted) {
+                comment = i;
+                break;
+            }
+        }
+        if (comment != std::string::npos) line.resize(comment);
+        result += line;
+        result.push_back('\n');
     }
+    return result;
+}
 
-    return content.substr(start, end - start);
+std::string ConfigParser::ExtractSection(const std::string& content, const std::string& sectionName) {
+    const std::string header = "[" + sectionName + "]";
+    std::istringstream lines(content);
+    std::string line;
+    std::string section;
+    bool collecting = false;
+    while (std::getline(lines, line)) {
+        const std::string trimmed = Trim(line);
+        if (trimmed == header) {
+            collecting = true;
+            continue;
+        }
+        if (collecting && trimmed.size() >= 2 &&
+            trimmed.front() == '[' && trimmed.back() == ']') {
+            break;
+        }
+        if (collecting) {
+            section += line;
+            section.push_back('\n');
+        }
+    }
+    return section;
+}
+
+bool ConfigParser::FindValue(const std::string& section,
+        const std::string& key, std::string& value) {
+    std::istringstream lines(section);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = Trim(line);
+        if (line.empty()) continue;
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos ||
+            Trim(line.substr(0, equals)) != key) {
+            continue;
+        }
+        value = Trim(line.substr(equals + 1));
+        return true;
+    }
+    value.clear();
+    return false;
 }
 
 bool ConfigParser::ParseBool(const std::string& value) {
@@ -570,19 +679,38 @@ bool ConfigParser::ParseBool(const std::string& value) {
 
 int ConfigParser::ParseInt(const std::string& value) {
     try {
-        if (value.length() > 2 && (value.substr(0, 2) == "0x" || value.substr(0, 2) == "0X")) {
-            return std::stoi(value, nullptr, 16);
+        size_t consumed = 0;
+        const bool isHex = value.length() > 2 &&
+            (value.substr(0, 2) == "0x" ||
+             value.substr(0, 2) == "0X");
+        const unsigned long long parsed =
+            std::stoull(value, &consumed, isHex ? 16 : 10);
+        if (consumed != value.size() ||
+            parsed > static_cast<unsigned long long>(
+                (std::numeric_limits<int>::max)())) {
+            throw std::out_of_range("integer outside int range");
         }
-        return std::stoi(value);
+        return static_cast<int>(parsed);
     } catch (...) {
+        if (m_lastError.empty()) {
+            m_lastError = "配置整数无法无损解析: " + value;
+        }
         return 0;
     }
 }
 
 double ConfigParser::ParseDouble(const std::string& value) {
     try {
-        return std::stod(value);
+        size_t consumed = 0;
+        const double parsed = std::stod(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed)) {
+            throw std::out_of_range("number is not finite");
+        }
+        return parsed;
     } catch (...) {
+        if (m_lastError.empty()) {
+            m_lastError = "配置数值无法无损解析: " + value;
+        }
         return 0.0;
     }
 }

@@ -31,21 +31,17 @@ struct CS_SECTION_CONFIG {
 
 struct CS_REBUILD_CONFIG {
     // 基本选项
-    BOOL            preserveTimestamps;     // 保留时间戳
+    BOOL            preserveTimestamps;     // TRUE=保留；与 zeroTimestamps 必须恰好一个为 TRUE
     BOOL            preserveChecksum;       // 保留校验和
     BOOL            preserveRichHeader;     // 保留 Rich Header
     BOOL            preserveDebugInfo;      // 保留调试信息
-    BOOL            preserveSignature;      // 保留签名
-    BOOL            preserveOverlay;        // 保留 Overlay 数据
+    BOOL            preserveSignature;      // 当前只支持 TRUE；不实现伪“移除签名”
+    BOOL            preserveOverlay;        // 当前只支持 TRUE；不实现伪“移除 Overlay”
 
     // 随机化选项
     BOOL            randomizeSectionNames;  // 随机化 section 名称
-    BOOL            randomizeTimestamps;    // 随机化时间戳
+    BOOL            randomizeTimestamps;    // 当前不支持，必须为 FALSE
     BOOL            zeroTimestamps;         // 时间戳归零
-
-    // 对齐选项
-    DWORD           fileAlignment;          // 文件对齐
-    DWORD           sectionAlignment;       // 内存对齐
 
     // 构造函数 - 默认值
     CS_REBUILD_CONFIG() :
@@ -53,13 +49,11 @@ struct CS_REBUILD_CONFIG {
         preserveChecksum(FALSE),
         preserveRichHeader(FALSE),
         preserveDebugInfo(FALSE),
-        preserveSignature(FALSE),
+        preserveSignature(TRUE),
         preserveOverlay(TRUE),
         randomizeSectionNames(TRUE),
         randomizeTimestamps(FALSE),
-        zeroTimestamps(TRUE),
-        fileAlignment(0x200),
-        sectionAlignment(0x1000) {}
+        zeroTimestamps(TRUE) {}
 };
 
 // ============================================================================
@@ -76,7 +70,7 @@ public:
      * @param image 解析后的 PE 镜像
      * @param config 重建配置
      * @param outputSize 输出数据大小
-     * @return 重建后的 PE 数据，调用者负责释放
+     * @return 重建后的 PE 数据，调用者负责释放；输入无效或随机源失败时返回 nullptr
      */
     BYTE* RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& config, DWORD* outputSize);
 
@@ -89,7 +83,7 @@ public:
 
     /**
      * 生成随机 section 名称
-     * @return 8字节的随机名称
+     * @return 8 字节随机名称（不保证 NUL 结尾）；失败时返回 nullptr
      */
     char* GenerateRandomSectionName();
 
@@ -112,7 +106,7 @@ public:
 
 private:
     // 辅助函数
-    void GenerateRandomName(char* name, DWORD length);
+    bool GenerateRandomName(char* name, DWORD length);
 };
 
 } // namespace CipherShell

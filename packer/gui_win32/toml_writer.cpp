@@ -8,32 +8,19 @@
 namespace CipherShellGui {
 namespace {
 
-// config_parser.cpp 的 stringPattern 是 ^"[^"\r\n]*"$ —— 值里完全不允许
-// 出现引号（连转义都不支持），也不允许换行。直接丢弃这些字符，好过生成一份
-// 会被 ValidateProductionSyntax 拒绝的配置文件。
-std::string SanitizeTomlString(const std::string& raw) {
-    std::string out;
-    out.reserve(raw.size());
-    for (char c : raw) {
-        if (c == '"' || c == '\r' || c == '\n') continue;
-        out.push_back(c);
-    }
-    return out;
-}
-
 std::string QuoteTomlString(const std::string& raw) {
-    return "\"" + SanitizeTomlString(raw) + "\"";
+    // 不在序列化层静默删除字符。Win32 CollectConfig 会在写出前拒绝当前
+    // schema 不支持的引号/换行；其他调用方若绕过验证，生产 ConfigParser
+    // 会 fail-closed 拒绝无效 TOML，而不是悄悄改成另一个目标。
+    return "\"" + raw + "\"";
 }
 
 std::string FormatBool(bool value) {
     return value ? "true" : "false";
 }
 
-// register_count / variant_group_* 等字段在 config_parser.cpp 里用
-// `\d+`（纯十进制）单独匹配，即便 ValidateProductionSyntax 的 Integer 类型
-// 本身允许十六进制，写十六进制也会被那个更窄的正则悄悄吃成错误的值。这里统一
-// 用十进制，只有 stack_size / target_rvas 走十六进制（对应的 regex 显式支持
-// 0x 前缀）。
+// register_count / variant_group_* 等 Integer 字段按生产 schema 使用纯十进制；
+// 只有 stack_size / target_rvas 明确允许 0x 前缀。
 std::string FormatDecimal(long long value) {
     return std::to_string(value);
 }

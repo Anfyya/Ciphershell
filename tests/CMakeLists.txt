@@ -238,7 +238,20 @@ add_executable(test_cli_options
 
 target_include_directories(test_cli_options PRIVATE ${CMAKE_SOURCE_DIR})
 
-# Fail-closed 基线测试（仅编译，不运行）
+# GUI 配置模型与生产解析器之间的纯 C++ 契约：不依赖 Win32 UI，也不链接
+# packer 核心；直接覆盖 model -> TomlWriter -> ConfigParser 往返及安全默认值。
+add_executable(test_gui_config_contract
+    test_gui_config_contract.cpp
+    ../packer/config/config_parser.cpp
+    ../packer/gui_win32/toml_writer.cpp
+)
+
+target_include_directories(test_gui_config_contract PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_definitions(test_gui_config_contract PRIVATE
+    CS_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+)
+
+# Fail-closed 基线测试（CTest/CI 会实际运行）
 add_executable(test_fail_closed
     test_fail_closed.cpp
 )
@@ -249,7 +262,7 @@ target_link_libraries(test_fail_closed PRIVATE
 
 target_include_directories(test_fail_closed PRIVATE ${CMAKE_SOURCE_DIR})
 
-# PE 解析/发射加固回归测试（仅编译，不运行）
+# PE 解析/发射加固回归测试（CTest/CI 会实际运行）
 add_executable(test_pe_hardening
     test_pe_hardening.cpp
 )
@@ -276,6 +289,7 @@ target_include_directories(test_function_discovery PRIVATE ${CMAKE_SOURCE_DIR})
 add_dependencies(test_function_discovery function_discovery_fixture)
 
 add_test(NAME cli_options COMMAND test_cli_options)
+add_test(NAME gui_config_contract COMMAND test_gui_config_contract)
 add_test(NAME pe_parser_bounds COMMAND test_pe_parser)
 add_test(NAME fail_closed_baseline COMMAND test_fail_closed)
 add_test(NAME pe_hardening_regression

@@ -3,10 +3,13 @@
  */
 
 #include "signature_eliminator.h"
+#include "../config/config_parser.h"
+#include "../pe_parser/pe_utils.h"
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <sstream>
 // 与 protection_build_context.cpp / section_encryptor.cpp / string_encryptor.cpp /
 // vm_section_emitter.cpp 统一：BCryptGenRandom 是 Windows-only API，非 Windows
@@ -20,6 +23,19 @@
 #endif
 
 namespace CipherShell {
+
+namespace {
+
+bool IsExactPreservedSectionName(const BYTE name[IMAGE_SIZEOF_SHORT_NAME]) {
+    static constexpr BYTE kResourceName[IMAGE_SIZEOF_SHORT_NAME] = {
+        '.', 'r', 's', 'r', 'c', 0, 0, 0};
+    static constexpr BYTE kRelocationName[IMAGE_SIZEOF_SHORT_NAME] = {
+        '.', 'r', 'e', 'l', 'o', 'c', 0, 0};
+    return std::memcmp(name, kResourceName, sizeof(kResourceName)) == 0 ||
+        std::memcmp(name, kRelocationName, sizeof(kRelocationName)) == 0;
+}
+
+} // namespace
 
 // ============================================================================
 // 已知壳的特征模式
@@ -47,6 +63,23 @@ SignatureEliminator::SignatureEliminator() {
 
 SignatureEliminator::~SignatureEliminator() {}
 
+EliminationConfig BuildEliminationConfig(const GlobalConfig& global) {
+    EliminationConfig config;
+    config.randomizeSectionNames = global.randomizeSections;
+    config.randomizeTimestamps = global.stripTimestamps;
+    config.clearRichHeader = global.stripRichHeader;
+    config.clearDebugDirectory = global.stripDebugInfo;
+
+    // Checksum 没有独立 UI 项；维持既有的强制输出卫生策略。其余历史字段
+    // 没有生产实现，必须显式关闭，不能借默认值伪装成已应用。
+    config.clearChecksum = true;
+    config.randomizeFileAlignment = false;
+    config.randomizeSectionAlignment = false;
+    config.addFakeImports = false;
+    config.addFakeResources = false;
+    return config;
+}
+
 // ============================================================================
 // 公共接口
 // ============================================================================
@@ -70,8 +103,17 @@ std::vector<SignatureMatch> SignatureEliminator::DetectSignatures(CS_PE_IMAGE* i
 
 bool SignatureEliminator::EliminateSignatures(CS_PE_IMAGE* image, const EliminationConfig& config,
         std::string& reason) {
+    reason.clear();
     if (!image || !image->isValid) {
         reason = "invalid_pe_image";
+        return false;
+    }
+
+    // 这些历史字段没有对应的生产实现，也未暴露为 global/UI 控件。显式传入
+    // true 时必须 fail-closed，不能把一个未执行的隐藏选项算进四个全局开关。
+    if (config.randomizeFileAlignment || config.randomizeSectionAlignment ||
+        config.addFakeImports || config.addFakeResources) {
+        reason = "unsupported_elimination_option_enabled";
         return false;
     }
 
@@ -122,6 +164,365 @@ bool SignatureEliminator::VerifyElimination(CS_PE_IMAGE* image) {
     // 重新检测
     auto matches = DetectSignatures(image);
     return matches.empty();
+}
+
+bool SignatureEliminator::VerifyElimination(CS_PE_IMAGE* image,
+        const EliminationConfig& config, std::string& reason) {
+    reason.clear();
+    if (!image || !image->isValid) {
+        reason = "invalid_pe_image";
+        return false;
+    }
+
+    if (config.randomizeFileAlignment || config.randomizeSectionAlignment ||
+        config.addFakeImports || config.addFakeResources) {
+        reason = "unsupported_elimination_option_enabled";
+        return false;
+    }
+
+    if (config.randomizeSectionNames) {
+        if (!image->sections || image->numSections == 0) {
+            reason = "section_table_missing";
+            return false;
+        }
+        for (WORD i = 0; i < image->numSections; i++) {
+            if (IsExactPreservedSectionName(image->sections[i].Name)) {
+                continue;
+            }
+
+            // GenerateRandomName 的生产后置条件是恰好 8 个小写字母；这也让
+            // verifier 能拒绝仍为 .text/UPX0 等原始名称的伪 applied 状态。
+            for (size_t j = 0; j < 8; j++) {
+                const BYTE value = image->sections[i].Name[j];
+                if (value < static_cast<BYTE>('a') ||
+                    value > static_cast<BYTE>('z')) {
+                    reason = "section_name_not_randomized index=" +
+                        std::to_string(i);
+                    return false;
+                }
+            }
+            if (!VerifyNoSignatureMatch(image->sections[i].Name, 8)) {
+                reason = "randomized_section_name_matches_signature index=" +
+                    std::to_string(i);
+                return false;
+            }
+        }
+    }
+
+    if (config.clearRichHeader) {
+        if (image->hasRichHeader) {
+            reason = "rich_header_present";
+            return false;
+        }
+        if (!image->rawData || !image->dosHeader ||
+            image->dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+            static_cast<uint64_t>(image->dosHeader->e_lfanew) > image->rawSize) {
+            reason = "rich_header_bounds_invalid";
+            return false;
+        }
+
+        constexpr DWORD kRichSignature = 0x68636952u;  // "Rich"
+        const DWORD end = static_cast<DWORD>(image->dosHeader->e_lfanew);
+        for (DWORD offset = static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER));
+             offset <= end - sizeof(DWORD); offset += sizeof(DWORD)) {
+            DWORD value = 0;
+            std::memcpy(&value, image->rawData + offset, sizeof(value));
+            if (value == kRichSignature) {
+                reason = "rich_header_marker_present";
+                return false;
+            }
+        }
+    }
+
+    if (config.clearDebugDirectory) {
+        const IMAGE_DATA_DIRECTORY* debugDirectory = nullptr;
+        if (image->is64Bit && image->ntHeaders64) {
+            debugDirectory = &image->ntHeaders64->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        } else if (!image->is64Bit && image->ntHeaders32) {
+            debugDirectory = &image->ntHeaders32->OptionalHeader
+                .DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        }
+        if (!debugDirectory) {
+            reason = "debug_directory_header_missing";
+            return false;
+        }
+        if (debugDirectory->VirtualAddress != 0 || debugDirectory->Size != 0) {
+            reason = "debug_directory_present";
+            return false;
+        }
+    }
+
+    if (config.randomizeTimestamps) {
+        DWORD timestamp = 0;
+        if (image->is64Bit && image->ntHeaders64) {
+            timestamp = image->ntHeaders64->FileHeader.TimeDateStamp;
+        } else if (!image->is64Bit && image->ntHeaders32) {
+            timestamp = image->ntHeaders32->FileHeader.TimeDateStamp;
+        } else {
+            reason = "timestamp_header_missing";
+            return false;
+        }
+        if (timestamp != 0) {
+            reason = "timestamp_not_cleared";
+            return false;
+        }
+    }
+
+    if (config.clearChecksum) {
+        DWORD checksum = 0;
+        if (image->is64Bit && image->ntHeaders64) {
+            checksum = image->ntHeaders64->OptionalHeader.CheckSum;
+        } else if (!image->is64Bit && image->ntHeaders32) {
+            checksum = image->ntHeaders32->OptionalHeader.CheckSum;
+        } else {
+            reason = "checksum_header_missing";
+            return false;
+        }
+        if (checksum != 0) {
+            reason = "checksum_not_cleared";
+            return false;
+        }
+    }
+
+    // 有意不调用 DetectSignatures：例如用户只请求清时间戳时，输入原本存在
+    // 的 UPX section 名或通用入口特征不属于本次请求，不能导致误判失败。
+    return true;
+}
+
+bool SignatureEliminator::CaptureState(CS_PE_IMAGE* image,
+        EliminationState& state, std::string& reason) {
+    state = EliminationState{};
+    reason.clear();
+    if (!image || !image->isValid || !image->rawData || !image->dosHeader) {
+        reason = "state_invalid_pe_image";
+        return false;
+    }
+    if (image->dosHeader->e_lfanew <
+            static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+        static_cast<uint64_t>(image->dosHeader->e_lfanew) > image->rawSize) {
+        reason = "state_pe_header_bounds_invalid";
+        return false;
+    }
+    if (image->numSections != 0 && !image->sections) {
+        reason = "state_section_table_missing";
+        return false;
+    }
+
+    const IMAGE_DATA_DIRECTORY* debugDirectory = nullptr;
+    if (image->is64Bit && image->ntHeaders64) {
+        debugDirectory = &image->ntHeaders64->OptionalHeader
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        state.machine = image->ntHeaders64->FileHeader.Machine;
+        state.optionalHeaderMagic =
+            image->ntHeaders64->OptionalHeader.Magic;
+        state.sizeOfOptionalHeader =
+            image->ntHeaders64->FileHeader.SizeOfOptionalHeader;
+        state.numberOfRvaAndSizes =
+            image->ntHeaders64->OptionalHeader.NumberOfRvaAndSizes;
+        state.coffTimestamp =
+            image->ntHeaders64->FileHeader.TimeDateStamp;
+        state.checksum = image->ntHeaders64->OptionalHeader.CheckSum;
+    } else if (!image->is64Bit && image->ntHeaders32) {
+        debugDirectory = &image->ntHeaders32->OptionalHeader
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        state.machine = image->ntHeaders32->FileHeader.Machine;
+        state.optionalHeaderMagic =
+            image->ntHeaders32->OptionalHeader.Magic;
+        state.sizeOfOptionalHeader =
+            image->ntHeaders32->FileHeader.SizeOfOptionalHeader;
+        state.numberOfRvaAndSizes =
+            image->ntHeaders32->OptionalHeader.NumberOfRvaAndSizes;
+        state.coffTimestamp =
+            image->ntHeaders32->FileHeader.TimeDateStamp;
+        state.checksum = image->ntHeaders32->OptionalHeader.CheckSum;
+    } else {
+        reason = "state_nt_headers_missing";
+        return false;
+    }
+
+    state.is64Bit = image->is64Bit != FALSE;
+    state.numberOfSections = image->numSections;
+    state.peHeaderOffset = static_cast<DWORD>(image->dosHeader->e_lfanew);
+    state.hasRichHeader = image->hasRichHeader != FALSE;
+    state.debugDirectoryRVA = debugDirectory->VirtualAddress;
+    state.debugDirectorySize = debugDirectory->Size;
+
+    try {
+        state.sectionNames.resize(image->numSections);
+        for (WORD i = 0; i < image->numSections; ++i) {
+            std::memcpy(state.sectionNames[i].data(),
+                image->sections[i].Name, IMAGE_SIZEOF_SHORT_NAME);
+        }
+        const BYTE* stubBegin =
+            image->rawData + sizeof(IMAGE_DOS_HEADER);
+        const BYTE* stubEnd = image->rawData + state.peHeaderOffset;
+        state.dosStubBytes.assign(stubBegin, stubEnd);
+    } catch (...) {
+        state = EliminationState{};
+        reason = "state_capture_allocation_failed";
+        return false;
+    }
+    return true;
+}
+
+bool SignatureEliminator::VerifyTransition(const EliminationState& before,
+        CS_PE_IMAGE* image, const EliminationConfig& config,
+        EliminationState& after, std::string& reason) {
+    if (!VerifyElimination(image, config, reason)) {
+        return false;
+    }
+    if (!CaptureState(image, after, reason)) {
+        return false;
+    }
+    if (before.is64Bit != after.is64Bit ||
+        before.machine != after.machine ||
+        before.optionalHeaderMagic != after.optionalHeaderMagic ||
+        before.sizeOfOptionalHeader != after.sizeOfOptionalHeader ||
+        before.numberOfSections != after.numberOfSections ||
+        before.numberOfRvaAndSizes != after.numberOfRvaAndSizes ||
+        before.peHeaderOffset != after.peHeaderOffset ||
+        before.sectionNames.size() != after.sectionNames.size()) {
+        reason = "state_layout_changed";
+        return false;
+    }
+
+    for (size_t i = 0; i < before.sectionNames.size(); ++i) {
+        const auto& oldName = before.sectionNames[i];
+        const auto& newName = after.sectionNames[i];
+        if (!config.randomizeSectionNames) {
+            if (oldName != newName) {
+                reason = "disabled_section_name_changed index=" +
+                    std::to_string(i);
+                return false;
+            }
+            continue;
+        }
+        if (IsExactPreservedSectionName(oldName.data())) {
+            if (oldName != newName) {
+                reason = "preserved_section_name_changed index=" +
+                    std::to_string(i);
+                return false;
+            }
+            continue;
+        }
+        if (oldName == newName) {
+            reason = "section_name_not_changed index=" +
+                std::to_string(i);
+            return false;
+        }
+        for (BYTE value : newName) {
+            if (value < static_cast<BYTE>('a') ||
+                value > static_cast<BYTE>('z')) {
+                reason = "section_name_not_randomized index=" +
+                    std::to_string(i);
+                return false;
+            }
+        }
+        if (!VerifyNoSignatureMatch(newName.data(),
+                static_cast<DWORD>(newName.size()))) {
+            reason = "randomized_section_name_matches_signature index=" +
+                std::to_string(i);
+            return false;
+        }
+    }
+
+    if (config.clearRichHeader) {
+        if (after.hasRichHeader) {
+            reason = "rich_header_present";
+            return false;
+        }
+        if (before.hasRichHeader) {
+            for (BYTE value : after.dosStubBytes) {
+                if (value != 0) {
+                    reason = "rich_header_region_not_zero";
+                    return false;
+                }
+            }
+        } else if (before.dosStubBytes != after.dosStubBytes) {
+            reason = "absent_rich_region_changed";
+            return false;
+        }
+    } else if (before.hasRichHeader != after.hasRichHeader ||
+            before.dosStubBytes != after.dosStubBytes) {
+        reason = "disabled_rich_header_changed";
+        return false;
+    }
+
+    if (config.clearDebugDirectory) {
+        if (after.debugDirectoryRVA != 0 ||
+            after.debugDirectorySize != 0) {
+            reason = "debug_directory_present";
+            return false;
+        }
+    } else if (before.debugDirectoryRVA != after.debugDirectoryRVA ||
+            before.debugDirectorySize != after.debugDirectorySize) {
+        reason = "disabled_debug_directory_changed";
+        return false;
+    }
+
+    if (config.randomizeTimestamps) {
+        if (after.coffTimestamp != 0) {
+            reason = "timestamp_not_cleared";
+            return false;
+        }
+    } else if (before.coffTimestamp != after.coffTimestamp) {
+        reason = "disabled_timestamp_changed";
+        return false;
+    }
+
+    if (config.clearChecksum) {
+        if (after.checksum != 0) {
+            reason = "checksum_not_cleared";
+            return false;
+        }
+    } else if (before.checksum != after.checksum) {
+        reason = "disabled_checksum_changed";
+        return false;
+    }
+    return true;
+}
+
+bool SignatureEliminator::VerifyExactState(CS_PE_IMAGE* image,
+        const EliminationState& expected, std::string& reason) {
+    EliminationState actual;
+    if (!CaptureState(image, actual, reason)) {
+        return false;
+    }
+    if (actual.is64Bit != expected.is64Bit ||
+        actual.machine != expected.machine ||
+        actual.optionalHeaderMagic != expected.optionalHeaderMagic ||
+        actual.sizeOfOptionalHeader != expected.sizeOfOptionalHeader ||
+        actual.numberOfSections != expected.numberOfSections ||
+        actual.numberOfRvaAndSizes != expected.numberOfRvaAndSizes ||
+        actual.peHeaderOffset != expected.peHeaderOffset) {
+        reason = "final_layout_changed";
+        return false;
+    }
+    if (actual.sectionNames != expected.sectionNames) {
+        reason = "final_section_names_changed";
+        return false;
+    }
+    if (actual.hasRichHeader != expected.hasRichHeader ||
+        actual.dosStubBytes != expected.dosStubBytes) {
+        reason = "final_rich_region_changed";
+        return false;
+    }
+    if (actual.debugDirectoryRVA != expected.debugDirectoryRVA ||
+        actual.debugDirectorySize != expected.debugDirectorySize) {
+        reason = "final_debug_directory_changed";
+        return false;
+    }
+    if (actual.coffTimestamp != expected.coffTimestamp) {
+        reason = "final_timestamp_changed";
+        return false;
+    }
+    if (actual.checksum != expected.checksum) {
+        reason = "final_checksum_changed";
+        return false;
+    }
+    reason.clear();
+    return true;
 }
 
 // ============================================================================
@@ -221,29 +622,30 @@ bool SignatureEliminator::CheckPEiDSignatures(CS_PE_IMAGE* image, std::vector<Si
         entryRVA = image->ntHeaders32->OptionalHeader.AddressOfEntryPoint;
     }
 
-    // 查找入口点在文件中的偏移
-    for (WORD i = 0; i < image->numSections; i++) {
-        if (entryRVA >= image->sections[i].VirtualAddress &&
-            entryRVA < image->sections[i].VirtualAddress + image->sections[i].Misc.VirtualSize) {
-            DWORD offset = entryRVA - image->sections[i].VirtualAddress + image->sections[i].PointerToRawData;
-            
-            if (offset + 16 <= image->rawSize) {
-                const BYTE* entryCode = image->rawData + offset;
-                
-                // 检查常见的壳入口模式
-                // pushad / mov ebp, esp / ...
-                if (entryCode[0] == 0x60 && entryCode[1] == 0x89 && entryCode[2] == 0xE5) {
-                    SignatureMatch match;
-                    match.signatureName = "Generic Packer Entry";
-                    match.detector = "Heuristic";
-                    match.matchOffset = offset;
-                    match.matchLength = 3;
-                    match.description = "Common packer entry pattern detected";
-                    matches.push_back(match);
-                }
-            }
-            break;
-        }
+    constexpr uint32_t kPatternSize = 3;
+    if (entryRVA > (std::numeric_limits<uint32_t>::max)() -
+            kPatternSize ||
+        !PEUtils::IsExecutableFileBackedRange(
+            image, entryRVA, entryRVA + kPatternSize)) {
+        return false;
+    }
+    const DWORD offset = PEUtils::RvaToOffset(image, entryRVA);
+    if (offset == 0 ||
+        !PEUtils::CheckRawBounds(image, offset, kPatternSize)) {
+        return false;
+    }
+
+    const BYTE* entryCode = image->rawData + offset;
+    // 检查常见的壳入口模式：pushad / mov ebp, esp / ...
+    if (entryCode[0] == 0x60 && entryCode[1] == 0x89 &&
+        entryCode[2] == 0xE5) {
+        SignatureMatch match;
+        match.signatureName = "Generic Packer Entry";
+        match.detector = "Heuristic";
+        match.matchOffset = offset;
+        match.matchLength = kPatternSize;
+        match.description = "Common packer entry pattern detected";
+        matches.push_back(match);
     }
 
     return !matches.empty();
@@ -255,20 +657,30 @@ bool SignatureEliminator::CheckPEiDSignatures(CS_PE_IMAGE* image, std::vector<Si
 
 bool SignatureEliminator::RandomizeSectionNames(CS_PE_IMAGE* image) {
     for (WORD i = 0; i < image->numSections; i++) {
-        char name[9] = {0};
-        memcpy(name, image->sections[i].Name, 8);
-
-        // 保留 .rsrc 和 .reloc（Windows loader 需要）
-        if (strncmp(name, ".rsrc", 5) == 0 || strncmp(name, ".reloc", 6) == 0) {
+        // 仅保留严格的零填充 .rsrc/.reloc 名称；“.rsrcX”等前缀相似
+        // 名称不属于保留集合，不能借前缀比较绕过随机化及后置验证。
+        if (IsExactPreservedSectionName(image->sections[i].Name)) {
             continue;
         }
 
-        // 生成随机名称
-        char newName[8];
-        if (!GenerateRandomName(newName, 8)) {
+        // 生成一个与输入精确不同的名称；这样过渡验证能证明该 section
+        // 确实被处理，而不是仅凭输入碰巧已有 8 个小写字母就判为成功。
+        char newName[IMAGE_SIZEOF_SHORT_NAME];
+        bool generated = false;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (!GenerateRandomName(newName, IMAGE_SIZEOF_SHORT_NAME)) {
+                return false;
+            }
+            if (std::memcmp(newName, image->sections[i].Name,
+                    IMAGE_SIZEOF_SHORT_NAME) != 0) {
+                generated = true;
+                break;
+            }
+        }
+        if (!generated) {
             return false;
         }
-        memcpy(image->sections[i].Name, newName, 8);
+        memcpy(image->sections[i].Name, newName, IMAGE_SIZEOF_SHORT_NAME);
     }
 
     return true;
@@ -279,16 +691,22 @@ bool SignatureEliminator::ClearRichHeader(CS_PE_IMAGE* image) {
         return true;
     }
 
-    // Rich Header 在 DOS Header 和 PE 签名之间
-    // 清除从 0x80 到 e_lfanew 之间的数据
-    DWORD start = 0x80;
-    DWORD end = image->dosHeader->e_lfanew;
-
-    if (start < end && end <= image->rawSize) {
-        memset(image->rawData + start, 0, end - start);
-        image->hasRichHeader = FALSE;
+    if (!image->rawData || !image->dosHeader) {
+        return false;
     }
 
+    // 与 PEParser::DetectRichHeader 使用同一范围：DOS Header 末尾到 PE
+    // 签名之前。固定从 0x80 开始会遗漏合法位于 0x40..0x7f 的早期 Rich。
+    const DWORD start = static_cast<DWORD>(sizeof(IMAGE_DOS_HEADER));
+    DWORD end = image->dosHeader->e_lfanew;
+
+    if (start >= end || end > image->rawSize) {
+        return false;
+    }
+
+    memset(image->rawData + start, 0, end - start);
+    image->hasRichHeader = FALSE;
+    image->richHeaderOffset = 0;
     return true;
 }
 
@@ -384,8 +802,8 @@ bool SignatureEliminator::GenerateRandomName(char* name, DWORD length) {
         }
         // 未通过自检，重新生成
     }
-    // 超过重试次数，使用最后生成的名称（极低概率到这里）
-    return true;
+    // 外部签名库可能覆盖所有候选结果；不能在自检连续失败后继续使用。
+    return false;
 }
 
 // BUG 17 修复：从外部文件加载签名数据库

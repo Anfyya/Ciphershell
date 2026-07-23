@@ -49,7 +49,9 @@ ProtectionBuildContext ProtectionBuildContext::FromConfig(
     bool verbose)
 {
     ProtectionBuildContext ctx;
-    ctx.quickLevel = config.global.protectionLevel > 0 ? config.global.protectionLevel : cliLevel;
+    ctx.quickLevel = config.global.protectionLevelSet
+        ? config.global.protectionLevel
+        : cliLevel;
     ctx.debugNames = verbose;
     ctx.randomizeSectionNames = config.global.randomizeSections;
 #ifdef _WIN32

@@ -64,6 +64,7 @@ private:
     void RefreshSummaryLabel();
     void UpdateVmEnabledState();
     void UpdateEvidenceEnabledState();
+    void ApplyPermanentDisabledState();
 
     void OnStartClicked();
     void OnCancelClicked();
@@ -82,6 +83,7 @@ private:
     HWND m_hwndTab = nullptr;
     int m_tabCount = 0;
     std::vector<std::vector<HWND>> m_tabControls;
+    std::vector<HWND> m_permanentlyDisabledControls;
     int m_vmTabIndex = -1;
     COLORREF m_statusColor = RGB(0, 0, 0);
 

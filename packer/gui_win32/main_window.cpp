@@ -12,6 +12,8 @@
 #include "control_ids.h"
 #include "drop_target.h"
 #include "file_dialogs.h"
+#include "input_validation.h"
+#include "../path_identity.h"
 #include "text_convert.h"
 #include "toml_writer.h"
 #include "ui_helpers.h"
@@ -215,6 +217,7 @@ void MainWindow::OnCreate(HWND hwnd) {
     ApplyDefaultsToControls();
     UpdateVmEnabledState();
     UpdateEvidenceEnabledState();
+    ApplyPermanentDisabledState();
     RefreshSummaryLabel();
     SelectTab(0);
 
@@ -273,16 +276,16 @@ void MainWindow::BuildBasicPage(int tabIndex) {
     y += kRowHeight + kGroupGap;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
-        L"保护等级（global.protection_level / -l，1-5）"));
+        L"保护等级（global.protection_level / -l；VM 仍由独立开关决定）"));
     y += kRowHeight;
     const int levelBoxHeight = kRowHeight * 5 + 10;
     track(CreateGroupBoxControl(m_hwnd, x, y, kPageWidth, levelBoxHeight, L""));
     static const wchar_t* const kLevelText[5] = {
-        L"L1 (Guard)     基础加密保护       (~1.05x 性能开销)",
-        L"L2 (Shield)    控制流平坦化       (~2-3x 性能开销)",
-        L"L3 (Armor)     高级混淆           (~5-8x 性能开销)",
-        L"L4 (Fortress)  代码虚拟化         (~15-30x 性能开销)",
-        L"L5 (Citadel)   多层嵌套 VM        (~50-100x+ 性能开销)",
+        L"L1 (Guard)     基础档；不隐式启用尚未闭环的变换",
+        L"L2 (Shield)    预留档；当前不隐式启用控制流变换",
+        L"L3 (Armor)     预留档；当前不隐式启用高级混淆",
+        L"L4 (Fortress)  后端函数级 VM preset（可被独立开关覆盖）",
+        L"L5 (Citadel)   当前同一 VM 链；strength 尚未改变 Handler",
     };
     int radioY = y + 8;
     for (int i = 0; i < 5; ++i) {
@@ -297,16 +300,18 @@ void MainWindow::BuildBasicPage(int tabIndex) {
     y += kRowHeight;
     const int halfWidth = kPageWidth / 2 - 6;
     m_stripDebugCheck = track(CreateCheckboxControl(
-        m_hwnd, x, y, halfWidth, kControlHeight, L"strip_debug_info（删除调试信息）", NextControlId(), true));
+        m_hwnd, x, y, halfWidth, kControlHeight,
+        L"strip_debug_info（清零 Debug 目录项；不擦原始载荷）", NextControlId(), true));
     m_stripRichCheck = track(CreateCheckboxControl(
         m_hwnd, x + halfWidth + 12, y, halfWidth, kControlHeight,
-        L"strip_rich_header（删除 Rich Header）", NextControlId(), true));
+        L"strip_rich_header（检测到 Rich 时清零 DOS stub 区）", NextControlId(), true));
     y += kRowHeight;
     m_stripTimestampsCheck = track(CreateCheckboxControl(
-        m_hwnd, x, y, halfWidth, kControlHeight, L"strip_timestamps（时间戳归零）", NextControlId(), true));
+        m_hwnd, x, y, halfWidth, kControlHeight,
+        L"strip_timestamps（COFF 文件头时间戳归零）", NextControlId(), true));
     m_randomizeSectionsCheck = track(CreateCheckboxControl(
         m_hwnd, x + halfWidth + 12, y, halfWidth, kControlHeight,
-        L"randomize_section_names（随机化节名）", NextControlId(), true));
+        L"randomize_section_names（随机化非 .rsrc/.reloc 节名）", NextControlId(), true));
     y += kRowHeight + kGroupGap;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight, L"命令行选项"));
@@ -340,9 +345,13 @@ void MainWindow::BuildVmPage(int tabIndex) {
         m_hwnd, x, y, kPageWidth, kControlHeight, L"启用虚拟化保护 [vm].enabled", IDC_VM_ENABLED, true));
     y += kRowHeight + 4;
 
-    track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"strength（1-100）"));
+    track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight,
+        L"strength（当前仅解析）"));
     m_vmStrengthEdit = track(CreateEditControl(
-        m_hwnd, kControlX, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
+        m_hwnd, kControlX, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER, false));
+    m_permanentlyDisabledControls.push_back(m_vmStrengthEdit);
+    track(CreateLabelControl(m_hwnd, kControlX + kShortWidth + 12, y, 390, kControlHeight,
+        L"生产 Handler 尚未消费该数值，先禁用编辑"));
     y += kRowHeight;
 
     track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"register_count（16-32）"));
@@ -381,7 +390,7 @@ void MainWindow::BuildVmPage(int tabIndex) {
 
     track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"native_body_policy"));
     m_nativeBodyCombo = track(CreateComboControl(
-        m_hwnd, kControlX, y, kShortWidth + 60, kControlHeight, NextControlId(), {L"destroy"}, 0, true));
+        m_hwnd, kControlX, y, kShortWidth + 60, kControlHeight, NextControlId(), {L"destroy"}, 0, false));
     track(CreateLabelControl(m_hwnd, kControlX + kShortWidth + 70, y, 280, kControlHeight,
         L"当前后端唯一接受的取值"));
     y += kRowHeight;
@@ -398,12 +407,12 @@ void MainWindow::BuildVmPage(int tabIndex) {
         L"VM Variant Group（函数级 VM 异构 / 分发去中心化）"));
     y += kRowHeight;
     const int thirdWidth = kPageWidth / 3;
-    track(CreateLabelControl(m_hwnd, x, y, 46, kControlHeight, L"count"));
+    track(CreateLabelControl(m_hwnd, x, y, 76, kControlHeight, L"count 0-64"));
     m_variantGroupCountEdit = track(CreateEditControl(
-        m_hwnd, x + 48, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
-    track(CreateLabelControl(m_hwnd, x + thirdWidth, y, 40, kControlHeight, L"max"));
+        m_hwnd, x + 78, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
+    track(CreateLabelControl(m_hwnd, x + thirdWidth, y, 72, kControlHeight, L"max 1-64"));
     m_variantGroupMaxEdit = track(CreateEditControl(
-        m_hwnd, x + thirdWidth + 42, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
+        m_hwnd, x + thirdWidth + 74, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
     track(CreateLabelControl(m_hwnd, x + 2 * thirdWidth, y, 150, kControlHeight, L"functions_per_group"));
     m_variantGroupFuncPerGroupEdit = track(CreateEditControl(
         m_hwnd, x + 2 * thirdWidth + 152, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
@@ -433,6 +442,11 @@ void MainWindow::BuildVmPage(int tabIndex) {
 void MainWindow::BuildControlFlowPage(int tabIndex) {
     using namespace Metrics;
     auto track = [&](HWND h) { TrackControl(tabIndex, h); return h; };
+    auto trackDisabled = [&](HWND h) {
+        TrackControl(tabIndex, h);
+        if (h) m_permanentlyDisabledControls.push_back(h);
+        return h;
+    };
     int y = kPageMarginTop;
     const int x = kPageMarginLeft;
 
@@ -468,9 +482,10 @@ void MainWindow::BuildControlFlowPage(int tabIndex) {
         L"CapabilityChecker 无条件拒绝 bogus.enabled=true（无法证明原函数语义保持，没有生产闭环）。\r\n"
         L"下面按 config/full_example.toml 的真实默认值只读展示，本界面不提供开关。"));
     y += kControlHeight * 2 + 4;
-    track(CreateCheckboxControl(m_hwnd, x, y, 150, kControlHeight, L"enabled", NextControlId(), false, false));
+    trackDisabled(CreateCheckboxControl(
+        m_hwnd, x, y, 150, kControlHeight, L"enabled", NextControlId(), false, false));
     track(CreateLabelControl(m_hwnd, x + 160, y, 60, kControlHeight, L"strength"));
-    HWND bogusStrength = track(CreateEditControl(
+    HWND bogusStrength = trackDisabled(CreateEditControl(
         m_hwnd, x + 224, y, kShortWidth, kControlHeight, NextControlId(), 0, false));
     SetEditInt(bogusStrength, ControlFlowOptions::kBogusStrength);
     y += kRowHeight;
@@ -483,12 +498,17 @@ void MainWindow::BuildControlFlowPage(int tabIndex) {
 void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
     using namespace Metrics;
     auto track = [&](HWND h) { TrackControl(tabIndex, h); return h; };
+    auto trackDisabled = [&](HWND h) {
+        TrackControl(tabIndex, h);
+        if (h) m_permanentlyDisabledControls.push_back(h);
+        return h;
+    };
     int y = kPageMarginTop;
     const int x = kPageMarginLeft;
     const int halfWidth = kPageWidth / 2 - 6;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
-        L"反调试 [anti_debug]（CipherShell Plus，尚未实现：勾选后打包会被拒绝）"));
+        L"反调试 [anti_debug]（CipherShell Plus 尚未实现；控件禁用）"));
     y += kRowHeight;
 
     static const wchar_t* const kAntiDebugLabels[8] = {
@@ -504,14 +524,14 @@ void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
     for (int i = 0; i < 8; ++i) {
         const int col = i % 2;
         const int row = i / 2;
-        m_antiDebugChecks[i] = track(CreateCheckboxControl(
+        m_antiDebugChecks[i] = trackDisabled(CreateCheckboxControl(
             m_hwnd, x + col * (halfWidth + 12), y + row * kRowHeight, halfWidth, kControlHeight,
-            kAntiDebugLabels[i], NextControlId(), false));
+            kAntiDebugLabels[i], NextControlId(), false, false));
     }
     y += 4 * kRowHeight + kGroupGap;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
-        L"反 Dump [anti_dump]（CipherShell Plus，尚未实现：勾选后打包会被拒绝）"));
+        L"反 Dump [anti_dump]（CipherShell Plus 尚未实现；控件禁用）"));
     y += kRowHeight;
     static const wchar_t* const kAntiDumpLabels[3] = {
         L"erase_pe_header（运行时擦除 PE 头）",
@@ -521,9 +541,9 @@ void MainWindow::BuildAntiDebugDumpPage(int tabIndex) {
     for (int i = 0; i < 3; ++i) {
         const int col = i % 2;
         const int row = i / 2;
-        m_antiDumpChecks[i] = track(CreateCheckboxControl(
+        m_antiDumpChecks[i] = trackDisabled(CreateCheckboxControl(
             m_hwnd, x + col * (halfWidth + 12), y + row * kRowHeight, halfWidth, kControlHeight,
-            kAntiDumpLabels[i], NextControlId(), false));
+            kAntiDumpLabels[i], NextControlId(), false, false));
     }
     y += 2 * kRowHeight;
 }
@@ -542,14 +562,16 @@ void MainWindow::BuildPerformancePage(int tabIndex) {
     y += kRowHeight;
     m_autoHotspotCheck = track(CreateCheckboxControl(
         m_hwnd, x, y, kPageWidth, kControlHeight,
-        L"auto_hotspot_analysis（自动分析热点函数并降低其保护等级）", NextControlId(), true));
+        L"auto_hotspot_analysis（按现有启发式上限降低热点函数等级）", NextControlId(), true));
     y += kRowHeight;
 
-    track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"max_vm_overhead_ratio"));
+    track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight,
+        L"max_vm_overhead_ratio"));
     m_maxOverheadEdit = track(CreateEditControl(
-        m_hwnd, kControlX, y, kShortWidth + 20, kControlHeight, NextControlId(), 0));
+        m_hwnd, kControlX, y, kShortWidth + 20, kControlHeight, NextControlId(), 0, false));
+    m_permanentlyDisabledControls.push_back(m_maxOverheadEdit);
     track(CreateLabelControl(m_hwnd, kControlX + kShortWidth + 30, y, 420, kControlHeight,
-        L"VM 执行最大允许倍率，超过则自动降级"));
+        L"当前仅解析、尚未参与生产判定，先禁用编辑"));
     y += kRowHeight;
 }
 
@@ -560,6 +582,11 @@ void MainWindow::BuildPerformancePage(int tabIndex) {
 void MainWindow::BuildUnavailablePage(int tabIndex) {
     using namespace Metrics;
     auto track = [&](HWND h) { TrackControl(tabIndex, h); return h; };
+    auto trackDisabled = [&](HWND h) {
+        TrackControl(tabIndex, h);
+        if (h) m_permanentlyDisabledControls.push_back(h);
+        return h;
+    };
     int y = kPageMarginTop;
     const int x = kPageMarginLeft;
 
@@ -576,23 +603,24 @@ void MainWindow::BuildUnavailablePage(int tabIndex) {
     track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight,
         L"原因：未认证算法 + 可恢复密钥，没有生产语义闭环"));
     y += kRowHeight;
-    track(CreateCheckboxControl(m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
+    trackDisabled(CreateCheckboxControl(
+        m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
     track(CreateLabelControl(m_hwnd, x + 116, y, 66, kControlHeight, L"strength"));
-    HWND stringStrength = track(CreateEditControl(
+    HWND stringStrength = trackDisabled(CreateEditControl(
         m_hwnd, x + 184, y, kShortWidth, kControlHeight, NextControlId(), 0, false));
     SetEditInt(stringStrength, defaults.unavailable.stringEncryption.strength);
     track(CreateLabelControl(m_hwnd, x + 184 + kShortWidth + 12, y, 48, kControlHeight, L"mode"));
-    HWND stringMode = track(CreateEditControl(
+    HWND stringMode = trackDisabled(CreateEditControl(
         m_hwnd, x + 184 + kShortWidth + 64, y, 100, kControlHeight, NextControlId(), 0, false));
     SetEditText(stringMode, Utf8ToWide(defaults.unavailable.stringEncryption.mode));
     y += kRowHeight;
-    track(CreateCheckboxControl(m_hwnd, x, y, 90, kControlHeight, L"ascii",
+    trackDisabled(CreateCheckboxControl(m_hwnd, x, y, 90, kControlHeight, L"ascii",
         NextControlId(), defaults.unavailable.stringEncryption.ascii, false));
-    track(CreateCheckboxControl(m_hwnd, x + 100, y, 90, kControlHeight, L"utf16",
+    trackDisabled(CreateCheckboxControl(m_hwnd, x + 100, y, 90, kControlHeight, L"utf16",
         NextControlId(), defaults.unavailable.stringEncryption.utf16, false));
-    track(CreateCheckboxControl(m_hwnd, x + 200, y, 130, kControlHeight, L"resources",
+    trackDisabled(CreateCheckboxControl(m_hwnd, x + 200, y, 130, kControlHeight, L"resources",
         NextControlId(), defaults.unavailable.stringEncryption.resources, false));
-    track(CreateCheckboxControl(m_hwnd, x + 340, y, 180, kControlHeight, L"clear_after_use",
+    trackDisabled(CreateCheckboxControl(m_hwnd, x + 340, y, 180, kControlHeight, L"clear_after_use",
         NextControlId(), defaults.unavailable.stringEncryption.clearAfterUse, false));
     y += kRowHeight + kGroupGap;
 
@@ -601,9 +629,10 @@ void MainWindow::BuildUnavailablePage(int tabIndex) {
     track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight,
         L"原因：仅追加假导入并保留真实 IAT，未改写 callsite，没有生产语义闭环"));
     y += kRowHeight;
-    track(CreateCheckboxControl(m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
+    trackDisabled(CreateCheckboxControl(
+        m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
     track(CreateLabelControl(m_hwnd, x + 116, y, 66, kControlHeight, L"strength"));
-    HWND importStrength = track(CreateEditControl(
+    HWND importStrength = trackDisabled(CreateEditControl(
         m_hwnd, x + 184, y, kShortWidth, kControlHeight, NextControlId(), 0, false));
     SetEditInt(importStrength, defaults.unavailable.importProtection.strength);
     y += kRowHeight + kGroupGap;
@@ -613,13 +642,14 @@ void MainWindow::BuildUnavailablePage(int tabIndex) {
     track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight,
         L"原因：未认证算法 + 可恢复密钥，没有生产语义闭环"));
     y += kRowHeight;
-    track(CreateCheckboxControl(m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
+    trackDisabled(CreateCheckboxControl(
+        m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
     track(CreateLabelControl(m_hwnd, x + 116, y, 66, kControlHeight, L"strength"));
-    HWND sectionStrength = track(CreateEditControl(
+    HWND sectionStrength = trackDisabled(CreateEditControl(
         m_hwnd, x + 184, y, kShortWidth, kControlHeight, NextControlId(), 0, false));
     SetEditInt(sectionStrength, defaults.unavailable.sectionEncryption.strength);
     track(CreateLabelControl(m_hwnd, x + 184 + kShortWidth + 12, y, 48, kControlHeight, L"mode"));
-    HWND sectionMode = track(CreateEditControl(
+    HWND sectionMode = trackDisabled(CreateEditControl(
         m_hwnd, x + 184 + kShortWidth + 64, y, 100, kControlHeight, NextControlId(), 0, false));
     SetEditText(sectionMode, Utf8ToWide(defaults.unavailable.sectionEncryption.mode));
     y += kRowHeight;
@@ -802,12 +832,19 @@ void MainWindow::UpdateVmEnabledState() {
     for (HWND hwnd : m_tabControls[static_cast<size_t>(m_vmTabIndex)]) {
         if (hwnd != m_vmEnabledCheck) ::EnableWindow(hwnd, enabled);
     }
+    ApplyPermanentDisabledState();
 }
 
 void MainWindow::UpdateEvidenceEnabledState() {
     const bool enabled = GetCheckboxChecked(m_evidenceCheck);
     ::EnableWindow(m_evidencePathEdit, enabled);
     ::EnableWindow(m_evidenceBrowseButton, enabled);
+}
+
+void MainWindow::ApplyPermanentDisabledState() {
+    for (HWND hwnd : m_permanentlyDisabledControls) {
+        if (hwnd) ::EnableWindow(hwnd, FALSE);
+    }
 }
 
 void MainWindow::ResolveDefaultBackendPath() {
@@ -849,10 +886,15 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
         return false;
     }
     {
-        std::error_code inputEc, outputEc;
-        const auto inputAbs = std::filesystem::weakly_canonical(m_inputFilePath, inputEc);
-        const auto outputAbs = std::filesystem::weakly_canonical(m_outputFilePath, outputEc);
-        if (!inputEc && !outputEc && inputAbs == outputAbs) {
+        bool same = false;
+        std::string pathReason;
+        if (!CipherShell::PathsReferToSameTarget(
+                m_inputFilePath, m_outputFilePath, same,
+                pathReason)) {
+            validationError = L"无法可靠确认输入/输出路径身份。";
+            return false;
+        }
+        if (same) {
             validationError = L"输出文件不能和输入文件是同一个路径。";
             return false;
         }
@@ -882,11 +924,24 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
             validationError = L"已勾选导出 VM handler 证据，但还没有选择保存路径。";
             return false;
         }
-        std::error_code evidenceEc, outputEc;
-        const auto evidenceAbs = std::filesystem::weakly_canonical(evidencePath, evidenceEc);
-        const auto outputAbs = std::filesystem::weakly_canonical(m_outputFilePath, outputEc);
-        if (!evidenceEc && !outputEc && evidenceAbs == outputAbs) {
+        bool sameAsOutput = false;
+        bool sameAsInput = false;
+        std::string pathReason;
+        if (!CipherShell::PathsReferToSameTarget(
+                evidencePath, m_outputFilePath, sameAsOutput,
+                pathReason) ||
+            !CipherShell::PathsReferToSameTarget(
+                evidencePath, m_inputFilePath, sameAsInput,
+                pathReason)) {
+            validationError = L"无法可靠确认 handler 证据路径身份。";
+            return false;
+        }
+        if (sameAsOutput) {
             validationError = L"证据文件路径不能和输出文件相同。";
+            return false;
+        }
+        if (sameAsInput) {
+            validationError = L"证据文件路径不能和输入文件相同。";
             return false;
         }
         outConfig.cli.vmHandlerEvidencePath = evidencePath;
@@ -900,8 +955,20 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
     VmOptions& vm = outConfig.vm;
     vm.enabled = GetCheckboxChecked(m_vmEnabledCheck);
     vm.strength = std::clamp(GetEditInt(m_vmStrengthEdit, 90), 1, 100);
-    vm.registerCount = GetEditInt(m_registerCountEdit, 24);
-    vm.stackSize = GetEditHexOrDecimal(m_stackSizeEdit, 0x20000);
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_registerCountEdit), 16, 32,
+            vm.registerCount)) {
+        validationError = L"register_count 必须是 16-32 之间的完整十进制整数。";
+        return false;
+    }
+    if (!TryParseHexOrDecimalUint32(
+            GetEditText(m_stackSizeEdit), vm.stackSize) ||
+        vm.stackSize < 0x4000 || vm.stackSize > 0x70000 ||
+        (vm.stackSize & 0xFFFu) != 0) {
+        validationError =
+            L"stack_size 必须是 0x4000-0x70000 之间、按 0x1000 对齐的完整十进制或 0x 十六进制值。";
+        return false;
+    }
     vm.opcodeRandomization = GetCheckboxChecked(m_opcodeRandCheck);
     vm.handlerMutation = GetCheckboxChecked(m_handlerMutationCheck);
     vm.bytecodeEncryption = GetCheckboxChecked(m_bytecodeEncryptionCheck);
@@ -915,39 +982,68 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
             sizeof(kX86CallAbiValues) / sizeof(kX86CallAbiValues[0]));
         vm.x86CallAbi = WideToUtf8(validSel ? kX86CallAbiValues[sel] : L"auto");
     }
-    vm.variantGroupCount = (std::max)(0, GetEditInt(m_variantGroupCountEdit, 0));
-    vm.variantGroupMax = (std::max)(1, GetEditInt(m_variantGroupMaxEdit, 4));
-    vm.variantGroupFunctionsPerGroup = (std::max)(1, GetEditInt(m_variantGroupFuncPerGroupEdit, 4));
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_variantGroupCountEdit), 0, 64,
+            vm.variantGroupCount)) {
+        validationError =
+            L"variant_group_count 必须是 0-64 之间的完整十进制整数。";
+        return false;
+    }
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_variantGroupMaxEdit), 1, 64,
+            vm.variantGroupMax)) {
+        validationError =
+            L"variant_group_max 必须是 1-64 之间的完整十进制整数。";
+        return false;
+    }
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_variantGroupFuncPerGroupEdit), 1,
+            (std::numeric_limits<int>::max)(),
+            vm.variantGroupFunctionsPerGroup)) {
+        validationError =
+            L"variant_group_functions_per_group 必须是正十进制整数。";
+        return false;
+    }
 
     vm.targetFunctions.clear();
     for (const auto& item : GetMultilineEntries(m_targetFunctionsEdit)) {
+        if (!IsSupportedTomlStringValue(item)) {
+            validationError =
+                L"target_functions 包含当前配置语法不支持的双引号或换行字符："
+                + item;
+            return false;
+        }
         vm.targetFunctions.push_back(WideToUtf8(item));
     }
     vm.targetRVAs.clear();
     for (const auto& item : GetMultilineEntries(m_targetRvasEdit)) {
-        wchar_t* end = nullptr;
-        const unsigned long value = wcstoul(item.c_str(), &end, 0);
-        if (end != item.c_str() && *end == L'\0' && value != 0) {
-            vm.targetRVAs.push_back(static_cast<uint32_t>(value));
-        }
-    }
-
-    if (vm.enabled) {
-        if (vm.registerCount < 16 || vm.registerCount > 32) {
-            validationError = L"register_count 必须在 16-32 之间（后端 ValidateVMRegisterMap 的硬性要求）。";
+        uint32_t value = 0;
+        if (!TryParseTargetRva(item, value)) {
+            validationError =
+                L"target_rvas 包含无效 RVA（必须为 1..0xffffffff 的完整十进制或 0x 十六进制值）："
+                + item;
             return false;
         }
-        if (vm.stackSize < 0x4000 || vm.stackSize > 0x70000 || (vm.stackSize & 0xFFFu) != 0) {
-            validationError = L"stack_size 必须在 0x4000-0x70000 之间，且是 0x1000 的整数倍。";
-            return false;
-        }
+        vm.targetRVAs.push_back(value);
     }
 
     ControlFlowOptions& cf = outConfig.controlFlow;
     cf.flatteningEnabled = GetCheckboxChecked(m_flatteningEnabledCheck);
-    cf.flatteningStrength = std::clamp(GetEditInt(m_flatteningStrengthEdit, 60), 1, 100);
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_flatteningStrengthEdit), 1, 100,
+            cf.flatteningStrength)) {
+        validationError =
+            L"flattening strength 必须是 1-100 之间的完整十进制整数。";
+        return false;
+    }
     cf.flatteningTargets.clear();
     for (const auto& item : GetMultilineEntries(m_flatteningTargetsEdit)) {
+        if (!IsSupportedTomlStringValue(item)) {
+            validationError =
+                L"flattening target_functions 包含当前配置语法不支持的双引号或换行字符："
+                + item;
+            return false;
+        }
         cf.flatteningTargets.push_back(WideToUtf8(item));
     }
 
@@ -1057,6 +1153,7 @@ void MainWindow::SetRunningState(bool running) {
         // 不能无条件把所有控件都打开。
         UpdateVmEnabledState();
         UpdateEvidenceEnabledState();
+        ApplyPermanentDisabledState();
     }
 }
 
@@ -1069,7 +1166,7 @@ void MainWindow::SetStatus(const std::wstring& text, COLORREF color) {
 void MainWindow::HandleProcessOutputLine(const std::wstring& line) {
     AppendLogLine(m_logEdit, line);
 
-    // 后端目前没有结构化的分阶段进度回调，main.cpp 只是把 "[1/5] ..." 这样的
+    // 后端目前没有结构化的分阶段进度回调，main.cpp 只是把 "[n/6] ..." 这样的
     // 阶段说明按行打印到 stdout。这里如实提炼这行原文当状态文案，不编造
     // 百分比或没有对应真实输出的子步骤。
     const size_t start = line.find_first_not_of(L" \t");

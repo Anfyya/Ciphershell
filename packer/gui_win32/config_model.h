@@ -1,11 +1,13 @@
 // CipherShell GUI - 配置数据模型
 //
-// 这里的字段与默认值直接镜像 packer/config/config_parser.h 里的
-// CipherShellConfig 系列结构体，以及 config/full_example.toml 给出的真实
-// 生产配置样例。GUI 进程不链接 ciphershell_packer，所以这里是一份独立的
-// 数据模型，但字段集合、取值范围、默认值都必须和后端 schema 一一对应——
-// 新增/删减字段时，请同时核对 packer/cli_options.h、
-// packer/config/config_parser.h、config/full_example.toml 三处是否一致。
+// 这里的字段直接镜像 packer/config/config_parser.h 里的 CipherShellConfig
+// 系列结构体；普通参数默认值参考 config/full_example.toml。运行默认目标列表
+// 保持为空，留空时由后端自动筛选安全函数；
+// fail-closed 功能也始终默认关闭。
+// GUI 进程不链接 ciphershell_packer，所以这里是一份独立的数据模型，但字段
+// 集合、取值范围和生产默认契约都必须与后端 schema 一一对应——新增/删减字段
+// 时，请同时核对 packer/cli_options.h、packer/config/config_parser.h、
+// config/full_example.toml 三处是否一致。
 //
 // string_encryption / import_protection / section_encryption 以及
 // control_flow.bogus 这几个开关在当前后端里是 fail-closed：显式启用会被
@@ -40,18 +42,19 @@ struct CliOptions {
 // 接受的 [global] 字段：protection_level 走 CliOptions.protectionLevel，
 // 不在这里重复）。
 struct GlobalOptions {
-    bool stripDebugInfo = true;
-    bool stripRichHeader = true;
-    bool stripTimestamps = true;
-    bool randomizeSectionNames = true;
+    bool stripDebugInfo = true;        // 清零 Debug DataDirectory；不擦残留载荷
+    bool stripRichHeader = true;       // 检测到 Rich 时清零整个 DOS stub/Rich 扫描区
+    bool stripTimestamps = true;       // 仅 COFF FileHeader 时间戳
+    bool randomizeSectionNames = true; // 严格 .rsrc/.reloc 名称除外
 };
 
-// 对应 config_parser.h::VMConfig，字段与默认值取自 config/full_example.toml
-// 的 [vm] 段。
+// 对应 config_parser.h::VMConfig。运行默认值必须可直接用于真实保护任务；
+// targetFunctions 保持为空。名称和 RVA 列表
+// 同时为空时，后端会自动筛选满足 VM 能力约束的函数。
 struct VmOptions {
     bool enabled = true;
-    int strength = 90;                          // 1-100
-    std::vector<std::string> targetFunctions = {"license_*", "verify_*"};
+    int strength = 90;                          // 仅解析/往返；Handler 尚未消费
+    std::vector<std::string> targetFunctions;   // 空 = 不限定名称/通配符
     std::vector<uint32_t> targetRVAs;            // 空 = 不按 RVA 精确选择
     int registerCount = 24;                      // 后端 ValidateVMRegisterMap 强制 16-32
     uint32_t stackSize = 0x20000;                // 后端强制 0x4000-0x70000 且按 0x1000 对齐
@@ -63,8 +66,8 @@ struct VmOptions {
     bool embedJunkHandlers = true;
     bool simdBridge = true;
     bool x87Bridge = true;
-    int variantGroupCount = 0;                   // 0 = 自适应
-    int variantGroupMax = 4;
+    int variantGroupCount = 0;                   // 0 = 自适应；有效范围 0-64
+    int variantGroupMax = 4;                     // 有效范围 1-64
     int variantGroupFunctionsPerGroup = 4;
 };
 
@@ -73,7 +76,7 @@ struct VmOptions {
 struct ControlFlowOptions {
     bool flatteningEnabled = false;              // full_example.toml 默认关闭，非任何等级预设的一部分
     int flatteningStrength = 60;
-    std::vector<std::string> flatteningTargets = {"license_*"};
+    std::vector<std::string> flatteningTargets;  // 空 = 后端选择所有 CFG 安全函数
 
     // 只读展示用；CapabilityChecker 无条件拒绝 bogus.enabled=true。
     static constexpr bool kBogusEnabled = false;

@@ -72,8 +72,8 @@ void ConsoleGUI::ShowMainMenu() {
         PrintBanner();
 
         std::vector<MenuItem> items = {
-            {"1", "保护 EXE/DLL", [this]() { ShowProtectionWizard(); }},
-            {"2", "配置编辑器", [this]() { ShowConfigEditor(); }},
+            {"1", "保护入口说明", [this]() { ShowProtectionWizard(); }},
+            {"2", "配置说明（只读）", [this]() { ShowConfigEditor(); }},
             {"3", "帮助", [this]() { ShowHelp(); }},
             {"4", "关于", [this]() { ShowAbout(); }},
             {"0", "退出", nullptr}
@@ -89,115 +89,50 @@ void ConsoleGUI::ShowMainMenu() {
 void ConsoleGUI::ShowProtectionWizard() {
     PrintBanner();
     SetColor(ConsoleColor::Cyan);
-    std::cout << "  保护向导" << std::endl;
+    std::cout << "  保护入口说明" << std::endl;
     ResetColor();
     PrintSeparator();
 
-    // 输入文件
-    std::string inputFile = ReadInput("  输入文件路径");
-    if (inputFile.empty()) {
-        PrintStatus("未指定输入文件", false);
-        return;
-    }
-
-    // 输出文件
-    std::string outputFile = ReadInput("  输出文件路径 (默认: <输入文件>_protected)");
-    if (outputFile.empty()) {
-        outputFile = inputFile;
-        size_t dotPos = outputFile.rfind('.');
-        if (dotPos != std::string::npos) {
-            outputFile = outputFile.substr(0, dotPos) + "_protected" + outputFile.substr(dotPos);
-        } else {
-            outputFile += "_protected";
-        }
-    }
-
-    // 保护等级
+    PrintStatus(
+        "控制台保护向导尚未接入真实打包后端，已拒绝执行；未读取或写出任何文件。",
+        false);
     std::cout << std::endl;
-    SetColor(ConsoleColor::Yellow);
-    std::cout << "  保护等级:" << std::endl;
-    ResetColor();
-    std::cout << "    L1 (Guard)    - 基础加密 (~1.05x 开销)" << std::endl;
-    std::cout << "    L2 (Shield)   - 控制流平坦化 (~2-3x)" << std::endl;
-    std::cout << "    L3 (Armor)    - 高级混淆 (~5-8x)" << std::endl;
-    std::cout << "    L4 (Fortress) - 代码虚拟化 (~15-30x)" << std::endl;
-    std::cout << "    L5 (Citadel)  - 多层嵌套VM (~50-100x+)" << std::endl;
+    std::cout << "  请改用真实入口:" << std::endl;
+    std::cout << "    CLI:        ciphershell [选项] <输入文件>" << std::endl;
+    std::cout << "    Win32 GUI:  ciphershell_gui.exe" << std::endl;
     std::cout << std::endl;
+    std::cout << "  两个入口都会调用真实打包流程，并对未实现功能执行 fail-closed。"
+              << std::endl;
 
-    int level = ReadChoice("  选择保护等级 (1-5)", 1, 5);
-
-    // 确认
-    std::cout << std::endl;
-    PrintSeparator();
-    SetColor(ConsoleColor::White);
-    std::cout << "  输入:    " << inputFile << std::endl;
-    std::cout << "  输出:    " << outputFile << std::endl;
-    std::cout << "  等级:    L" << level << std::endl;
-    ResetColor();
-    PrintSeparator();
-
-    if (!ReadYesNo("  开始保护?")) {
-        PrintStatus("已取消保护", false);
-        return;
-    }
-
-    // 开始保护
-    std::cout << std::endl;
-    SetColor(ConsoleColor::Green);
-    std::cout << "  开始保护..." << std::endl;
-    ResetColor();
-
-    // 模拟保护过程
-    const char* steps[] = {
-        "解析 PE 文件",
-        "分析代码结构",
-        "构建控制流图",
-        "应用变换",
-        "生成VM字节码",
-        "加密代码段",
-        "消除签名",
-        "重建 PE 文件",
-        "验证输出"
-    };
-
-    int stepCount = sizeof(steps) / sizeof(steps[0]);
-    for (int i = 0; i < stepCount; i++) {
-        PrintProgress(i + 1, stepCount, steps[i]);
-        Sleep(500);  // 模拟处理时间
-    }
-
-    std::cout << std::endl;
-    PrintStatus("保护完成!", true);
-    std::cout << std::endl;
-    std::cout << "  输出文件: " << outputFile << std::endl;
+    ReadInput("  按回车键返回...");
 }
 
 void ConsoleGUI::ShowConfigEditor() {
     PrintBanner();
     SetColor(ConsoleColor::Cyan);
-    std::cout << "  配置编辑器" << std::endl;
+    std::cout << "  配置说明（只读）" << std::endl;
     ResetColor();
     PrintSeparator();
 
-    std::cout << "  当前设置:" << std::endl;
-    std::cout << "    保护等级: L3" << std::endl;
-    std::cout << "    反调试: 隐式" << std::endl;
-    std::cout << "    字符串加密: 是" << std::endl;
-    std::cout << "    导入表混淆: 是" << std::endl;
-    std::cout << "    VM寄存器数: 24" << std::endl;
+    PrintStatus(
+        "控制台配置编辑器尚未接入真实配置模型，已禁用伪加载和伪保存。",
+        false);
     std::cout << std::endl;
+    std::cout << "  当前真实语义:" << std::endl;
+    std::cout << "    - L1-L3 不会隐式启用尚未闭环的保护模块" << std::endl;
+    std::cout << "    - L4/L5 当前进入同一函数级 VM 生产链；不是多层嵌套 VM"
+              << std::endl;
+    std::cout << "      （两档的 strength 字段不同，但当前尚未改变 Handler 生成）"
+              << std::endl;
+    std::cout << "    - 字符串、IAT、反调试、反 Dump/Nanomite 等未实现开关"
+              << std::endl;
+    std::cout << "      被显式请求时会 fail-closed，不会生成伪成功产物" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  请使用 ciphershell_gui.exe 编辑配置，或用"
+              << " ciphershell -c <配置文件> <输入文件> 执行真实打包。"
+              << std::endl;
 
-    std::cout << "  从文件加载配置? (Y/N): ";
-    char choice;
-    std::cin >> choice;
-    std::cin.ignore();
-
-    if (choice == 'Y' || choice == 'y') {
-        std::string configFile = ReadInput("  配置文件路径");
-        if (!configFile.empty()) {
-            PrintStatus("已加载配置: " + configFile, true);
-        }
-    }
+    ReadInput("  按回车键返回...");
 }
 
 void ConsoleGUI::ShowHelp() {
@@ -212,17 +147,29 @@ void ConsoleGUI::ShowHelp() {
     std::cout << std::endl;
     std::cout << "  选项:" << std::endl;
     std::cout << "    -o <文件>      输出文件路径" << std::endl;
-    std::cout << "    -l <1-5>       保护等级" << std::endl;
-    std::cout << "    -c <文件>      配置文件 (TOML格式)" << std::endl;
+    std::cout << "    -l, --level <1-5>        快速 preset 等级" << std::endl;
+    std::cout << "    -c, --config <文件>      配置文件（显式 protection_level 覆盖 -l）"
+              << std::endl;
+    std::cout << "    --vm-handler-evidence <文件>" << std::endl;
+    std::cout << "                              写出本次真实构建的 handler 比较证据"
+              << std::endl;
     std::cout << "    -v             显示详细信息" << std::endl;
     std::cout << "    -h             显示帮助" << std::endl;
     std::cout << std::endl;
-    std::cout << "  保护等级:" << std::endl;
-    std::cout << "    L1 (Guard)     Section加密 + 基础反调试" << std::endl;
-    std::cout << "    L2 (Shield)    + 控制流平坦化" << std::endl;
-    std::cout << "    L3 (Armor)     + 虚假控制流 + 不透明谓词" << std::endl;
-    std::cout << "    L4 (Fortress)  + 代码虚拟化 (Mirage VM)" << std::endl;
-    std::cout << "    L5 (Citadel)   + 多层嵌套VM + Nanomite" << std::endl;
+    std::cout << "  快速等级的当前语义:" << std::endl;
+    std::cout << "    L1-L3           不隐式启用尚未闭环的保护模块" << std::endl;
+    std::cout << "    L4 (Fortress)   启用函数级 Mirage VM 预设" << std::endl;
+    std::cout << "    L5 (Citadel)    当前使用同一函数级 VM 生产链" << std::endl;
+    std::cout << "                     （strength 尚未改变 Handler；非嵌套 VM/Nanomite）"
+              << std::endl;
+    std::cout << std::endl;
+    std::cout << "  Plus 功能状态:" << std::endl;
+    std::cout << "    字符串保护、IAT 保护、反调试、反 Dump/Nanomite 等开关"
+              << std::endl;
+    std::cout << "    尚未接入生产闭环；显式请求时会 fail-closed。" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  本控制台菜单不执行打包。请使用上述 CLI，或运行"
+              << " ciphershell_gui.exe。" << std::endl;
     std::cout << std::endl;
 
     ReadInput("  按回车键继续...");
@@ -237,20 +184,17 @@ void ConsoleGUI::ShowAbout() {
 
     SetColor(ConsoleColor::White);
     std::cout << "  CipherShell 代码保护器 v0.1" << std::endl;
-    std::cout << "  自研高强度代码保护壳" << std::endl;
+    std::cout << "  PE 分析、能力检查与 Mirage VM 生产链" << std::endl;
     ResetColor();
     std::cout << std::endl;
-    std::cout << "  特性:" << std::endl;
-    std::cout << "    - 与已知壳零特征重叠" << std::endl;
-    std::cout << "    - 最大化反逆向分析" << std::endl;
-    std::cout << "    - 可控的保护粒度" << std::endl;
-    std::cout << "    - 双模式: PE文件 + 可选源码级保护" << std::endl;
+    std::cout << "  当前已接入的预设:" << std::endl;
+    std::cout << "    - L1-L3 不隐式开启未闭环模块" << std::endl;
+    std::cout << "    - L4/L5 当前进入同一函数级 Mirage VM 生产链" << std::endl;
     std::cout << std::endl;
-    std::cout << "  Mirage VM 引擎:" << std::endl;
-    std::cout << "    - 混合架构 (栈 + 寄存器)" << std::endl;
-    std::cout << "    - 每次加壳随机化ISA" << std::endl;
-    std::cout << "    - 滚动密钥字节码加密" << std::endl;
-    std::cout << "    - 多层嵌套支持" << std::endl;
+    std::cout << "  边界:" << std::endl;
+    std::cout << "    - L5 不表示多层嵌套 VM 或 Nanomite 已实现" << std::endl;
+    std::cout << "    - 字符串、IAT 及其他未闭环 Plus 开关会 fail-closed" << std::endl;
+    std::cout << "    - 控制台菜单仅提供状态说明，不会伪造打包成功" << std::endl;
     std::cout << std::endl;
 
     ReadInput("  按回车键继续...");
@@ -274,7 +218,7 @@ void ConsoleGUI::PrintBanner() {
   ║    ╚██████╗██║██║     ██║  ██║███████╗██║  ██║               ║
   ║     ╚═════╝╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝               ║
   ║                                                               ║
-  ║            Shell Protector v0.1                               ║
+  ║            PE / Mirage VM Tool v0.1                           ║
   ║            Mirage VM Engine                                   ║
   ║                                                               ║
   ╚═══════════════════════════════════════════════════════════════╝

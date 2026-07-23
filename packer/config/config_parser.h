@@ -15,6 +15,7 @@ struct FunctionOverride {
 
 struct GlobalConfig {
     int protectionLevel;
+    bool protectionLevelSet;
     bool stripDebugInfo;
     bool stripRichHeader;
     bool stripTimestamps;
@@ -26,6 +27,7 @@ struct GlobalConfig {
 
     GlobalConfig() :
         protectionLevel(1),
+        protectionLevelSet(false),
         stripDebugInfo(true),
         stripRichHeader(true),
         stripTimestamps(true),
@@ -185,6 +187,11 @@ struct AntiDumpConfig {
         nanomitePatches(false) {}
 };
 
+// 生产入口与配置契约测试共用的显式请求判定。当前任一 true 都会在 main
+// 的 Plus fail-closed 守卫处被拒绝；后续逐项实现时再同步收窄这里的集合。
+bool HasAnyAntiDebugRequest(const AntiDebugConfigFile& config);
+bool HasAnyAntiDumpRequest(const AntiDumpConfig& config);
+
 struct PerformanceConfig {
     bool autoHotspotAnalysis;
     double maxVMOverheadRatio;
@@ -234,7 +241,10 @@ private:
     void ParseFunctionOverrides(const std::string& content, std::vector<FunctionOverride>& overrides);
 
     std::string Trim(const std::string& str);
+    std::string StripComments(const std::string& content);
     std::string ExtractSection(const std::string& content, const std::string& sectionName);
+    bool FindValue(const std::string& section, const std::string& key,
+        std::string& value);
     bool ParseBool(const std::string& value);
     int ParseInt(const std::string& value);
     double ParseDouble(const std::string& value);

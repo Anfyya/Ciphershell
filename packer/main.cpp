@@ -55,6 +55,7 @@
 #include "config/protection_build_context.h"
 #include "vm/vm_verifier.h"
 #include "cli_options.h"
+#include "path_identity.h"
 
 namespace fs = std::filesystem;
 
@@ -64,29 +65,33 @@ namespace fs = std::filesystem;
 
 void PrintHelp() {
     std::cout << R"(
-CipherShell v0.1 - 自研高强度代码保护壳
+CipherShell v0.1 - PE 分析与 Mirage VM 保护工具
 
 用法: ciphershell [选项] <输入文件>
 
 选项:
   -o, --output <文件>      指定输出文件路径
-  -l, --level <1-5>        设置保护等级 (默认: 1)
-  -c, --config <文件>      指定配置文件路径 (TOML 格式)
+  -l, --level <1-5>        设置快速 preset 等级 (默认: 1)
+  -c, --config <文件>      指定配置文件路径 (TOML；其中 protection_level 覆盖 -l)
   --vm-handler-evidence <文件>
                             写出本次真实构建的明文 handler 比较证据
   -v, --verbose            显示详细信息
   -h, --help               显示此帮助信息
 
-保护等级:
-  L1 (Guard)    基础加密保护 (~1.05x 性能开销)
-  L2 (Shield)   控制流平坦化 (~2-3x 性能开销)
-  L3 (Armor)    高级混淆 (~5-8x 性能开销)
-  L4 (Fortress) 代码虚拟化 (~15-30x 性能开销)
-  L5 (Citadel)  多层嵌套 VM (~50-100x+ 性能开销)
+保护等级（preset）:
+  L1 (Guard)    基础档；不隐式启用尚未闭环的变换
+  L2 (Shield)   预留档；当前不隐式启用控制流变换
+  L3 (Armor)    预留档；当前不隐式启用高级混淆
+  L4 (Fortress) 启用当前函数级 VM 生产链
+  L5 (Citadel)  当前使用与 L4 相同的函数级 VM 生产链
+
+说明:
+  VM strength 当前只解析/往返，尚未改变生产 Handler。
+  使用 -c 时，以配置文件中的 global.protection_level 为准。
 
 示例:
   ciphershell input.exe -o protected.exe -l 3
-  ciphershell input.dll -l 2 -c config.toml
+  ciphershell input.dll -o protected.dll -c config.toml
 )" << std::endl;
 }
 
@@ -724,7 +729,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::cout << "CipherShell v0.1 - 自研高强度代码保护壳" << std::endl;
+    std::cout << "CipherShell v0.1 - PE 分析与 Mirage VM 保护工具" << std::endl;
     std::cout << "======================================" << std::endl;
 
     CipherShell::CommandLineOptions cli;
@@ -757,15 +762,54 @@ int main(int argc, char* argv[]) {
         outputFile = inputPath.stem().string() + "_protected" + inputPath.extension().string();
     }
 
+    // 所有会被覆盖/删除的目标都必须与只读源、彼此之间保持身份隔离。
+    // existing 文件使用 equivalent 识别硬链接/重解析别名，不存在目标再用
+    // 规范化绝对路径兜底。
+    auto rejectPathAlias = [](const fs::path& first,
+            const fs::path& second, const char* conflict) {
+        bool same = false;
+        std::string pathReason;
+        if (!CipherShell::PathsReferToSameTarget(
+                first, second, same, pathReason)) {
+            std::cerr << "错误: 无法确认路径身份: "
+                      << pathReason << std::endl;
+            return false;
+        }
+        if (same) {
+            std::cerr << "错误: " << conflict << std::endl;
+            return false;
+        }
+        return true;
+    };
+    if (!rejectPathAlias(inputFile, outputFile,
+            "输出文件不能与输入文件指向同一目标")) {
+        return 1;
+    }
+    if (!configFile.empty() &&
+        !rejectPathAlias(configFile, outputFile,
+            "输出文件不能与配置文件指向同一目标")) {
+        return 1;
+    }
+    if (!vmHandlerEvidenceFile.empty()) {
+        if (!rejectPathAlias(inputFile, vmHandlerEvidenceFile,
+                "handler 证据文件不能与输入文件指向同一目标") ||
+            !rejectPathAlias(outputFile, vmHandlerEvidenceFile,
+                "handler 证据文件不能与输出文件指向同一目标") ||
+            (!configFile.empty() &&
+             !rejectPathAlias(configFile, vmHandlerEvidenceFile,
+                "handler 证据文件不能与配置文件指向同一目标"))) {
+            return 1;
+        }
+    }
+
     std::cout << "输入文件: " << inputFile << std::endl;
     std::cout << "输出文件: " << outputFile << std::endl;
-    std::cout << "保护等级: L" << protectionLevel << std::endl;
 
     // ============================================================================
     // Step 1: 解析输入 PE
     // ============================================================================
 
-    std::cout << "\n[1/5] 解析输入 PE 文件..." << std::endl;
+    std::cout << "\n[1/6] 解析输入 PE 文件..." << std::endl;
 
     CipherShell::PEParser parser;
     auto imageDeleter = [&parser](CipherShell::CS_PE_IMAGE* img) {
@@ -816,7 +860,13 @@ int main(int argc, char* argv[]) {
             std::cerr << "错误: " << configParser.GetLastError() << std::endl;
             return 1;
         }
-        protectionLevel = config.global.protectionLevel;
+        if (config.global.protectionLevelSet) {
+            protectionLevel = config.global.protectionLevel;
+        } else {
+            // 配置未显式提供 protection_level 时保留 CLI -l；不能让
+            // GlobalConfig 的构造默认值静默覆盖用户命令行选择。
+            config.global.protectionLevel = protectionLevel;
+        }
         if (protectionLevel < 1 || protectionLevel > 5) {
             std::cerr << "错误: 配置中的保护等级必须在 1-5 之间" << std::endl;
             return 1;
@@ -825,6 +875,7 @@ int main(int argc, char* argv[]) {
         // 使用默认配置
         config.global.protectionLevel = protectionLevel;
     }
+    std::cout << "最终保护等级: L" << protectionLevel << std::endl;
 
     CipherShell::ProtectionBuildContext buildCtx =
         CipherShell::ProtectionBuildContext::FromConfig(config, protectionLevel, verbose);
@@ -868,7 +919,7 @@ int main(int argc, char* argv[]) {
     // 重要: 先做代码分析/变换（明文代码可反汇编），最后才做 Section 加密
     // ============================================================================
 
-    std::cout << "\n[2/5] 应用保护变换 (L" << protectionLevel << ")..." << std::endl;
+    std::cout << "\n[2/6] 应用保护变换 (L" << protectionLevel << ")..." << std::endl;
 
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
 
@@ -893,18 +944,11 @@ int main(int argc, char* argv[]) {
     }
     PrintFeatureStatus("import_protection", "skipped", "disabled");
 
-    // Phase B.5: 反调试 / 反 Dump（含 nanomite）—— config_parser 完整解析这些
-    // 开关、GUI 也能正常勾选，但当前没有任何 transform 消费它们：不会注入任何
-    // 检测代码或 section 权限守卫。这些是明确规划中的 CipherShell Plus 能力，
-    // 不删除配置字段/GUI/实现目录，但在真正接入之前绝不能让用户打开开关后
-    // 却拿到一个"看起来生效、其实什么都没做"的产物，所以在此 fail-closed 拒绝，
-    // 而不是像未消费之前那样悄悄忽略。默认值已改为 false；只有用户显式打开
-    // 才会走到这里。
-    const bool antiDebugRequested = config.antiDebug.timingChecks ||
-        config.antiDebug.hardwareBPDetection || config.antiDebug.softwareBPDetection ||
-        config.antiDebug.memoryIntegrity || config.antiDebug.debuggerWindowScan ||
-        config.antiDebug.parentProcessCheck || config.antiDebug.threadHiding ||
-        config.antiDebug.kernelDebuggerCheck;
+    // Phase B.5: 反调试 / 反 Dump（含 nanomite）—— config_parser 保留兼容
+    // 解析，Win32 GUI 将对应控件显示为禁用；当前没有 transform 消费这些项。
+    // 手工 TOML 显式请求时必须在任何变换前 fail-closed，不能生成伪成功产物。
+    const bool antiDebugRequested =
+        CipherShell::HasAnyAntiDebugRequest(config.antiDebug);
     if (antiDebugRequested) {
         std::cerr << "ANTI_DEBUG_REJECT module=AntiDebug"
                   << " reason=ciphershell_plus_not_implemented" << std::endl;
@@ -913,8 +957,8 @@ int main(int argc, char* argv[]) {
     }
     PrintFeatureStatus("anti_debug", "skipped", "disabled");
 
-    const bool antiDumpRequested = config.antiDump.erasePEHeader ||
-        config.antiDump.sectionPermissionGuard || config.antiDump.nanomitePatches;
+    const bool antiDumpRequested =
+        CipherShell::HasAnyAntiDumpRequest(config.antiDump);
     if (antiDumpRequested) {
         std::cerr << "ANTI_DUMP_REJECT module=AntiDump"
                   << " reason=ciphershell_plus_not_implemented" << std::endl;
@@ -2120,44 +2164,10 @@ int main(int argc, char* argv[]) {
     (void)encryptedStringRegions;
 
     // ============================================================================
-    // Step 3: 签名消除
+    // Step 3: 嵌入 Stub
     // ============================================================================
 
-    std::cout << "\n[3/5] 消除壳签名..." << std::endl;
-
-    {
-        CipherShell::SignatureEliminator sigEliminator;
-
-        auto sigMatches = sigEliminator.DetectSignatures(image.get());
-        if (!sigMatches.empty()) {
-            std::cout << "  发现 " << sigMatches.size() << " 个签名匹配:" << std::endl;
-            for (const auto& match : sigMatches) {
-                std::cout << "    - " << match.signatureName << " (" << match.detector << ")" << std::endl;
-            }
-        }
-
-        CipherShell::EliminationConfig elimConfig;
-        std::string sigReason;
-        if (!sigEliminator.EliminateSignatures(image.get(), elimConfig, sigReason)) {
-            std::cerr << "SIGNATURE_ELIMINATION_FAIL module=SignatureEliminator reason="
-                      << sigReason << std::endl;
-            PrintFeatureStatus("signature_elimination", "failed", sigReason);
-            return 1;
-        }
-        PrintFeatureStatus("signature_elimination", "applied");
-
-        if (sigEliminator.VerifyElimination(image.get())) {
-            std::cout << "  签名消除成功" << std::endl;
-        } else {
-            std::cout << "  警告: 仍有签名残留" << std::endl;
-        }
-    }
-
-    // ============================================================================
-    // Step 4: 嵌入 Stub
-    // ============================================================================
-
-    std::cout << "\n[4/6] 嵌入解密 Stub..." << std::endl;
+    std::cout << "\n[3/6] 嵌入解密 Stub..." << std::endl;
 
     if (!encryptedSections.empty()) {
         CipherShell::StubBuilder stubBuilder;
@@ -2183,6 +2193,73 @@ int main(int argc, char* argv[]) {
     }
 
     // ============================================================================
+    // Step 4: 签名元数据控制
+    // ============================================================================
+
+    // 必须位于所有会追加 section 的 transform/Stub 之后；否则最终精确
+    // 快照会漏掉 .csldr/.cstub/unwind/TLS 等后加 section。
+    std::cout << "\n[4/6] 应用签名元数据控制..." << std::endl;
+
+    const CipherShell::EliminationConfig elimConfig =
+        CipherShell::BuildEliminationConfig(config.global);
+    const bool globalSignatureControlsEnabled =
+        elimConfig.randomizeSectionNames ||
+        elimConfig.randomizeTimestamps ||
+        elimConfig.clearRichHeader ||
+        elimConfig.clearDebugDirectory;
+    CipherShell::EliminationState verifiedEliminationState;
+    size_t finalResidualDetectorHits = 0;
+
+    {
+        CipherShell::SignatureEliminator sigEliminator;
+
+        auto sigMatches = sigEliminator.DetectSignatures(image.get());
+        if (!sigMatches.empty()) {
+            std::cout << "  发现 " << sigMatches.size()
+                      << " 个检测器命中条目:" << std::endl;
+            for (const auto& match : sigMatches) {
+                std::cout << "    - " << match.signatureName << " (" << match.detector << ")" << std::endl;
+            }
+        }
+
+        CipherShell::EliminationState beforeElimination;
+        std::string sigReason;
+        if (!sigEliminator.CaptureState(
+                image.get(), beforeElimination, sigReason)) {
+            std::cerr << "SIGNATURE_STATE_CAPTURE_FAIL "
+                      << "module=SignatureEliminator reason="
+                      << sigReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed", sigReason);
+            return 1;
+        }
+        if (!sigEliminator.EliminateSignatures(image.get(), elimConfig, sigReason)) {
+            std::cerr << "SIGNATURE_ELIMINATION_FAIL module=SignatureEliminator reason="
+                      << sigReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed", sigReason);
+            return 1;
+        }
+
+        if (!sigEliminator.VerifyTransition(beforeElimination, image.get(),
+                elimConfig, verifiedEliminationState, sigReason)) {
+            std::cerr << "SIGNATURE_ELIMINATION_VERIFY_FAIL module=SignatureEliminator reason="
+                      << sigReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed", sigReason);
+            return 1;
+        }
+
+        const size_t intermediateResidualDetectorHits =
+            sigEliminator.DetectSignatures(image.get()).size();
+        std::cout << "  中间镜像的配置过渡及精确状态已通过；最终状态将在重建及写盘复验后上报"
+                  << std::endl;
+        if (intermediateResidualDetectorHits != 0) {
+            std::cout << "  范围提示：仍有 "
+                      << intermediateResidualDetectorHits
+                      << " 个启发式/未请求检测器命中条目；不属于本次元数据控制的 applied 声明"
+                      << std::endl;
+        }
+    }
+
+    // ============================================================================
     // Step 5: 重建 PE
     // ============================================================================
 
@@ -2191,10 +2268,15 @@ int main(int argc, char* argv[]) {
     CipherShell::PERebuilder rebuilder;
     CipherShell::CS_REBUILD_CONFIG rebuildConfig;
 
-    rebuildConfig.randomizeSectionNames = config.global.randomizeSections;
-    rebuildConfig.zeroTimestamps = config.global.stripTimestamps;
-    rebuildConfig.preserveRichHeader = !config.global.stripRichHeader;
-    rebuildConfig.preserveDebugInfo = !config.global.stripDebugInfo;
+    // 四项 global 操作已由 SignatureEliminator 逐项完成。重建器只复制该
+    // 已验证状态，不能再用另一套随机数/变换覆盖它；最终解析后会再次复验。
+    rebuildConfig.randomizeSectionNames = FALSE;
+    rebuildConfig.preserveTimestamps = TRUE;
+    rebuildConfig.randomizeTimestamps = FALSE;
+    rebuildConfig.zeroTimestamps = FALSE;
+    rebuildConfig.preserveRichHeader = TRUE;
+    rebuildConfig.preserveDebugInfo = TRUE;
+    rebuildConfig.preserveChecksum = FALSE;
 
     DWORD outputSize = 0;
     std::unique_ptr<BYTE[]> outputData(rebuilder.RebuildImage(image.get(), rebuildConfig, &outputSize));
@@ -2216,6 +2298,25 @@ int main(int argc, char* argv[]) {
         else delete[] verificationBuffer;
         std::cerr << "PE_STATIC_CHECK_FAIL module=PEVerifier reason=rebuilt_image_parse_failed" << std::endl;
         return 1;
+    }
+    {
+        CipherShell::SignatureEliminator finalSignatureVerifier;
+        std::string finalSignatureReason;
+        if (!finalSignatureVerifier.VerifyElimination(
+                rebuiltImage, elimConfig, finalSignatureReason) ||
+            !finalSignatureVerifier.VerifyExactState(
+                rebuiltImage, verifiedEliminationState,
+                finalSignatureReason)) {
+            parser.FreeImage(rebuiltImage);
+            std::cerr << "SIGNATURE_FINAL_STATIC_CHECK_FAIL "
+                      << "module=SignatureEliminator reason="
+                      << finalSignatureReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed",
+                finalSignatureReason);
+            return 1;
+        }
+        std::cout << "SIGNATURE_FINAL_STATIC_CHECK_PASS "
+                  << "module=SignatureEliminator" << std::endl;
     }
     if (vmApplied) {
         // 每个 Group 是一份独立的 handler/dispatch 产物，逐组复验，不合并
@@ -2292,6 +2393,26 @@ int main(int argc, char* argv[]) {
         std::remove(outputFile.c_str());
         std::cerr << "PE_WRITE_VERIFY_FAIL module=PEVerifier reason=written_image_parse_failed" << std::endl;
         return 1;
+    }
+    {
+        CipherShell::SignatureEliminator writtenSignatureVerifier;
+        std::string writtenSignatureReason;
+        if (!writtenSignatureVerifier.VerifyElimination(
+                verifyImage, elimConfig, writtenSignatureReason) ||
+            !writtenSignatureVerifier.VerifyExactState(
+                verifyImage, verifiedEliminationState,
+                writtenSignatureReason)) {
+            parser.FreeImage(verifyImage);
+            std::remove(outputFile.c_str());
+            std::cerr << "SIGNATURE_WRITE_VERIFY_FAIL "
+                      << "module=SignatureEliminator reason="
+                      << writtenSignatureReason << std::endl;
+            PrintFeatureStatus("signature_elimination", "failed",
+                writtenSignatureReason);
+            return 1;
+        }
+        finalResidualDetectorHits =
+            writtenSignatureVerifier.DetectSignatures(verifyImage).size();
     }
     if (vmApplied) {
         for (const auto& outcome : vmGroupOutcomes) {
@@ -2397,6 +2518,16 @@ int main(int argc, char* argv[]) {
 
         fs::path temporaryEvidence = evidencePath;
         temporaryEvidence += ".tmp." + std::to_string(GetCurrentProcessId());
+        if (!rejectPathAlias(inputFile, temporaryEvidence,
+                "handler 临时证据文件不能与输入文件指向同一目标") ||
+            !rejectPathAlias(outputFile, temporaryEvidence,
+                "handler 临时证据文件不能与输出文件指向同一目标") ||
+            (!configFile.empty() &&
+             !rejectPathAlias(configFile, temporaryEvidence,
+                "handler 临时证据文件不能与配置文件指向同一目标"))) {
+            std::remove(outputFile.c_str());
+            return 1;
+        }
         pathError.clear();
         fs::remove(temporaryEvidence, pathError);
         FILE* evidence = fopen(temporaryEvidence.string().c_str(), "wb");
@@ -2527,6 +2658,27 @@ int main(int argc, char* argv[]) {
         std::cout << "CFG_PROTECTION_SCOPE_NOTE correctness=static_link_verified "
                      "execution_differential=covered_by_cfg_flattener_differential_test "
                      "vm_dependency=false" << std::endl;
+    }
+    if (globalSignatureControlsEnabled) {
+        PrintFeatureStatus("signature_elimination", "applied",
+            "configured_metadata_controls_final_output_verified");
+        std::cout << "SIGNATURE_ELIMINATION_SCOPE_NOTE "
+                     "configured_postconditions=verified "
+                     "exact_controlled_metadata_state=preserved "
+                     "debug_payload_bytes=not_scrubbed "
+                     "coff_timestamp_only=true "
+                     "residual_detector_hits="
+                  << finalResidualDetectorHits << std::endl;
+    } else {
+        PrintFeatureStatus("signature_elimination", "skipped",
+            "global_signature_controls_disabled");
+        std::cout << "  四项 global 签名控制均已关闭；仅校验和按强制输出卫生策略清零"
+                  << std::endl;
+        std::cout << "SIGNATURE_ELIMINATION_SCOPE_NOTE "
+                     "configured_postconditions=verified "
+                     "exact_controlled_metadata_state=preserved "
+                     "residual_detector_hits="
+                  << finalResidualDetectorHits << std::endl;
     }
 
     std::cout << "\n======================================" << std::endl;
