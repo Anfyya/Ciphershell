@@ -3176,7 +3176,9 @@ void TestPlusStateChainingExecutionAndFailClosed() {
     const std::vector<MicroInstruction> program = {
         Uop(VM_UOP_PUSH_IMM, {0x2Au,
             architecture == VMHandlerArchitecture::X64 ? 8u : 4u}, 0),
-        Uop(VM_UOP_POP_VREG, {0u}, 1),
+        Uop(VM_UOP_POP_VREG, {0u,
+            architecture == VMHandlerArchitecture::X64 ? 8u : 4u,
+            0u, 1u}, 1),
         Uop(VM_UOP_RET, {0}, 2),
     };
     std::vector<uint8_t> chainedBytecode =
