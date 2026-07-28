@@ -301,7 +301,7 @@ void MainWindow::BuildBasicPage(int tabIndex) {
     const int halfWidth = kPageWidth / 2 - 6;
     m_stripDebugCheck = track(CreateCheckboxControl(
         m_hwnd, x, y, halfWidth, kControlHeight,
-        L"strip_debug_info（清零 Debug 目录项；不擦原始载荷）", NextControlId(), true));
+        L"strip_debug_info（擦除 Debug 目录、CodeView/PDB 载荷）", NextControlId(), true));
     m_stripRichCheck = track(CreateCheckboxControl(
         m_hwnd, x + halfWidth + 12, y, halfWidth, kControlHeight,
         L"strip_rich_header（检测到 Rich 时清零 DOS stub 区）", NextControlId(), true));

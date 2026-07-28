@@ -3,6 +3,7 @@
  */
 
 #include "pe_rebuilder.h"
+#include "debug_directory_scrubber.h"
 #include "pe_utils.h"
 #include <cstring>
 #include <algorithm>
@@ -177,9 +178,16 @@ BYTE* PERebuilder::RebuildImage(CS_PE_IMAGE* image, const CS_REBUILD_CONFIG& con
         ntHeaders->FileHeader.TimeDateStamp = 0;
     }
 
-    // 仅移除 Debug DataDirectory 引用；该选项不承诺擦除文件中已失去引用的
-    // CodeView/PDB 原始载荷。对外 UI/模板使用相同的精确措辞。
     if (!config.preserveDebugInfo) {
+        std::vector<DebugScrubRange> ranges;
+        std::string scrubReason;
+        if (!CollectDebugScrubRanges(image, output, totalSize,
+                ranges, scrubReason)) {
+            delete[] output;
+            *outputSize = 0;
+            return nullptr;
+        }
+        ScrubDebugRanges(output, ranges);
         if (layout.is64Bit) {
             PIMAGE_NT_HEADERS64 nt64 = (PIMAGE_NT_HEADERS64)ntHeaders;
             nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;

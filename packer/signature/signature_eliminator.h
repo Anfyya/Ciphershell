@@ -6,6 +6,7 @@
 #ifndef CS_SIGNATURE_ELIMINATOR_H
 #define CS_SIGNATURE_ELIMINATOR_H
 
+#include "../pe_parser/debug_directory_scrubber.h"
 #include "../pe_parser/pe_parser.h"
 #include <array>
 #include <string>
@@ -77,8 +78,10 @@ struct EliminationState {
     DWORD debugDirectorySize = 0;
     DWORD coffTimestamp = 0;
     DWORD checksum = 0;
+    bool debugPayloadScrubbed = false;
     std::vector<std::array<BYTE, IMAGE_SIZEOF_SHORT_NAME>> sectionNames;
     std::vector<BYTE> dosStubBytes;
+    std::vector<DebugScrubRange> debugScrubRanges;
 };
 
 // ============================================================================

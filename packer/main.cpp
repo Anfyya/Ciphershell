@@ -2721,7 +2721,7 @@ int main(int argc, char* argv[]) {
         std::cout << "SIGNATURE_ELIMINATION_SCOPE_NOTE "
                      "configured_postconditions=verified "
                      "exact_controlled_metadata_state=preserved "
-                     "debug_payload_bytes=not_scrubbed "
+                     "debug_payload_bytes=scrubbed_and_verified "
                      "coff_timestamp_only=true "
                      "residual_detector_hits="
                   << finalResidualDetectorHits << std::endl;

@@ -107,7 +107,7 @@ bool ConfigParser::GenerateDefaultConfig(const std::string& filePath) {
 
 [global]
 protection_level = 3              # 全局默认保护等级 1-5
-strip_debug_info = true           # 清零 Debug DataDirectory 引用；不擦除失去引用的原始载荷
+strip_debug_info = true           # 擦除 Debug 目录数组、CodeView/PDB 载荷及目录引用
 strip_rich_header = true          # 检测到 Rich 时清零整个 DOS stub/Rich 扫描区
 strip_timestamps = true           # COFF FileHeader.TimeDateStamp 归零
 randomize_section_names = true    # 随机化除严格 .rsrc/.reloc 外的 Section 名称

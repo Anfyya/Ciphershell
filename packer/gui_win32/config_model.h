@@ -42,7 +42,7 @@ struct CliOptions {
 // 接受的 [global] 字段：protection_level 走 CliOptions.protectionLevel，
 // 不在这里重复）。
 struct GlobalOptions {
-    bool stripDebugInfo = true;        // 清零 Debug DataDirectory；不擦残留载荷
+    bool stripDebugInfo = true;        // 擦除 Debug 目录数组、载荷及 DataDirectory
     bool stripRichHeader = true;       // 检测到 Rich 时清零整个 DOS stub/Rich 扫描区
     bool stripTimestamps = true;       // 仅 COFF FileHeader 时间戳
     bool randomizeSectionNames = true; // 严格 .rsrc/.reloc 名称除外

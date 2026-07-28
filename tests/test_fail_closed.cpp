@@ -28,6 +28,19 @@
 
 namespace {
 
+constexpr DWORD kDebugPayloadOffset = 0x440u;
+constexpr char kCodeViewPayload[] =
+    "RSDSD:\\vs2022\\vmp\\x64\\Release\\vmp.pdb";
+
+bool IsZeroed(const BYTE* data, size_t size) {
+    for (size_t index = 0; index < size; ++index) {
+        if (data[index] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // 构造一个最小合法 PE32/PE32+：DOS + NT + 一个 .text section。
 // signatureMetadata 为 true 时额外放入可验证的
 // Rich/Debug/timestamp/checksum 元数据。
@@ -123,12 +136,19 @@ CipherShell::CS_PE_IMAGE* BuildMinimalImage(bool cetCompatible = false,
         debug->Type = cetCompatible
             ? kExtendedDllCharacteristicsType
             : IMAGE_DEBUG_TYPE_CODEVIEW;
-        debug->SizeOfData = static_cast<DWORD>(sizeof(WORD));
+        debug->SizeOfData = cetCompatible
+            ? static_cast<DWORD>(sizeof(WORD))
+            : static_cast<DWORD>(sizeof(kCodeViewPayload));
         debug->AddressOfRawData = 0x1040;
         debug->PointerToRawData = kSectionRawOffset + 0x40;
-        const WORD extendedCharacteristics = cetCompatible ? 0x0001u : 0x4242u;
-        std::memcpy(buf + debug->PointerToRawData,
-            &extendedCharacteristics, sizeof(extendedCharacteristics));
+        if (cetCompatible) {
+            const WORD extendedCharacteristics = 0x0001u;
+            std::memcpy(buf + debug->PointerToRawData,
+                &extendedCharacteristics, sizeof(extendedCharacteristics));
+        } else {
+            std::memcpy(buf + debug->PointerToRawData,
+                kCodeViewPayload, sizeof(kCodeViewPayload));
+        }
     }
 
     CipherShell::PEParser parser;
@@ -394,11 +414,12 @@ void TestSignatureEliminatorHonorsEnabledGlobalControls() {
         CS_TEST_CHECK(ImageChecksum(image) == 0);
         CS_TEST_CHECK(image->sections[0].Characteristics == beforePermissions);
 
-        // strip_debug_info 的精确契约只移除目录引用，不擦除失去引用的载荷。
-        WORD residualDebugPayload = 0;
-        std::memcpy(&residualDebugPayload, image->rawData + 0x440,
-            sizeof(residualDebugPayload));
-        CS_TEST_CHECK(residualDebugPayload == 0x4242u);
+        CS_TEST_CHECK(IsZeroed(
+            image->rawData + kDebugPayloadOffset,
+            sizeof(kCodeViewPayload)));
+        CS_TEST_CHECK(IsZeroed(
+            image->rawData + 0x420u,
+            sizeof(IMAGE_DEBUG_DIRECTORY)));
 
         CipherShell::PEParser parser;
         parser.FreeImage(image);
@@ -441,6 +462,9 @@ void TestSignatureEliminatorPreservesDisabledGlobalControls() {
         const auto& afterDebug = DebugDirectory(image);
         CS_TEST_CHECK(afterDebug.VirtualAddress == beforeDebug.VirtualAddress);
         CS_TEST_CHECK(afterDebug.Size == beforeDebug.Size);
+        CS_TEST_CHECK(std::memcmp(
+            image->rawData + kDebugPayloadOffset,
+            kCodeViewPayload, sizeof(kCodeViewPayload)) == 0);
         CS_TEST_CHECK(FileHeader(image).TimeDateStamp == beforeTimestamp);
 
         // Checksum 没有 global/UI 开关；保持现有强制输出卫生策略。
@@ -837,10 +861,12 @@ void TestStandaloneRebuilderHonorsExactMetadataContract() {
         CS_TEST_CHECK(FileHeader(rebuilt).TimeDateStamp == 0);
         CS_TEST_CHECK(ImageChecksum(rebuilt) == 0);
 
-        WORD residualDebugPayload = 0;
-        std::memcpy(&residualDebugPayload, rebuilt->rawData + 0x440,
-            sizeof(residualDebugPayload));
-        CS_TEST_CHECK(residualDebugPayload == 0x4242u);
+        CS_TEST_CHECK(IsZeroed(
+            rebuilt->rawData + kDebugPayloadOffset,
+            sizeof(kCodeViewPayload)));
+        CS_TEST_CHECK(IsZeroed(
+            rebuilt->rawData + 0x420u,
+            sizeof(IMAGE_DEBUG_DIRECTORY)));
         parser.FreeImage(rebuilt);
     }
 }
@@ -1039,10 +1065,15 @@ void TestRebuildAndFinalParsePreserveConfiguredSignatureState() {
             }
             CS_TEST_CHECK(ImageChecksum(rebuilt) == 0);
 
-            WORD residualDebugPayload = 0;
-            std::memcpy(&residualDebugPayload, rebuilt->rawData + 0x440,
-                sizeof(residualDebugPayload));
-            CS_TEST_CHECK(residualDebugPayload == 0x4242u);
+            if (controlsEnabled) {
+                CS_TEST_CHECK(IsZeroed(
+                    rebuilt->rawData + kDebugPayloadOffset,
+                    sizeof(kCodeViewPayload)));
+            } else {
+                CS_TEST_CHECK(std::memcmp(
+                    rebuilt->rawData + kDebugPayloadOffset,
+                    kCodeViewPayload, sizeof(kCodeViewPayload)) == 0);
+            }
 
             parser.FreeImage(rebuilt);
         }

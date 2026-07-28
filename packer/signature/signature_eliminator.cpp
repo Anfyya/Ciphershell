@@ -363,6 +363,11 @@ bool SignatureEliminator::CaptureState(CS_PE_IMAGE* image,
         reason = "state_capture_allocation_failed";
         return false;
     }
+    if (!CollectDebugScrubRanges(image, image->rawData, image->rawSize,
+            state.debugScrubRanges, reason)) {
+        state = EliminationState{};
+        return false;
+    }
     return true;
 }
 
@@ -455,8 +460,15 @@ bool SignatureEliminator::VerifyTransition(const EliminationState& before,
             reason = "debug_directory_present";
             return false;
         }
+        if (!VerifyDebugRangesScrubbed(image->rawData, image->rawSize,
+                before.debugScrubRanges, reason)) {
+            return false;
+        }
+        after.debugPayloadScrubbed = true;
+        after.debugScrubRanges = before.debugScrubRanges;
     } else if (before.debugDirectoryRVA != after.debugDirectoryRVA ||
-            before.debugDirectorySize != after.debugDirectorySize) {
+            before.debugDirectorySize != after.debugDirectorySize ||
+            before.debugScrubRanges != after.debugScrubRanges) {
         reason = "disabled_debug_directory_changed";
         return false;
     }
@@ -511,6 +523,11 @@ bool SignatureEliminator::VerifyExactState(CS_PE_IMAGE* image,
     if (actual.debugDirectoryRVA != expected.debugDirectoryRVA ||
         actual.debugDirectorySize != expected.debugDirectorySize) {
         reason = "final_debug_directory_changed";
+        return false;
+    }
+    if (expected.debugPayloadScrubbed &&
+        !VerifyDebugRangesScrubbed(image->rawData, image->rawSize,
+            expected.debugScrubRanges, reason)) {
         return false;
     }
     if (actual.coffTimestamp != expected.coffTimestamp) {
@@ -711,7 +728,16 @@ bool SignatureEliminator::ClearRichHeader(CS_PE_IMAGE* image) {
 }
 
 bool SignatureEliminator::ClearDebugDirectory(CS_PE_IMAGE* image) {
-    // 清除调试目录
+    std::vector<DebugScrubRange> ranges;
+    std::string reason;
+    if (!CollectDebugScrubRanges(image, image->rawData, image->rawSize,
+            ranges, reason)) {
+        return false;
+    }
+    ScrubDebugRanges(image->rawData, ranges);
+
+    // 在载荷与目录数组完成擦除后再移除目录引用；顺序不可颠倒，否则
+    // 后续阶段无法证明原始 CodeView/PDB 字节确实已经清除。
     if (image->is64Bit) {
         image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
         image->ntHeaders64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
@@ -719,7 +745,7 @@ bool SignatureEliminator::ClearDebugDirectory(CS_PE_IMAGE* image) {
         image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress = 0;
         image->ntHeaders32->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
     }
-
+    image->debugDir = CS_DEBUG_DIRECTORY{};
     return true;
 }
 
