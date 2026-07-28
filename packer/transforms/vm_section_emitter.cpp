@@ -3,6 +3,7 @@
 #include "../pe_parser/pe_emitter.h"
 #include "../vm/vm_schema.h"
 #include "../../runtime/common/vm_crypto.h"
+#include "../../runtime/common/vm_state_chain.h"
 #include <algorithm>
 #ifdef _WIN32
 #include <bcrypt.h>
@@ -35,7 +36,8 @@ constexpr uint32_t kKnownHeaderFlags = VM_METADATA_FLAG_AUTHENTICATED |
     VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
     VM_METADATA_FLAG_DIRECT_THREADED |
     VM_METADATA_FLAG_HANDLER_ENCRYPTED |
-    VM_METADATA_FLAG_RUNTIME_TRACE;
+    VM_METADATA_FLAG_RUNTIME_TRACE |
+    VM_METADATA_FLAG_STATE_CHAINED;
 constexpr uint32_t kKnownRecordFlags = VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
     VM_RECORD_FLAG_UNWIND_VERIFIED |
@@ -301,7 +303,8 @@ VMEmitResult VMSectionEmitter::Emit(
     header.flags = VM_METADATA_FLAG_AUTHENTICATED |
         VM_METADATA_FLAG_BYTECODE_CHACHA20 |
         VM_METADATA_FLAG_MICRO_STREAM |
-        VM_METADATA_FLAG_LAZY_FLAGS;
+        VM_METADATA_FLAG_LAZY_FLAGS |
+        VM_METADATA_FLAG_STATE_CHAINED;
     if (image->loadConfig.hasCFG) header.flags |= VM_METADATA_FLAG_CFG_ENABLED;
     if (handlerMutationEnabled) header.flags |= VM_METADATA_FLAG_HANDLER_MUTATED;
     if (junkHandlersEnabled) header.flags |= VM_METADATA_FLAG_JUNK_HANDLERS;
@@ -406,6 +409,7 @@ VMEmitResult VMSectionEmitter::Emit(
         header.cookie, header.encodedMasterKey);
 
     result.records = inputRecords;
+    std::vector<uint8_t> chainedBytecode = bytecode;
     std::vector<uint8_t> encryptedBytecode = bytecode;
     std::unordered_set<uint32_t> functionRVAs;
     for (auto& record : result.records) {
@@ -428,10 +432,36 @@ VMEmitResult VMSectionEmitter::Emit(
             std::memset(masterKey, 0, sizeof(masterKey));
             return result;
         }
+        const VM_OPERAND_CODEC codec = VMSchema::DeriveOperandCodec(
+            operandCodecSeed, record.functionRVA);
+        std::vector<DecodedMicroInstruction> decoded;
+        std::string decodeError;
+        if (!VMSchema::DecodeStream(
+                bytecode.data() + record.bytecodeOffset,
+                record.bytecodeSize, reverseOpcode, codec,
+                decoded, decodeError) ||
+            decoded.empty()) {
+            result.error =
+                "VM_EMIT: state-chain instruction boundaries are invalid: " +
+                decodeError;
+            std::memset(masterKey, 0, sizeof(masterKey));
+            return result;
+        }
+        for (const auto& instruction : decoded) {
+            const uint32_t seed = vm_state_chain_mask_seed(
+                operandCodecSeed, record.functionRVA,
+                instruction.byteOffset);
+            for (uint32_t index = 0u;
+                 index < instruction.encodedSize; ++index) {
+                chainedBytecode[record.bytecodeOffset +
+                    instruction.byteOffset + index] ^=
+                    vm_state_chain_mask_byte(seed, index);
+            }
+        }
         uint8_t recordKey[32]{};
         vm_derive_record_key(masterKey, header.buildId, record.functionRVA, recordKey);
         vm_chacha20_xor(
-            bytecode.data() + record.bytecodeOffset,
+            chainedBytecode.data() + record.bytecodeOffset,
             encryptedBytecode.data() + record.bytecodeOffset,
             record.bytecodeSize,
             recordKey,

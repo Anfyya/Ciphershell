@@ -299,7 +299,12 @@ static bool ValidateVMStaticLink(
         !runtimeResult.directThreadedVerified ||
         !runtimeResult.handlerEncryptionVerified ||
         !runtimeResult.runtimeContentVerified ||
-        !runtimeResult.referenceRuntimeBlobFreeVerified) {
+        !runtimeResult.referenceRuntimeBlobFreeVerified ||
+        !runtimeResult.stateChainingApplied ||
+        runtimeResult.stateChainEntryCount == 0u ||
+        static_cast<uint64_t>(runtimeResult.stateChainTableSize) !=
+            static_cast<uint64_t>(runtimeResult.stateChainEntryCount) *
+                sizeof(VM_STATE_CHAIN_ENTRY)) {
         reason = "runtime_not_execution_ready_or_linkage_unverified";
         return false;
     }
@@ -1926,6 +1931,7 @@ int main(int argc, char* argv[]) {
                     vmRuntimeImports.flushInstructionCacheIatRVA;
                 synthesisConfig.runtimeTraceEnabled = traceBindingPtr != nullptr;
                 synthesisConfig.mbaStrength = vmMbaStrength;
+                synthesisConfig.stateChainingEnabled = true;
                 outcome.runtimeResult = runtimeBuilder.Build(image.get(), outcome.vmRecords,
                     outcome.vmBytecodeBlob, outcome.opcodeMap,
                     outcome.emitResult.metadataRVA, outcome.emitResult.runtimeKeyShare,
@@ -1944,12 +1950,17 @@ int main(int argc, char* argv[]) {
                     outcome.runtimeResult.mbaStrength != vmMbaStrength ||
                     outcome.runtimeResult.mbaHandlerCount !=
                         3u * VM_HANDLER_VARIANT_COUNT ||
-                    outcome.runtimeResult.mbaMinimumComplexity == 0u) {
+                    outcome.runtimeResult.mbaMinimumComplexity == 0u ||
+                    !outcome.runtimeResult.stateChainingApplied ||
+                    outcome.runtimeResult.stateChainEntryCount == 0u ||
+                    outcome.runtimeResult.stateChainTableSize == 0u) {
                     std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder vm_group=" << g
                               << " reason=" << (outcome.runtimeResult.error.empty()
                                   ? "mba_applied_evidence_incomplete"
                                   : outcome.runtimeResult.error) << std::endl;
                     PrintFeatureStatus("vm.mba", "failed",
+                        "applied_evidence_incomplete");
+                    PrintFeatureStatus("vm.state_chaining", "failed",
                         "applied_evidence_incomplete");
                     return 1;
                 }
@@ -2672,6 +2683,17 @@ int main(int argc, char* argv[]) {
             "strength=" + std::to_string(buildCtx.vm.strength) +
             " handlers=" + std::to_string(mbaHandlerCount) +
             " min_complexity=" + std::to_string(mbaMinimumComplexity));
+        uint64_t stateChainEntries = 0u;
+        uint64_t stateChainBytes = 0u;
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            stateChainEntries += outcome.runtimeResult.stateChainEntryCount;
+            stateChainBytes += outcome.runtimeResult.stateChainTableSize;
+        }
+        PrintFeatureStatus("vm.state_chaining", "applied",
+            "entries=" + std::to_string(stateChainEntries) +
+            " table_bytes=" + std::to_string(stateChainBytes) +
+            " invalid_history=bytecode_range");
         // Scope note (do not drop this when editing nearby logging): "applied"
         // means every emitted function passed real native-CPU-vs-synthesized-
         // handler differential evidence (VM_NATIVE_DIFFERENTIAL_PASS) for its
@@ -2684,6 +2706,7 @@ int main(int argc, char* argv[]) {
                      "native_fallback=false" << std::endl;
     } else {
         PrintFeatureStatus("vm.mba", "skipped", "vm_disabled");
+        PrintFeatureStatus("vm.state_chaining", "skipped", "vm_disabled");
     }
     if (cfgApplied) {
         PrintFeatureStatus("control_flow.flattening", "applied",

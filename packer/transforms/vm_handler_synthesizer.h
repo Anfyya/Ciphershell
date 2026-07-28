@@ -34,6 +34,7 @@ struct VMHandlerFunctionDecodePlans {
     uint32_t functionRVA = 0;
     VM_OPERAND_CODEC codec{};
     std::array<VM_RUNTIME_DECODE_PLAN, VM_UOP_COUNT> plans{};
+    std::vector<VM_STATE_CHAIN_ENTRY> stateChainEntries;
 };
 
 struct VMHandlerSynthesisConfig {
@@ -51,6 +52,7 @@ struct VMHandlerSynthesisConfig {
     bool encryptHandlerBodies = true;
     bool emitCetLandingPads = true;
     bool runtimeTraceEnabled = false;
+    bool stateChainingEnabled = false;
     // 0 disables Plus MBA emission.  Production maps vm.strength (1-100)
     // here; tests may keep zero to exercise the legacy non-Plus core.
     uint8_t mbaStrength = 0;
@@ -168,6 +170,10 @@ struct VMHandlerSynthesisResult {
     VMDispatchTableCodec dispatchTableCodec{};
     uint32_t decodePlanTableOffset = 0;
     uint32_t decodePlanTableSize = 0;
+    uint32_t stateChainTableOffset = 0;
+    uint32_t stateChainTableSize = 0;
+    uint32_t stateChainEntryCount = 0;
+    bool stateChainingApplied = false;
     uint32_t encryptedHandlerOffset = 0;
     uint32_t encryptedHandlerSize = 0;
     // x64 CALL_HOST phase-two cleanup thunk.  The UNWIND_INFO handler field is

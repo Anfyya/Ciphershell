@@ -208,7 +208,8 @@ bool FindPackedRecord(const LoadedImage& image, const void* function,
             VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
             VM_METADATA_FLAG_DIRECT_THREADED |
             VM_METADATA_FLAG_HANDLER_ENCRYPTED |
-            VM_METADATA_FLAG_RUNTIME_TRACE;
+            VM_METADATA_FLAG_RUNTIME_TRACE |
+            VM_METADATA_FLAG_STATE_CHAINED;
         const bool nonzeroBuildId = std::any_of(
             std::begin(metadata->buildId), std::end(metadata->buildId),
             [](uint8_t value) { return value != 0; });

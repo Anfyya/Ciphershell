@@ -373,7 +373,9 @@ void MainWindow::BuildVmPage(int tabIndex) {
         m_hwnd, x + halfWidth + 12, y, halfWidth, kControlHeight, L"handler_mutation", NextControlId(), true));
     y += kRowHeight;
     m_bytecodeEncryptionCheck = track(CreateCheckboxControl(
-        m_hwnd, x, y, halfWidth, kControlHeight, L"bytecode_encryption", NextControlId(), true));
+        m_hwnd, x, y, halfWidth, kControlHeight,
+        L"bytecode_encryption（ChaCha20 + 状态绑定链）",
+        NextControlId(), true));
     m_embedJunkCheck = track(CreateCheckboxControl(
         m_hwnd, x + halfWidth + 12, y, halfWidth, kControlHeight, L"embed_junk_handlers", NextControlId(), true));
     y += kRowHeight;
@@ -384,7 +386,8 @@ void MainWindow::BuildVmPage(int tabIndex) {
     y += kRowHeight;
     track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight * 2,
         L"提示：生产构建要求 opcode_randomization / handler_mutation / embed_junk_handlers /\r\n"
-        L"bytecode_encryption 保持开启，否则会被拒绝（main.cpp: VM_INIT_FAIL）。"));
+        L"bytecode_encryption 保持开启；它同时启用 ChaCha20 与按前驱/flags 失败闭合的状态绑定链，\r\n"
+        L"否则会被拒绝（main.cpp: VM_INIT_FAIL）。"));
     y += kControlHeight * 2 + kGroupGap;
 
     track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"native_body_policy"));

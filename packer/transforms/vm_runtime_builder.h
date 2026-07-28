@@ -117,6 +117,9 @@ struct VMRuntimeBuildResult {
     uint8_t mbaStrength = 0;
     uint8_t mbaMinimumComplexity = 0;
     uint32_t mbaHandlerCount = 0;
+    bool stateChainingApplied = false;
+    uint32_t stateChainEntryCount = 0;
+    uint32_t stateChainTableSize = 0;
     VMRuntimeTraceBinding traceBinding{};
     // Exact non-junk semantic-body ranges synthesized for this runtime, keyed
     // by semantic and K-variant. They are never emitted into the protected PE;

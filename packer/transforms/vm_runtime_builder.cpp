@@ -5,11 +5,14 @@
 #include "../vm/vm_schema.h"
 #include "../../runtime/common/vm_metadata.h"
 #include "../../runtime/common/vm_micro_runtime_abi.h"
+#include "../../runtime/common/vm_state_chain.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
 #include <set>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace CipherShell {
@@ -32,6 +35,131 @@ struct MappedRuntimeImage {
 
 bool RangeValid(size_t offset, size_t size, size_t total) {
     return offset <= total && size <= total - offset;
+}
+
+bool BuildStateChainEntries(
+    const std::vector<DecodedMicroInstruction>& decoded,
+    uint64_t operandCodecSeed,
+    uint32_t functionRVA,
+    std::vector<VM_STATE_CHAIN_ENTRY>& entries,
+    std::string& error)
+{
+    entries.clear();
+    if (decoded.empty() || decoded.front().byteOffset != 0u) {
+        error = "state-chain bytecode has no zero-offset entry instruction";
+        return false;
+    }
+    std::unordered_map<uint32_t, size_t> byOffset;
+    for (size_t index = 0; index < decoded.size(); ++index) {
+        if (!byOffset.emplace(decoded[index].byteOffset, index).second) {
+            error = "state-chain bytecode contains duplicate boundaries";
+            return false;
+        }
+    }
+    const auto conditionTrue = [](uint8_t flags, VM_CONDITION condition) {
+        const bool cf = (flags & 0x01u) != 0u;
+        const bool pf = (flags & 0x02u) != 0u;
+        const bool zf = (flags & 0x04u) != 0u;
+        const bool sf = (flags & 0x08u) != 0u;
+        const bool of = (flags & 0x10u) != 0u;
+        switch (condition) {
+            case VM_CONDITION_ALWAYS: return true;
+            case VM_CONDITION_O: return of;
+            case VM_CONDITION_NO: return !of;
+            case VM_CONDITION_B: return cf;
+            case VM_CONDITION_AE: return !cf;
+            case VM_CONDITION_E: return zf;
+            case VM_CONDITION_NE: return !zf;
+            case VM_CONDITION_BE: return cf || zf;
+            case VM_CONDITION_A: return !cf && !zf;
+            case VM_CONDITION_S: return sf;
+            case VM_CONDITION_NS: return !sf;
+            case VM_CONDITION_P: return pf;
+            case VM_CONDITION_NP: return !pf;
+            case VM_CONDITION_L: return sf != of;
+            case VM_CONDITION_GE: return sf == of;
+            case VM_CONDITION_LE: return zf || (sf != of);
+            case VM_CONDITION_G: return !zf && (sf == of);
+            default: return false;
+        }
+    };
+    constexpr uint8_t kAnyFlags = 0xFFu;
+    std::set<std::tuple<uint32_t, uint32_t, uint8_t>> transitions;
+    transitions.emplace(0xFFFFFFFFu, 0u, kAnyFlags);
+    std::vector<uint32_t> callReturnOffsets;
+    std::vector<uint32_t> returnOffsets;
+    for (size_t index = 0; index < decoded.size(); ++index) {
+        const auto& item = decoded[index];
+        const VMOpcodeDescriptor* descriptor =
+            VMSchema::Lookup(item.instruction.opcode);
+        if (descriptor == nullptr) {
+            error = "state-chain bytecode references an unknown semantic";
+            return false;
+        }
+        std::vector<uint32_t> successors;
+        if (item.instruction.opcode == VM_UOP_RET)
+            returnOffsets.push_back(item.byteOffset);
+        if (descriptor->branchTargetOperand >= 0) {
+            const uint64_t rawTarget = item.instruction.operands[
+                static_cast<uint8_t>(descriptor->branchTargetOperand)];
+            if (rawTarget > (std::numeric_limits<uint32_t>::max)() ||
+                byOffset.count(static_cast<uint32_t>(rawTarget)) == 0u) {
+                error = "state-chain branch target is not a bytecode boundary";
+                return false;
+            }
+            successors.push_back(static_cast<uint32_t>(rawTarget));
+        }
+        if (item.instruction.opcode == VM_UOP_CALL_VM) {
+            if (index + 1u >= decoded.size()) {
+                error = "state-chain CALL_VM has no return boundary";
+                return false;
+            }
+            callReturnOffsets.push_back(decoded[index + 1u].byteOffset);
+        } else if (!descriptor->terminal &&
+            (!descriptor->branch || descriptor->conditional)) {
+            if (index + 1u >= decoded.size()) {
+                error = "state-chain fallthrough exits the bytecode record";
+                return false;
+            }
+            successors.push_back(decoded[index + 1u].byteOffset);
+        }
+        if (item.instruction.opcode == VM_UOP_BRANCH_IF) {
+            if (successors.size() != 2u ||
+                item.instruction.operandCount == 0u ||
+                item.instruction.operands[0] > VM_CONDITION_G) {
+                error = "state-chain conditional branch contract is invalid";
+                return false;
+            }
+            const auto condition = static_cast<VM_CONDITION>(
+                item.instruction.operands[0]);
+            for (uint8_t flags = 0u; flags < 32u; ++flags) {
+                transitions.emplace(item.byteOffset,
+                    conditionTrue(flags, condition)
+                        ? successors.front() : successors.back(),
+                    flags);
+            }
+        } else {
+            for (const uint32_t successor : successors)
+                transitions.emplace(item.byteOffset, successor, kAnyFlags);
+        }
+    }
+    for (const uint32_t returnOffset : returnOffsets) {
+        for (const uint32_t callReturnOffset : callReturnOffsets) {
+            transitions.emplace(
+                returnOffset, callReturnOffset, kAnyFlags);
+        }
+    }
+    entries.reserve(transitions.size());
+    for (const auto& transition : transitions) {
+        VM_STATE_CHAIN_ENTRY entry{};
+        entry.previousOffset = std::get<0>(transition);
+        entry.currentOffset = std::get<1>(transition);
+        entry.flagsState = std::get<2>(transition);
+        entry.maskSeed = vm_state_chain_mask_seed(operandCodecSeed,
+            functionRVA, entry.currentOffset);
+        entries.push_back(entry);
+    }
+    return !entries.empty();
 }
 
 constexpr uint64_t kRuntimeSectionDigestDomain = 0x4353564D53454354ULL;
@@ -1310,17 +1438,23 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     }
     synthesisConfig.architecture = image->is64Bit
         ? VMHandlerArchitecture::X64 : VMHandlerArchitecture::X86;
+    VM_METADATA_HEADER metadataHeader{};
+    if (!ReadMetadataHeader(image, metadataRVA, metadataHeader)) {
+        result.error = "VM_RUNTIME: micro metadata header is unavailable";
+        return result;
+    }
+    if (((metadataHeader.flags & VM_METADATA_FLAG_STATE_CHAINED) != 0u) !=
+            synthesisConfig.stateChainingEnabled) {
+        result.error =
+            "VM_RUNTIME: metadata and synthesized state-chain modes disagree";
+        return result;
+    }
     if (synthesisConfig.virtualProtectIatRVA == 0 ||
         synthesisConfig.flushInstructionCacheIatRVA == 0) {
         result.error = "VM_RUNTIME: handler RX decryption API IAT RVAs are missing";
         return result;
     }
     if (synthesisConfig.functionDecodePlans.empty()) {
-        VM_METADATA_HEADER metadataHeader{};
-        if (!ReadMetadataHeader(image, metadataRVA, metadataHeader)) {
-            result.error = "VM_RUNTIME: micro metadata header cannot seed operand decode plans";
-            return result;
-        }
         synthesisConfig.functionDecodePlans.reserve(records.size());
         for (const auto& record : records) {
             VMHandlerFunctionDecodePlans plans{};
@@ -1381,6 +1515,17 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
             result.error = "VM_RUNTIME: plaintext evidence bytecode decode failed: " +
                 decodeError;
             return result;
+        }
+        if (synthesisConfig.stateChainingEnabled) {
+            std::string chainError;
+            if (!BuildStateChainEntries(decoded,
+                    metadataHeader.operandCodecSeed, record.functionRVA,
+                    plans->stateChainEntries, chainError)) {
+                result.error =
+                    "VM_RUNTIME: state-chain graph generation failed: " +
+                    chainError;
+                return result;
+            }
         }
         VMRecordHandlerReferences recordEvidence{};
         recordEvidence.functionRVA = record.functionRVA;
@@ -1470,6 +1615,9 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.mbaStrength = synthesized.mbaStrength;
     result.mbaMinimumComplexity = synthesized.mbaMinimumComplexity;
     result.mbaHandlerCount = synthesized.mbaHandlerCount;
+    result.stateChainingApplied = synthesized.stateChainingApplied;
+    result.stateChainEntryCount = synthesized.stateChainEntryCount;
+    result.stateChainTableSize = synthesized.stateChainTableSize;
     // Keep handlerReferences bound to the K values selected by the real
     // bytecode, but close the plaintext sidecar over every synthesized K for
     // each referenced semantic.  This makes same-(semantic,K) cross-build

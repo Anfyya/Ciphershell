@@ -33,7 +33,8 @@ constexpr uint32_t kKnownMetadataFlags = kRequiredMetadataFlags |
     VM_METADATA_FLAG_CFG_ENABLED |
     VM_METADATA_FLAG_HANDLER_MUTATED |
     VM_METADATA_FLAG_JUNK_HANDLERS |
-    VM_METADATA_FLAG_RUNTIME_TRACE;
+    VM_METADATA_FLAG_RUNTIME_TRACE |
+    VM_METADATA_FLAG_STATE_CHAINED;
 constexpr uint32_t kKnownRecordFlags =
     VM_RECORD_FLAG_X64 |
     VM_RECORD_FLAG_NATIVE_BODY_DESTROYED |
@@ -55,13 +56,15 @@ constexpr uint32_t kRuntimeScratchSize = kRuntimeKeyOffset + 64u;
 #pragma pack(push, 1)
 struct RuntimeFunctionDecodeTable {
     uint32_t functionRVA;
+    uint32_t stateChainStartIndex;
+    uint32_t stateChainEntryCount;
     VM_OPERAND_CODEC codec;
     VM_RUNTIME_DECODE_PLAN plans[VM_UOP_COUNT];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(RuntimeFunctionDecodeTable) ==
-    sizeof(uint32_t) + sizeof(VM_OPERAND_CODEC) +
+    sizeof(uint32_t) * 3u + sizeof(VM_OPERAND_CODEC) +
         sizeof(VM_RUNTIME_DECODE_PLAN) * VM_UOP_COUNT,
     "runtime decode table layout mismatch");
 
@@ -113,6 +116,19 @@ constexpr uint32_t CtxFlushInstructionCache =
     static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, flushInstructionCache));
 constexpr uint32_t CtxRollingKey =
     static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, rollingKey));
+constexpr uint32_t CtxStateChainTable =
+    static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, stateChainTable));
+constexpr uint32_t CtxStateChainCount =
+    static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, stateChainCount));
+constexpr uint32_t CtxStateChainPreviousOffset =
+    static_cast<uint32_t>(offsetof(
+        VM_MICRO_EXECUTION_CONTEXT, stateChainPreviousOffset));
+constexpr uint32_t CtxStateChainCurrentOffset =
+    static_cast<uint32_t>(offsetof(
+        VM_MICRO_EXECUTION_CONTEXT, stateChainCurrentOffset));
+constexpr uint32_t CtxStateChainMaskSeed =
+    static_cast<uint32_t>(offsetof(
+        VM_MICRO_EXECUTION_CONTEXT, stateChainMaskSeed));
 constexpr uint32_t CtxOperandCodec =
     static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, operandCodec));
 constexpr uint32_t CtxDecodedOperands =
@@ -704,6 +720,20 @@ bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) 
         error = "entry codegen decode-plan table size does not match function count";
         return false;
     }
+    const uint64_t expectedChainBytes =
+        static_cast<uint64_t>(config.stateChainEntryCount) *
+        sizeof(VM_STATE_CHAIN_ENTRY);
+    if (config.stateChainingEnabled) {
+        if (config.stateChainEntryCount == 0u ||
+            expectedChainBytes != config.layout.stateChainTableSize) {
+            error = "entry codegen state-chain table size is invalid";
+            return false;
+        }
+    } else if (config.stateChainEntryCount != 0u ||
+               config.layout.stateChainTableSize != 0u) {
+        error = "disabled entry codegen published state-chain storage";
+        return false;
+    }
     if (config.layout.encryptedHandlerSize == 0 ||
         (config.layout.encryptedHandlerOffset & (kPageSize - 1u)) != 0) {
         error = "entry codegen encrypted handler range is empty or not page aligned";
@@ -727,7 +757,7 @@ bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) 
         error = "entry decryptor must not share a page with encrypted handlers";
         return false;
     }
-    const std::array<uint32_t, 10> codeOffsets = {
+    std::vector<uint32_t> codeOffsets = {
         config.layout.publicEntryOffset,
         config.layout.validationEntryOffset,
         config.layout.decryptorOffset,
@@ -739,6 +769,8 @@ bool ConfigValid(const VMHandlerEntryCodegenConfig& config, std::string& error) 
         config.layout.dispatchTableOffset,
         config.layout.encryptedHandlerOffset
     };
+    if (config.stateChainingEnabled)
+        codeOffsets.push_back(config.layout.stateChainTableOffset);
     std::set<uint32_t> unique(codeOffsets.begin(), codeOffsets.end());
     if (unique.size() != codeOffsets.size()) {
         error = "entry codegen layout aliases code, key, plan, or dispatch offsets";
@@ -849,11 +881,17 @@ bool VMHandlerEntryCodegen::Validate(
         {config.layout.keyMarkerOffset, VM_RUNTIME_KEY_SHARE_SIZE, "runtime key share"},
         {config.layout.decodePlanTableOffset,
             config.layout.decodePlanTableSize, "decode plan table"},
+    };
+    if (config.stateChainingEnabled) {
+        segments.push_back({config.layout.stateChainTableOffset,
+            config.layout.stateChainTableSize, "state chain table"});
+    }
+    segments.insert(segments.end(), {
         {config.layout.dispatchTableOffset,
             static_cast<uint32_t>(dispatchBytes64), "dispatch table"},
         {config.layout.encryptedHandlerOffset,
             config.layout.encryptedHandlerSize, "encrypted handlers"}
-    };
+    });
     std::sort(segments.begin(), segments.end(),
         [](const Segment& lhs, const Segment& rhs) { return lhs.offset < rhs.offset; });
     for (size_t i = 0; i < segments.size(); ++i) {
@@ -1993,6 +2031,57 @@ bool BuildOperandDecoder(
         const size_t decoded = code.NewLabel();
         const size_t epilog = code.NewLabel();
 
+        if (config.stateChainingEnabled) {
+            const size_t chainLoop = code.NewLabel();
+            const size_t chainNext = code.NewLabel();
+            const size_t chainFlagsMatch = code.NewLabel();
+            const size_t chainFound = code.NewLabel();
+            // Bind the next instruction to the exact predecessor boundary and
+            // the materialized CF/PF/ZF/SF/OF state left by that predecessor.
+            code.Raw({0x49,0x8B,0x87}); code.U32(CtxVip);
+            code.Raw({0x49,0x2B,0x87}); code.U32(CtxBytecodeBegin);
+            code.Raw({0x48,0x3D,0xFF,0xFF,0xFF,0xFF});
+            code.Jcc32(0x87, fail);
+            code.Raw({0x89,0x44,0x24,0x1C});
+            code.Raw({0x41,0x8B,0xB7}); code.U32(CtxStateChainCurrentOffset);
+            code.Raw({0x49,0x8B,0x9F}); code.U32(CtxStateChainTable);
+            code.Raw({0x41,0x8B,0x8F}); code.U32(CtxStateChainCount);
+            code.Raw({0x48,0x85,0xDB}); code.Jcc32(0x84, fail);
+            code.Raw({0x85,0xC9}); code.Jcc32(0x84, fail);
+            code.Raw({0x41,0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0x89,0xC2,0x83,0xE2,0x01});
+            code.Raw({0x89,0xC5,0xD1,0xED,0x83,0xE5,0x02,0x09,0xEA});
+            code.Raw({0x89,0xC5,0xC1,0xED,0x04,0x83,0xE5,0x04,0x09,0xEA});
+            code.Raw({0x89,0xC5,0xC1,0xED,0x04,0x83,0xE5,0x08,0x09,0xEA});
+            code.Raw({0x89,0xC5,0xC1,0xED,0x07,0x83,0xE5,0x10,0x09,0xEA});
+            code.Bind(chainLoop);
+            code.Raw({0x39,0x33}); code.Jcc32(0x85, chainNext);
+            code.Raw({0x8B,0x44,0x24,0x1C,0x39,0x43,0x04});
+            code.Jcc32(0x85, chainNext);
+            code.Raw({0x0F,0xB6,0x43,0x0C,0x3C,0xFF});
+            code.Jcc32(0x84, chainFlagsMatch);
+            code.Raw({0x38,0xD0}); code.Jcc32(0x84, chainFlagsMatch);
+            code.Jmp32(chainNext);
+            code.Bind(chainFlagsMatch);
+            code.Raw({0x8B,0x43,0x08,0x85,0xC0});
+            code.Jcc32(0x85, chainFound);
+            code.Jmp32(fail);
+            code.Bind(chainFound);
+            code.Raw({0x41,0x89,0x87}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0x41,0x89,0xB7}); code.U32(CtxStateChainPreviousOffset);
+            code.Raw({0x8B,0x44,0x24,0x1C,0x41,0x89,0x87});
+            code.U32(CtxStateChainCurrentOffset);
+            const size_t chainReady = code.NewLabel();
+            code.Jmp32(chainReady);
+            code.Bind(chainNext);
+            code.Raw({0x48,0x83,0xC3,
+                      static_cast<uint8_t>(sizeof(VM_STATE_CHAIN_ENTRY)),
+                      0xFF,0xC9});
+            code.Jcc32(0x85, chainLoop);
+            code.Jmp32(fail);
+            code.Bind(chainReady);
+        }
+
         code.Raw({0x4C,0x89,0xF9}); code.CallLabel(readByte);
         code.Raw({0x85,0xC0}); code.Jcc32(0x88, fail);
         code.Raw({0x49,0x8B,0x8F}); code.U32(CtxReverseOpcodeMap);
@@ -2198,6 +2287,7 @@ bool BuildOperandDecoder(
         const size_t readerFail = code.NewLabel();
         const size_t readerPlain = code.NewLabel();
         const size_t readerRounds = code.NewLabel();
+        const size_t readerMask = code.NewLabel();
         const size_t readerDone = code.NewLabel();
         code.Raw({0x4D,0x8B,0xAF}); code.U32(CtxVip);
         code.Raw({0x4D,0x3B,0xAF}); code.U32(CtxBytecodeEnd);
@@ -2242,12 +2332,24 @@ bool BuildOperandDecoder(
         code.Raw({0x44,0x89,0xF3,0x83,0xE3,0x3F,0x89,0xD9,0xC1,0xE9,0x02,
                   0x8B,0x44,0x8C,0x20,0x03,0x44,0x8C,0x60,
                   0x89,0xD9,0x83,0xE1,0x03,0xC1,0xE1,0x03,0xD3,0xE8,
-                  0x41,0x0F,0xB6,0x55,0x00,0x31,0xD0,0x0F,0xB6,0xC0,
-                  0x49,0xFF,0xC5,0x4D,0x89,0xAF}); code.U32(CtxVip);
-        code.Jmp32(readerDone);
+                  0x41,0x0F,0xB6,0x55,0x00,0x31,0xD0,0x0F,0xB6,0xC0});
+        code.Jmp32(readerMask);
         code.Bind(readerPlain);
-        code.Raw({0x41,0x0F,0xB6,0x45,0x00,0x49,0xFF,0xC5,
-                  0x4D,0x89,0xAF}); code.U32(CtxVip);
+        code.Raw({0x41,0x0F,0xB6,0x45,0x00});
+        code.Bind(readerMask);
+        if (config.stateChainingEnabled) {
+            // mask = seed[lane] ^ (instructionByteOffset * 0x9d) ^
+            //        seed.highByte
+            code.Raw({0x4C,0x89,0xEF,0x49,0x2B,0xBF}); code.U32(CtxBytecodeBegin);
+            code.Raw({0x41,0x2B,0xBF}); code.U32(CtxStateChainCurrentOffset);
+            code.Raw({0x89,0xF9,0x83,0xE1,0x03,0xC1,0xE1,0x03});
+            code.Raw({0x41,0x8B,0x97}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0xD3,0xEA,0x31,0xD0,0x69,0xFF,0x9D,0x00,0x00,0x00,
+                      0x31,0xF8});
+            code.Raw({0x41,0x8B,0x97}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0xC1,0xEA,0x18,0x31,0xD0,0x25,0xFF,0x00,0x00,0x00});
+        }
+        code.Raw({0x49,0xFF,0xC5,0x4D,0x89,0xAF}); code.U32(CtxVip);
         code.Jmp32(readerDone);
         code.Bind(readerFail);
         code.Raw({0x41,0xC7,0x87}); code.U32(CtxError); code.U32(VM_MICRO_ERR_BYTECODE_RANGE);
@@ -2278,6 +2380,56 @@ bool BuildOperandDecoder(
         const size_t store = code.NewLabel();
         const size_t decoded = code.NewLabel();
         const size_t epilog = code.NewLabel();
+        if (config.stateChainingEnabled) {
+            const size_t chainLoop = code.NewLabel();
+            const size_t chainNext = code.NewLabel();
+            const size_t chainFlagsMatch = code.NewLabel();
+            const size_t chainFound = code.NewLabel();
+            code.Raw({0x8B,0x87}); code.U32(CtxVip);
+            code.Raw({0x2B,0x87}); code.U32(CtxBytecodeBegin);
+            code.Raw({0x89,0x45,0xF4});
+            code.Raw({0x8B,0xB7}); code.U32(CtxStateChainCurrentOffset);
+            code.Raw({0x8B,0x9F}); code.U32(CtxStateChainTable);
+            code.Raw({0x8B,0x8F}); code.U32(CtxStateChainCount);
+            code.Raw({0x85,0xDB}); code.Jcc32(0x84, fail);
+            code.Raw({0x85,0xC9}); code.Jcc32(0x84, fail);
+            code.Raw({0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0x89,0xC2,0x83,0xE2,0x01});
+            code.Raw({0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0xD1,0xE8,0x83,0xE0,0x02,0x09,0xC2});
+            code.Raw({0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0xC1,0xE8,0x04,0x83,0xE0,0x04,0x09,0xC2});
+            code.Raw({0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0xC1,0xE8,0x04,0x83,0xE0,0x08,0x09,0xC2});
+            code.Raw({0x8B,0x87}); code.U32(CtxVirtualFlags);
+            code.Raw({0xC1,0xE8,0x07,0x83,0xE0,0x10,0x09,0xC2});
+            code.Bind(chainLoop);
+            code.Raw({0x39,0x33}); code.Jcc32(0x85, chainNext);
+            code.Raw({0x8B,0x45,0xF4,0x39,0x43,0x04});
+            code.Jcc32(0x85, chainNext);
+            code.Raw({0x0F,0xB6,0x43,0x0C,0x3C,0xFF});
+            code.Jcc32(0x84, chainFlagsMatch);
+            code.Raw({0x38,0xD0}); code.Jcc32(0x84, chainFlagsMatch);
+            code.Jmp32(chainNext);
+            code.Bind(chainFlagsMatch);
+            code.Raw({0x8B,0x43,0x08,0x85,0xC0});
+            code.Jcc32(0x85, chainFound);
+            code.Jmp32(fail);
+            code.Bind(chainFound);
+            code.Raw({0x89,0x87}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0x89,0xB7}); code.U32(CtxStateChainPreviousOffset);
+            code.Raw({0x8B,0x45,0xF4,0x89,0x87});
+            code.U32(CtxStateChainCurrentOffset);
+            const size_t chainReady = code.NewLabel();
+            code.Jmp32(chainReady);
+            code.Bind(chainNext);
+            code.Raw({0x83,0xC3,
+                      static_cast<uint8_t>(sizeof(VM_STATE_CHAIN_ENTRY)),
+                      0x49});
+            code.Jcc32(0x85, chainLoop);
+            code.Jmp32(fail);
+            code.Bind(chainReady);
+        }
         code.Raw({0x57}); code.CallLabel(readByte); code.Raw({0x83,0xC4,0x04,0x85,0xC0});
         code.Jcc32(0x88, fail);
         code.Raw({0x8B,0x8F}); code.U32(CtxReverseOpcodeMap);
@@ -2475,6 +2627,7 @@ bool BuildOperandDecoder(
         const size_t xReaderFail = code.NewLabel();
         const size_t xReaderPlain = code.NewLabel();
         const size_t xRounds = code.NewLabel();
+        const size_t xReaderMask = code.NewLabel();
         const size_t xReaderDone = code.NewLabel();
         code.Raw({0x3B,0xB7}); code.U32(CtxBytecodeEnd); code.Jcc32(0x83, xReaderFail);
         code.Raw({0x8B,0x9F}); code.U32(CtxRollingKey);
@@ -2515,10 +2668,22 @@ bool BuildOperandDecoder(
                   0x8B,0x44,0x94,0x08,0x03,0x44,0x94,0x48,
                   0x83,0xE1,0x03,0xC1,0xE1,0x03,0xD3,0xE8,
                   0x8B,0xB4,0x24,0x88,0x00,0x00,0x00,
-                  0x0F,0xB6,0x16,0x31,0xD0,0x0F,0xB6,0xC0,
-                  0x46,0x89,0xB7}); code.U32(CtxVip); code.Jmp32(xReaderDone);
+                  0x0F,0xB6,0x16,0x31,0xD0,0x0F,0xB6,0xC0});
+        code.Jmp32(xReaderMask);
         code.Bind(xReaderPlain);
-        code.Raw({0x0F,0xB6,0x06,0x46,0x89,0xB7}); code.U32(CtxVip); code.Jmp32(xReaderDone);
+        code.Raw({0x0F,0xB6,0x06});
+        code.Bind(xReaderMask);
+        if (config.stateChainingEnabled) {
+            code.Raw({0x89,0xF3,0x2B,0x9F}); code.U32(CtxBytecodeBegin);
+            code.Raw({0x2B,0x9F}); code.U32(CtxStateChainCurrentOffset);
+            code.Raw({0x89,0xD9,0x83,0xE1,0x03,0xC1,0xE1,0x03});
+            code.Raw({0x8B,0x97}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0xD3,0xEA,0x31,0xD0,0x69,0xDB,0x9D,0x00,0x00,0x00,
+                      0x31,0xD8});
+            code.Raw({0x8B,0x97}); code.U32(CtxStateChainMaskSeed);
+            code.Raw({0xC1,0xEA,0x18,0x31,0xD0,0x25,0xFF,0x00,0x00,0x00});
+        }
+        code.Raw({0x46,0x89,0xB7}); code.U32(CtxVip); code.Jmp32(xReaderDone);
         code.Bind(xReaderFail);
         code.Raw({0xC7,0x87}); code.U32(CtxError); code.U32(VM_MICRO_ERR_BYTECODE_RANGE);
         code.Raw({0xC7,0x87}); code.U32(CtxHalted); code.U32(1);
@@ -2690,6 +2855,9 @@ bool BuildPublicEntryX64(
     size_t sipHash,
     size_t hChaCha)
 {
+    const uint32_t requiredMetadataFlags = kRequiredMetadataFlags |
+        (config.stateChainingEnabled
+            ? static_cast<uint32_t>(VM_METADATA_FLAG_STATE_CHAINED) : 0u);
     const uint32_t begin = code.ImageOffset();
     EmitCet(code, true, config.emitCetLandingPads);
     std::vector<std::pair<uint8_t, uint8_t>> pushes;
@@ -2760,8 +2928,8 @@ bool BuildPublicEntryX64(
     code.Raw({0x8B,0x86}); code.U32(MetaFlags);
     code.Raw({0x89,0xC1,0x81,0xE1}); code.U32(~kKnownMetadataFlags);
     code.Jcc32(0x85, failMetadata);
-    code.Raw({0x25}); code.U32(kRequiredMetadataFlags);
-    code.Raw({0x3D}); code.U32(kRequiredMetadataFlags); code.Jcc32(0x85, failMetadata);
+    code.Raw({0x25}); code.U32(requiredMetadataFlags);
+    code.Raw({0x3D}); code.U32(requiredMetadataFlags); code.Jcc32(0x85, failMetadata);
     code.Raw({0xF7,0x86}); code.U32(MetaFlags); code.U32(VM_METADATA_FLAG_UNWIND_VERIFIED);
     code.Jcc32(0x84, failMetadata);
     code.Raw({0x8B,0x86}); code.U32(MetaTotalSize);
@@ -3153,13 +3321,33 @@ bool BuildValidationEntry(
         code.Raw({0x48,0x81,0xC6}); code.U32(sizeof(RuntimeFunctionDecodeTable));
         code.Raw({0x41,0xFF,0xC4}); code.Jmp32(planLoop);
         code.Bind(planFound);
-        code.Raw({0xF3,0x0F,0x6F,0x46,0x04,
-                  0xF3,0x41,0x0F,0x7F,0x87}); code.U32(CtxOperandCodec);
-        code.Raw({0xF3,0x0F,0x6F,0x46,0x10,
-                  0xF3,0x41,0x0F,0x7F,0x87}); code.U32(CtxOperandCodec + 12u);
+        code.Raw({0xF3,0x0F,0x6F,0x46}); code.U8(static_cast<uint8_t>(
+            offsetof(RuntimeFunctionDecodeTable, codec)));
+        code.Raw({0xF3,0x41,0x0F,0x7F,0x87}); code.U32(CtxOperandCodec);
+        code.Raw({0xF3,0x0F,0x6F,0x46}); code.U8(static_cast<uint8_t>(
+            offsetof(RuntimeFunctionDecodeTable, codec) + 12u));
+        code.Raw({0xF3,0x41,0x0F,0x7F,0x87}); code.U32(CtxOperandCodec + 12u);
         code.Raw({0x48,0x8D,0x46}); code.U8(static_cast<uint8_t>(
             offsetof(RuntimeFunctionDecodeTable, plans)));
         code.Raw({0x49,0x89,0x87}); code.U32(CtxDecodePlans);
+        if (config.stateChainingEnabled) {
+            code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
+                offsetof(RuntimeFunctionDecodeTable, stateChainStartIndex)));
+            code.Raw({0x48,0xC1,0xE0,0x04,0x48,0x8D,0x15});
+            if (!code.RipDisp32(config.layout.stateChainTableOffset,
+                    result.error)) return false;
+            code.Raw({0x48,0x01,0xD0,0x49,0x89,0x87});
+            code.U32(CtxStateChainTable);
+            code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
+                offsetof(RuntimeFunctionDecodeTable, stateChainEntryCount)));
+            code.Raw({0x41,0x89,0x87}); code.U32(CtxStateChainCount);
+            code.Raw({0x41,0xC7,0x87}); code.U32(CtxStateChainPreviousOffset);
+            code.U32(0xFFFFFFFFu);
+            code.Raw({0x41,0xC7,0x87}); code.U32(CtxStateChainCurrentOffset);
+            code.U32(0xFFFFFFFFu);
+            code.Raw({0x41,0xC7,0x87}); code.U32(CtxStateChainMaskSeed);
+            code.U32(0u);
+        }
         // The state/plan/dispatch page is data-only.  The runtime section is
         // initially RX, so make this page RW before the first atomic owner
         // election.  It intentionally remains non-executable and writable:
@@ -3257,12 +3445,30 @@ bool BuildValidationEntry(
         code.Raw({0xFF,0x45,0xF0}); code.Jmp32(planLoop);
         code.Bind(planFound);
         code.Raw({0x8D,0x9F}); code.U32(CtxOperandCodec);
-        code.Raw({0x8D,0x4E,0x04,0xBA}); code.U32(sizeof(VM_OPERAND_CODEC));
+        code.Raw({0x8D,0x4E}); code.U8(static_cast<uint8_t>(
+            offsetof(RuntimeFunctionDecodeTable, codec)));
+        code.U8(0xBA); code.U32(sizeof(VM_OPERAND_CODEC));
         const size_t copyCodec = code.NewLabel(); code.Bind(copyCodec);
         code.Raw({0x8A,0x01,0x88,0x03,0x41,0x43,0x4A}); code.Jcc32(0x85, copyCodec);
         code.Raw({0x8D,0x46}); code.U8(static_cast<uint8_t>(
             offsetof(RuntimeFunctionDecodeTable,plans)));
         code.Raw({0x89,0x87}); code.U32(CtxDecodePlans);
+        if (config.stateChainingEnabled) {
+            code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
+                offsetof(RuntimeFunctionDecodeTable, stateChainStartIndex)));
+            code.Raw({0xC1,0xE0,0x04,0x8D,0x96});
+            code.U32(config.layout.stateChainTableOffset - pop);
+            code.Raw({0x01,0xD0,0x89,0x87}); code.U32(CtxStateChainTable);
+            code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
+                offsetof(RuntimeFunctionDecodeTable, stateChainEntryCount)));
+            code.Raw({0x89,0x87}); code.U32(CtxStateChainCount);
+            code.Raw({0xC7,0x87}); code.U32(CtxStateChainPreviousOffset);
+            code.U32(0xFFFFFFFFu);
+            code.Raw({0xC7,0x87}); code.U32(CtxStateChainCurrentOffset);
+            code.U32(0xFFFFFFFFu);
+            code.Raw({0xC7,0x87}); code.U32(CtxStateChainMaskSeed);
+            code.U32(0u);
+        }
         code.Raw({0x8B,0x87}); code.U32(CtxDecodeOperands);
         code.Raw({0x05}); code.U32(config.layout.decryptionStateOffset -
             config.layout.operandDecoderOffset);
@@ -3426,6 +3632,9 @@ bool BuildPublicEntryX86(
     size_t sipHash,
     size_t hChaCha)
 {
+    const uint32_t requiredMetadataFlags = kRequiredMetadataFlags |
+        (config.stateChainingEnabled
+            ? static_cast<uint32_t>(VM_METADATA_FLAG_STATE_CHAINED) : 0u);
     EmitCet(code, false, config.emitCetLandingPads);
     code.Raw({0x55,0x8B,0xEC,0x53,0x56,0x57,0x81,0xEC}); code.U32(0x70);
     code.Raw({0x8B,0x5D,0x08,0x8B,0x75,0x10,
@@ -3479,8 +3688,8 @@ bool BuildPublicEntryX86(
     code.Raw({0x8B,0x86}); code.U32(MetaFlags);
     code.Raw({0x89,0xC2,0x81,0xE2}); code.U32(~kKnownMetadataFlags);
     code.Jcc32(0x85, failMetadata);
-    code.Raw({0x25}); code.U32(kRequiredMetadataFlags);
-    code.Raw({0x3D}); code.U32(kRequiredMetadataFlags); code.Jcc32(0x85, failMetadata);
+    code.Raw({0x25}); code.U32(requiredMetadataFlags);
+    code.Raw({0x3D}); code.U32(requiredMetadataFlags); code.Jcc32(0x85, failMetadata);
     code.Raw({0x8B,0x86}); code.U32(MetaTotalSize);
     code.Raw({0x3D}); code.U32(sizeof(VM_METADATA_HEADER)); code.Jcc32(0x82, failMetadata);
     code.Raw({0x8B,0xCE,0x2B,0xCF,0x8B,0x55,0xE8,0x2B,0xD1,0x3B,0xC2});

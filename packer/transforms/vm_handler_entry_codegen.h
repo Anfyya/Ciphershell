@@ -42,6 +42,8 @@ struct VMHandlerEntryLayout {
     uint32_t keyMarkerOffset = 0;
     uint32_t decodePlanTableOffset = 0;
     uint32_t decodePlanTableSize = 0;
+    uint32_t stateChainTableOffset = 0;
+    uint32_t stateChainTableSize = 0;
     uint32_t dispatchTableOffset = 0;
     uint32_t encryptedHandlerOffset = 0;
     uint32_t encryptedHandlerSize = 0;
@@ -69,6 +71,8 @@ struct VMHandlerEntryCodegenConfig {
     uint32_t virtualProtectIatRVA = 0;
     uint32_t flushInstructionCacheIatRVA = 0;
     uint32_t functionPlanCount = 0;
+    uint32_t stateChainEntryCount = 0;
+    bool stateChainingEnabled = false;
     bool emitCetLandingPads = true;
     bool runtimeTraceEnabled = false;
 };

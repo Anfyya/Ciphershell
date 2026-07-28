@@ -151,6 +151,11 @@ typedef struct VM_MICRO_EXECUTION_CONTEXT {
     uint64_t virtualProtect;
     uint64_t flushInstructionCache;
     uint64_t rollingKey;
+    uint64_t stateChainTable;
+    uint32_t stateChainCount;
+    uint32_t stateChainPreviousOffset;
+    uint32_t stateChainCurrentOffset;
+    uint32_t stateChainMaskSeed;
     VM_OPERAND_CODEC operandCodec;
     uint64_t decodedOperands[VM_MICRO_MAX_OPERANDS];
     uint8_t decodedOperandCount;
@@ -168,6 +173,14 @@ typedef struct VM_MICRO_EXECUTION_CONTEXT {
     /* Optional authenticated RW/NX evidence buffer. Zero in normal builds. */
     uint64_t traceState;
 } VM_MICRO_EXECUTION_CONTEXT;
+
+typedef struct VM_STATE_CHAIN_ENTRY {
+    uint32_t previousOffset;
+    uint32_t currentOffset;
+    uint32_t maskSeed;
+    uint8_t flagsState;
+    uint8_t reserved[3];
+} VM_STATE_CHAIN_ENTRY;
 #pragma pack(pop)
 
 #ifdef __cplusplus
@@ -179,6 +192,8 @@ static_assert(sizeof(VM_EXTENDED_STATE) == 848, "extended state layout mismatch"
 static_assert(sizeof(VM_NATIVE_CALL_STATE) == 1096, "native call state layout mismatch");
 static_assert(sizeof(VM_INSTRUCTION_BRIDGE_STATE) == 1144,
               "instruction bridge state layout mismatch");
+static_assert(sizeof(VM_STATE_CHAIN_ENTRY) == 16,
+              "state chain entry layout mismatch");
 #endif
 
 #endif // CS_RUNTIME_VM_MICRO_RUNTIME_ABI_H

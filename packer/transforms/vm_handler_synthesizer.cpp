@@ -159,13 +159,15 @@ bool ExpectedSemanticStackFunclet(
 #pragma pack(push, 1)
 struct RuntimeFunctionDecodeTable {
     uint32_t functionRVA;
+    uint32_t stateChainStartIndex;
+    uint32_t stateChainEntryCount;
     VM_OPERAND_CODEC codec;
     VM_RUNTIME_DECODE_PLAN plans[VM_UOP_COUNT];
 };
 #pragma pack(pop)
 
 static_assert(sizeof(RuntimeFunctionDecodeTable) ==
-    sizeof(uint32_t) + sizeof(VM_OPERAND_CODEC) +
+    sizeof(uint32_t) * 3u + sizeof(VM_OPERAND_CODEC) +
         sizeof(VM_RUNTIME_DECODE_PLAN) * VM_UOP_COUNT,
     "runtime decode table layout mismatch");
 
@@ -835,6 +837,24 @@ bool ConfigValid(const VMHandlerSynthesisConfig& config, std::string& error) {
                 return false;
             }
         }
+        if (config.stateChainingEnabled &&
+            function.stateChainEntries.empty()) {
+            error = "state chaining function table is empty";
+            return false;
+        }
+        for (const auto& entry : function.stateChainEntries) {
+            if (entry.maskSeed == 0u ||
+                (entry.flagsState >= 32u &&
+                 entry.flagsState != 0xFFu)) {
+                error = "state chaining entry is malformed";
+                return false;
+            }
+        }
+        if (!config.stateChainingEnabled &&
+            !function.stateChainEntries.empty()) {
+            error = "state chaining entries were supplied while disabled";
+            return false;
+        }
     }
     return true;
 }
@@ -952,8 +972,36 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     if (result.decodePlanTableOffset > (std::numeric_limits<uint32_t>::max)() -
             result.decodePlanTableSize ||
         !AlignUpChecked(result.decodePlanTableOffset + result.decodePlanTableSize,
-            pointerSize, result.dispatchTableOffset)) {
-        result.error = "runtime decode plan/dispatch layout overflows";
+            alignof(VM_STATE_CHAIN_ENTRY), result.stateChainTableOffset)) {
+        result.error = "runtime decode plan/state-chain layout overflows";
+        return result;
+    }
+    uint64_t stateChainCount = 0u;
+    for (const auto& function : functionPlans)
+        stateChainCount += function.stateChainEntries.size();
+    if (stateChainCount > (std::numeric_limits<uint32_t>::max)() ||
+        stateChainCount >
+            (std::numeric_limits<uint32_t>::max)() /
+                sizeof(VM_STATE_CHAIN_ENTRY)) {
+        result.error = "runtime state-chain table exceeds uint32 range";
+        return result;
+    }
+    result.stateChainEntryCount = static_cast<uint32_t>(stateChainCount);
+    result.stateChainTableSize = static_cast<uint32_t>(
+        stateChainCount * sizeof(VM_STATE_CHAIN_ENTRY));
+    result.stateChainingApplied = config.stateChainingEnabled &&
+        result.stateChainEntryCount != 0u;
+    if (config.stateChainingEnabled && !result.stateChainingApplied) {
+        result.error = "runtime state chaining was requested without entries";
+        return result;
+    }
+    if (result.stateChainTableOffset >
+            (std::numeric_limits<uint32_t>::max)() -
+                result.stateChainTableSize ||
+        !AlignUpChecked(result.stateChainTableOffset +
+            result.stateChainTableSize, pointerSize,
+            result.dispatchTableOffset)) {
+        result.error = "runtime state-chain/dispatch layout overflows";
         return result;
     }
     const uint64_t dispatchBytes = static_cast<uint64_t>(VM_HANDLER_TABLE_SIZE) *
@@ -987,14 +1035,27 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     std::copy(kRuntimeKeyMarker.begin(), kRuntimeKeyMarker.end(),
         result.image.begin() + result.keyMarkerOffset);
 
+    uint32_t stateChainIndex = 0u;
     for (size_t index = 0; index < functionPlans.size(); ++index) {
         RuntimeFunctionDecodeTable table{};
         table.functionRVA = functionPlans[index].functionRVA;
+        table.stateChainStartIndex = stateChainIndex;
+        table.stateChainEntryCount = static_cast<uint32_t>(
+            functionPlans[index].stateChainEntries.size());
         table.codec = functionPlans[index].codec;
         std::copy(functionPlans[index].plans.begin(), functionPlans[index].plans.end(),
             std::begin(table.plans));
         std::memcpy(result.image.data() + result.decodePlanTableOffset +
             index * sizeof(RuntimeFunctionDecodeTable), &table, sizeof(table));
+        if (!functionPlans[index].stateChainEntries.empty()) {
+            std::memcpy(result.image.data() + result.stateChainTableOffset +
+                static_cast<size_t>(stateChainIndex) *
+                    sizeof(VM_STATE_CHAIN_ENTRY),
+                functionPlans[index].stateChainEntries.data(),
+                functionPlans[index].stateChainEntries.size() *
+                    sizeof(VM_STATE_CHAIN_ENTRY));
+            stateChainIndex += table.stateChainEntryCount;
+        }
     }
 
     uint32_t cursor = result.encryptedHandlerOffset;
@@ -1080,6 +1141,8 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     entryConfig.layout.keyMarkerOffset = result.keyMarkerOffset;
     entryConfig.layout.decodePlanTableOffset = result.decodePlanTableOffset;
     entryConfig.layout.decodePlanTableSize = result.decodePlanTableSize;
+    entryConfig.layout.stateChainTableOffset = result.stateChainTableOffset;
+    entryConfig.layout.stateChainTableSize = result.stateChainTableSize;
     entryConfig.layout.dispatchTableOffset = result.dispatchTableOffset;
     entryConfig.layout.encryptedHandlerOffset = result.encryptedHandlerOffset;
     entryConfig.layout.encryptedHandlerSize = result.encryptedHandlerSize;
@@ -1096,6 +1159,8 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     entryConfig.virtualProtectIatRVA = config.virtualProtectIatRVA;
     entryConfig.flushInstructionCacheIatRVA = config.flushInstructionCacheIatRVA;
     entryConfig.functionPlanCount = static_cast<uint32_t>(functionPlans.size());
+    entryConfig.stateChainEntryCount = result.stateChainEntryCount;
+    entryConfig.stateChainingEnabled = config.stateChainingEnabled;
     entryConfig.emitCetLandingPads = config.emitCetLandingPads;
     entryConfig.runtimeTraceEnabled = config.runtimeTraceEnabled;
 
@@ -1388,11 +1453,77 @@ bool VMHandlerSynthesizer::Validate(
         result.dispatchTableSize > result.image.size() - result.dispatchTableOffset ||
         result.decodePlanTableOffset > result.image.size() ||
         result.decodePlanTableSize > result.image.size() - result.decodePlanTableOffset ||
+        result.stateChainTableOffset > result.image.size() ||
+        result.stateChainTableSize >
+            result.image.size() - result.stateChainTableOffset ||
         result.encryptedHandlerOffset > result.image.size() ||
         result.encryptedHandlerSize > result.image.size() - result.encryptedHandlerOffset ||
         result.keyMarkerOffset > result.image.size() ||
         VM_RUNTIME_KEY_SHARE_SIZE > result.image.size() - result.keyMarkerOffset) {
         error = "synthesized runtime range is invalid";
+        return false;
+    }
+    const uint64_t expectedStateChainSize =
+        static_cast<uint64_t>(result.stateChainEntryCount) *
+        sizeof(VM_STATE_CHAIN_ENTRY);
+    if (expectedStateChainSize != result.stateChainTableSize ||
+        result.stateChainingApplied !=
+            (config.stateChainingEnabled &&
+             result.stateChainEntryCount != 0u) ||
+        (config.stateChainingEnabled &&
+            (!result.stateChainingApplied ||
+             result.stateChainTableSize == 0u)) ||
+        (!config.stateChainingEnabled &&
+            (result.stateChainingApplied ||
+             result.stateChainEntryCount != 0u ||
+             result.stateChainTableSize != 0u))) {
+        error = "synthesized runtime state-chain evidence is inconsistent";
+        return false;
+    }
+    std::vector<VMHandlerFunctionDecodePlans> expectedFunctionPlans;
+    if (!BuildFunctionPlans(config, expectedFunctionPlans, error)) return false;
+    if (result.decodePlanTableSize !=
+            expectedFunctionPlans.size() *
+                sizeof(RuntimeFunctionDecodeTable)) {
+        error = "runtime decode-plan table count is inconsistent";
+        return false;
+    }
+    uint32_t expectedChainIndex = 0u;
+    for (size_t index = 0u; index < expectedFunctionPlans.size(); ++index) {
+        RuntimeFunctionDecodeTable table{};
+        std::memcpy(&table,
+            result.image.data() + result.decodePlanTableOffset +
+                index * sizeof(table),
+            sizeof(table));
+        const auto& expectedPlan = expectedFunctionPlans[index];
+        if (table.functionRVA != expectedPlan.functionRVA ||
+            table.stateChainStartIndex != expectedChainIndex ||
+            table.stateChainEntryCount !=
+                expectedPlan.stateChainEntries.size() ||
+            std::memcmp(&table.codec, &expectedPlan.codec,
+                sizeof(table.codec)) != 0 ||
+            std::memcmp(table.plans, expectedPlan.plans.data(),
+                sizeof(table.plans)) != 0) {
+            error = "runtime function decode/state-chain index table differs";
+            return false;
+        }
+        const size_t entryBytes =
+            expectedPlan.stateChainEntries.size() *
+                sizeof(VM_STATE_CHAIN_ENTRY);
+        if (entryBytes != 0u &&
+            std::memcmp(
+                result.image.data() + result.stateChainTableOffset +
+                    static_cast<size_t>(expectedChainIndex) *
+                        sizeof(VM_STATE_CHAIN_ENTRY),
+                expectedPlan.stateChainEntries.data(),
+                entryBytes) != 0) {
+            error = "runtime state-chain entries differ from the CFG plan";
+            return false;
+        }
+        expectedChainIndex += table.stateChainEntryCount;
+    }
+    if (expectedChainIndex != result.stateChainEntryCount) {
+        error = "runtime state-chain entry count differs from function plans";
         return false;
     }
 

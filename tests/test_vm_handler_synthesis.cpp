@@ -8,6 +8,7 @@
 #include "packer/pe_parser/pe_utils.h"
 #include "packer/vm/micro_semantics.h"
 #include "packer/vm/vm_schema.h"
+#include "runtime/common/vm_state_chain.h"
 
 #include <Zydis/Zydis.h>
 
@@ -42,6 +43,7 @@ using CipherShell::VMHandlerSemanticCodegenResult;
 using CipherShell::VMHandlerSynthesisConfig;
 using CipherShell::VMHandlerSynthesisResult;
 using CipherShell::VMHandlerSynthesizer;
+using CipherShell::VMHandlerFunctionDecodePlans;
 using CipherShell::GenerateVMHandlerSemanticKernel;
 using CipherShell::ValidateVMHandlerSemanticVariantKernel;
 using CipherShell::VMOpcodeDescriptor;
@@ -3156,6 +3158,138 @@ void TestHostContextEntryExecution() {
                 strategy, true, config, result, encoding, testImage);
         }
     }
+}
+
+void TestPlusStateChainingExecutionAndFailClosed() {
+#if defined(_M_X64)
+    constexpr VMHandlerArchitecture architecture = VMHandlerArchitecture::X64;
+    constexpr uint8_t seedDomain = 0xE6u;
+#else
+    constexpr VMHandlerArchitecture architecture = VMHandlerArchitecture::X86;
+    constexpr uint8_t seedDomain = 0xE5u;
+#endif
+    const auto seed = MakeSeed(seedDomain);
+    const RuntimeEncoding encoding = MakeRuntimeEncoding(architecture, seed);
+    VMHandlerSynthesisConfig config = MakeConfig(architecture, seed);
+    config.stateChainingEnabled = true;
+
+    const std::vector<MicroInstruction> program = {
+        Uop(VM_UOP_PUSH_IMM, {0x2Au,
+            architecture == VMHandlerArchitecture::X64 ? 8u : 4u}, 0),
+        Uop(VM_UOP_RET, {0}, 1),
+    };
+    std::vector<uint8_t> chainedBytecode =
+        EncodeStraightLineRuntimeProgram(program, encoding);
+    const std::vector<uint32_t> offsets =
+        RuntimeInstructionOffsets(program, encoding);
+    Require(offsets.size() == 2u && offsets[0] == 0u &&
+            offsets[1] < chainedBytecode.size(),
+        "状态链测试的指令边界无效");
+
+    uint64_t operandCodecSeed = 0u;
+    std::memcpy(&operandCodecSeed, seed.data(), sizeof(operandCodecSeed));
+    VMHandlerFunctionDecodePlans plans{};
+    plans.functionRVA = 0u;
+    plans.codec = encoding.codec;
+    std::string planError;
+    Require(VMSchema::BuildRuntimeDecodePlans(
+            plans.codec, plans.plans.data(), planError),
+        "状态链测试无法构建运行时解码计划: " + planError);
+
+    VM_STATE_CHAIN_ENTRY chainEntry{};
+    chainEntry.previousOffset = 0xFFFFFFFFu;
+    chainEntry.currentOffset = offsets[0];
+    chainEntry.maskSeed = vm_state_chain_mask_seed(
+        operandCodecSeed, plans.functionRVA, chainEntry.currentOffset);
+    chainEntry.flagsState = 0xFFu;
+    plans.stateChainEntries.push_back(chainEntry);
+    chainEntry = {};
+    chainEntry.previousOffset = offsets[0];
+    chainEntry.currentOffset = offsets[1];
+    chainEntry.maskSeed = vm_state_chain_mask_seed(
+        operandCodecSeed, plans.functionRVA, chainEntry.currentOffset);
+    chainEntry.flagsState = 0u;
+    plans.stateChainEntries.push_back(chainEntry);
+    config.functionDecodePlans.push_back(plans);
+
+    for (size_t instructionIndex = 0u;
+         instructionIndex < offsets.size(); ++instructionIndex) {
+        const uint32_t begin = offsets[instructionIndex];
+        const uint32_t end = instructionIndex + 1u < offsets.size()
+            ? offsets[instructionIndex + 1u]
+            : static_cast<uint32_t>(chainedBytecode.size());
+        const uint32_t maskSeed = vm_state_chain_mask_seed(
+            operandCodecSeed, plans.functionRVA, begin);
+        for (uint32_t index = 0u; index < end - begin; ++index)
+            chainedBytecode[begin + index] ^=
+                vm_state_chain_mask_byte(maskSeed, index);
+    }
+
+    VMHandlerSynthesizer synthesizer;
+    const VMHandlerSynthesisResult result = synthesizer.Synthesize(config);
+    ValidateOneBuild(config, result);
+    Require(result.stateChainingApplied &&
+            result.stateChainEntryCount == plans.stateChainEntries.size() &&
+            result.stateChainTableSize ==
+                plans.stateChainEntries.size() * sizeof(VM_STATE_CHAIN_ENTRY) &&
+            RangeInside(result.image.size(), result.stateChainTableOffset,
+                result.stateChainTableSize) &&
+            std::memcmp(result.image.data() + result.stateChainTableOffset,
+                plans.stateChainEntries.data(),
+                result.stateChainTableSize) == 0,
+        "状态链表未按每函数合法迁移原样发布到运行时映像");
+
+    LoadedSynthImage loaded;
+    std::string loadError;
+    Require(loaded.Load(result, loadError),
+        "状态链运行时映像装载失败: " + loadError);
+    TestRuntimeIatImage testImage;
+    std::array<uint8_t, VM_REGISTER_MAP_SIZE> registerMap{};
+    for (uint8_t index = 0; index < registerMap.size(); ++index)
+        registerMap[index] = index;
+    const std::array<uint64_t, 32> initialGprs{};
+    const auto synthEntry = reinterpret_cast<SynthEntry>(
+        loaded.Base() + result.contextEntryOffset);
+
+    VM_MICRO_EXECUTION_CONTEXT valid = MakeRuntimeContext(
+        chainedBytecode, encoding, config, registerMap, testImage,
+        initialGprs, 0x202u);
+    DWORD exceptionCode = 0u;
+    const uint32_t validError =
+        InvokeSynthEntry(synthEntry, &valid, &exceptionCode);
+    Require(exceptionCode == 0u &&
+            validError == VM_MICRO_ERR_NONE &&
+            valid.error == VM_MICRO_ERR_NONE &&
+            valid.halted == 1u &&
+            valid.stateChainPreviousOffset == offsets[0] &&
+            valid.stateChainCurrentOffset == offsets[1],
+        "合法状态链未完成解码执行");
+
+    VM_MICRO_EXECUTION_CONTEXT skipped = MakeRuntimeContext(
+        chainedBytecode, encoding, config, registerMap, testImage,
+        initialGprs, 0x202u);
+    skipped.vip += offsets[1];
+    exceptionCode = 0u;
+    const uint32_t skippedError =
+        InvokeSynthEntry(synthEntry, &skipped, &exceptionCode);
+    Require(exceptionCode == 0u &&
+            skippedError == VM_MICRO_ERR_BYTECODE_RANGE &&
+            skipped.error == VM_MICRO_ERR_BYTECODE_RANGE &&
+            skipped.halted == 1u,
+        "跳过前驱历史的 VIP 未按 BYTECODE_RANGE 失败闭合");
+
+    VM_MICRO_EXECUTION_CONTEXT wrongFlags = MakeRuntimeContext(
+        chainedBytecode, encoding, config, registerMap, testImage,
+        initialGprs, 0x203u);
+    exceptionCode = 0u;
+    const uint32_t flagsError =
+        InvokeSynthEntry(synthEntry, &wrongFlags, &exceptionCode);
+    Require(exceptionCode == 0u &&
+            flagsError == VM_MICRO_ERR_BYTECODE_RANGE &&
+            wrongFlags.error == VM_MICRO_ERR_BYTECODE_RANGE &&
+            wrongFlags.halted == 1u &&
+            wrongFlags.stateChainCurrentOffset == offsets[0],
+        "篡改 CF 状态未在下一条指令解码前失败闭合");
 }
 
 void TestPlusMbaCodegenEvidence() {
@@ -7566,6 +7700,8 @@ int main() {
 #if defined(_M_X64) || defined(_M_IX86)
     Run("host-arch direct-threaded handler 差分执行与 #DE",
         &TestHostContextEntryExecution, failures);
+    Run("Plus 状态绑定字节码链与失败闭合",
+        &TestPlusStateChainingExecutionAndFailClosed, failures);
 #endif
     Run("Plus MBA 结构证据、强度与种子变异",
         &TestPlusMbaCodegenEvidence, failures);

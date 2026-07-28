@@ -1,6 +1,7 @@
 #include "vm_verifier.h"
 
 #include "../../runtime/common/vm_crypto.h"
+#include "../../runtime/common/vm_state_chain.h"
 #include "../pe_parser/pe_emitter.h"
 
 #include <algorithm>
@@ -205,7 +206,8 @@ bool VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
         VM_METADATA_FLAG_LAZY_FLAGS |
         VM_METADATA_FLAG_HANDLER_SYNTHESIZED |
         VM_METADATA_FLAG_DIRECT_THREADED |
-        VM_METADATA_FLAG_HANDLER_ENCRYPTED;
+        VM_METADATA_FLAG_HANDLER_ENCRYPTED |
+        VM_METADATA_FLAG_STATE_CHAINED;
     if ((header.flags & requiredFlags) != requiredFlags ||
         (header.architecture == VM_ARCH_X64 &&
             !(header.flags & VM_METADATA_FLAG_UNWIND_VERIFIED)) ||
@@ -314,6 +316,33 @@ bool VMBytecodeVerifier::VerifyEmittedMetadataAndBytecode(
             record.nonce,
             1,
             0);
+        std::vector<DecodedMicroInstruction> decoded;
+        std::string decodeError;
+        const VM_OPERAND_CODEC codec = VMSchema::DeriveOperandCodec(
+            header.operandCodecSeed, record.functionRVA);
+        if (!VMSchema::DecodeStream(
+                expectedPlaintext.data() + record.bytecodeOffset,
+                record.bytecodeSize,
+                metadata + header.reverseOpcodeMapOffset,
+                codec, decoded, decodeError) ||
+            decoded.empty()) {
+            std::memset(recordKey, 0, sizeof(recordKey));
+            std::memset(masterKey, 0, sizeof(masterKey));
+            error = "state-chain expected bytecode boundaries are invalid: " +
+                decodeError;
+            return false;
+        }
+        for (const auto& instruction : decoded) {
+            const uint32_t seed = vm_state_chain_mask_seed(
+                header.operandCodecSeed, record.functionRVA,
+                instruction.byteOffset);
+            for (uint32_t index = 0u;
+                 index < instruction.encodedSize; ++index) {
+                recovered[record.bytecodeOffset +
+                    instruction.byteOffset + index] ^=
+                    vm_state_chain_mask_byte(seed, index);
+            }
+        }
         std::memset(recordKey, 0, sizeof(recordKey));
     }
     std::memset(masterKey, 0, sizeof(masterKey));
