@@ -1118,6 +1118,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        if (buildCtx.vm.strength < 1 || buildCtx.vm.strength > 100) {
+            std::cerr << "VM_INIT_FAIL module=MBAEngine"
+                      << " reason=vm_strength_must_be_1_to_100"
+                      << " strength=" << buildCtx.vm.strength << std::endl;
+            PrintFeatureStatus("vm.mba", "failed", "invalid_strength");
+            return 1;
+        }
+        const uint8_t vmMbaStrength = static_cast<uint8_t>(
+            buildCtx.vm.strength);
+
         const uint32_t vmRegisterCountConfig = static_cast<uint32_t>(config.vm.registerCount);
 
         CipherShell::Disassembler disasm;
@@ -1915,6 +1925,7 @@ int main(int argc, char* argv[]) {
                 synthesisConfig.flushInstructionCacheIatRVA =
                     vmRuntimeImports.flushInstructionCacheIatRVA;
                 synthesisConfig.runtimeTraceEnabled = traceBindingPtr != nullptr;
+                synthesisConfig.mbaStrength = vmMbaStrength;
                 outcome.runtimeResult = runtimeBuilder.Build(image.get(), outcome.vmRecords,
                     outcome.vmBytecodeBlob, outcome.opcodeMap,
                     outcome.emitResult.metadataRVA, outcome.emitResult.runtimeKeyShare,
@@ -1928,10 +1939,18 @@ int main(int argc, char* argv[]) {
                     !outcome.runtimeResult.handlerSynthesisVerified ||
                     !outcome.runtimeResult.directThreadedVerified ||
                     !outcome.runtimeResult.handlerEncryptionVerified ||
-                    !outcome.runtimeResult.runtimeContentVerified) {
+                    !outcome.runtimeResult.runtimeContentVerified ||
+                    !outcome.runtimeResult.mbaApplied ||
+                    outcome.runtimeResult.mbaStrength != vmMbaStrength ||
+                    outcome.runtimeResult.mbaHandlerCount !=
+                        3u * VM_HANDLER_VARIANT_COUNT ||
+                    outcome.runtimeResult.mbaMinimumComplexity == 0u) {
                     std::cerr << "VM_RUNTIME_FAIL module=VMRuntimeBuilder vm_group=" << g
-                              << " reason=" << outcome.runtimeResult.error << std::endl;
-                    PrintFeatureStatus("vm", "failed", outcome.runtimeResult.error);
+                              << " reason=" << (outcome.runtimeResult.error.empty()
+                                  ? "mba_applied_evidence_incomplete"
+                                  : outcome.runtimeResult.error) << std::endl;
+                    PrintFeatureStatus("vm.mba", "failed",
+                        "applied_evidence_incomplete");
                     return 1;
                 }
 
@@ -2641,6 +2660,18 @@ int main(int argc, char* argv[]) {
         }
         PrintFeatureStatus("vm", "applied", "functions=" + std::to_string(vmAppliedFunctionCount) +
             " vm_groups=" + std::to_string(vmActiveGroupCount));
+        uint32_t mbaHandlerCount = 0u;
+        uint8_t mbaMinimumComplexity = (std::numeric_limits<uint8_t>::max)();
+        for (const auto& outcome : vmGroupOutcomes) {
+            if (outcome.vmRecords.empty()) continue;
+            mbaHandlerCount += outcome.runtimeResult.mbaHandlerCount;
+            mbaMinimumComplexity = (std::min)(mbaMinimumComplexity,
+                outcome.runtimeResult.mbaMinimumComplexity);
+        }
+        PrintFeatureStatus("vm.mba", "applied",
+            "strength=" + std::to_string(buildCtx.vm.strength) +
+            " handlers=" + std::to_string(mbaHandlerCount) +
+            " min_complexity=" + std::to_string(mbaMinimumComplexity));
         // Scope note (do not drop this when editing nearby logging): "applied"
         // means every emitted function passed real native-CPU-vs-synthesized-
         // handler differential evidence (VM_NATIVE_DIFFERENTIAL_PASS) for its
@@ -2651,6 +2682,8 @@ int main(int argc, char* argv[]) {
         std::cout << "VM_PROTECTION_SCOPE_NOTE correctness=verified "
                      "per_build_diversity=requires_two_build_gate "
                      "native_fallback=false" << std::endl;
+    } else {
+        PrintFeatureStatus("vm.mba", "skipped", "vm_disabled");
     }
     if (cfgApplied) {
         PrintFeatureStatus("control_flow.flattening", "applied",

@@ -27,6 +27,7 @@ struct VMHandlerSemanticCodegenConfig {
     std::array<uint8_t, 32> buildSeed{};
     VM_MICRO_OPCODE semantic = VM_UOP_TRAP;
     uint8_t variant = 0;
+    uint8_t mbaStrength = 0;
 };
 
 enum class VMHandlerSemanticUnwindKind : uint8_t {
@@ -165,6 +166,11 @@ struct VMHandlerSemanticCodegenResult {
     uint8_t semanticInputStrategy = 0;
     uint8_t semanticCoreStrategy = 0;
     uint8_t semanticResultStrategy = 0;
+    // Plus MBA evidence.  Validation re-decodes the exact core-variant range
+    // before accepting these fields; they are not descriptive-only flags.
+    bool mbaApplied = false;
+    uint8_t mbaComplexity = 0;
+    uint8_t mbaStrategy = 0;
     // Every range is a mandatory encode/decode stage for the persistent
     // build-seed-specific VM value-stack representation.  Ranges are kept
     // separate from the business-core range so the quantitative gate cannot

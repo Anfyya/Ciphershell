@@ -1466,6 +1466,10 @@ VMRuntimeBuildResult VMRuntimeBuilder::Build(
     result.handlerBodyDigest = synthesized.microSelectionDigest;
     result.dispatchKeyDigest = synthesized.dispatchKeyDigest;
     result.variantSelectorDigest = synthesized.variantSelectorDigest;
+    result.mbaApplied = synthesized.mbaApplied;
+    result.mbaStrength = synthesized.mbaStrength;
+    result.mbaMinimumComplexity = synthesized.mbaMinimumComplexity;
+    result.mbaHandlerCount = synthesized.mbaHandlerCount;
     // Keep handlerReferences bound to the K values selected by the real
     // bytecode, but close the plaintext sidecar over every synthesized K for
     // each referenced semantic.  This makes same-(semantic,K) cross-build

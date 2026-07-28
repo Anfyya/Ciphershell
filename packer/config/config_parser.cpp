@@ -114,7 +114,7 @@ randomize_section_names = true    # 随机化除严格 .rsrc/.reloc 外的 Secti
 
 [vm]
 enabled = false                   # 显式功能开关；L1-L5 只提供未显式设置时的 preset
-strength = 80                    # 当前仅解析/往返；生产 Handler 尚未消费
+strength = 80                    # ADD/SUB/XOR Handler 的 MBA 强度；每 25 级增加一轮掩码恒等式
 target_functions = []             # 与 target_rvas 均空时自动筛选 VM 安全函数；非空时按名称通配选择
 target_rvas = []                  # 与 target_functions 均空时自动筛选；非空时按入口 RVA 精确选择
 register_count = 24               # 虚拟寄存器数量（16-32）

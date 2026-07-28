@@ -285,7 +285,7 @@ void MainWindow::BuildBasicPage(int tabIndex) {
         L"L2 (Shield)    预留档；当前不隐式启用控制流变换",
         L"L3 (Armor)     预留档；当前不隐式启用高级混淆",
         L"L4 (Fortress)  后端函数级 VM preset（可被独立开关覆盖）",
-        L"L5 (Citadel)   当前同一 VM 链；strength 尚未改变 Handler",
+        L"L5 (Citadel)   同一 VM 链；strength 提高 MBA 多项式复杂度",
     };
     int radioY = y + 8;
     for (int i = 0; i < 5; ++i) {
@@ -346,12 +346,11 @@ void MainWindow::BuildVmPage(int tabIndex) {
     y += kRowHeight + 4;
 
     track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight,
-        L"strength（当前仅解析）"));
+        L"MBA strength（1-100）"));
     m_vmStrengthEdit = track(CreateEditControl(
-        m_hwnd, kControlX, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER, false));
-    m_permanentlyDisabledControls.push_back(m_vmStrengthEdit);
+        m_hwnd, kControlX, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
     track(CreateLabelControl(m_hwnd, kControlX + kShortWidth + 12, y, 390, kControlHeight,
-        L"生产 Handler 尚未消费该数值，先禁用编辑"));
+        L"控制 ADD/SUB/XOR Handler 的 MBA 复杂度与掩码恒等式轮数"));
     y += kRowHeight;
 
     track(CreateLabelControl(m_hwnd, x, y, kLabelWidth, kControlHeight, L"register_count（16-32）"));
@@ -954,7 +953,13 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
 
     VmOptions& vm = outConfig.vm;
     vm.enabled = GetCheckboxChecked(m_vmEnabledCheck);
-    vm.strength = std::clamp(GetEditInt(m_vmStrengthEdit, 90), 1, 100);
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_vmStrengthEdit), 1, 100,
+            vm.strength)) {
+        validationError =
+            L"MBA strength 必须是 1-100 之间的完整十进制整数。";
+        return false;
+    }
     if (!TryParseDecimalIntInRange(
             GetEditText(m_registerCountEdit), 16, 32,
             vm.registerCount)) {

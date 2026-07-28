@@ -3,6 +3,7 @@
 #include "../vm/vm_schema.h"
 
 #include <Zydis/Encoder.h>
+#include <Zydis/Decoder.h>
 
 #include <algorithm>
 #include <array>
@@ -105,6 +106,7 @@ public:
     KeyedPermutationPlan valueCodec{};
     KeyedPermutationPlan coreSelector{};
     std::array<uint8_t, 4> registerAssignment{};
+    uint8_t mbaStrength = 0;
     std::vector<std::pair<uint32_t, uint32_t>> valueCodecRanges;
     uint32_t callHostSehHandlerOffset = 0;
     bool hasCallHostSehHandler = false;
@@ -657,6 +659,7 @@ void ConfigurePermutationPlans(
             (static_cast<uint64_t>(config.semantic) << 13u) ^
             (static_cast<uint64_t>(config.variant) << 41u),
         static_cast<uint8_t>(kCoreSelectorRoundCount), 8u);
+    code.mbaStrength = config.mbaStrength;
 }
 
 #define CTX_OFFSET(field) static_cast<uint32_t>(offsetof(VM_MICRO_EXECUTION_CONTEXT, field))
@@ -3352,9 +3355,215 @@ void FinishZydisAluRegisters(
     if (plan.value != 0u) EmitZydisMove(c, x64, 0u, plan.value);
 }
 
+bool IsMbaSemantic(VM_MICRO_OPCODE semantic) {
+    return semantic == VM_UOP_ADD || semantic == VM_UOP_SUB ||
+        semantic == VM_UOP_XOR;
+}
+
+uint8_t MbaIdentityRoundCount(uint8_t strength) {
+    if (strength == 0u) return 0u;
+    return static_cast<uint8_t>(1u + (strength - 1u) / 25u);
+}
+
+uint8_t MbaComplexityScore(VM_MICRO_OPCODE semantic, uint8_t strength) {
+    const uint8_t base = semantic == VM_UOP_SUB ? 6u : 3u;
+    return static_cast<uint8_t>(base + 5u * MbaIdentityRoundCount(strength));
+}
+
+// Re-express x as (x & k) + (x & ~k).  The two terms are disjoint, so the
+// addition is exact in both Z_2^32 and Z_2^64.  Repeating with independently
+// derived masks adds real constant-bearing Boolean structure while preserving
+// the semantic result produced by the selected MBA polynomial.
+void EmitMbaMaskedIdentity(
+    CodeBuffer& c,
+    bool x64,
+    const ZydisAluRegisterPlan& registers,
+    uint8_t strategy)
+{
+    const uint8_t rounds = MbaIdentityRoundCount(c.mbaStrength);
+    for (uint8_t round = 0; round < rounds; ++round) {
+        const uint32_t key = CoreKey32(c,
+            static_cast<size_t>(strategy) * 3u + round + 1u);
+        const uint64_t fullKey = x64
+            ? static_cast<uint64_t>(key)
+            : static_cast<uint64_t>(static_cast<uint32_t>(key));
+        const uint64_t complement = x64
+            ? ~fullKey
+            : static_cast<uint64_t>(static_cast<uint32_t>(~key));
+
+        EmitZydisMove(c, x64, registers.scratch, registers.value);
+        EmitZydisMoveImmediate(c, x64, registers.source, fullKey);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.source);
+        EmitZydisMoveImmediate(c, x64, registers.source, complement);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.value, registers.scratch);
+    }
+}
+
+void EmitMbaAddSubCore(
+    CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
+{
+    const ZydisAluRegisterPlan registers =
+        PrepareZydisAluRegisters(c, x64, true);
+
+    if (!subtract && strategy == 0u) {
+        // a + b = (a ^ b) + 2 * (a & b)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.scratch, registers.scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.value, registers.scratch);
+    } else if (!subtract) {
+        // a + b = (a | b) + (a & b)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.value, registers.scratch);
+    } else if (strategy == 0u) {
+        // a - b = (a ^ b) - 2 * ((~a) & b)
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.scratch, registers.scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            registers.value, registers.scratch);
+    } else {
+        // a - b = 2 * (a & ~b) - (a ^ b)
+        EmitZydisUnary(c, x64, ZYDIS_MNEMONIC_NOT, registers.scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_XOR,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.scratch, registers.scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            registers.scratch, registers.value);
+        EmitZydisMove(c, x64, registers.value, registers.scratch);
+    }
+
+    EmitMbaMaskedIdentity(c, x64, registers, strategy);
+    FinishZydisAluRegisters(c, x64, registers);
+}
+
+void EmitMbaXorCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    const ZydisAluRegisterPlan registers =
+        PrepareZydisAluRegisters(c, x64, true);
+    if (strategy == 0u) {
+        // a ^ b = (a | b) - (a & b)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_OR,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            registers.value, registers.scratch);
+    } else {
+        // a ^ b = (a + b) - 2 * (a & b)
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_AND,
+            registers.scratch, registers.value);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.value, registers.source);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_ADD,
+            registers.scratch, registers.scratch);
+        EmitZydisBinary(c, x64, ZYDIS_MNEMONIC_SUB,
+            registers.value, registers.scratch);
+    }
+    EmitMbaMaskedIdentity(c, x64, registers, strategy);
+    FinishZydisAluRegisters(c, x64, registers);
+}
+
+bool ValidateMbaCoreShape(
+    const std::vector<uint8_t>& code,
+    uint32_t offset,
+    uint32_t size,
+    bool x64,
+    uint8_t strength,
+    uint8_t minimumComplexity,
+    std::string& error)
+{
+    if (strength == 0u || size == 0u || offset > code.size() ||
+        size > code.size() - offset) {
+        error = "MBA evidence range is empty or outside the semantic kernel";
+        return false;
+    }
+
+    ZydisDecoder decoder{};
+    if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder,
+            x64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32,
+            x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32))) {
+        error = "MBA evidence decoder initialization failed";
+        return false;
+    }
+
+    uint32_t cursor = 0u;
+    uint32_t instructionCount = 0u;
+    uint32_t booleanCount = 0u;
+    uint32_t arithmeticCount = 0u;
+    uint32_t immediateCount = 0u;
+    while (cursor < size) {
+        ZydisDecodedInstruction instruction{};
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
+                code.data() + offset + cursor, size - cursor,
+                &instruction, operands)) || instruction.length == 0u ||
+            instruction.length > size - cursor) {
+            error = "MBA evidence contains an undecodable instruction";
+            return false;
+        }
+        ++instructionCount;
+        switch (instruction.mnemonic) {
+            case ZYDIS_MNEMONIC_AND:
+            case ZYDIS_MNEMONIC_OR:
+            case ZYDIS_MNEMONIC_XOR:
+            case ZYDIS_MNEMONIC_NOT:
+                ++booleanCount;
+                break;
+            case ZYDIS_MNEMONIC_ADD:
+            case ZYDIS_MNEMONIC_SUB:
+                ++arithmeticCount;
+                break;
+            default:
+                break;
+        }
+        for (uint8_t operand = 0;
+             operand < instruction.operand_count_visible; ++operand) {
+            if (operands[operand].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                ++immediateCount;
+                break;
+            }
+        }
+        cursor += instruction.length;
+    }
+
+    const uint32_t rounds = MbaIdentityRoundCount(strength);
+    if (cursor != size || instructionCount < minimumComplexity ||
+        booleanCount < 2u + rounds * 2u ||
+        arithmeticCount < 1u + rounds ||
+        immediateCount < rounds * 2u) {
+        error = "MBA core lacks the required Boolean/arithmetic/masked-constant complexity";
+        return false;
+    }
+    return true;
+}
+
 void EmitZydisKeyedAddSubCore(
     CodeBuffer& c, bool x64, bool subtract, uint8_t strategy)
 {
+    if (c.mbaStrength != 0u) {
+        EmitMbaAddSubCore(c, x64, subtract, strategy);
+        return;
+    }
     const uint32_t k0 = CoreKey32(c, strategy + 0u);
     const uint32_t k1 = CoreKey32(c, strategy + 3u);
     const uint32_t k2 = CoreKey32(c, strategy + 5u);
@@ -3392,6 +3601,10 @@ void EmitZydisKeyedAddSubCore(
 }
 
 void EmitKeyedXorCore(CodeBuffer& c, bool x64, uint8_t strategy) {
+    if (c.mbaStrength != 0u) {
+        EmitMbaXorCore(c, x64, strategy);
+        return;
+    }
     const std::array<uint32_t, 3> keys = {
         CoreKey32(c, strategy + 1u), CoreKey32(c, strategy + 4u),
         CoreKey32(c, strategy + 6u)};
@@ -8510,6 +8723,10 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     const VMHandlerSemanticCodegenConfig& config)
 {
     VMHandlerSemanticCodegenResult result{};
+    if (config.mbaStrength > 100u) {
+        result.error = "MBA strength must be in the range 0-100";
+        return result;
+    }
     if (config.architecture != VM_ARCH_X64 && config.architecture != VM_ARCH_X86) {
         result.error = "semantic code generator received an unknown architecture";
         return result;
@@ -8537,6 +8754,12 @@ VMHandlerSemanticCodegenResult GenerateVMHandlerSemanticKernel(
     CodeBuffer code;
     ConfigurePermutationPlans(code, config);
     result.semanticCoreStrategy = DeriveBusinessCoreStrategy(config);
+    result.mbaApplied = config.mbaStrength != 0u &&
+        IsMbaSemantic(config.semantic);
+    result.mbaComplexity = result.mbaApplied
+        ? MbaComplexityScore(config.semantic, config.mbaStrength) : 0u;
+    result.mbaStrategy = result.mbaApplied
+        ? result.semanticCoreStrategy : 0u;
     result.registerAssignment = DeriveVariantRegisters(
         x64, config.variant, config.semantic, config.buildSeed,
         result.semanticCoreStrategy);
@@ -8825,7 +9048,8 @@ bool ValidateVMHandlerSemanticVariantKernel(
     std::string& error)
 {
     const bool x64 = config.architecture == VM_ARCH_X64;
-    if ((!x64 && config.architecture != VM_ARCH_X86) || result.code.empty()) {
+    if ((!x64 && config.architecture != VM_ARCH_X86) || result.code.empty() ||
+        config.mbaStrength > 100u) {
         error = "variant evidence has invalid architecture or empty code";
         return false;
     }
@@ -9119,8 +9343,26 @@ bool ValidateVMHandlerSemanticVariantKernel(
             error = "business core is fixed or disagrees with variant/seed";
             return false;
         }
+
+        const bool expectsMba = config.mbaStrength != 0u &&
+            IsMbaSemantic(config.semantic);
+        const uint8_t expectedMbaComplexity = expectsMba
+            ? MbaComplexityScore(config.semantic, config.mbaStrength) : 0u;
+        if (result.mbaApplied != expectsMba ||
+            result.mbaComplexity != expectedMbaComplexity ||
+            result.mbaStrategy != (expectsMba ? expectedCoreStrategy : 0u)) {
+            error = "MBA applied/complexity metadata disagrees with config and semantic";
+            return false;
+        }
+        if (expectsMba && !ValidateMbaCoreShape(result.code,
+                result.semanticCoreVariantOffset,
+                result.semanticCoreVariantSize, x64, config.mbaStrength,
+                expectedMbaComplexity, error)) {
+            return false;
+        }
     } else if (result.semanticCoreVariantOffset != 0 ||
-               result.semanticCoreVariantSize != 0) {
+               result.semanticCoreVariantSize != 0 || result.mbaApplied ||
+               result.mbaComplexity != 0u || result.mbaStrategy != 0u) {
         error = "semantic without a business alternative published false core evidence";
         return false;
     }

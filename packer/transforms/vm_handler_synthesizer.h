@@ -51,6 +51,9 @@ struct VMHandlerSynthesisConfig {
     bool encryptHandlerBodies = true;
     bool emitCetLandingPads = true;
     bool runtimeTraceEnabled = false;
+    // 0 disables Plus MBA emission.  Production maps vm.strength (1-100)
+    // here; tests may keep zero to exercise the legacy non-Plus core.
+    uint8_t mbaStrength = 0;
 };
 
 struct VMHandlerRelocation {
@@ -112,6 +115,9 @@ struct VMSynthesizedHandler {
     uint64_t dispatchTailDigest = 0;
     std::array<uint8_t, 4> registerAssignment{};
     bool semanticComplete = false;
+    bool mbaApplied = false;
+    uint8_t mbaComplexity = 0;
+    uint8_t mbaStrategy = 0;
     uint32_t callHostSehHandlerOffset = 0;
     bool hasCallHostSehHandler = false;
     std::vector<VMSynthesizedStackFunclet> semanticStackFunclets;
@@ -180,6 +186,10 @@ struct VMHandlerSynthesisResult {
     uint64_t dispatchKeyDigest = 0;
     uint64_t microSelectionDigest = 0;
     uint64_t variantSelectorDigest = 0;
+    bool mbaApplied = false;
+    uint8_t mbaStrength = 0;
+    uint8_t mbaMinimumComplexity = 0;
+    uint32_t mbaHandlerCount = 0;
     std::vector<uint8_t> image;
     std::vector<VMHandlerRelocation> relocations;
     std::vector<VMSynthesizedHandler> handlers;

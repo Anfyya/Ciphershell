@@ -11,7 +11,7 @@ randomize_section_names = true # 随机化除严格 .rsrc/.reloc 外的 section 
 
 [vm]
 enabled = true
-strength = 90                 # 当前仅解析/往返；生产 Handler 尚未消费
+strength = 90                 # ADD/SUB/XOR Handler 的 MBA 强度；每 25 级增加一轮掩码恒等式
 target_functions = []
 target_rvas = []
 register_count = 24

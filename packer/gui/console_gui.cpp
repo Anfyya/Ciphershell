@@ -122,7 +122,7 @@ void ConsoleGUI::ShowConfigEditor() {
     std::cout << "    - L1-L3 不会隐式启用尚未闭环的保护模块" << std::endl;
     std::cout << "    - L4/L5 当前进入同一函数级 VM 生产链；不是多层嵌套 VM"
               << std::endl;
-    std::cout << "      （两档的 strength 字段不同，但当前尚未改变 Handler 生成）"
+    std::cout << "      （strength 控制 ADD/SUB/XOR Handler 的 MBA 多项式复杂度）"
               << std::endl;
     std::cout << "    - 字符串、IAT、反调试、反 Dump/Nanomite 等未实现开关"
               << std::endl;
@@ -160,7 +160,7 @@ void ConsoleGUI::ShowHelp() {
     std::cout << "    L1-L3           不隐式启用尚未闭环的保护模块" << std::endl;
     std::cout << "    L4 (Fortress)   启用函数级 Mirage VM 预设" << std::endl;
     std::cout << "    L5 (Citadel)    当前使用同一函数级 VM 生产链" << std::endl;
-    std::cout << "                     （strength 尚未改变 Handler；非嵌套 VM/Nanomite）"
+    std::cout << "                     （strength 控制 MBA 复杂度；非嵌套 VM/Nanomite）"
               << std::endl;
     std::cout << std::endl;
     std::cout << "  Plus 功能状态:" << std::endl;

@@ -113,6 +113,10 @@ struct VMRuntimeBuildResult {
     uint64_t semanticPlaintextEvidenceDigest = 0;
     uint64_t dispatchKeyDigest = 0;
     uint64_t variantSelectorDigest = 0;
+    bool mbaApplied = false;
+    uint8_t mbaStrength = 0;
+    uint8_t mbaMinimumComplexity = 0;
+    uint32_t mbaHandlerCount = 0;
     VMRuntimeTraceBinding traceBinding{};
     // Exact non-junk semantic-body ranges synthesized for this runtime, keyed
     // by semantic and K-variant. They are never emitted into the protected PE;

@@ -3063,7 +3063,11 @@ void TestHostContextEntryExecution() {
     constexpr uint8_t seedDomain = 0xD3;
 #endif
     const auto seed = MakeSeed(seedDomain);
-    const VMHandlerSynthesisConfig config = MakeConfig(architecture, seed);
+    VMHandlerSynthesisConfig config = MakeConfig(architecture, seed);
+    // Production maps vm.strength into the same field.  Running the existing
+    // full-width arithmetic matrix with MBA enabled proves the emitted x86/x64
+    // machine code, lazy flags and downstream branches remain equivalent.
+    config.mbaStrength = 80u;
     const RuntimeEncoding encoding = MakeRuntimeEncoding(architecture, seed);
     Require(config.handlerSemanticToSlot == encoding.semanticToSlot &&
         config.handlerSlotToSemantic == encoding.slotToSemantic,
@@ -3152,6 +3156,90 @@ void TestHostContextEntryExecution() {
                 strategy, true, config, result, encoding, testImage);
         }
     }
+}
+
+void TestPlusMbaCodegenEvidence() {
+    constexpr std::array<VM_MICRO_OPCODE, 3> semantics = {
+        VM_UOP_ADD, VM_UOP_SUB, VM_UOP_XOR};
+    constexpr std::array<uint8_t, 5> strengths = {1u, 26u, 51u, 76u, 100u};
+    constexpr std::array<uint32_t, 2> architectures = {
+        VM_ARCH_X86, VM_ARCH_X64};
+
+    for (const uint32_t architecture : architectures) {
+        for (const VM_MICRO_OPCODE semantic : semantics) {
+            uint8_t previousComplexity = 0u;
+            uint32_t previousSize = 0u;
+            for (const uint8_t strength : strengths) {
+                VMHandlerSemanticCodegenConfig config{};
+                config.architecture = architecture;
+                config.buildSeed = MakeSeed(static_cast<uint8_t>(
+                    0x31u + static_cast<uint8_t>(semantic)));
+                config.semantic = semantic;
+                config.variant = 1u;
+                config.mbaStrength = strength;
+
+                const VMHandlerSemanticCodegenResult generated =
+                    GenerateVMHandlerSemanticKernel(config);
+                Require(generated.success && generated.semanticComplete,
+                    "Plus MBA semantic kernel generation failed: " +
+                    generated.error);
+                Require(generated.mbaApplied && generated.mbaComplexity > 0u &&
+                    generated.mbaStrategy == generated.semanticCoreStrategy,
+                    "Plus MBA did not publish exact applied/complexity evidence");
+                Require(generated.mbaComplexity > previousComplexity &&
+                    generated.semanticCoreVariantSize > previousSize,
+                    "Plus MBA strength did not monotonically increase real core complexity");
+                previousComplexity = generated.mbaComplexity;
+                previousSize = generated.semanticCoreVariantSize;
+
+                std::string validationError;
+                Require(ValidateVMHandlerSemanticVariantKernel(
+                        config, generated, validationError),
+                    "Plus MBA emitted core failed structural revalidation: " +
+                    validationError);
+
+                VMHandlerSemanticCodegenResult tampered = generated;
+                tampered.mbaComplexity = 0u;
+                validationError.clear();
+                Require(!ValidateVMHandlerSemanticVariantKernel(
+                        config, tampered, validationError),
+                    "Plus MBA validator accepted forged zero-complexity evidence");
+            }
+
+            VMHandlerSemanticCodegenConfig seedA{};
+            seedA.architecture = architecture;
+            seedA.buildSeed = MakeSeed(0x42u);
+            seedA.semantic = semantic;
+            seedA.variant = 0u;
+            seedA.mbaStrength = 80u;
+            VMHandlerSemanticCodegenConfig seedB = seedA;
+            seedB.buildSeed = MakeSeed(0xA7u);
+            const auto generatedA = GenerateVMHandlerSemanticKernel(seedA);
+            const auto generatedB = GenerateVMHandlerSemanticKernel(seedB);
+            Require(generatedA.success && generatedB.success &&
+                Slice(generatedA.code, generatedA.semanticCoreVariantOffset,
+                    generatedA.semanticCoreVariantSize) !=
+                Slice(generatedB.code, generatedB.semanticCoreVariantOffset,
+                    generatedB.semanticCoreVariantSize),
+                "Plus MBA build seed did not change the emitted polynomial core");
+        }
+    }
+
+    VMHandlerSemanticCodegenConfig disabled{};
+    disabled.architecture = VM_ARCH_X64;
+    disabled.buildSeed = MakeSeed(0x55u);
+    disabled.semantic = VM_UOP_ADD;
+    disabled.mbaStrength = 0u;
+    const auto disabledResult = GenerateVMHandlerSemanticKernel(disabled);
+    Require(disabledResult.success && !disabledResult.mbaApplied &&
+        disabledResult.mbaComplexity == 0u,
+        "disabled Plus MBA published false applied evidence");
+
+    VMHandlerSemanticCodegenConfig invalid = disabled;
+    invalid.mbaStrength = 101u;
+    const auto invalidResult = GenerateVMHandlerSemanticKernel(invalid);
+    Require(!invalidResult.success,
+        "Plus MBA accepted strength outside 0-100");
 }
 #endif
 
@@ -7464,6 +7552,8 @@ int main() {
     Run("host-arch direct-threaded handler 差分执行与 #DE",
         &TestHostContextEntryExecution, failures);
 #endif
+    Run("Plus MBA 结构证据、强度与种子变异",
+        &TestPlusMbaCodegenEvidence, failures);
     Run("x86 pack-time handler 合成与差异度", &TestX86, failures);
     Run("x64 pack-time handler 合成与差异度", &TestX64, failures);
     Run("semanticBody 真 K 变体负向门禁",

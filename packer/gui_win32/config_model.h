@@ -53,7 +53,7 @@ struct GlobalOptions {
 // 同时为空时，后端会自动筛选满足 VM 能力约束的函数。
 struct VmOptions {
     bool enabled = true;
-    int strength = 90;                          // 仅解析/往返；Handler 尚未消费
+    int strength = 90;                          // ADD/SUB/XOR Handler 的 MBA 强度（1-100）
     std::vector<std::string> targetFunctions;   // 空 = 不限定名称/通配符
     std::vector<uint32_t> targetRVAs;            // 空 = 不按 RVA 精确选择
     int registerCount = 24;                      // 后端 ValidateVMRegisterMap 强制 16-32

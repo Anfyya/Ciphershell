@@ -259,6 +259,12 @@ bool SemanticRequired(const VMHandlerSynthesisConfig& config, uint8_t semantic) 
         : descriptor->runtimeSupportedX86;
 }
 
+bool IsMbaSemantic(uint8_t semantic) {
+    return semantic == static_cast<uint8_t>(VM_UOP_ADD) ||
+        semantic == static_cast<uint8_t>(VM_UOP_SUB) ||
+        semantic == static_cast<uint8_t>(VM_UOP_XOR);
+}
+
 void EmitCetLandingPad(CodeBuffer& code, bool x64, bool enabled) {
     if (!enabled) return;
     code.Raw(x64 ? std::initializer_list<uint8_t>{0xF3,0x0F,0x1E,0xFA}
@@ -393,6 +399,7 @@ bool BuildHandler(
         semanticConfig.buildSeed = config.buildSeed;
         semanticConfig.semantic = static_cast<VM_MICRO_OPCODE>(semantic);
         semanticConfig.variant = variant;
+        semanticConfig.mbaStrength = config.mbaStrength;
         VMHandlerSemanticCodegenResult generated =
             GenerateVMHandlerSemanticKernel(semanticConfig);
         if (!generated.success || !generated.semanticComplete || generated.code.empty()) {
@@ -510,6 +517,9 @@ bool BuildHandler(
         handler.registerAssignment = generated.registerAssignment;
         handler.operandBytesConsumed = generated.decodedOperandCount;
         handler.semanticComplete = true;
+        handler.mbaApplied = generated.mbaApplied;
+        handler.mbaComplexity = generated.mbaComplexity;
+        handler.mbaStrategy = generated.mbaStrategy;
     }
 
     // Similarity resistance comes from the executed per-variant allocation,
@@ -764,6 +774,10 @@ bool ConfigValid(const VMHandlerSynthesisConfig& config, std::string& error) {
         error = "plaintext handler storage is forbidden";
         return false;
     }
+    if (config.mbaStrength > 100u) {
+        error = "MBA strength must be in the range 0-100";
+        return false;
+    }
     if (config.virtualProtectIatRVA == 0 ||
         config.flushInstructionCacheIatRVA == 0) {
         error = "handler synthesis requires VirtualProtect and FlushInstructionCache IAT RVAs";
@@ -867,6 +881,7 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
     if (!ConfigValid(config, result.error)) return result;
 
     result.architecture = static_cast<uint32_t>(config.architecture);
+    result.mbaStrength = config.mbaStrength;
     result.directThreaded = true;
     result.handlerBodiesEncrypted = true;
     result.fixedRuntimeBlobUsed = false;
@@ -893,6 +908,17 @@ VMHandlerSynthesisResult VMHandlerSynthesizer::Synthesize(
             }
             result.handlers.push_back(std::move(handler));
         }
+    }
+    if (config.mbaStrength != 0u) {
+        result.mbaMinimumComplexity = (std::numeric_limits<uint8_t>::max)();
+        for (const auto& handler : result.handlers) {
+            if (!handler.mbaApplied) continue;
+            ++result.mbaHandlerCount;
+            result.mbaMinimumComplexity = (std::min)(
+                result.mbaMinimumComplexity, handler.mbaComplexity);
+        }
+        result.mbaApplied = result.mbaHandlerCount != 0u;
+        if (!result.mbaApplied) result.mbaMinimumComplexity = 0u;
     }
     for (uint32_t slot = 0; slot < VM_HANDLER_USABLE_SLOT_COUNT; ++slot) {
         if (config.handlerSlotToSemantic[slot] != VM_HANDLER_JUNK) continue;
@@ -1566,6 +1592,8 @@ bool VMHandlerSynthesizer::Validate(
     std::vector<StoredRange> storedRanges;
     storedRanges.reserve(result.handlers.size() + result.junkHandlers.size());
     uint64_t storedBytes = 0;
+    uint32_t observedMbaHandlers = 0u;
+    uint8_t observedMbaMinimum = (std::numeric_limits<uint8_t>::max)();
     for (const auto& handler : result.handlers) {
         if (handler.semantic >= VM_UOP_COUNT ||
             !SemanticRequired(config, handler.semantic) ||
@@ -1611,6 +1639,21 @@ bool VMHandlerSynthesizer::Validate(
                 std::to_string(handler.dispatchTailSize);
             return false;
         }
+        const bool expectsMba = config.mbaStrength != 0u &&
+            IsMbaSemantic(handler.semantic);
+        if (handler.mbaApplied != expectsMba ||
+            (expectsMba && (handler.mbaComplexity == 0u ||
+                handler.mbaStrategy > 1u)) ||
+            (!expectsMba && (handler.mbaComplexity != 0u ||
+                handler.mbaStrategy != 0u))) {
+            error = "synthesized handler MBA evidence is missing or inconsistent";
+            return false;
+        }
+        if (expectsMba) {
+            ++observedMbaHandlers;
+            observedMbaMinimum = (std::min)(
+                observedMbaMinimum, handler.mbaComplexity);
+        }
         uint32_t previousCodecEnd = handler.semanticCoreOffset;
         for (const auto& range : handler.valueCodecRanges) {
             if (range.size < 32u || range.offset < previousCodecEnd ||
@@ -1655,6 +1698,15 @@ bool VMHandlerSynthesizer::Validate(
         storedBytes += handler.storageSize;
         storedRanges.push_back({handler.storageOffset, handler.storageSize,
             &handler.plaintextBody});
+    }
+
+    if (result.mbaStrength != config.mbaStrength ||
+        result.mbaHandlerCount != observedMbaHandlers ||
+        result.mbaApplied != (observedMbaHandlers != 0u) ||
+        result.mbaMinimumComplexity != (observedMbaHandlers != 0u
+            ? observedMbaMinimum : 0u)) {
+        error = "synthesized runtime MBA aggregate evidence is inconsistent";
+        return false;
     }
 
     size_t expectedJunkHandlers = 0;
