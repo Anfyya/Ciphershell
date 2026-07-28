@@ -3405,6 +3405,7 @@ void ValidateOneBuild(
             semanticConfig.semantic =
                 static_cast<VM_MICRO_OPCODE>(handler.semantic);
             semanticConfig.variant = handler.variant;
+            semanticConfig.mbaStrength = config.mbaStrength;
             const VMHandlerSemanticCodegenResult generated =
                 GenerateVMHandlerSemanticKernel(semanticConfig);
             Require(generated.success &&
