@@ -48,6 +48,8 @@ constexpr uint64_t kRuntimeSectionDigestDomain = 0x4353564D53454354ULL;
 constexpr uint64_t kRuntimeImageDigestDomain = 0x4353564D494D4147ULL;
 constexpr uint64_t kEncryptedHandlerDigestDomain = 0x4353564D48444C52ULL;
 constexpr uint64_t kDispatchTableDigestDomain = 0x4353564D44535054ULL;
+constexpr uint64_t kBuilderOperandCodecSeed = 0x8899AABBCCDDEEFFULL;
+constexpr uint32_t kBuilderMetadataRVA = 0x1080u;
 
 class TestFailure final : public std::runtime_error {
 public:
@@ -356,6 +358,43 @@ public:
     OwnedBuilderImage(const OwnedBuilderImage&) = delete;
     OwnedBuilderImage& operator=(const OwnedBuilderImage&) = delete;
 
+    void InstallMetadata(bool stateChainingEnabled) {
+        VM_METADATA_HEADER metadata{};
+        metadata.cookie = 0xC0DEC51Fu;
+        metadata.headerSize = sizeof(metadata);
+        metadata.totalSize = sizeof(metadata);
+        metadata.metadataVersion = VM_METADATA_VERSION;
+        metadata.schemaVersion = VM_SCHEMA_VERSION;
+        metadata.runtimeVersion = VM_RUNTIME_VERSION;
+        metadata.architecture = image.is64Bit ? VM_ARCH_X64 : VM_ARCH_X86;
+        metadata.flags = VM_METADATA_FLAG_AUTHENTICATED |
+            VM_METADATA_FLAG_BYTECODE_CHACHA20 |
+            VM_METADATA_FLAG_MICRO_STREAM |
+            VM_METADATA_FLAG_LAZY_FLAGS |
+            (stateChainingEnabled
+                ? static_cast<uint32_t>(VM_METADATA_FLAG_STATE_CHAINED) : 0u);
+        metadata.recordCount = 1u;
+        metadata.recordSize = sizeof(VM_FUNCTION_RECORD);
+        metadata.layoutSeed = 0xA17E5EEDu;
+        metadata.operandCodecSeed = kBuilderOperandCodecSeed;
+        metadata.keyEncodingVersion = VM_KEY_ENCODING_VERSION;
+        metadata.opcodeMapSize = VM_OPCODE_MAP_SIZE;
+        metadata.registerMapSize = VM_REGISTER_MAP_SIZE;
+        metadata.handlerTableSize = VM_HANDLER_TABLE_SIZE;
+        metadata.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+        metadata.imageSize = image.is64Bit
+            ? image.ntHeaders64->OptionalHeader.SizeOfImage
+            : image.ntHeaders32->OptionalHeader.SizeOfImage;
+
+        constexpr uint32_t metadataOffset =
+            0x400u + (kBuilderMetadataRVA - 0x1000u);
+        Require(metadataOffset <= image.rawSize &&
+                sizeof(metadata) <= image.rawSize - metadataOffset,
+            "runtime builder integration metadata exceeds the test image");
+        std::memcpy(image.rawData + metadataOffset,
+            &metadata, sizeof(metadata));
+    }
+
     CS_PE_IMAGE image{};
 };
 
@@ -414,11 +453,12 @@ VMHandlerSynthesisConfig MakeBuilderConfig(
     config.flushInstructionCacheIatRVA = 0x1108u;
     config.encryptHandlerBodies = true;
     config.emitCetLandingPads = true;
+    config.stateChainingEnabled = true;
 
     VMHandlerFunctionDecodePlans plans{};
     plans.functionRVA = functionRVA;
     plans.codec = VMSchema::DeriveOperandCodec(
-        0x8899AABBCCDDEEFFULL, functionRVA);
+        kBuilderOperandCodecSeed, functionRVA);
     std::string planError;
     Require(VMSchema::BuildRuntimeDecodePlans(
             plans.codec, plans.plans.data(), planError),
@@ -601,6 +641,7 @@ void VerifyX64TrampolineVirtualUnwind(const VMRuntimeBuildResult& result) {
 void TestBuilderAndReparseIntegration() {
     constexpr uint32_t functionRVA = 0x1000u;
     OwnedBuilderImage owned;
+    owned.InstallMetadata(true);
     VMFunctionRecord record{};
     record.functionRVA = functionRVA;
     record.functionSize = 0x20u;
@@ -624,11 +665,13 @@ void TestBuilderAndReparseIntegration() {
     VMRuntimeBuilder builder;
     const VMRuntimeBuildResult result = builder.Build(
         &owned.image, {record}, bytecode, opcodeMap,
-        0x1080u, runtimeKeyShare, config,
+        kBuilderMetadataRVA, runtimeKeyShare, config,
         runtimeSection, unwindSection, relocationSection, safeSehSection);
     Require(result.success && result.executionReady &&
             result.runtimeContentVerified &&
-            result.referenceRuntimeBlobFreeVerified,
+            result.referenceRuntimeBlobFreeVerified &&
+            result.stateChainingApplied &&
+            result.stateChainEntryCount == 1u,
         "VMRuntimeBuilder 未通过自身产物完整性门禁: " + result.error);
     Require(result.trampolines.size() == 1,
         "VMRuntimeBuilder 集成测试没有生成唯一 trampoline");
@@ -714,6 +757,7 @@ void TestBuilderAndReparseIntegration() {
 void TestBuilderX86SelfBaseAndCetBalance() {
     constexpr uint32_t functionRVA = 0x1000u;
     OwnedBuilderImage owned(false);
+    owned.InstallMetadata(true);
     VMFunctionRecord record{};
     record.functionRVA = functionRVA;
     record.functionSize = 0x20u;
@@ -737,10 +781,12 @@ void TestBuilderX86SelfBaseAndCetBalance() {
     VMRuntimeBuilder builder;
     const VMRuntimeBuildResult result = builder.Build(
         &owned.image, {record}, bytecode, opcodeMap,
-        0x1080u, runtimeKeyShare, config,
+        kBuilderMetadataRVA, runtimeKeyShare, config,
         runtimeSection, unwindSection, relocationSection, safeSehSection);
     Require(result.success && result.executionReady &&
-            result.architecture == VM_ARCH_X86,
+            result.architecture == VM_ARCH_X86 &&
+            result.stateChainingApplied &&
+            result.stateChainEntryCount == 1u,
         "x86 VMRuntimeBuilder integration failed: " + result.error);
     Require(result.trampolines.size() == 1u,
         "x86 VMRuntimeBuilder did not emit exactly one trampoline");

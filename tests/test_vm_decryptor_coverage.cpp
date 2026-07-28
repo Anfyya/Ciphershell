@@ -217,9 +217,8 @@ VMHandlerEntryCodegenConfig MakeConfig(
     config.layout.keyMarkerOffset = 0xA010u;
     config.layout.decodePlanTableOffset = 0xA030u;
     config.functionPlanCount = 1u;
-    config.layout.decodePlanTableSize = static_cast<uint32_t>(
-        sizeof(uint32_t) + sizeof(VM_OPERAND_CODEC) +
-        sizeof(VM_RUNTIME_DECODE_PLAN) * VM_UOP_COUNT);
+    config.layout.decodePlanTableSize =
+        VM_RUNTIME_FUNCTION_DECODE_TABLE_SIZE;
     const uint32_t pointerSize = config.architecture == VM_ARCH_X64 ? 8u : 4u;
     config.layout.dispatchTableOffset = AlignUp(
         config.layout.decodePlanTableOffset + config.layout.decodePlanTableSize,

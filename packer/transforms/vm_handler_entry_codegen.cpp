@@ -64,8 +64,7 @@ struct RuntimeFunctionDecodeTable {
 #pragma pack(pop)
 
 static_assert(sizeof(RuntimeFunctionDecodeTable) ==
-    sizeof(uint32_t) * 3u + sizeof(VM_OPERAND_CODEC) +
-        sizeof(VM_RUNTIME_DECODE_PLAN) * VM_UOP_COUNT,
+    VM_RUNTIME_FUNCTION_DECODE_TABLE_SIZE,
     "runtime decode table layout mismatch");
 
 constexpr uint32_t CtxValues =

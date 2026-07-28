@@ -27,6 +27,14 @@ inline constexpr std::array<std::array<uint8_t, 3>, 8>
 inline constexpr uint8_t VM_DECRYPTOR_INSTRUCTION_PLAN_COUNT = 48u;
 
 /*
+ * Serialized per-function decoder records are shared by the synthesizer,
+ * entry generator and layout tests. Keep the size in one public contract.
+ */
+inline constexpr uint32_t VM_RUNTIME_FUNCTION_DECODE_TABLE_SIZE =
+    sizeof(uint32_t) * 3u + sizeof(VM_OPERAND_CODEC) +
+    sizeof(VM_RUNTIME_DECODE_PLAN) * VM_UOP_COUNT;
+
+/*
  * All offsets in this interface are offsets from the beginning of the
  * synthesized runtime image.  The orchestrator is therefore free to append
  * the image at any PE RVA without teaching the entry generator a preferred

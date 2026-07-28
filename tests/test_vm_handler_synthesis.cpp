@@ -3176,14 +3176,15 @@ void TestPlusStateChainingExecutionAndFailClosed() {
     const std::vector<MicroInstruction> program = {
         Uop(VM_UOP_PUSH_IMM, {0x2Au,
             architecture == VMHandlerArchitecture::X64 ? 8u : 4u}, 0),
-        Uop(VM_UOP_RET, {0}, 1),
+        Uop(VM_UOP_POP_VREG, {0u}, 1),
+        Uop(VM_UOP_RET, {0}, 2),
     };
     std::vector<uint8_t> chainedBytecode =
         EncodeStraightLineRuntimeProgram(program, encoding);
     const std::vector<uint32_t> offsets =
         RuntimeInstructionOffsets(program, encoding);
-    Require(offsets.size() == 2u && offsets[0] == 0u &&
-            offsets[1] < chainedBytecode.size(),
+    Require(offsets.size() == 3u && offsets[0] == 0u &&
+            offsets[1] < offsets[2] && offsets[2] < chainedBytecode.size(),
         "状态链测试的指令边界无效");
 
     uint64_t operandCodecSeed = 0u;
@@ -3206,6 +3207,13 @@ void TestPlusStateChainingExecutionAndFailClosed() {
     chainEntry = {};
     chainEntry.previousOffset = offsets[0];
     chainEntry.currentOffset = offsets[1];
+    chainEntry.maskSeed = vm_state_chain_mask_seed(
+        operandCodecSeed, plans.functionRVA, chainEntry.currentOffset);
+    chainEntry.flagsState = 0u;
+    plans.stateChainEntries.push_back(chainEntry);
+    chainEntry = {};
+    chainEntry.previousOffset = offsets[1];
+    chainEntry.currentOffset = offsets[2];
     chainEntry.maskSeed = vm_state_chain_mask_seed(
         operandCodecSeed, plans.functionRVA, chainEntry.currentOffset);
     chainEntry.flagsState = 0u;
@@ -3261,8 +3269,9 @@ void TestPlusStateChainingExecutionAndFailClosed() {
             validError == VM_MICRO_ERR_NONE &&
             valid.error == VM_MICRO_ERR_NONE &&
             valid.halted == 1u &&
-            valid.stateChainPreviousOffset == offsets[0] &&
-            valid.stateChainCurrentOffset == offsets[1],
+            valid.vregs[0] == 0x2Au &&
+            valid.stateChainPreviousOffset == offsets[1] &&
+            valid.stateChainCurrentOffset == offsets[2],
         "合法状态链未完成解码执行");
 
     VM_MICRO_EXECUTION_CONTEXT skipped = MakeRuntimeContext(
