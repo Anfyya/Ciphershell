@@ -8,6 +8,10 @@
 #include "vm_runtime_trace_reader.h"
 
 static int g_relocated_value = 0x13579BDF;
+static const char kStaticStringSentinel[] =
+    "CIPHERSHELL_STATIC_STRING_SENTINEL_7F3A91D2";
+static const char* volatile g_static_string_probe =
+    kStaticStringSentinel;
 
 using BinaryFn = int (__cdecl*)(int, int);
 using SubFn = VmProtectedSubFunction;
@@ -154,6 +158,9 @@ static bool ReadOnDiskPreferredRange(
 }
 
 int main(int argc, char** argv) {
+    const char* stringProbe = g_static_string_probe;
+    const bool stringEncryptionOk = stringProbe &&
+        stringProbe[0] == 'C' && stringProbe[42] == '2';
     const bool expectTrace = argc == 2 &&
         std::strcmp(argv[1], "--expect-trace") == 0;
     if (argc != 1 && !expectTrace) return 1;
@@ -219,7 +226,7 @@ int main(int argc, char** argv) {
         readInitial, writeOld1, pointerAfterWrite, readAfterWrite, writeOld2,
         pointerFinal, readFinal, capturedSubResult);
     const bool traceOk = EmitVmRuntimeTrace(module, expectTrace);
-    if (!scalarOk || !relocationOk || !flagsOk || !abiOk ||
+    if (!stringEncryptionOk || !scalarOk || !relocationOk || !flagsOk || !abiOk ||
         !platformAbiOk || !traceOk) {
         std::fprintf(stderr,
             "packed EXE VM result mismatch "

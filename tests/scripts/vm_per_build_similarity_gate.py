@@ -93,6 +93,8 @@ TARGET_EXPORT_NAMES = {
     "add", "sub2", "max2", "is_zero", "local1",
     "relocated_ptr", "relocated_read", "relocated_write",
 }
+STATIC_STRING_SENTINEL = \
+    b"CIPHERSHELL_STATIC_STRING_SENTINEL_7F3A91D2"
 
 # Independent per-(vm_group,semantic,K) pair ceilings.  The aggregate
 # similarity below is a Dice score pooled over every live handler pair
@@ -199,6 +201,28 @@ def run_build(ciphershell: Path, sample: Path, output: Path, config: Path,
             f"ciphershell reported success but plaintext handler evidence "
             f"{evidence} was not created:\n{log}")
     return log
+
+
+def validate_static_string_protection(
+        raw_inputs: tuple[Path, ...],
+        protected_outputs: tuple[Path, ...],
+        build_logs: tuple[str, ...]) -> None:
+    for raw_input in raw_inputs:
+        if STATIC_STRING_SENTINEL not in raw_input.read_bytes():
+            raise GateFailure(
+                "string-encryption fixture sentinel is absent from raw "
+                f"input: {raw_input}")
+    for protected_output in protected_outputs:
+        if STATIC_STRING_SENTINEL in protected_output.read_bytes():
+            raise GateFailure(
+                "protected output still contains the plaintext business "
+                f"string sentinel: {protected_output}")
+    for log in build_logs:
+        if "FEATURE_STATUS name=string_encryption status=applied" not in log or \
+           "STRING_ENCRYPTION_FINAL_STATIC_CHECK_PASS" not in log:
+            raise GateFailure(
+                "packer did not publish applied plus final static evidence "
+                "for startup string encryption")
 
 
 def parse_return_flags(log: str, output: Path) -> tuple[int, int, int, int]:
@@ -1264,6 +1288,10 @@ def main() -> int:
         exe_log2 = run_build(
             args.ciphershell, args.exe_sample, exe_output2, args.config,
             exe_evidence2_path)
+        validate_static_string_protection(
+            (args.sample, args.exe_sample),
+            (output1, output2, exe_output1, exe_output2),
+            (log1, log2, exe_log1, exe_log2))
         assert_forced_relocation_exe_layout(exe_output1)
         assert_forced_relocation_exe_layout(exe_output2)
         packed_exe_flags1, packed_exe_result1, packed_exe_runtime_log1 = \

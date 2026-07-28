@@ -7,6 +7,10 @@
 #include <windows.h>
 
 static int g_relocated_value = 0x13579BDF;
+static const char kStaticStringSentinel[] =
+    "CIPHERSHELL_STATIC_STRING_SENTINEL_7F3A91D2";
+static const char* volatile g_static_string_probe =
+    kStaticStringSentinel;
 
 #if defined(_M_IX86)
 // Keep the fixed public export contract while making the real Win32 target a
@@ -63,6 +67,12 @@ extern "C" __declspec(dllexport) __declspec(noinline) int relocated_write(int va
     return previous;
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        const char* probe = g_static_string_probe;
+        if (!probe || probe[0] != 'C' || probe[42] != '2') {
+            return FALSE;
+        }
+    }
     return TRUE;
 }

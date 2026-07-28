@@ -15,6 +15,8 @@
 #include "../packer/signature/signature_eliminator.h"
 #include "../packer/pe_parser/pe_parser.h"
 #include "../packer/pe_parser/pe_rebuilder.h"
+#include "../packer/transforms/runtime_stream_cipher.h"
+#include "../packer/transforms/string_encryptor.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -314,7 +316,7 @@ void TestExplicitSectionEncryptionRejected() {
     parser2.FreeImage(image);
 }
 
-void TestExplicitStringEncryptionRejected() {
+void TestSupportedStringEncryptionAccepted() {
     CipherShell::ConfigParser parser;
     auto config = parser.LoadFromString("[string_encryption]\nenabled = true\n");
     CS_TEST_CHECK(!parser.HasError());
@@ -325,10 +327,91 @@ void TestExplicitStringEncryptionRejected() {
     CS_TEST_CHECK(image && image->isValid);
     CipherShell::CapabilityChecker checker;
     auto report = checker.CheckImage(image, ctx);
-    CS_TEST_CHECK(!report.ok);
-    CS_TEST_CHECK(ContextHasFatal(report, "StringEncryption"));
+    CS_TEST_CHECK(report.ok);
+    CS_TEST_CHECK(!ContextHasFatal(report, "StringEncryption"));
     CipherShell::PEParser parser2;
     parser2.FreeImage(image);
+}
+
+void TestUnsupportedStringEncryptionModesRejected() {
+    for (const std::string& body : {
+            "[string_encryption]\nenabled = true\nmode = \"lazy\"\n",
+            "[string_encryption]\nenabled = true\nascii = false\nutf16 = false\n",
+            "[string_encryption]\nenabled = true\nresources = true\n",
+            "[string_encryption]\nenabled = true\nclear_after_use = true\n"}) {
+        CipherShell::ConfigParser parser;
+        auto config = parser.LoadFromString(body);
+        CS_TEST_CHECK(!parser.HasError());
+        auto ctx = CipherShell::ProtectionBuildContext::FromConfig(
+            config, 1, false);
+        auto* image = BuildMinimalImage();
+        CS_TEST_CHECK(image && image->isValid);
+        CipherShell::CapabilityChecker checker;
+        const auto report = checker.CheckImage(image, ctx);
+        CS_TEST_CHECK(!report.ok);
+        CS_TEST_CHECK(ContextHasFatal(report, "StringEncryption"));
+        CipherShell::PEParser parser2;
+        parser2.FreeImage(image);
+    }
+}
+
+void TestStartupStringCipherRoundTripAndPlaintextRemoval() {
+    constexpr char kBusinessString[] =
+        "Software\\Policies\\System\\StaticLeakSentinel";
+    for (const bool is64Bit : {false, true}) {
+        auto* image = BuildMinimalImage(false, false, is64Bit);
+        CS_TEST_CHECK(image && image->isValid);
+        auto& section = image->sections[0];
+        std::memset(section.Name, 0, sizeof(section.Name));
+        std::memcpy(section.Name, ".rdata", 6);
+        section.Characteristics =
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        section.Misc.VirtualSize = section.SizeOfRawData;
+        BYTE* sectionData =
+            image->rawData + section.PointerToRawData;
+        std::memset(sectionData, 0, section.SizeOfRawData);
+        std::memcpy(sectionData, kBusinessString,
+            sizeof(kBusinessString));
+
+        CipherShell::CS_STRING_CONFIG config;
+        config.minLength = 4;
+        config.encryptWideStrings = false;
+        config.excludeSectionsAtOrAfter = 1;
+        CipherShell::StringEncryptor encryptor;
+        auto strings = encryptor.ScanStrings(image, config);
+        CS_TEST_CHECK(!encryptor.HasError());
+        CS_TEST_CHECK(strings.size() == 1);
+        CS_TEST_CHECK(strings[0].sectionIndex == 0);
+        CS_TEST_CHECK(strings[0].length == sizeof(kBusinessString));
+
+        CS_TEST_CHECK(encryptor.EncryptStrings(image, strings));
+        CS_TEST_CHECK(!encryptor.HasError());
+        CS_TEST_CHECK(std::memcmp(sectionData, kBusinessString,
+            sizeof(kBusinessString)) != 0);
+        CS_TEST_CHECK(strings[0].ciphertextDigest ==
+            CipherShell::RuntimeStreamCipher::PlaintextDigest(
+                sectionData, strings[0].length));
+
+        std::vector<BYTE> decrypted(
+            sectionData, sectionData + strings[0].length);
+        if (is64Bit) {
+            CipherShell::RuntimeStreamCipher::ApplyRolling(
+                decrypted.data(), strings[0].length,
+                strings[0].key, false);
+        } else {
+            CipherShell::RuntimeStreamCipher::ApplyLegacyXor(
+                decrypted.data(), strings[0].length,
+                strings[0].key);
+        }
+        CS_TEST_CHECK(std::memcmp(decrypted.data(),
+            kBusinessString, sizeof(kBusinessString)) == 0);
+        CS_TEST_CHECK(strings[0].plaintextDigest ==
+            CipherShell::RuntimeStreamCipher::PlaintextDigest(
+                decrypted.data(), strings[0].length));
+
+        CipherShell::PEParser parser;
+        parser.FreeImage(image);
+    }
 }
 
 void TestControlFlowMasterNoopRejected() {
@@ -1090,7 +1173,9 @@ int main() {
     TestExplicitBogusRejected();
     TestExplicitImportProtectionRejected();
     TestExplicitSectionEncryptionRejected();
-    TestExplicitStringEncryptionRejected();
+    TestSupportedStringEncryptionAccepted();
+    TestUnsupportedStringEncryptionModesRejected();
+    TestStartupStringCipherRoundTripAndPlaintextRemoval();
     TestControlFlowMasterNoopRejected();
     TestSignatureEliminatorKeepsReadOnlyPermissions();
     TestSignatureEliminatorHonorsEnabledGlobalControls();

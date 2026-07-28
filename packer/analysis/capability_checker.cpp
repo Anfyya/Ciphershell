@@ -72,10 +72,26 @@ CapabilityReport CapabilityChecker::CheckImage(const CS_PE_IMAGE* image, const P
             true);
     }
     if (ctx.stringEncryption.enabled) {
-        AddIssue(report, "StringEncryption", 0,
-            "startup string encryption uses an unauthenticated cipher with a recoverable key; "
-            "no production closure exists (reject before any PE modification)",
-            true);
+        if (ctx.stringEncryption.mode != "startup") {
+            AddIssue(report, "StringEncryption", 0,
+                "only the verified startup-decryption mode is implemented",
+                true);
+        }
+        if (!ctx.stringAscii && !ctx.stringUtf16) {
+            AddIssue(report, "StringEncryption", 0,
+                "string encryption is enabled but both ASCII and UTF-16 coverage are disabled",
+                true);
+        }
+        if (ctx.stringResources) {
+            AddIssue(report, "StringEncryption", 0,
+                "resource strings may be consumed by the loader before the startup stub runs",
+                true);
+        }
+        if (ctx.stringClearAfterUse) {
+            AddIssue(report, "StringEncryption", 0,
+                "clear_after_use requires per-reference lazy decryption and is not implemented",
+                true);
+        }
     }
     if (ctx.importProtection.enabled) {
         AddIssue(report, "ImportProtection", 0,

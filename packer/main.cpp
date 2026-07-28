@@ -30,6 +30,7 @@
 #include "pe_parser/pe_utils.h"
 #include "transforms/section_encryptor.h"
 #include "transforms/string_encryptor.h"
+#include "transforms/runtime_stream_cipher.h"
 #include "transforms/import_obfuscator.h"
 #include "config/config_parser.h"
 #include "signature/signature_eliminator.h"
@@ -101,6 +102,36 @@ static void PrintFeatureStatus(const std::string& name, const std::string& statu
         std::cout << " reason=" << reason;
     }
     std::cout << std::endl;
+}
+
+static bool ValidateEncryptedRegions(
+    const CipherShell::CS_PE_IMAGE* image,
+    const std::vector<CipherShell::CS_ENCRYPTED_SECTION>& regions,
+    std::string& reason) {
+    reason.clear();
+    if (!image || !image->isValid) {
+        reason = "invalid_image";
+        return false;
+    }
+    for (const auto& region : regions) {
+        const uint32_t offset =
+            CipherShell::PEUtils::RvaToOffset(image, region.originalRVA);
+        if (offset == 0 || region.encryptedSize == 0 ||
+            offset > image->rawSize ||
+            region.encryptedSize > image->rawSize - offset) {
+            reason = "encrypted_region_out_of_bounds";
+            return false;
+        }
+        const uint32_t digest =
+            CipherShell::RuntimeStreamCipher::PlaintextDigest(
+                image->rawData + offset, region.encryptedSize);
+        if (digest != region.ciphertextDigest ||
+            digest == region.plaintextDigest) {
+            reason = "encrypted_region_ciphertext_changed";
+            return false;
+        }
+    }
+    return true;
 }
 // ============================================================================
 // 主函数
@@ -928,16 +959,11 @@ int main(int argc, char* argv[]) {
 
     std::vector<CipherShell::CS_ENCRYPTED_SECTION> encryptedStringRegions;
 
-    // Phase A: 字符串加密 —— 弱加密（未认证算法 + 可恢复密钥），不具备生产语义闭环。
-    // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫，
-    // 绝不应用，绝不打印 applied/partial。
-    if (buildCtx.stringEncryption.enabled) {
-        std::cerr << "STRING_ENCRYPTION_REJECT module=StringEncryption"
-                  << " reason=fail_closed_unfinished_cipher_with_recoverable_key" << std::endl;
-        PrintFeatureStatus("string_encryption", "rejected", "fail_closed_unfinished_closure");
-        return 1;
-    }
-    PrintFeatureStatus("string_encryption", "skipped", "disabled");
+    // Phase A 只记录请求。真实扫描与加密必须等所有代码变换结束后执行，
+    // 并限制在输入 PE 的原始 section 集合内，避免把后加 VM/CFG/loader
+    // 元数据误当业务字符串。
+    const bool stringEncryptionRequested =
+        buildCtx.stringEncryption.enabled;
 
     // Phase B: 导入表混淆 —— 仅追加假导入并保留真实 IAT，未改写 callsite，不具备生产闭环。
     // 由 CapabilityChecker 在任何 PE 修改之前 fatal 拒绝；此处保留显式 fail-closed 守卫。
@@ -2190,8 +2216,78 @@ int main(int argc, char* argv[]) {
     }
     PrintFeatureStatus("section_encryption", "skipped", "disabled");
 
-    // 字符串运行时解密任务区域始终为空（string encryption 已 fail-closed）。
-    (void)encryptedStringRegions;
+    if (stringEncryptionRequested) {
+        CipherShell::CS_STRING_CONFIG stringConfig;
+        const int strength =
+            (std::max)(0, (std::min)(100,
+                buildCtx.stringEncryption.strength));
+        stringConfig.minLength = strength >= 75 ? 4u :
+            (strength >= 50 ? 6u : (strength >= 25 ? 8u : 12u));
+        stringConfig.encryptAnsiStrings = buildCtx.stringAscii;
+        stringConfig.encryptWideStrings = buildCtx.stringUtf16;
+        stringConfig.scanResources = buildCtx.stringResources;
+        stringConfig.excludeSectionsAtOrAfter = originalSectionCount;
+
+        CipherShell::StringEncryptor stringEncryptor;
+        auto strings = stringEncryptor.ScanStrings(
+            image.get(), stringConfig);
+        if (stringEncryptor.HasError()) {
+            std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor"
+                      << " phase=scan reason="
+                      << stringEncryptor.GetLastError() << std::endl;
+            PrintFeatureStatus("string_encryption", "failed",
+                "candidate_scan_failed");
+            return 1;
+        }
+        if (!strings.empty() &&
+            !stringEncryptor.EncryptStrings(image.get(), strings)) {
+            std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor"
+                      << " phase=encrypt reason="
+                      << stringEncryptor.GetLastError() << std::endl;
+            PrintFeatureStatus("string_encryption", "failed",
+                "cipher_round_trip_failed");
+            return 1;
+        }
+
+        uint64_t encryptedBytes = 0;
+        encryptedStringRegions.reserve(strings.size());
+        for (const auto& entry : strings) {
+            if (entry.sectionIndex >= originalSectionCount ||
+                entry.sectionIndex >= image->numSections ||
+                entry.encryptedSize == 0 ||
+                entry.rva == 0) {
+                std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor"
+                          << " phase=publish reason=invalid_region"
+                          << std::endl;
+                return 1;
+            }
+            CipherShell::CS_ENCRYPTED_SECTION region{};
+            region.sectionIndex = entry.sectionIndex;
+            region.originalRVA = entry.rva;
+            region.originalSize = entry.length;
+            region.encryptedSize = entry.encryptedSize;
+            region.originalCharacteristics =
+                image->sections[entry.sectionIndex].Characteristics;
+            region.plaintextDigest = entry.plaintextDigest;
+            region.ciphertextDigest = entry.ciphertextDigest;
+            std::memcpy(region.sectionKey.key,
+                entry.key, sizeof(region.sectionKey.key));
+            std::memcpy(region.sectionKey.nonce,
+                entry.nonce, sizeof(region.sectionKey.nonce));
+            region.sectionKey.counter = 0;
+            encryptedBytes += entry.encryptedSize;
+            encryptedStringRegions.push_back(region);
+        }
+        encryptedSections.insert(encryptedSections.end(),
+            encryptedStringRegions.begin(),
+            encryptedStringRegions.end());
+        std::cout << "STRING_ENCRYPTION_STATIC_PASS module=StringEncryptor"
+                  << " strings=" << encryptedStringRegions.size()
+                  << " bytes=" << encryptedBytes
+                  << " min_length=" << stringConfig.minLength
+                  << " loader_metadata_excluded=true"
+                  << " round_trip_verified=true" << std::endl;
+    }
 
     // ============================================================================
     // Step 3: 嵌入 Stub
@@ -2220,6 +2316,22 @@ int main(int argc, char* argv[]) {
         loaderApplied = true;
     } else {
         std::cout << "  跳过（没有需要解密的 section）" << std::endl;
+    }
+    if (stringEncryptionRequested) {
+        if (encryptedStringRegions.empty()) {
+            PrintFeatureStatus("string_encryption", "skipped",
+                "no_eligible_business_strings");
+        } else if (loaderApplied) {
+            PrintFeatureStatus("string_encryption", "applied",
+                "startup_loader_verified");
+        } else {
+            std::cerr << "STRING_ENCRYPTION_FAIL module=StringEncryptor"
+                      << " phase=loader reason=loader_not_applied"
+                      << std::endl;
+            return 1;
+        }
+    } else {
+        PrintFeatureStatus("string_encryption", "skipped", "disabled");
     }
 
     // ============================================================================
@@ -2387,6 +2499,20 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "LOADER_FINAL_STATIC_CHECK_PASS module=LoaderVerifier" << std::endl;
     }
+    if (!encryptedStringRegions.empty()) {
+        std::string stringReason;
+        if (!ValidateEncryptedRegions(
+                rebuiltImage, encryptedStringRegions, stringReason)) {
+            parser.FreeImage(rebuiltImage);
+            std::cerr << "STRING_ENCRYPTION_FINAL_STATIC_CHECK_FAIL "
+                      << "module=StringEncryptor reason="
+                      << stringReason << std::endl;
+            return 1;
+        }
+        std::cout << "STRING_ENCRYPTION_FINAL_STATIC_CHECK_PASS "
+                  << "module=StringEncryptor strings="
+                  << encryptedStringRegions.size() << std::endl;
+    }
     parser.FreeImage(rebuiltImage);
     std::cout << "PE_STATIC_CHECK_PASS module=PEVerifier" << std::endl;
 
@@ -2480,6 +2606,18 @@ int main(int argc, char* argv[]) {
             std::remove(outputFile.c_str());
             std::cerr << "LOADER_WRITE_VERIFY_FAIL module=LoaderVerifier reason="
                       << loaderReason << std::endl;
+            return 1;
+        }
+    }
+    if (!encryptedStringRegions.empty()) {
+        std::string stringReason;
+        if (!ValidateEncryptedRegions(
+                verifyImage, encryptedStringRegions, stringReason)) {
+            parser.FreeImage(verifyImage);
+            std::remove(outputFile.c_str());
+            std::cerr << "STRING_ENCRYPTION_WRITE_VERIFY_FAIL "
+                      << "module=StringEncryptor reason="
+                      << stringReason << std::endl;
             return 1;
         }
     }

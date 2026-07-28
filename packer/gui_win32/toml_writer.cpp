@@ -110,19 +110,17 @@ std::string BuildConfigToml(const AppConfig& config) {
         FormatDecimal(vm.variantGroupFunctionsPerGroup));
     out << "\n";
 
-    // Fail-closed：CapabilityChecker 对这三个模块的 enabled=true 无条件 fatal
-    // 拒绝（packer/analysis/capability_checker.cpp）。GUI 不提供开关，这里恒定
-    // 写 false；其余字段保留 full_example.toml 里的真实默认值，仅用于保持
-    // 配置 schema 完整、可读。
-    const auto& stringDefaults = config.unavailable.stringEncryption;
+    // 字符串静态保护已经接入生产链。当前只开放经过闭环验证的 startup 模式
+    // 与 ASCII/UTF-16 扫描；resources / clear_after_use 继续固定 false。
+    const auto& strings = config.stringEncryption;
     AppendLine(out, "[string_encryption]");
-    AppendLine(out, "enabled = false");
-    AppendLine(out, "strength = " + FormatDecimal(stringDefaults.strength));
-    AppendLine(out, "mode = " + QuoteTomlString(stringDefaults.mode));
-    AppendLine(out, "ascii = " + FormatBool(stringDefaults.ascii));
-    AppendLine(out, "utf16 = " + FormatBool(stringDefaults.utf16));
-    AppendLine(out, "resources = " + FormatBool(stringDefaults.resources));
-    AppendLine(out, "clear_after_use = " + FormatBool(stringDefaults.clearAfterUse));
+    AppendLine(out, "enabled = " + FormatBool(strings.enabled));
+    AppendLine(out, "strength = " + FormatDecimal(strings.strength));
+    AppendLine(out, "mode = " + QuoteTomlString(strings.mode));
+    AppendLine(out, "ascii = " + FormatBool(strings.ascii));
+    AppendLine(out, "utf16 = " + FormatBool(strings.utf16));
+    AppendLine(out, "resources = false");
+    AppendLine(out, "clear_after_use = false");
     out << "\n";
 
     const auto& importDefaults = config.unavailable.importProtection;

@@ -202,7 +202,7 @@ void MainWindow::OnCreate(HWND hwnd) {
     const int tabControlFlow = AddTab(L"控制流");
     const int tabAntiDebugDump = AddTab(L"反调试 / 反Dump");
     const int tabPerformance = AddTab(L"性能");
-    const int tabUnavailable = AddTab(L"不可用模块");
+    const int tabUnavailable = AddTab(L"数据保护");
     const int tabRun = AddTab(L"运行");
     m_vmTabIndex = tabVm;
 
@@ -578,7 +578,7 @@ void MainWindow::BuildPerformancePage(int tabIndex) {
 }
 
 // ============================================================================
-// 不可用模块页（只读展示，无可勾选开关）
+// 数据保护页（字符串加密可用，其余模块如实保持 fail-closed）
 // ============================================================================
 
 void MainWindow::BuildUnavailablePage(int tabIndex) {
@@ -592,39 +592,35 @@ void MainWindow::BuildUnavailablePage(int tabIndex) {
     int y = kPageMarginTop;
     const int x = kPageMarginLeft;
 
-    track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight * 3,
-        L"以下模块目前是 fail-closed：显式启用会被 CapabilityChecker 在任何 PE 改动之前无条件\r\n"
-        L"拒绝，本界面不提供可勾选的启用开关。字段与默认值取自 config/full_example.toml 的真实\r\n"
-        L"schema，仅供了解现状（勾选框/输入框均已禁用）。"));
-    y += kControlHeight * 3 + kGroupGap;
-
     const AppConfig defaults;  // 默认构造即真实 schema 默认值。
 
-    track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight, L"[string_encryption]"));
+    track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight,
+        L"业务字符串静态保护 [string_encryption]"));
     y += kRowHeight;
-    track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight,
-        L"原因：未认证算法 + 可恢复密钥，没有生产语义闭环"));
+    track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight * 2,
+        L"加密原始非代码节中的 ASCII/UTF-16 业务字符串，启动时先恢复再进入原入口。\r\n"
+        L"导入/导出名及 PE 装载元数据会排除；此功能消除磁盘明文，不承诺运行期内存明文不可见。"));
+    y += kControlHeight * 2 + 4;
+    m_stringEncryptionCheck = track(CreateCheckboxControl(
+        m_hwnd, x, y, 220, kControlHeight, L"启用字符串静态加密", NextControlId(), false));
+    track(CreateLabelControl(m_hwnd, x + 230, y, 66, kControlHeight, L"strength"));
+    m_stringStrengthEdit = track(CreateEditControl(
+        m_hwnd, x + 298, y, kShortWidth, kControlHeight, NextControlId(), ES_NUMBER));
+    track(CreateLabelControl(m_hwnd, x + 298 + kShortWidth + 12, y, 170, kControlHeight,
+        L"1-100；mode 固定 startup"));
     y += kRowHeight;
-    trackDisabled(CreateCheckboxControl(
-        m_hwnd, x, y, 110, kControlHeight, L"enabled", NextControlId(), false, false));
-    track(CreateLabelControl(m_hwnd, x + 116, y, 66, kControlHeight, L"strength"));
-    HWND stringStrength = trackDisabled(CreateEditControl(
-        m_hwnd, x + 184, y, kShortWidth, kControlHeight, NextControlId(), 0, false));
-    SetEditInt(stringStrength, defaults.unavailable.stringEncryption.strength);
-    track(CreateLabelControl(m_hwnd, x + 184 + kShortWidth + 12, y, 48, kControlHeight, L"mode"));
-    HWND stringMode = trackDisabled(CreateEditControl(
-        m_hwnd, x + 184 + kShortWidth + 64, y, 100, kControlHeight, NextControlId(), 0, false));
-    SetEditText(stringMode, Utf8ToWide(defaults.unavailable.stringEncryption.mode));
-    y += kRowHeight;
-    trackDisabled(CreateCheckboxControl(m_hwnd, x, y, 90, kControlHeight, L"ascii",
-        NextControlId(), defaults.unavailable.stringEncryption.ascii, false));
-    trackDisabled(CreateCheckboxControl(m_hwnd, x + 100, y, 90, kControlHeight, L"utf16",
-        NextControlId(), defaults.unavailable.stringEncryption.utf16, false));
-    trackDisabled(CreateCheckboxControl(m_hwnd, x + 200, y, 130, kControlHeight, L"resources",
-        NextControlId(), defaults.unavailable.stringEncryption.resources, false));
-    trackDisabled(CreateCheckboxControl(m_hwnd, x + 340, y, 180, kControlHeight, L"clear_after_use",
-        NextControlId(), defaults.unavailable.stringEncryption.clearAfterUse, false));
+    m_stringAsciiCheck = track(CreateCheckboxControl(
+        m_hwnd, x, y, 160, kControlHeight, L"扫描 ASCII", NextControlId(), true));
+    m_stringUtf16Check = track(CreateCheckboxControl(
+        m_hwnd, x + 170, y, 180, kControlHeight, L"扫描 UTF-16", NextControlId(), true));
+    track(CreateLabelControl(m_hwnd, x + 360, y, kPageWidth - 360, kControlHeight,
+        L"resources / clear_after_use 暂不支持"));
     y += kRowHeight + kGroupGap;
+
+    track(CreateLabelControl(m_hwnd, x, y, kPageWidth, kControlHeight * 2,
+        L"以下模块仍是 fail-closed：显式启用会在任何 PE 改动之前被拒绝。\r\n"
+        L"界面仅展示真实默认值，禁用控件不可写入 enabled=true。"));
+    y += kControlHeight * 2 + kGroupGap;
 
     track(CreateSectionHeaderControl(m_hwnd, x, y, kPageWidth, kLabelHeight, L"[import_protection]"));
     y += kRowHeight;
@@ -754,6 +750,11 @@ void MainWindow::ApplyDefaultsToControls() {
 
     SetCheckboxChecked(m_autoHotspotCheck, defaults.performance.autoHotspotAnalysis);
     SetEditDouble(m_maxOverheadEdit, defaults.performance.maxVmOverheadRatio);
+
+    SetCheckboxChecked(m_stringEncryptionCheck, defaults.stringEncryption.enabled);
+    SetEditInt(m_stringStrengthEdit, defaults.stringEncryption.strength);
+    SetCheckboxChecked(m_stringAsciiCheck, defaults.stringEncryption.ascii);
+    SetCheckboxChecked(m_stringUtf16Check, defaults.stringEncryption.utf16);
 }
 
 // ============================================================================
@@ -1073,6 +1074,22 @@ bool MainWindow::CollectConfig(AppConfig& outConfig, std::wstring& validationErr
     outConfig.performance.autoHotspotAnalysis = GetCheckboxChecked(m_autoHotspotCheck);
     outConfig.performance.maxVmOverheadRatio = (std::max)(0.0, GetEditDouble(m_maxOverheadEdit, 15.0));
 
+    StringEncryptionOptions& strings = outConfig.stringEncryption;
+    strings.enabled = GetCheckboxChecked(m_stringEncryptionCheck);
+    if (!TryParseDecimalIntInRange(
+            GetEditText(m_stringStrengthEdit), 1, 100,
+            strings.strength)) {
+        validationError =
+            L"字符串加密 strength 必须是 1-100 之间的完整十进制整数。";
+        return false;
+    }
+    strings.ascii = GetCheckboxChecked(m_stringAsciiCheck);
+    strings.utf16 = GetCheckboxChecked(m_stringUtf16Check);
+    if (strings.enabled && !strings.ascii && !strings.utf16) {
+        validationError = L"启用字符串加密时，ASCII 和 UTF-16 至少选择一种。";
+        return false;
+    }
+
     return true;
 }
 
@@ -1152,7 +1169,7 @@ void MainWindow::SetRunningState(bool running) {
     ::SendMessageW(m_progressBar, PBM_SETMARQUEE, running ? TRUE : FALSE, running ? 50 : 0);
 
     // 运行期间锁住除"运行"页以外的所有配置控件；创建顺序固定为
-    // 基本(0)/虚拟化(1)/控制流(2)/反调试与反Dump(3)/性能(4)/不可用模块(5)/运行(6)。
+    // 基本(0)/虚拟化(1)/控制流(2)/反调试与反Dump(3)/性能(4)/数据保护(5)/运行(6)。
     for (int tab = 0; tab <= 5; ++tab) {
         for (HWND hwnd : m_tabControls[static_cast<size_t>(tab)]) ::EnableWindow(hwnd, !running);
     }

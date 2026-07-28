@@ -38,7 +38,7 @@ variant_group_max = 4
 variant_group_functions_per_group = 4
 
 [string_encryption]
-enabled = false
+enabled = true
 strength = 60
 mode = "startup"
 ascii = true

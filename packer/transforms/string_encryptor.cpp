@@ -4,6 +4,8 @@
 
 #include "string_encryptor.h"
 #include "runtime_stream_cipher.h"
+#include "../pe_parser/pe_utils.h"
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
@@ -42,7 +44,9 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
     }
 
     // 扫描所有 section
-    for (WORD i = 0; i < image->numSections; i++) {
+    for (WORD i = 0;
+         i < image->numSections && i < config.excludeSectionsAtOrAfter;
+         i++) {
         PIMAGE_SECTION_HEADER section = &image->sections[i];
 
         // 跳过不可读的 section
@@ -94,12 +98,17 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
                 }
 
                 if (strLen >= config.minLength && sectionData[pos + strLen - 1] == 0) {
-                    CS_STRING_ENTRY entry;
+                    CS_STRING_ENTRY entry{};
+                    entry.sectionIndex = i;
                     entry.rva = section->VirtualAddress + pos;
                     entry.offset = section->PointerToRawData + pos;
                     entry.length = strLen;
                     entry.isWideChar = false;
                     entry.original = (const char*)(sectionData + pos);
+                    if (IsLoaderMetadataString(image, entry)) {
+                        pos += strLen;
+                        continue;
+                    }
 
                     // 生成独立密钥
                     if (!GenerateRandomBytes(entry.key, 32) || !GenerateRandomBytes(entry.nonce, 12)) {
@@ -130,7 +139,8 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
 
                 if (strLen >= config.minLength && 
                     *(wchar_t*)(sectionData + pos + (strLen - 1) * 2) == 0) {
-                    CS_STRING_ENTRY entry;
+                    CS_STRING_ENTRY entry{};
+                    entry.sectionIndex = i;
                     entry.rva = section->VirtualAddress + pos;
                     entry.offset = section->PointerToRawData + pos;
                     entry.length = strLen * 2;  // 字节数
@@ -143,6 +153,10 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
                         narrowBuf[j] = (ch < 0x80) ? (char)ch : '?';
                     }
                     entry.original = narrowBuf;
+                    if (IsLoaderMetadataString(image, entry)) {
+                        pos += strLen * 2;
+                        continue;
+                    }
 
                     if (!GenerateRandomBytes(entry.key, 32) || !GenerateRandomBytes(entry.nonce, 12)) {
                         m_lastError = "secure random generation failed for UTF-16 string";
@@ -262,28 +276,75 @@ bool StringEncryptor::EncryptStrings(
     CS_PE_IMAGE* image,
     std::vector<CS_STRING_ENTRY>& strings)
 {
+    m_lastError.clear();
     if (!image || !image->isValid) {
+        m_lastError = "invalid PE image";
         return false;
     }
 
     for (auto& entry : strings) {
         // 检查偏移是否有效
-        if (entry.offset + entry.length > image->rawSize) {
+        if (entry.length == 0 || entry.offset > image->rawSize ||
+            entry.length > image->rawSize - entry.offset) {
             m_lastError = "string range is outside file data";
             return false;
         }
 
         // 获取字符串数据
         BYTE* data = image->rawData + entry.offset;
+        std::vector<BYTE> plaintext;
+        std::vector<BYTE> verified;
+        try {
+            plaintext.assign(data, data + entry.length);
+            verified.assign(data, data + entry.length);
+        } catch (...) {
+            m_lastError = "string verification allocation failed";
+            return false;
+        }
+        entry.plaintextDigest =
+            RuntimeStreamCipher::PlaintextDigest(data, entry.length);
 
         if (image->is64Bit) {
             RuntimeStreamCipher::ApplyRolling(data, entry.length, entry.key, true);
         } else {
             RuntimeStreamCipher::ApplyLegacyXor(data, entry.length, entry.key);
         }
+        if (std::equal(plaintext.begin(), plaintext.end(), data)) {
+            m_lastError = "string cipher produced unchanged plaintext";
+            std::fill(plaintext.begin(), plaintext.end(),
+                static_cast<BYTE>(0));
+            return false;
+        }
+
+        std::copy(data, data + entry.length, verified.begin());
+        if (image->is64Bit) {
+            RuntimeStreamCipher::ApplyRolling(
+                verified.data(), entry.length, entry.key, false);
+        } else {
+            RuntimeStreamCipher::ApplyLegacyXor(
+                verified.data(), entry.length, entry.key);
+        }
+        if (verified != plaintext ||
+            RuntimeStreamCipher::PlaintextDigest(
+                verified.data(), entry.length) != entry.plaintextDigest) {
+            m_lastError = "string cipher round-trip verification failed";
+            std::fill(plaintext.begin(), plaintext.end(),
+                static_cast<BYTE>(0));
+            std::fill(verified.begin(), verified.end(),
+                static_cast<BYTE>(0));
+            return false;
+        }
+        std::fill(plaintext.begin(), plaintext.end(),
+            static_cast<BYTE>(0));
+        std::fill(verified.begin(), verified.end(),
+            static_cast<BYTE>(0));
+        std::fill(entry.original.begin(), entry.original.end(), '\0');
+        entry.original.clear();
 
         // 更新加密后大小
         entry.encryptedSize = entry.length;
+        entry.ciphertextDigest =
+            RuntimeStreamCipher::PlaintextDigest(data, entry.length);
     }
 
     return true;
@@ -398,6 +459,76 @@ bool StringEncryptor::IsLikelyString(const BYTE* data, DWORD length) {
 
     // 至少 80% 的字符是可打印的
     return (printableCount * 100 / length) >= 80;
+}
+
+bool StringEncryptor::IsLoaderMetadataString(
+    const CS_PE_IMAGE* image,
+    const CS_STRING_ENTRY& entry) const {
+    if (!image || entry.isWideChar) {
+        return false;
+    }
+
+    const uint64_t entryBegin = entry.offset;
+    const uint64_t entryEnd = entryBegin + entry.length;
+    for (uint32_t index = 0;
+         index < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++index) {
+        const IMAGE_DATA_DIRECTORY directory =
+            PEUtils::GetDataDirectory(image, index);
+        if (directory.VirtualAddress == 0 || directory.Size == 0) {
+            continue;
+        }
+        uint32_t directoryOffset = 0;
+        if (index == IMAGE_DIRECTORY_ENTRY_SECURITY) {
+            directoryOffset = directory.VirtualAddress;
+        } else {
+            directoryOffset =
+                PEUtils::RvaToOffset(image, directory.VirtualAddress);
+        }
+        if (directoryOffset == 0) {
+            continue;
+        }
+        const uint64_t directoryBegin = directoryOffset;
+        const uint64_t directoryEnd =
+            directoryBegin + directory.Size;
+        if (entryBegin < directoryEnd &&
+            directoryBegin < entryEnd) {
+            return true;
+        }
+    }
+
+    const auto matches = [&](const std::string& value) {
+        return !value.empty() && value == entry.original;
+    };
+    for (const CS_IMPORT_DLL& dll : image->imports.dlls) {
+        if (matches(dll.dllName)) {
+            return true;
+        }
+        for (const CS_IMPORT_FUNCTION& function : dll.functions) {
+            if (!function.isOrdinal && matches(function.name)) {
+                return true;
+            }
+        }
+    }
+    for (const CS_DELAY_IMPORT_DLL& dll : image->delayImports.dlls) {
+        if (matches(dll.dllName)) {
+            return true;
+        }
+        for (const CS_IMPORT_FUNCTION& function : dll.functions) {
+            if (!function.isOrdinal && matches(function.name)) {
+                return true;
+            }
+        }
+    }
+    if (matches(image->exports.dllName)) {
+        return true;
+    }
+    for (const CS_EXPORT_FUNCTION& function : image->exports.functions) {
+        if (matches(function.name) ||
+            (function.isForwarded && matches(function.forwarderName))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool StringEncryptor::IsStringReference(CS_PE_IMAGE* image, DWORD codeOffset, DWORD& stringRVA) {

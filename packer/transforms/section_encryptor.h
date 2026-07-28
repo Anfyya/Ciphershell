@@ -34,6 +34,8 @@ struct CS_ENCRYPTED_SECTION {
     DWORD       originalSize;       // 原始大小
     DWORD       encryptedSize;      // 加密后大小（可能因对齐而不同）
     DWORD       originalCharacteristics; // 运行时恢复 W^X 时使用的原始节权限
+    DWORD       plaintextDigest;    // 启动解密后的完整明文校验
+    DWORD       ciphertextDigest;   // 重建/写盘后密文未被复活或改写
     CS_ENCRYPTION_KEY sectionKey;   // 每个 section 的独立密钥
 };
 

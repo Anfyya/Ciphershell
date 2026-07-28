@@ -9,12 +9,13 @@
 // 时，请同时核对 packer/cli_options.h、packer/config/config_parser.h、
 // config/full_example.toml 三处是否一致。
 //
-// string_encryption / import_protection / section_encryption 以及
-// control_flow.bogus 这几个开关在当前后端里是 fail-closed：显式启用会被
+// import_protection / section_encryption 以及 control_flow.bogus 这几个
+// 开关在当前后端里是 fail-closed：显式启用会被
 // CapabilityChecker 在任何 PE 改动之前 fatal 拒绝（见
 // packer/analysis/capability_checker.cpp）。本模型仍保留这些字段（配合
 // UI 上以只读方式展示真实默认值），但没有对应的“启用”状态可写，写出的
 // TOML 里这些模块永远是 enabled = false。
+// string_encryption 已接入生产链，作为独立可编辑模型暴露。
 //
 // control_flow.flattening 不在上面这份 fail-closed 名单里：它有独立的本地
 // 代码/重定位/unwind/入口修补闭环（CapabilityChecker::CheckImage 不会无条件
@@ -110,19 +111,20 @@ struct PerformanceOptions {
     double maxVmOverheadRatio = 15.0;
 };
 
-// 只读展示：string_encryption / import_protection / section_encryption 的
-// 真实默认字段值（取自 config/full_example.toml），用于在“当前不可用模块”
-// 页面里如实显示 schema，而不是让用户凭空猜。enabled 恒为 false。
-struct UnavailableModuleDefaults {
-    struct {
-        int strength = 80;
-        std::string mode = "startup";
-        bool ascii = true;
-        bool utf16 = true;
-        bool resources = false;
-        bool clearAfterUse = false;
-    } stringEncryption;
+// 对应 config_parser.h::StringEncryptionConfig。当前生产链支持启动期恢复，
+// 但 resources / clear_after_use 仍由 CapabilityChecker fail-closed 拒绝。
+struct StringEncryptionOptions {
+    bool enabled = false;
+    int strength = 80;
+    std::string mode = "startup";
+    bool ascii = true;
+    bool utf16 = true;
+    bool resources = false;
+    bool clearAfterUse = false;
+};
 
+// 只读展示：import_protection / section_encryption 的真实默认字段值。
+struct UnavailableModuleDefaults {
     struct {
         int strength = 60;
     } importProtection;
@@ -141,6 +143,7 @@ struct AppConfig {
     AntiDebugOptions antiDebug;
     AntiDumpOptions antiDump;
     PerformanceOptions performance;
+    StringEncryptionOptions stringEncryption;
     UnavailableModuleDefaults unavailable;  // 只读展示用，不写入 TOML 的可变部分
 };
 

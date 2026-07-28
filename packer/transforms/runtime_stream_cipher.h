@@ -6,6 +6,15 @@
 namespace CipherShell {
 namespace RuntimeStreamCipher {
 
+inline uint32_t PlaintextDigest(const uint8_t* data, uint32_t size) {
+    uint32_t digest = 2166136261u;
+    for (uint32_t index = 0; index < size; ++index) {
+        digest ^= data[index];
+        digest *= 16777619u;
+    }
+    return digest;
+}
+
 inline uint32_t LoadLe32(const uint8_t* value) {
     return static_cast<uint32_t>(value[0]) |
         (static_cast<uint32_t>(value[1]) << 8) |

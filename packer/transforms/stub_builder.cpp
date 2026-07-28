@@ -17,7 +17,7 @@ constexpr uint32_t kPageReadWrite = 0x04u;
 constexpr uint32_t kPageExecute = 0x10u;
 constexpr uint32_t kPageExecuteRead = 0x20u;
 constexpr uint32_t kTaskHeaderSize = 20u;
-constexpr uint32_t kTaskSize = 44u;
+constexpr uint32_t kTaskSize = 48u;
 constexpr uint32_t kLoaderFlagTlsCallback = 0x00000001u;
 
 struct LoaderTask {
@@ -25,6 +25,7 @@ struct LoaderTask {
     uint32_t size = 0;
     uint32_t finalProtection = 0;
     std::array<uint8_t, 32> key{};
+    uint32_t plaintextDigest = 0;
 };
 
 struct Label {
@@ -130,6 +131,7 @@ void AppendLoaderTable(
         AppendU32(code, task.size);
         AppendU32(code, task.finalProtection);
         code.insert(code.end(), task.key.begin(), task.key.end());
+        AppendU32(code, task.plaintextDigest);
     }
 }
 
@@ -223,6 +225,7 @@ X64StubImage BuildX64Stub(
     c.Jnz(rollingStateReady);
     c.Raw({0x41,0xBB}); c.U32(0x0C5C5E11u);  // Match RuntimeStreamCipher zero-state fallback.
     c.Bind(rollingStateReady);
+    c.U8(0xBD); c.U32(2166136261u);           // ebp = plaintext FNV-1a digest
     c.Bind(decryptLoop);
     c.Raw({0x85,0xD2});
     c.Jz(nextTask);
@@ -230,6 +233,8 @@ X64StubImage BuildX64Stub(
     c.Raw({0x43,0x8A,0x04,0x0A});            // al = key[r9]
     c.Raw({0x44,0x30,0xD8});                 // xor al, r11b
     c.Raw({0x30,0x01});                      // xor [rcx], al
+    c.Raw({0x0F,0xB6,0x01,0x31,0xC5});       // digest ^= decrypted byte
+    c.Raw({0x69,0xED}); c.U32(16777619u);     // digest *= FNV prime
     c.Raw({0x41,0xC1,0xCB,0x08});            // ror r11d, 8
     c.Raw({0x45,0x0F,0xB6,0xC0});            // movzx r8d, r8b
     c.Raw({0x45,0x31,0xC3});                 // xor r11d, r8d
@@ -243,6 +248,8 @@ X64StubImage BuildX64Stub(
     c.Jmp(decryptLoop);
 
     c.Bind(nextTask);
+    c.Raw({0x3B,0x6F,0x2C});                 // cmp ebp,[rdi+plaintextDigest]
+    c.Jnz(fail);
     // Restore the original non-RWX protection.
     c.Raw({0x4C,0x89,0xE9});
     c.Raw({0x44,0x89,0xF2});
@@ -313,7 +320,7 @@ std::vector<uint8_t> BuildX86Stub(
 
     c.U8(0x9C); // pushfd
     c.U8(0x60); // pushad
-    c.Raw({0x83,0xEC,0x18}); // locals: old,target,size,count,vpIat,flushIat
+    c.Raw({0x83,0xEC,0x1C}); // locals: old,target,size,count,vpIat,flushIat,digest
     // EBX = image base.
     c.Raw({0x64,0xA1}); c.U32(0x30);
     c.Raw({0x8B,0x58,0x08});
@@ -346,11 +353,16 @@ std::vector<uint8_t> BuildX86Stub(
     c.Raw({0x8B,0x4C,0x24,0x08});
     c.Raw({0x8D,0x6E,0x0C});
     c.Raw({0x31,0xD2});
+    c.Raw({0xC7,0x44,0x24,0x18}); c.U32(2166136261u);
     c.Bind(decryptLoop);
     c.Raw({0x85,0xC9});
     c.Jz(decrypted);
     c.Raw({0x8A,0x44,0x15,0x00});
     c.Raw({0x30,0x07,0x47,0x42,0x83,0xFA,0x20});
+    c.Raw({0x0F,0xB6,0x47,0xFF});             // eax = byte just decrypted
+    c.Raw({0x31,0x44,0x24,0x18});
+    c.Raw({0x69,0x44,0x24,0x18}); c.U32(16777619u);
+    c.Raw({0x89,0x44,0x24,0x18});
     c.Jb8(keyNoWrap);
     c.Raw({0x31,0xD2});
     c.Bind(keyNoWrap);
@@ -358,6 +370,8 @@ std::vector<uint8_t> BuildX86Stub(
     c.Jmp(decryptLoop);
 
     c.Bind(decrypted);
+    c.Raw({0x8B,0x44,0x24,0x18,0x3B,0x46,0x2C});
+    c.Jnz(fail);
     // Restore original protection.
     c.Raw({0x8D,0x04,0x24,0x50});
     c.Raw({0xFF,0x76,0x08});
@@ -379,7 +393,7 @@ std::vector<uint8_t> BuildX86Stub(
     c.Jmp(loop);
 
     c.Bind(done);
-    c.Raw({0x83,0xC4,0x18,0x61,0x9D});
+    c.Raw({0x83,0xC4,0x1C,0x61,0x9D});
     if (tlsCallback) {
         c.Raw({0xC2,0x0C,0x00});
     } else {
@@ -547,6 +561,7 @@ StubEmbedResult StubBuilder::EmbedStub(
         }
         std::copy(std::begin(encrypted.sectionKey.key), std::end(encrypted.sectionKey.key),
             task.key.begin());
+        task.plaintextDigest = encrypted.plaintextDigest;
         tasks.push_back(task);
     }
     if (tasks.empty()) {

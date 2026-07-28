@@ -19,10 +19,13 @@ namespace CipherShell {
 // ============================================================================
 
 struct CS_STRING_ENTRY {
+    WORD        sectionIndex;   // 所属原始 section
     DWORD       rva;            // 字符串 RVA
     DWORD       offset;         // 文件偏移
     DWORD       length;         // 字符串长度（含 null）
     DWORD       encryptedSize;  // 加密后大小
+    DWORD       plaintextDigest;// 启动解密后的完整明文校验
+    DWORD       ciphertextDigest;// 最终密文字节校验
     uint8_t     key[32];        // 每个字符串的独立密钥
     uint8_t     nonce[12];      // 随机数
     std::string original;       // 原始字符串（用于调试）
@@ -53,6 +56,7 @@ struct CS_STRING_CONFIG {
     bool        insertDecryptionStub; // 是否插入解密桩
     bool        scanReadableSections; // 扫描可读 section（.rdata/.data 等）
     bool        scanResources;        // 扫描资源字符串表
+    WORD        excludeSectionsAtOrAfter; // 不扫描打包器后加 section
 
     CS_STRING_CONFIG() :
         minLength(4),
@@ -61,7 +65,8 @@ struct CS_STRING_CONFIG {
         encryptAnsiStrings(true),
         insertDecryptionStub(true),
         scanReadableSections(true),
-        scanResources(false) {}
+        scanResources(false),
+        excludeSectionsAtOrAfter(0xFFFFu) {}
 };
 
 // ============================================================================
@@ -121,6 +126,9 @@ private:
     // 字符串检测
     bool IsPrintableString(const BYTE* data, DWORD length, bool& isWide);
     bool IsLikelyString(const BYTE* data, DWORD length);
+    bool IsLoaderMetadataString(
+        const CS_PE_IMAGE* image,
+        const CS_STRING_ENTRY& entry) const;
 
     // 引用查找
     bool IsStringReference(CS_PE_IMAGE* image, DWORD codeOffset, DWORD& stringRVA);

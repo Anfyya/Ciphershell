@@ -133,6 +133,12 @@ private:
     HWND m_autoHotspotCheck = nullptr;
     HWND m_maxOverheadEdit = nullptr;
 
+    // --- 数据保护页 ---
+    HWND m_stringEncryptionCheck = nullptr;
+    HWND m_stringStrengthEdit = nullptr;
+    HWND m_stringAsciiCheck = nullptr;
+    HWND m_stringUtf16Check = nullptr;
+
     // --- 运行页 ---
     HWND m_summaryLabel = nullptr;
     HWND m_startButton = nullptr;

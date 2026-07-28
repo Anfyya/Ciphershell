@@ -76,6 +76,15 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
         }
 
         const DWORD originalCharacteristics = section->Characteristics;
+        const DWORD rawOffset = section->PointerToRawData;
+        const DWORD rawSize = section->SizeOfRawData;
+        if (rawOffset > image->rawSize ||
+            rawSize > image->rawSize - rawOffset) {
+            continue;
+        }
+        const DWORD plaintextDigest =
+            RuntimeStreamCipher::PlaintextDigest(
+                image->rawData + rawOffset, rawSize);
         // 加密 section
         if (EncryptSection(image, i, sectionKey)) {
             CS_ENCRYPTED_SECTION encSection{};
@@ -84,6 +93,11 @@ std::vector<CS_ENCRYPTED_SECTION> SectionEncryptor::EncryptSections(
             encSection.originalSize = section->Misc.VirtualSize;
             encSection.encryptedSize = section->SizeOfRawData;
             encSection.originalCharacteristics = originalCharacteristics;
+            encSection.plaintextDigest = plaintextDigest;
+            encSection.ciphertextDigest =
+                RuntimeStreamCipher::PlaintextDigest(
+                    image->rawData + section->PointerToRawData,
+                    section->SizeOfRawData);
             memcpy(&encSection.sectionKey, &sectionKey, sizeof(CS_ENCRYPTION_KEY));
 
             result.push_back(encSection);
@@ -169,7 +183,8 @@ BYTE* SectionEncryptor::SerializeKeys(
 
     // 计算输出大小
     // 格式：[section_count:4][section_info:N*56]
-    DWORD totalSize = 4 + (DWORD)encryptedSections.size() * (4 + 4 + 4 + 4 + 32 + 12 + 4);
+    DWORD totalSize = 4 + (DWORD)encryptedSections.size() *
+        (4 + 4 + 4 + 4 + 32 + 12 + 4 + 4);
 
     BYTE* output = new(std::nothrow) BYTE[totalSize];
     if (!output) {
@@ -202,6 +217,9 @@ BYTE* SectionEncryptor::SerializeKeys(
         offset += 12;
 
         *(DWORD*)(output + offset) = encSection.sectionKey.counter;
+        offset += 4;
+
+        *(DWORD*)(output + offset) = encSection.plaintextDigest;
         offset += 4;
     }
 
@@ -382,6 +400,3 @@ void SectionEncryptor::SecureZeroMemory(void* ptr, size_t size) {
 }
 
 } // namespace CipherShell
-
-
-

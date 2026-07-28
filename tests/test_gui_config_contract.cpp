@@ -30,7 +30,6 @@ bool RequestsUnimplementedPlus(const CipherShell::CipherShellConfig& config) {
 
 bool RequestsAnyFailClosedModule(const CipherShell::CipherShellConfig& config) {
     return RequestsUnimplementedPlus(config) ||
-        config.stringEncryption.enabled ||
         config.importProtection.enabled ||
         config.sectionEncryption.enabled ||
         config.controlFlow.bogusEnabled;
@@ -45,6 +44,16 @@ void CheckGuiRuntimeDefaults() {
         "GUI VM 运行默认 RVA 目标必须为空");
     Check(defaults.controlFlow.flatteningTargets.empty(),
         "GUI flattening 运行默认目标必须为空，不能继承示例占位符");
+    Check(!defaults.stringEncryption.enabled,
+        "GUI 字符串加密默认必须关闭，不能改变既有出包行为");
+    Check(defaults.stringEncryption.mode == "startup",
+        "GUI 字符串加密只能写出已闭环的 startup 模式");
+    Check(defaults.stringEncryption.ascii &&
+            defaults.stringEncryption.utf16,
+        "GUI 字符串加密默认字符集必须覆盖 ASCII 与 UTF-16");
+    Check(!defaults.stringEncryption.resources &&
+            !defaults.stringEncryption.clearAfterUse,
+        "GUI 不得默认请求尚未闭环的资源/使用后清除模式");
 
     const auto& antiDebug = defaults.antiDebug;
     Check(!antiDebug.timingChecks, "GUI timing_checks 默认必须为 false");
@@ -333,6 +342,12 @@ void CheckEditedGuiRoundTrip() {
     edited.performance.autoHotspotAnalysis = false;
     edited.performance.maxVmOverheadRatio = 7.125;
 
+    edited.stringEncryption.enabled = true;
+    edited.stringEncryption.strength = 91;
+    edited.stringEncryption.mode = "startup";
+    edited.stringEncryption.ascii = true;
+    edited.stringEncryption.utf16 = false;
+
     CipherShell::ConfigParser parser;
     const CipherShell::CipherShellConfig parsed =
         parser.LoadFromString(CipherShellGui::BuildConfigToml(edited));
@@ -431,6 +446,25 @@ void CheckEditedGuiRoundTrip() {
     Check(parsed.performance.maxVMOverheadRatio ==
             edited.performance.maxVmOverheadRatio,
         "performance.max_vm_overhead_ratio 往返不一致");
+
+    Check(parsed.stringEncryption.enabled ==
+            edited.stringEncryption.enabled,
+        "string_encryption.enabled 往返不一致");
+    Check(parsed.stringEncryption.strength ==
+            edited.stringEncryption.strength,
+        "string_encryption.strength 往返不一致");
+    Check(parsed.stringEncryption.mode ==
+            edited.stringEncryption.mode,
+        "string_encryption.mode 往返不一致");
+    Check(parsed.stringEncryption.ascii ==
+            edited.stringEncryption.ascii,
+        "string_encryption.ascii 往返不一致");
+    Check(parsed.stringEncryption.utf16 ==
+            edited.stringEncryption.utf16,
+        "string_encryption.utf16 往返不一致");
+    Check(!parsed.stringEncryption.resources &&
+            !parsed.stringEncryption.clearAfterUse,
+        "GUI 必须固定关闭尚未闭环的资源/使用后清除模式");
 }
 
 void CheckGlobalOneHotRoundTrips() {
