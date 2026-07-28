@@ -3169,6 +3169,7 @@ void TestPlusMbaCodegenEvidence() {
         for (const VM_MICRO_OPCODE semantic : semantics) {
             uint8_t previousComplexity = 0u;
             uint32_t previousSize = 0u;
+            uint8_t previousRounds = 0u;
             for (const uint8_t strength : strengths) {
                 VMHandlerSemanticCodegenConfig config{};
                 config.architecture = architecture;
@@ -3186,11 +3187,24 @@ void TestPlusMbaCodegenEvidence() {
                 Require(generated.mbaApplied && generated.mbaComplexity > 0u &&
                     generated.mbaStrategy == generated.semanticCoreStrategy,
                     "Plus MBA did not publish exact applied/complexity evidence");
-                Require(generated.mbaComplexity > previousComplexity &&
-                    generated.semanticCoreVariantSize > previousSize,
-                    "Plus MBA strength did not monotonically increase real core complexity");
+                const uint8_t rounds = static_cast<uint8_t>(
+                    1u + (strength - 1u) / 25u);
+                const uint8_t expectedComplexity = static_cast<uint8_t>(
+                    (semantic == VM_UOP_SUB ? 6u : 3u) + 5u * rounds);
+                Require(generated.mbaComplexity == expectedComplexity,
+                    "Plus MBA strength did not publish the exact tier complexity");
+                if (previousRounds != 0u && rounds > previousRounds) {
+                    Require(generated.mbaComplexity > previousComplexity &&
+                        generated.semanticCoreVariantSize > previousSize,
+                        "Plus MBA tier transition did not increase real core complexity");
+                } else if (previousRounds == rounds) {
+                    Require(generated.mbaComplexity == previousComplexity &&
+                        generated.semanticCoreVariantSize == previousSize,
+                        "Plus MBA strengths in the same tier emitted inconsistent complexity");
+                }
                 previousComplexity = generated.mbaComplexity;
                 previousSize = generated.semanticCoreVariantSize;
+                previousRounds = rounds;
 
                 std::string validationError;
                 Require(ValidateVMHandlerSemanticVariantKernel(

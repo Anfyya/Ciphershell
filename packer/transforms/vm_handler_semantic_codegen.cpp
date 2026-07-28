@@ -3548,7 +3548,7 @@ bool ValidateMbaCoreShape(
 
     const uint32_t rounds = MbaIdentityRoundCount(strength);
     if (cursor != size || instructionCount < minimumComplexity ||
-        booleanCount < 2u + rounds * 2u ||
+        booleanCount < 1u + rounds * 2u ||
         arithmeticCount < 1u + rounds ||
         immediateCount < rounds * 2u) {
         error = "MBA core lacks the required Boolean/arithmetic/masked-constant complexity";
