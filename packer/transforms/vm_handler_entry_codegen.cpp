@@ -3421,6 +3421,10 @@ bool BuildValidationEntry(
         code.Raw({0x89,0x8F}); code.U32(CtxFlushInstructionCache);
         code.Raw({0xE8,0x00,0x00,0x00,0x00,0x5E});
         const uint32_t pop = code.CurrentImageOffset() - 1u;
+        // ESI is reused below to walk the per-function decode-plan table.
+        // Preserve the get-PC anchor so state-chain RVAs remain relative to the
+        // emitted VM section instead of to whichever plan record was selected.
+        code.Raw({0x89,0x75,0xEC});
         code.Raw({0x8D,0x86}); code.U32(config.layout.operandDecoderOffset - pop);
         code.Raw({0x89,0x87}); code.U32(CtxDecodeOperands);
         code.Raw({0x8D,0x86}); code.U32(config.layout.flagMaterializerOffset - pop);
@@ -3455,7 +3459,7 @@ bool BuildValidationEntry(
         if (config.stateChainingEnabled) {
             code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
                 offsetof(RuntimeFunctionDecodeTable, stateChainStartIndex)));
-            code.Raw({0xC1,0xE0,0x04,0x8D,0x96});
+            code.Raw({0xC1,0xE0,0x04,0x8B,0x55,0xEC,0x81,0xC2});
             code.U32(config.layout.stateChainTableOffset - pop);
             code.Raw({0x01,0xD0,0x89,0x87}); code.U32(CtxStateChainTable);
             code.Raw({0x8B,0x46}); code.U8(static_cast<uint8_t>(
