@@ -414,6 +414,40 @@ void TestStartupStringCipherRoundTripAndPlaintextRemoval() {
     }
 }
 
+void TestStringScannerExcludesIndirectDebugPayloads() {
+    for (const bool is64Bit : {false, true}) {
+        auto* image = BuildMinimalImage(
+            false, true, is64Bit);
+        CS_TEST_CHECK(image && image->isValid);
+        auto& section = image->sections[0];
+        std::memset(section.Name, 0, sizeof(section.Name));
+        std::memcpy(section.Name, ".rdata", 6);
+        section.Characteristics =
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+
+        CipherShell::CS_STRING_CONFIG config;
+        config.minLength = 4;
+        config.encryptWideStrings = false;
+        config.excludeSectionsAtOrAfter = 1;
+        CipherShell::StringEncryptor encryptor;
+        const auto strings = encryptor.ScanStrings(image, config);
+        CS_TEST_CHECK(!encryptor.HasError());
+        for (const auto& entry : strings) {
+            const uint64_t entryBegin = entry.offset;
+            const uint64_t entryEnd =
+                entryBegin + entry.length;
+            const uint64_t debugBegin = kDebugPayloadOffset;
+            const uint64_t debugEnd =
+                debugBegin + sizeof(kCodeViewPayload);
+            CS_TEST_CHECK(entryEnd <= debugBegin ||
+                debugEnd <= entryBegin);
+        }
+
+        CipherShell::PEParser parser;
+        parser.FreeImage(image);
+    }
+}
+
 void TestControlFlowMasterNoopRejected() {
     // 总开关开启但无子功能 → no-op，被 fatal 拒绝。
     CipherShell::ConfigParser parser;
@@ -1176,6 +1210,7 @@ int main() {
     TestSupportedStringEncryptionAccepted();
     TestUnsupportedStringEncryptionModesRejected();
     TestStartupStringCipherRoundTripAndPlaintextRemoval();
+    TestStringScannerExcludesIndirectDebugPayloads();
     TestControlFlowMasterNoopRejected();
     TestSignatureEliminatorKeepsReadOnlyPermissions();
     TestSignatureEliminatorHonorsEnabledGlobalControls();

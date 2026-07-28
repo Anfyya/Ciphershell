@@ -9,6 +9,7 @@
 #include "../pe_parser/pe_parser.h"
 #include "../third_party/chacha20.h"
 #include <cstdint>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -141,6 +142,7 @@ private:
     bool GenerateRandomBytes(uint8_t* buffer, DWORD length);
 
     std::string m_lastError;
+    std::vector<std::pair<DWORD, DWORD>> m_loaderMetadataRanges;
 };
 
 } // namespace CipherShell

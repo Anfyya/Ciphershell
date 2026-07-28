@@ -4,6 +4,7 @@
 
 #include "string_encryptor.h"
 #include "runtime_stream_cipher.h"
+#include "../pe_parser/debug_directory_scrubber.h"
 #include "../pe_parser/pe_utils.h"
 #include <algorithm>
 #include <cstring>
@@ -38,9 +39,52 @@ std::vector<CS_STRING_ENTRY> StringEncryptor::ScanStrings(
 {
     std::vector<CS_STRING_ENTRY> result;
     m_lastError.clear();
+    m_loaderMetadataRanges.clear();
 
     if (!image || !image->isValid) {
         return result;
+    }
+
+    try {
+        for (uint32_t index = 0;
+             index < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++index) {
+            const IMAGE_DATA_DIRECTORY directory =
+                PEUtils::GetDataDirectory(image, index);
+            if (directory.VirtualAddress == 0 || directory.Size == 0) {
+                continue;
+            }
+            const DWORD directoryOffset =
+                index == IMAGE_DIRECTORY_ENTRY_SECURITY
+                    ? directory.VirtualAddress
+                    : PEUtils::RvaToOffset(
+                        image, directory.VirtualAddress);
+            if (directoryOffset != 0) {
+                m_loaderMetadataRanges.emplace_back(
+                    directoryOffset, directory.Size);
+            }
+        }
+
+        // Debug DataDirectory 只覆盖 IMAGE_DEBUG_DIRECTORY 数组，实际
+        // CodeView/PDB 载荷由 PointerToRawData/AddressOfRawData 间接引用。
+        // 后续 strip_debug_info 会擦除这些载荷，因此必须在字符串阶段排除，
+        // 否则最终重建验证会正确发现“密文被后续元数据变换改写”。
+        std::vector<DebugScrubRange> debugRanges;
+        std::string debugReason;
+        if (!CollectDebugScrubRanges(
+                image, image->rawData, image->rawSize,
+                debugRanges, debugReason)) {
+            m_lastError =
+                "failed to collect debug metadata exclusions: " +
+                debugReason;
+            return {};
+        }
+        for (const DebugScrubRange& range : debugRanges) {
+            m_loaderMetadataRanges.emplace_back(
+                range.fileOffset, range.size);
+        }
+    } catch (...) {
+        m_lastError = "loader metadata exclusion allocation failed";
+        return {};
     }
 
     // 扫描所有 section
@@ -470,26 +514,10 @@ bool StringEncryptor::IsLoaderMetadataString(
 
     const uint64_t entryBegin = entry.offset;
     const uint64_t entryEnd = entryBegin + entry.length;
-    for (uint32_t index = 0;
-         index < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++index) {
-        const IMAGE_DATA_DIRECTORY directory =
-            PEUtils::GetDataDirectory(image, index);
-        if (directory.VirtualAddress == 0 || directory.Size == 0) {
-            continue;
-        }
-        uint32_t directoryOffset = 0;
-        if (index == IMAGE_DIRECTORY_ENTRY_SECURITY) {
-            directoryOffset = directory.VirtualAddress;
-        } else {
-            directoryOffset =
-                PEUtils::RvaToOffset(image, directory.VirtualAddress);
-        }
-        if (directoryOffset == 0) {
-            continue;
-        }
-        const uint64_t directoryBegin = directoryOffset;
+    for (const auto& range : m_loaderMetadataRanges) {
+        const uint64_t directoryBegin = range.first;
         const uint64_t directoryEnd =
-            directoryBegin + directory.Size;
+            directoryBegin + range.second;
         if (entryBegin < directoryEnd &&
             directoryBegin < entryEnd) {
             return true;
