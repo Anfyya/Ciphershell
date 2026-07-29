@@ -170,6 +170,7 @@ X64StubImage BuildX64Stub(
     uint32_t flushInstructionCacheIatRVA,
     uint32_t originalEntryPointRVA,
     bool tlsCallback,
+    bool moduleBaseFromFirstArgument,
     bool preservePEHeaders,
     std::string& error)
 {
@@ -190,9 +191,14 @@ X64StubImage BuildX64Stub(
     c.Raw({0x48,0x89,0x54,0x24,0x38});
     c.Raw({0x4C,0x89,0x44,0x24,0x40});
 
-    // RBX = image base.
-    c.Raw({0x65,0x48,0x8B,0x1C,0x25,0x60,0x00,0x00,0x00});
-    c.Raw({0x48,0x8B,0x5B,0x10});
+    // DLL entry 与 TLS callback 的 RCX 是当前模块 HMODULE；普通 EXE
+    // entry 没有该 ABI 保证，才从 PEB 取主映像基址。
+    if (moduleBaseFromFirstArgument) {
+        c.Raw({0x48,0x89,0xCB});             // rbx = rcx
+    } else {
+        c.Raw({0x65,0x48,0x8B,0x1C,0x25,0x60,0x00,0x00,0x00});
+        c.Raw({0x48,0x8B,0x5B,0x10});
+    }
     // RSI = table base, RDI = first task, R12D = task count.
     c.Raw({0x48,0x8D,0x35}); c.Rel32(table);
     c.Raw({0x44,0x8B,0x26});
@@ -304,6 +310,7 @@ std::vector<uint8_t> BuildX86Stub(
     uint32_t flushInstructionCacheIatRVA,
     uint32_t originalEntryPointRVA,
     bool tlsCallback,
+    bool moduleBaseFromFirstArgument,
     bool preservePEHeaders,
     std::string& error)
 {
@@ -317,9 +324,13 @@ std::vector<uint8_t> BuildX86Stub(
     c.U8(0x9C); // pushfd
     c.U8(0x60); // pushad
     c.Raw({0x83,0xEC,0x1C}); // locals: old,target,size,count,vpIat,flushIat,digest
-    // EBX = image base.
-    c.Raw({0x64,0xA1}); c.U32(0x30);
-    c.Raw({0x8B,0x58,0x08});
+    // pushfd + pushad + 0x1C locals 后，原始第一个参数位于 esp+0x44。
+    if (moduleBaseFromFirstArgument) {
+        c.Raw({0x8B,0x5C,0x24,0x44});        // ebx = HMODULE
+    } else {
+        c.Raw({0x64,0xA1}); c.U32(0x30);
+        c.Raw({0x8B,0x58,0x08});
+    }
     // ESI = table base via call/pop, then task base.
     c.U8(0xE8); c.U32(0);
     const size_t popAddress = c.Size();
@@ -579,6 +590,12 @@ StubEmbedResult StubBuilder::EmbedStub(
     result.flushInstructionCacheIatRVA = imports.flushInstructionCacheIatRVA;
 
     const bool useTls = image->tls.valid && image->tls.directoryRVA != 0;
+    const WORD fileCharacteristics = image->is64Bit
+        ? image->ntHeaders64->FileHeader.Characteristics
+        : image->ntHeaders32->FileHeader.Characteristics;
+    const bool moduleBaseFromFirstArgument =
+        useTls ||
+        (fileCharacteristics & IMAGE_FILE_DLL) != 0;
     std::string buildError;
     std::vector<uint8_t> stub;
     std::vector<uint8_t> unwindInfo;
@@ -586,14 +603,16 @@ StubEmbedResult StubBuilder::EmbedStub(
     if (image->is64Bit) {
         X64StubImage built = BuildX64Stub(tasks, imports.virtualProtectIatRVA,
             imports.flushInstructionCacheIatRVA, originalEntryPointRVA,
-            useTls, preservePEHeaders, buildError);
+            useTls, moduleBaseFromFirstArgument,
+            preservePEHeaders, buildError);
         stub = std::move(built.code);
         unwindInfo = std::move(built.unwindInfo);
         executableSize = built.executableSize;
     } else {
         stub = BuildX86Stub(tasks, imports.virtualProtectIatRVA,
             imports.flushInstructionCacheIatRVA, originalEntryPointRVA,
-            useTls, preservePEHeaders, buildError);
+            useTls, moduleBaseFromFirstArgument,
+            preservePEHeaders, buildError);
     }
     if (stub.empty()) {
         result.error = buildError.empty() ? "loader stub generation failed" : buildError;
