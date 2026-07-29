@@ -175,8 +175,8 @@ X64StubImage BuildX64Stub(
 {
     (void)preservePEHeaders; // Headers remain intact for the authenticated VM metadata path.
     CodeBuffer c;
-    Label table, loop, decryptLoop, keyNoWrap, rollingStateReady, nextTask, done, fail;
-    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap, &rollingStateReady, &nextTask, &done, &fail}) c.Track(*label);
+    Label table, loop, decryptLoop, keyNoWrap, nextTask, done, fail;
+    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap, &nextTask, &done, &fail}) c.Track(*label);
 
     // ABI-correct prologue.  Preserve all x64 non-volatiles and the original
     // DLL/TLS arguments (RCX/RDX/R8) before invoking kernel32 APIs.
@@ -215,29 +215,19 @@ X64StubImage BuildX64Stub(
     c.Raw({0xFF,0xD0,0x85,0xC0});
     c.Jz(fail);
 
-    // Rolling stream decrypt used by SectionEncryptor on x64.
+    // 双架构共用 32 字节循环密钥；每个任务仍有独立随机密钥。
     c.Raw({0x4C,0x89,0xE9});                 // rcx = current byte
     c.Raw({0x44,0x89,0xF2});                 // edx = remaining
     c.Raw({0x4C,0x8D,0x57,0x0C});            // r10 = key
     c.Raw({0x45,0x31,0xC9});                 // r9d = key index
-    c.Raw({0x45,0x8B,0x1A});                 // r11d = rolling state
-    c.Raw({0x45,0x85,0xDB});                 // test r11d, r11d
-    c.Jnz(rollingStateReady);
-    c.Raw({0x41,0xBB}); c.U32(0x0C5C5E11u);  // Match RuntimeStreamCipher zero-state fallback.
-    c.Bind(rollingStateReady);
     c.U8(0xBD); c.U32(2166136261u);           // ebp = plaintext FNV-1a digest
     c.Bind(decryptLoop);
     c.Raw({0x85,0xD2});
     c.Jz(nextTask);
-    c.Raw({0x44,0x8A,0x01});                 // r8b = ciphertext feedback
     c.Raw({0x43,0x8A,0x04,0x0A});            // al = key[r9]
-    c.Raw({0x44,0x30,0xD8});                 // xor al, r11b
     c.Raw({0x30,0x01});                      // xor [rcx], al
     c.Raw({0x0F,0xB6,0x01,0x31,0xC5});       // digest ^= decrypted byte
     c.Raw({0x69,0xED}); c.U32(16777619u);     // digest *= FNV prime
-    c.Raw({0x41,0xC1,0xCB,0x08});            // ror r11d, 8
-    c.Raw({0x45,0x0F,0xB6,0xC0});            // movzx r8d, r8b
-    c.Raw({0x45,0x31,0xC3});                 // xor r11d, r8d
     c.Raw({0x48,0xFF,0xC1});                 // inc rcx
     c.Raw({0x41,0xFF,0xC1});                 // inc r9d
     c.Raw({0x41,0x83,0xF9,0x20});
@@ -358,11 +348,12 @@ std::vector<uint8_t> BuildX86Stub(
     c.Raw({0x85,0xC9});
     c.Jz(decrypted);
     c.Raw({0x8A,0x44,0x15,0x00});
-    c.Raw({0x30,0x07,0x47,0x42,0x83,0xFA,0x20});
+    c.Raw({0x30,0x07,0x47,0x42});
     c.Raw({0x0F,0xB6,0x47,0xFF});             // eax = byte just decrypted
     c.Raw({0x31,0x44,0x24,0x18});
     c.Raw({0x69,0x44,0x24,0x18}); c.U32(16777619u);
     c.Raw({0x89,0x44,0x24,0x18});
+    c.Raw({0x83,0xFA,0x20});                  // cmp key index,32 after digest flags
     c.Jb8(keyNoWrap);
     c.Raw({0x31,0xD2});
     c.Bind(keyNoWrap);

@@ -394,15 +394,9 @@ void TestStartupStringCipherRoundTripAndPlaintextRemoval() {
 
         std::vector<BYTE> decrypted(
             sectionData, sectionData + strings[0].length);
-        if (is64Bit) {
-            CipherShell::RuntimeStreamCipher::ApplyRolling(
-                decrypted.data(), strings[0].length,
-                strings[0].key, false);
-        } else {
-            CipherShell::RuntimeStreamCipher::ApplyLegacyXor(
-                decrypted.data(), strings[0].length,
-                strings[0].key);
-        }
+        CipherShell::RuntimeStreamCipher::ApplyLegacyXor(
+            decrypted.data(), strings[0].length,
+            strings[0].key);
         CS_TEST_CHECK(std::memcmp(decrypted.data(),
             kBusinessString, sizeof(kBusinessString)) == 0);
         CS_TEST_CHECK(strings[0].plaintextDigest ==

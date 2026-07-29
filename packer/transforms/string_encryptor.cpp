@@ -348,11 +348,8 @@ bool StringEncryptor::EncryptStrings(
         entry.plaintextDigest =
             RuntimeStreamCipher::PlaintextDigest(data, entry.length);
 
-        if (image->is64Bit) {
-            RuntimeStreamCipher::ApplyRolling(data, entry.length, entry.key, true);
-        } else {
-            RuntimeStreamCipher::ApplyLegacyXor(data, entry.length, entry.key);
-        }
+        RuntimeStreamCipher::ApplyLegacyXor(
+            data, entry.length, entry.key);
         if (std::equal(plaintext.begin(), plaintext.end(), data)) {
             m_lastError = "string cipher produced unchanged plaintext";
             std::fill(plaintext.begin(), plaintext.end(),
@@ -361,13 +358,8 @@ bool StringEncryptor::EncryptStrings(
         }
 
         std::copy(data, data + entry.length, verified.begin());
-        if (image->is64Bit) {
-            RuntimeStreamCipher::ApplyRolling(
-                verified.data(), entry.length, entry.key, false);
-        } else {
-            RuntimeStreamCipher::ApplyLegacyXor(
-                verified.data(), entry.length, entry.key);
-        }
+        RuntimeStreamCipher::ApplyLegacyXor(
+            verified.data(), entry.length, entry.key);
         if (verified != plaintext ||
             RuntimeStreamCipher::PlaintextDigest(
                 verified.data(), entry.length) != entry.plaintextDigest) {
