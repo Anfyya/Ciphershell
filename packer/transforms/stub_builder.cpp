@@ -271,6 +271,12 @@ X64StubImage BuildX64Stub(
     c.Jmp(loop);
 
     c.Bind(done);
+    if (!tlsCallback) {
+        // RBX 始终是当前受保护模块的基址。DLL 不能在成功路径上重新从
+        // PEB 读取宿主 EXE 基址，否则会跳到 host+originalEntryPointRVA。
+        c.Raw({0x48,0x89,0xD8});             // rax = current module base
+        c.Raw({0x48,0x05}); c.U32(originalEntryPointRVA);
+    }
     c.Raw({0x48,0x8B,0x4C,0x24,0x30});
     c.Raw({0x48,0x8B,0x54,0x24,0x38});
     c.Raw({0x4C,0x8B,0x44,0x24,0x40});
@@ -280,9 +286,6 @@ X64StubImage BuildX64Stub(
     if (tlsCallback) {
         c.U8(0xC3);
     } else {
-        c.Raw({0x65,0x48,0x8B,0x04,0x25,0x60,0x00,0x00,0x00});
-        c.Raw({0x48,0x8B,0x40,0x10});
-        c.Raw({0x48,0x05}); c.U32(originalEntryPointRVA);
         c.Raw({0xFF,0xE0});
     }
 
@@ -401,12 +404,16 @@ std::vector<uint8_t> BuildX86Stub(
     c.Jmp(loop);
 
     c.Bind(done);
+    if (!tlsCallback) {
+        // 当前 locals 下 pushad 保存的 EAX 槽位在 esp+0x38。把
+        // currentModule+OEP 写入该槽，popad 后 EAX 即为最终跳转目标。
+        c.Raw({0x8B,0xC3,0x05}); c.U32(originalEntryPointRVA);
+        c.Raw({0x89,0x44,0x24,0x38});
+    }
     c.Raw({0x83,0xC4,0x1C,0x61,0x9D});
     if (tlsCallback) {
         c.Raw({0xC2,0x0C,0x00});
     } else {
-        c.Raw({0x64,0xA1}); c.U32(0x30);
-        c.Raw({0x8B,0x40,0x08,0x05}); c.U32(originalEntryPointRVA);
         c.Raw({0xFF,0xE0});
     }
 
