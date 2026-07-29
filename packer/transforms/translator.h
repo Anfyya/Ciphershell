@@ -81,6 +81,11 @@ struct TranslationConfig {
     bool enableX87Bridge = true;
     VM_CALL_ABI x86CallAbi = VM_ABI_X86_AUTO;
     std::unordered_set<uint32_t> importThunkRVAs;
+    // Direct x64 CALL targets are accepted only when they name a discovered
+    // function entry.  The runtime bridge can then call either the surviving
+    // native body or the entry trampoline installed for a VM-protected callee;
+    // interior/unknown targets remain fail-closed.
+    std::unordered_set<uint32_t> nativeCallTargetRVAs;
 };
 
 struct VMIRModelPreflightConfig {
@@ -348,6 +353,7 @@ private:
         uint64_t& observableRflagsMask);
     void AnalyzeNativeCallStackArguments(const Function& function);
     bool ResolveX64ImportSlotCall(const InstructionIR& instruction, uint32_t& thunkRVA) const;
+    bool ResolveX64NativeRvaCall(const InstructionIR& instruction, uint32_t& targetRVA) const;
     bool FailInstruction(const InstructionIR& instruction, const std::string& reason);
     static std::string FormatInstructionBytes(const InstructionIR& instruction);
 

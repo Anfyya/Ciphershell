@@ -877,6 +877,18 @@ void TestMicroExecutorDeterministicHostCallModel() {
         "deterministic host-call model 返回后操作数栈未清空");
     Require(accepted.rflags == (0x202u | VM_FLAG_CF),
         "deterministic host-call model 意外破坏了已物化的 RFLAGS");
+    const std::vector<MicroInstruction> nativeProgram = {
+        Uop(VM_UOP_PUSH_IMM, {0x5000, 8}),
+        Uop(VM_UOP_CALL_HOST, {VM_MICRO_CALL_NATIVE_RVA, VM_ABI_WIN64, 0}),
+        Uop(VM_UOP_EXIT, {0})
+    };
+    VMMicroMachineState nativeAccepted{};
+    nativeAccepted.rflags = 0x202u | VM_FLAG_CF;
+    error.clear();
+    Require(ExecuteEncoded(nativeProgram, environment, nativeAccepted, memory, 0x1000, error),
+        "deterministic host-call model 未接受 x64 native RVA CALL_HOST: " + error);
+    Require(nativeAccepted.gpr[0] == CipherShell::VM_MICRO_HOST_CALL_MODEL_RESULT,
+        "deterministic native RVA host-call model 未写入约定的 RAX 返回值");
 }
 
 void TestDifferentialArchitectureState() {
@@ -1773,7 +1785,8 @@ TranslationResult TranslateForGate(
     VMMicroDensity density,
     uint32_t minimumRatio,
     const OpcodeMaps& maps,
-    const std::unordered_set<uint32_t>* importThunkRVAs = nullptr)
+    const std::unordered_set<uint32_t>* importThunkRVAs = nullptr,
+    const std::unordered_set<uint32_t>* nativeCallTargetRVAs = nullptr)
 {
     TranslationConfig config{};
     config.virtualRegisterCount = 32;
@@ -1785,6 +1798,9 @@ TranslationResult TranslateForGate(
     config.enableX87Bridge = true;
     if (importThunkRVAs) {
         config.importThunkRVAs = *importThunkRVAs;
+    }
+    if (nativeCallTargetRVAs) {
+        config.nativeCallTargetRVAs = *nativeCallTargetRVAs;
     }
     Translator translator;
     Require(translator.Initialize(config), "Translator 拒绝合法微操作配置");
@@ -2714,6 +2730,76 @@ void TestTranslatorX64ImportCallHostModel() {
         "x64 import CALL_HOST preflight failed: " + verified.error);
 }
 
+void TestTranslatorX64NativeRvaCallHostModel() {
+    CipherShell::Function function = MakeImportCallFunction();
+    function.name = "micro_gate_native_call";
+    auto& call = function.blocks[0].instructions[1];
+    call.rawBytes[0] = 0xE8;
+    call.rawBytes[1] = 0xF6;
+    call.rawBytes[2] = 0x0F;
+    call.rawBytes[3] = 0x00;
+    call.rawBytes[4] = 0x00;
+    call.length = 5;
+    call.displacementOffset = 1;
+    call.displacementSize = 4;
+    call.isIndirectBranch = false;
+    call.hasBranchTarget = true;
+    call.branchTargetRVA = 0x5000;
+    call.branchTargetVA = 0x0000000140005000ULL;
+    call.operands.clear();
+    auto& ret = function.blocks[0].instructions[2];
+    ret.address = 0x400A;
+    ret.rva = 0x400A;
+    function.blocks[0].endAddress = 0x400B;
+    function.size = 0x0B;
+    function.decodedBytes = 0x0B;
+
+    OpcodeMaps maps = MakeOpcodeMaps(MakeSeed(0xD4));
+    KeepRuntimeSupportedOpcodes(maps, true);
+    const std::unordered_set<uint32_t> nativeCallTargetRVAs = {0x5000};
+    const TranslationResult rejected = TranslateForGate(
+        function, 0xD411223344556677ULL, VMMicroDensity::Heavy,
+        VM_MICRO_HEAVY_MIN_RATIO, maps);
+    Require(!rejected.success,
+        "unknown direct native CALL was not kept fail-closed");
+    const TranslationResult translation = TranslateForGate(
+        function, 0xD411223344556677ULL, VMMicroDensity::Heavy,
+        VM_MICRO_HEAVY_MIN_RATIO, maps, nullptr, &nativeCallTargetRVAs);
+    Require(translation.success,
+        "x64 direct native CALL_HOST lowering failed");
+
+    bool sawNativeTargetPush = false;
+    bool sawNativeCallHost = false;
+    for (const auto& instruction : translation.instructions) {
+        if (instruction.opcode == VM_UOP_PUSH_IMM &&
+            instruction.operandCount >= 2 && instruction.operands[0] == 0x5000 &&
+            instruction.operands[1] == 8u) {
+            sawNativeTargetPush = true;
+        }
+        if (instruction.opcode == VM_UOP_CALL_HOST) {
+            sawNativeCallHost = true;
+            Require(instruction.operands[0] == VM_MICRO_CALL_NATIVE_RVA,
+                "direct native CALL_HOST callKind is not native-RVA");
+            Require(instruction.operands[1] == VM_ABI_WIN64,
+                "direct native CALL_HOST ABI is not Win64");
+            Require(instruction.operands[2] == 8u,
+                "direct native CALL_HOST stack-argument window did not capture [rsp+20h]");
+        }
+    }
+    Require(sawNativeTargetPush, "direct native CALL_HOST 未推入目标 RVA");
+    Require(sawNativeCallHost, "direct native CALL 未降到 CALL_HOST");
+
+    CipherShell::VMIRModelPreflightConfig config{};
+    config.corpusSeed = 0xD4D1FF22ULL;
+    config.corpusCount = 32;
+    config.memorySize = 0x10000;
+    config.maxSteps = 100000;
+    const auto verified = CipherShell::VMIRModelPreflightVerifier::Verify(
+        function, translation, maps.forward, IdentityRegisterMap(), config);
+    Require(verified.success && verified.casesExecuted == config.corpusCount,
+        "x64 direct native CALL_HOST preflight failed: " + verified.error);
+}
+
 void TestTranslatorRejectsImplicitAtomicMemoryXchg() {
     CipherShell::Function function = MakeMemoryAddFunction();
     auto& xchg = function.blocks[0].instructions[0];
@@ -3556,6 +3642,8 @@ int main() {
         &TestTranslatorInternalCallAndAddressSizeDifferential, failures);
     Run("Translator x64 import CALL_HOST model",
         &TestTranslatorX64ImportCallHostModel, failures);
+    Run("Translator x64 native RVA CALL_HOST model",
+        &TestTranslatorX64NativeRvaCallHostModel, failures);
     Run("Translator implicit atomic XCHG fail-closed",
         &TestTranslatorRejectsImplicitAtomicMemoryXchg, failures);
     Run("Translator stack/implicit flags differential",

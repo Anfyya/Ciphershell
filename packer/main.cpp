@@ -1193,6 +1193,12 @@ int main(int argc, char* argv[]) {
         for (auto& function : discoveryResult.functions) {
             function.assignedLevel = static_cast<uint32_t>((std::max)(1, buildCtx.quickLevel));
         }
+        std::unordered_set<uint32_t> nativeCallTargetRVAs;
+        for (const auto& discovered : discoveryResult.functions) {
+            if (discovered.entryAddress <= (std::numeric_limits<uint32_t>::max)()) {
+                nativeCallTargetRVAs.insert(static_cast<uint32_t>(discovered.entryAddress));
+            }
+        }
         if (config.performance.autoHotspotAnalysis) {
             CipherShell::HotspotAnalyzer hotspotAnalyzer;
             CipherShell::HotspotConfig hotspotConfig;
@@ -1613,6 +1619,7 @@ int main(int argc, char* argv[]) {
                     transConfig.importThunkRVAs.insert(imported.thunkRVA);
                 }
             }
+            transConfig.nativeCallTargetRVAs = nativeCallTargetRVAs;
             if (!grp.translator.Initialize(transConfig)) {
                 std::cerr << "VM_INIT_FAIL module=Translator reason=initialize_failed"
                           << " vm_group=" << g << std::endl;

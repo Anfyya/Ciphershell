@@ -151,6 +151,38 @@ bool BuildNativeCodeFixups(
     fixups.clear();
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
+            if (instruction.machineMode == MachineMode::X64 &&
+                instruction.IsCall() && !instruction.isIndirectBranch &&
+                instruction.hasBranchTarget &&
+                (instruction.branchTargetRVA < function.entryAddress ||
+                 instruction.branchTargetRVA >= function.entryAddress + function.size)) {
+                if (instruction.rva < function.entryAddress ||
+                    instruction.branchTargetRVA > (std::numeric_limits<uint32_t>::max)() ||
+                    instruction.immediateOffset == 0u ||
+                    instruction.immediateSize != 4u ||
+                    instruction.immediateOffset + 4u > instruction.length) {
+                    error = "native differential direct CALL is not an exact rel32";
+                    return false;
+                }
+                const uint64_t instructionOffset =
+                    instruction.rva - function.entryAddress;
+                const uint64_t fieldOffset = instructionOffset +
+                    instruction.immediateOffset;
+                const uint64_t nextOffset = instructionOffset + instruction.length;
+                if (fieldOffset > code.size() || 4u > code.size() -
+                        static_cast<size_t>(fieldOffset) || nextOffset > code.size()) {
+                    error = "native differential direct CALL fixup escapes copied code";
+                    return false;
+                }
+                VMNativeDifferentialCodeFixup fixup{};
+                fixup.fieldOffset = static_cast<uint32_t>(fieldOffset);
+                fixup.nextInstructionOffset = static_cast<uint32_t>(nextOffset);
+                fixup.targetRVA = static_cast<uint32_t>(instruction.branchTargetRVA);
+                fixup.kind = VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL;
+                fixup.fieldSize = 4u;
+                fixups.push_back(fixup);
+                continue;
+            }
             const OperandIR* ripOperand = nullptr;
             for (const auto& operand : instruction.operands) {
                 if (operand.type != OperandType::Memory ||

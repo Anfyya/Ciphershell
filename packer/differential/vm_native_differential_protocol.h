@@ -20,7 +20,7 @@ namespace CipherShell {
  * File layout:
  *   [VMNativeDifferentialRequestHeader]
  *   [native code bytes]                    nativeCodeSize
- *   [native RIP-relative code fixups]      nativeCodeFixupsCount * sizeof(VMNativeDifferentialCodeFixup)
+ *   [native code fixups]                  nativeCodeFixupsCount * sizeof(VMNativeDifferentialCodeFixup)
  *   [corpus memory, pre-execution]         memorySize
  *   [vm bytecode, with forced trailing
  *    FLAGS_MATERIALIZE before RET/EXIT]    vmBytecodeSize
@@ -36,7 +36,7 @@ namespace CipherShell {
 
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_REQUEST_MAGIC = 0x43534E44u;  /* "CSND" */
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_RESPONSE_MAGIC = 0x43534E52u; /* "CSNR" */
-constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 3u;
+constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 4u;
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE = 64u * 1024u * 1024u;
 
 #pragma pack(push, 1)
@@ -75,7 +75,8 @@ struct VMNativeDifferentialRequestHeader {
 
 enum : uint8_t {
     VM_NATIVE_CODE_FIXUP_RIP_REL32 = 1u,
-    VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL = 2u
+    VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL = 2u,
+    VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL = 3u
 };
 
 struct VMNativeDifferentialCodeFixup {

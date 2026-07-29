@@ -715,13 +715,14 @@ bool VMMicroSemanticExecutor::ExecuteOne(
                     "micro semantic requires an external runtime effect", error);
             }
             if (!pop(a)) return stackFault();
-            if (instruction.operands[0] != VM_MICRO_CALL_IMPORT_SLOT ||
+            if ((instruction.operands[0] != VM_MICRO_CALL_IMPORT_SLOT &&
+                 instruction.operands[0] != VM_MICRO_CALL_NATIVE_RVA) ||
                 instruction.operands[1] != VM_ABI_WIN64 ||
                 instruction.operands[2] > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES ||
                 (instruction.operands[2] & 7u) != 0u ||
                 options.addressWidth != 8u) {
                 return SetError(state, VMMicroFault::UnsupportedSemantic,
-                    "deterministic host-call model only supports x64 import slots", error);
+                    "deterministic host-call model only supports x64 native/import calls", error);
             }
             {
                 const uint8_t raxSlot = options.nativeFamilyToVregSlot[0];

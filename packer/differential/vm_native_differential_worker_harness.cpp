@@ -99,16 +99,102 @@ private:
     size_t m_size = 0;
 };
 
-bool HasImportCallFixups(
+bool HasHostCallFixups(
     const VMNativeDifferentialRequestHeader& header,
     const VMNativeDifferentialCodeFixup* fixups)
 {
     for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
-        if (fixups[index].kind == VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL) {
+        if (fixups[index].kind == VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL ||
+            fixups[index].kind == VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL) {
             return true;
         }
     }
     return false;
+}
+
+struct NativeTargetStubPatch {
+    uint32_t targetRVA = 0;
+    DWORD oldProtection = 0;
+    std::vector<uint8_t> original;
+};
+
+void RestoreNativeCallTargetStubs(
+    uint8_t* corpusMemory,
+    std::vector<NativeTargetStubPatch>& patches);
+
+bool PatchNativeCallTargetStubs(
+    const VMNativeDifferentialRequestHeader& header,
+    const VMNativeDifferentialCodeFixup* fixups,
+    uint8_t* corpusMemory,
+    uintptr_t target,
+    std::vector<NativeTargetStubPatch>& patches,
+    std::string& error)
+{
+    patches.clear();
+    if (!header.architectureIsX64) {
+        for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
+            if (fixups[index].kind == VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL) {
+                error = "native differential direct-call stubs require x64";
+                return false;
+            }
+        }
+        return true;
+    }
+    constexpr uint32_t kStubSize = 12u; // mov rax, imm64; jmp rax
+    for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
+        const auto& fixup = fixups[index];
+        if (fixup.kind != VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL) continue;
+        if (fixup.targetRVA >= header.memorySize ||
+            kStubSize > header.memorySize - fixup.targetRVA) {
+            error = "native differential direct-call target stub is outside corpus memory";
+            RestoreNativeCallTargetStubs(corpusMemory, patches);
+            return false;
+        }
+        bool alreadyPatched = false;
+        for (const auto& patch : patches) {
+            if (patch.targetRVA == fixup.targetRVA) {
+                alreadyPatched = true;
+                break;
+            }
+        }
+        if (alreadyPatched) continue;
+
+        NativeTargetStubPatch patch{};
+        patch.targetRVA = fixup.targetRVA;
+        patch.original.resize(kStubSize);
+        std::memcpy(patch.original.data(), corpusMemory + patch.targetRVA, kStubSize);
+        uint8_t stub[kStubSize] = {0x48, 0xB8};
+        const uint64_t target64 = static_cast<uint64_t>(target);
+        std::memcpy(stub + 2u, &target64, sizeof(target64));
+        stub[10] = 0xFF;
+        stub[11] = 0xE0;
+        if (!VirtualProtect(corpusMemory + patch.targetRVA, kStubSize,
+                PAGE_EXECUTE_READWRITE, &patch.oldProtection)) {
+            error = "native differential worker could not make direct-call target stub writable";
+            RestoreNativeCallTargetStubs(corpusMemory, patches);
+            return false;
+        }
+        std::memcpy(corpusMemory + patch.targetRVA, stub, sizeof(stub));
+        FlushInstructionCache(GetCurrentProcess(), corpusMemory + patch.targetRVA, kStubSize);
+        patches.push_back(std::move(patch));
+    }
+    return true;
+}
+
+void RestoreNativeCallTargetStubs(
+    uint8_t* corpusMemory,
+    std::vector<NativeTargetStubPatch>& patches)
+{
+    for (auto it = patches.rbegin(); it != patches.rend(); ++it) {
+        std::memcpy(corpusMemory + it->targetRVA,
+            it->original.data(), it->original.size());
+        DWORD ignored = 0;
+        VirtualProtect(corpusMemory + it->targetRVA, it->original.size(),
+            it->oldProtection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), corpusMemory + it->targetRVA,
+            it->original.size());
+    }
+    patches.clear();
 }
 
 bool PatchImportCallSlots(
@@ -142,7 +228,8 @@ void NormalizeImportCallReturnArtifacts(
 {
     for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
         const auto& fixup = fixups[index];
-        if (fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL ||
+        if (fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL &&
+            fixup.kind != VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL ||
             fixup.nextInstructionOffset > header.nativeCodeSize) {
             continue;
         }
@@ -210,6 +297,7 @@ bool RunNativeHalf(
     const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* originalCorpusMemory,
     uint8_t* corpusMemory,
+    uintptr_t hostCallTarget,
     VMNativeDifferentialWorkerOutcome& outcome,
     std::string& error)
 {
@@ -247,19 +335,24 @@ bool RunNativeHalf(
     for (uint32_t index = 0; index < header.nativeCodeFixupsCount; ++index) {
         const VMNativeDifferentialCodeFixup& fixup = nativeCodeFixups[index];
         if ((fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32 &&
-                fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL) ||
+                fixup.kind != VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL &&
+                fixup.kind != VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL) ||
             fixup.fieldSize != 4u || fixup.reserved != 0u ||
             fixup.fieldOffset > header.nativeCodeSize ||
             4u > header.nativeCodeSize - fixup.fieldOffset ||
             fixup.nextInstructionOffset > header.nativeCodeSize ||
             fixup.targetRVA >= header.memorySize ||
             (fixup.kind == VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL &&
-                8u > header.memorySize - fixup.targetRVA)) {
+                8u > header.memorySize - fixup.targetRVA) ||
+            (fixup.kind == VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL &&
+                !header.architectureIsX64)) {
             VirtualFree(codeBuffer, 0, MEM_RELEASE);
-            error = "native differential RIP-relative fixup is malformed";
+            error = "native differential code fixup is malformed";
             return false;
         }
-        const uint64_t target = header.memoryBase + fixup.targetRVA;
+        const uint64_t target = fixup.kind == VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL
+            ? static_cast<uint64_t>(hostCallTarget)
+            : header.memoryBase + fixup.targetRVA;
         const uint64_t next = reinterpret_cast<uintptr_t>(codeBuffer) +
             fixup.nextInstructionOffset;
         const int64_t displacement = static_cast<int64_t>(target) -
@@ -267,7 +360,7 @@ bool RunNativeHalf(
         if (displacement < (std::numeric_limits<int32_t>::min)() ||
             displacement > (std::numeric_limits<int32_t>::max)()) {
             VirtualFree(codeBuffer, 0, MEM_RELEASE);
-            error = "native differential RIP-relative target exceeds signed disp32 range";
+            error = "native differential code-fixup target exceeds signed disp32 range";
             return false;
         }
         const int32_t encoded = static_cast<int32_t>(displacement);
@@ -498,6 +591,8 @@ bool RunVmHalf(
     const VMNativeDifferentialRequestHeader& header,
     const uint8_t* vmBytecode,
     uint8_t* corpusMemory,
+    const VMNativeDifferentialCodeFixup* nativeCodeFixups,
+    uintptr_t hostCallTarget,
     const uint8_t* handlerImage,
     const VMNativeDifferentialRelocation* handlerRelocations,
     const VMNativeDifferentialUnwindEntry* handlerUnwindEntries,
@@ -565,6 +660,11 @@ bool RunVmHalf(
     context.extendedState = reinterpret_cast<uintptr_t>(&extendedState);
 
     const auto entry = reinterpret_cast<ContextEntry>(loaded.Base() + header.contextEntryOffset);
+    std::vector<NativeTargetStubPatch> nativeTargetPatches;
+    if (!PatchNativeCallTargetStubs(header, nativeCodeFixups, corpusMemory,
+            hostCallTarget, nativeTargetPatches, error)) {
+        return false;
+    }
     DWORD exceptionCode = 0;
     uintptr_t exceptionAddress = 0;
     std::array<uint64_t, 16> faultGpr{};
@@ -572,6 +672,7 @@ bool RunVmHalf(
     const uint32_t runtimeError = InvokeContextEntry(entry, &context,
         header.familyToVregSlot, header.architectureIsX64 != 0,
         &exceptionCode, &exceptionAddress, &faultGpr, &faultRflags);
+    RestoreNativeCallTargetStubs(corpusMemory, nativeTargetPatches);
 
     outcome.vmExecuted = true;
     outcome.vmFaulted = exceptionCode != 0;
@@ -625,14 +726,14 @@ bool RunNativeDifferentialWorkerCase(
         error = "native differential worker received an invalid corpus/fixup range";
         return false;
     }
-    const bool hasImportCallFixups =
-        HasImportCallFixups(header, nativeCodeFixups);
-    if (hasImportCallFixups && !header.architectureIsX64) {
-        error = "native differential import-call fixups require an x64 corpus";
+    const bool hasHostCallFixups =
+        HasHostCallFixups(header, nativeCodeFixups);
+    if (hasHostCallFixups && !header.architectureIsX64) {
+        error = "native differential host-call fixups require an x64 corpus";
         return false;
     }
     HostCallSurrogate hostCallSurrogate;
-    if (hasImportCallFixups && !hostCallSurrogate.Build(error)) {
+    if (hasHostCallFixups && !hostCallSurrogate.Build(error)) {
         return false;
     }
     const uintptr_t hostCallTarget =
@@ -653,7 +754,7 @@ bool RunNativeDifferentialWorkerCase(
         return false;
     }
     if (!RunNativeHalf(header, nativeCode, nativeCodeFixups, corpusMemory,
-            static_cast<uint8_t*>(nativeMemory), outcome, error)) {
+            static_cast<uint8_t*>(nativeMemory), hostCallTarget, outcome, error)) {
         VirtualFree(nativeMemory, 0, MEM_RELEASE);
         return false;
     }
@@ -675,8 +776,9 @@ bool RunNativeDifferentialWorkerCase(
         VirtualFree(vmMemory, 0, MEM_RELEASE);
         return false;
     }
-    if (!RunVmHalf(header, vmBytecode, static_cast<uint8_t*>(vmMemory), handlerImage,
-            handlerRelocations, handlerUnwindEntries, outcome, error)) {
+    if (!RunVmHalf(header, vmBytecode, static_cast<uint8_t*>(vmMemory),
+            nativeCodeFixups, hostCallTarget, handlerImage, handlerRelocations,
+            handlerUnwindEntries, outcome, error)) {
         VirtualFree(vmMemory, 0, MEM_RELEASE);
         return false;
     }

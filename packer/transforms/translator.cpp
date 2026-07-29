@@ -127,8 +127,7 @@ uint32_t AlignUp32(uint32_t value, uint32_t alignment) {
 bool IsX64RipRelativeImageMemoryOperand(const OperandIR& operand) {
     return operand.type == OperandType::Memory &&
         operand.memory.isRipRelative &&
-        operand.memory.isImageAddress &&
-        operand.memory.width == 64u;
+        operand.memory.isImageAddress;
 }
 
 uint32_t DefinedFlagsFor(InstructionMnemonic mnemonic) {
@@ -763,6 +762,33 @@ bool Translator::ResolveX64ImportSlotCall(
     return true;
 }
 
+bool Translator::ResolveX64NativeRvaCall(
+    const InstructionIR& instruction,
+    uint32_t& targetRVA) const
+{
+    if (!instruction.IsCall() || instruction.isIndirectBranch ||
+        !instruction.hasBranchTarget || instruction.machineMode != MachineMode::X64 ||
+        instruction.rawBytes[0] != 0xE8 || instruction.immediateOffset == 0u ||
+        instruction.immediateSize != 4u ||
+        instruction.immediateOffset + 4u > instruction.length ||
+        instruction.branchTargetRVA > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    // Calls within the translated function are ordinary VM calls.  Only a
+    // cross-function edge can enter the native bridge, and only at a
+    // discovered function entry that remains callable after VM patching.
+    if (instruction.branchTargetRVA >= m_functionStart &&
+        instruction.branchTargetRVA < m_functionEnd) {
+        return false;
+    }
+    if (m_config.nativeCallTargetRVAs.find(instruction.branchTargetRVA) ==
+            m_config.nativeCallTargetRVAs.end()) {
+        return false;
+    }
+    targetRVA = instruction.branchTargetRVA;
+    return true;
+}
+
 void Translator::AnalyzeNativeCallStackArguments(const Function& function) {
     m_nativeCallStackBytes.clear();
     for (const auto& block : function.blocks) {
@@ -826,6 +852,26 @@ bool Translator::LowerCall(const InstructionIR& instruction, TranslationResult& 
         Emit(result, VM_UOP_PUSH_IMM, {importThunkRVA, 8u}, instruction.rva);
         Emit(result, VM_UOP_CALL_HOST,
             {VM_MICRO_CALL_IMPORT_SLOT, VM_ABI_WIN64, stackBytes},
+            instruction.rva);
+        return true;
+    }
+    uint32_t nativeTargetRVA = 0;
+    if (ResolveX64NativeRvaCall(instruction, nativeTargetRVA)) {
+        uint32_t stackBytes = 0;
+        const auto foundStackBytes = m_nativeCallStackBytes.find(instruction.address);
+        if (foundStackBytes != m_nativeCallStackBytes.end()) {
+            stackBytes = foundStackBytes->second;
+        }
+        if (stackBytes > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES ||
+            (stackBytes & 7u) != 0u) {
+            return FailInstruction(instruction,
+                "x64 native CALL stack-argument window exceeds CALL_HOST contract");
+        }
+        Emit(result, VM_UOP_FLAGS_UPDATE,
+            {VM_FLAG_UPDATE_CLEAR, 0u}, instruction.rva);
+        Emit(result, VM_UOP_PUSH_IMM, {nativeTargetRVA, 8u}, instruction.rva);
+        Emit(result, VM_UOP_CALL_HOST,
+            {VM_MICRO_CALL_NATIVE_RVA, VM_ABI_WIN64, stackBytes},
             instruction.rva);
         return true;
     }
@@ -2009,6 +2055,18 @@ bool IsOracleX64ImportSlotCall(const InstructionIR& instruction) {
     return memoryOperand && IsX64RipRelativeImageMemoryOperand(*memoryOperand);
 }
 
+bool IsOracleX64NativeRvaCall(
+    const Function& function,
+    const InstructionIR& instruction)
+{
+    if (!instruction.IsCall() || instruction.isIndirectBranch ||
+        !instruction.hasBranchTarget || instruction.machineMode != MachineMode::X64) {
+        return false;
+    }
+    return instruction.branchTargetRVA < function.entryAddress ||
+        instruction.branchTargetRVA >= function.entryAddress + function.size;
+}
+
 bool ExecuteOracle(
     const Function& function,
     OracleState& state,
@@ -2304,6 +2362,10 @@ bool ExecuteOracle(
             }
             case InstructionMnemonic::Call:
                 if (IsOracleX64ImportSlotCall(instruction)) {
+                    state.gpr[0] = VM_MICRO_HOST_CALL_MODEL_RESULT;
+                    break;
+                }
+                if (IsOracleX64NativeRvaCall(function, instruction)) {
                     state.gpr[0] = VM_MICRO_HOST_CALL_MODEL_RESULT;
                     break;
                 }
