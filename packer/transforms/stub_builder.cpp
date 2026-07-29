@@ -175,8 +175,10 @@ X64StubImage BuildX64Stub(
 {
     (void)preservePEHeaders; // Headers remain intact for the authenticated VM metadata path.
     CodeBuffer c;
-    Label table, loop, decryptLoop, keyNoWrap, nextTask, done, fail;
-    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap, &nextTask, &done, &fail}) c.Track(*label);
+    Label table, loop, decryptLoop, keyNoWrap, nextTask, done;
+    Label apiFail, digestFail;
+    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap,
+            &nextTask, &done, &apiFail, &digestFail}) c.Track(*label);
 
     // ABI-correct prologue.  Preserve all x64 non-volatiles and the original
     // DLL/TLS arguments (RCX/RDX/R8) before invoking kernel32 APIs.
@@ -213,7 +215,7 @@ X64StubImage BuildX64Stub(
     c.Raw({0x8B,0x46,0x04});
     c.Raw({0x48,0x8B,0x04,0x03});
     c.Raw({0xFF,0xD0,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
 
     // 双架构共用 32 字节循环密钥；每个任务仍有独立随机密钥。
     c.Raw({0x4C,0x89,0xE9});                 // rcx = current byte
@@ -239,7 +241,7 @@ X64StubImage BuildX64Stub(
 
     c.Bind(nextTask);
     c.Raw({0x3B,0x6F,0x2C});                 // cmp ebp,[rdi+plaintextDigest]
-    c.Jnz(fail);
+    c.Jnz(digestFail);
     // Restore the original non-RWX protection.
     c.Raw({0x4C,0x89,0xE9});
     c.Raw({0x44,0x89,0xF2});
@@ -248,7 +250,7 @@ X64StubImage BuildX64Stub(
     c.Raw({0x8B,0x46,0x04});
     c.Raw({0x48,0x8B,0x04,0x03});
     c.Raw({0xFF,0xD0,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
     // FlushInstructionCache((HANDLE)-1, target, size).
     c.Raw({0x48,0xC7,0xC1,0xFF,0xFF,0xFF,0xFF});
     c.Raw({0x4C,0x89,0xEA});
@@ -256,7 +258,7 @@ X64StubImage BuildX64Stub(
     c.Raw({0x8B,0x46,0x08});
     c.Raw({0x48,0x8B,0x04,0x03});
     c.Raw({0xFF,0xD0,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
 
     c.Raw({0x48,0x83,0xC7,static_cast<uint8_t>(kTaskSize)});
     c.Raw({0x41,0xFF,0xCC});
@@ -278,8 +280,10 @@ X64StubImage BuildX64Stub(
         c.Raw({0xFF,0xE0});
     }
 
-    c.Bind(fail);
+    c.Bind(apiFail);
     c.Raw({0xCC,0x0F,0x0B});
+    c.Bind(digestFail);
+    c.Raw({0x0F,0x0B,0xCC});
     c.Bind(table);
     const uint32_t executableSize = static_cast<uint32_t>(table.offset);
     AppendLoaderTable(c.bytes, tasks, virtualProtectIatRVA,
@@ -305,8 +309,10 @@ std::vector<uint8_t> BuildX86Stub(
 {
     (void)preservePEHeaders;
     CodeBuffer c;
-    Label table, loop, decryptLoop, keyNoWrap, decrypted, done, fail;
-    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap, &decrypted, &done, &fail}) c.Track(*label);
+    Label table, loop, decryptLoop, keyNoWrap, decrypted, done;
+    Label apiFail, digestFail;
+    for (Label* label : {&table, &loop, &decryptLoop, &keyNoWrap,
+            &decrypted, &done, &apiFail, &digestFail}) c.Track(*label);
 
     c.U8(0x9C); // pushfd
     c.U8(0x60); // pushad
@@ -336,7 +342,7 @@ std::vector<uint8_t> BuildX86Stub(
     c.U8(0x51); c.U8(0x50);
     c.Raw({0x8B,0x54,0x24,0x20}); // adjusted local + pushed args: vp RVA
     c.Raw({0xFF,0x14,0x13,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
 
     // Legacy XOR stream used by the x86 encryptor.
     c.Raw({0x8B,0x7C,0x24,0x04});
@@ -362,7 +368,7 @@ std::vector<uint8_t> BuildX86Stub(
 
     c.Bind(decrypted);
     c.Raw({0x8B,0x44,0x24,0x18,0x3B,0x46,0x2C});
-    c.Jnz(fail);
+    c.Jnz(digestFail);
     // Restore original protection.
     c.Raw({0x8D,0x04,0x24,0x50});
     c.Raw({0xFF,0x76,0x08});
@@ -370,14 +376,14 @@ std::vector<uint8_t> BuildX86Stub(
     c.Raw({0xFF,0x74,0x24,0x10});
     c.Raw({0x8B,0x54,0x24,0x20});
     c.Raw({0xFF,0x14,0x13,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
     // FlushInstructionCache(-1,target,size).
     c.Raw({0xFF,0x74,0x24,0x08});
     c.Raw({0xFF,0x74,0x24,0x08});
     c.U8(0x6A); c.U8(0xFF);
     c.Raw({0x8B,0x54,0x24,0x20});
     c.Raw({0xFF,0x14,0x13,0x85,0xC0});
-    c.Jz(fail);
+    c.Jz(apiFail);
 
     c.Raw({0x83,0xC6,static_cast<uint8_t>(kTaskSize)});
     c.Raw({0xFF,0x4C,0x24,0x0C});
@@ -393,8 +399,10 @@ std::vector<uint8_t> BuildX86Stub(
         c.Raw({0xFF,0xE0});
     }
 
-    c.Bind(fail);
+    c.Bind(apiFail);
     c.Raw({0xCC,0x0F,0x0B});
+    c.Bind(digestFail);
+    c.Raw({0x0F,0x0B,0xCC});
     c.Bind(table);
     AppendLoaderTable(c.bytes, tasks, virtualProtectIatRVA,
         flushInstructionCacheIatRVA, originalEntryPointRVA, tlsCallback);
