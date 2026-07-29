@@ -182,30 +182,6 @@ int RunExeWithForcedRelocation(const char* path, bool expectTrace) {
     return static_cast<int>(exitCode);
 }
 
-LONG CALLBACK CaptureLoaderException(EXCEPTION_POINTERS* pointers) {
-    if (!pointers || !pointers->ExceptionRecord) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const auto* record = pointers->ExceptionRecord;
-    MEMORY_BASIC_INFORMATION memory{};
-    const SIZE_T queried = VirtualQuery(
-        record->ExceptionAddress, &memory, sizeof(memory));
-    const uintptr_t address =
-        reinterpret_cast<uintptr_t>(record->ExceptionAddress);
-    const uintptr_t base = queried == sizeof(memory)
-        ? reinterpret_cast<uintptr_t>(memory.AllocationBase)
-        : 0;
-    std::fprintf(stderr,
-        "LOADER_EXCEPTION code=0x%08lx address=0x%llx "
-        "allocation_base=0x%llx rva=0x%llx\n",
-        record->ExceptionCode,
-        static_cast<unsigned long long>(address),
-        static_cast<unsigned long long>(base),
-        static_cast<unsigned long long>(
-            base != 0 && address >= base ? address - base : 0));
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
 int main(int argc, char** argv) {
     if (argc == 3 && (std::strcmp(argv[1], "--exe") == 0 ||
                       std::strcmp(argv[1], "--exe-trace") == 0)) {
@@ -242,14 +218,7 @@ int main(int argc, char** argv) {
             return 3;
         }
     }
-    PVOID exceptionHandler = expectTrace
-        ? AddVectoredExceptionHandler(
-            1, CaptureLoaderException)
-        : nullptr;
     HMODULE module = LoadLibraryA(dllPath);
-    if (exceptionHandler) {
-        RemoveVectoredExceptionHandler(exceptionHandler);
-    }
     if (!module) {
         std::fprintf(stderr, "LoadLibrary failed: %lu\n", GetLastError());
         if (reservation) VirtualFree(reservation, 0, MEM_RELEASE);
