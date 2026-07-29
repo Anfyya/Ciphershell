@@ -346,6 +346,8 @@ private:
         const Function& function,
         uint32_t& terminalReturnStackCleanup,
         uint64_t& observableRflagsMask);
+    void AnalyzeNativeCallStackArguments(const Function& function);
+    bool ResolveX64ImportSlotCall(const InstructionIR& instruction, uint32_t& thunkRVA) const;
     bool FailInstruction(const InstructionIR& instruction, const std::string& reason);
     static std::string FormatInstructionBytes(const InstructionIR& instruction);
 
@@ -354,6 +356,7 @@ private:
     std::unordered_map<uint8_t, uint8_t> m_opcodeMap;
     std::vector<TranslationFailure> m_lastFailures;
     std::vector<BranchFixup> m_branchFixups;
+    std::unordered_map<uint64_t, uint32_t> m_nativeCallStackBytes;
     uint64_t m_functionStart = 0;
     uint64_t m_functionEnd = 0;
     uint32_t m_currentFunctionRva = 0;

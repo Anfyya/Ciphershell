@@ -120,6 +120,17 @@ uint8_t ImplicitWidth(const InstructionIR& instruction) {
     return instruction.machineMode == MachineMode::X64 ? 8u : 4u;
 }
 
+uint32_t AlignUp32(uint32_t value, uint32_t alignment) {
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+bool IsX64RipRelativeImageMemoryOperand(const OperandIR& operand) {
+    return operand.type == OperandType::Memory &&
+        operand.memory.isRipRelative &&
+        operand.memory.isImageAddress &&
+        operand.memory.width == 64u;
+}
+
 uint32_t DefinedFlagsFor(InstructionMnemonic mnemonic) {
     switch (mnemonic) {
         case InstructionMnemonic::And:
@@ -725,7 +736,99 @@ bool Translator::LowerBranch(const InstructionIR& instruction, TranslationResult
     return true;
 }
 
+bool Translator::ResolveX64ImportSlotCall(
+    const InstructionIR& instruction,
+    uint32_t& thunkRVA) const
+{
+    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
+        instruction.machineMode != MachineMode::X64) {
+        return false;
+    }
+    const OperandIR* memoryOperand = nullptr;
+    for (const auto& operand : instruction.operands) {
+        if (operand.type != OperandType::Memory) continue;
+        if (memoryOperand) return false;
+        memoryOperand = &operand;
+    }
+    if (!memoryOperand ||
+        !IsX64RipRelativeImageMemoryOperand(*memoryOperand)) {
+        return false;
+    }
+    const uint32_t candidate = memoryOperand->memory.resolvedRVA;
+    if (m_config.importThunkRVAs.find(candidate) ==
+            m_config.importThunkRVAs.end()) {
+        return false;
+    }
+    thunkRVA = candidate;
+    return true;
+}
+
+void Translator::AnalyzeNativeCallStackArguments(const Function& function) {
+    m_nativeCallStackBytes.clear();
+    for (const auto& block : function.blocks) {
+        uint32_t stackArgumentBytes = 0;
+        for (const auto& instruction : block.instructions) {
+            if (instruction.machineMode == MachineMode::X64) {
+                for (const auto& operand : instruction.operands) {
+                    if (operand.type != OperandType::Memory ||
+                        !OperandWrites(operand.action) ||
+                        !operand.memory.hasBase ||
+                        operand.memory.hasIndex ||
+                        operand.memory.baseInfo.registerClass !=
+                            RegisterCategory::GeneralPurpose ||
+                        operand.memory.baseInfo.family != 4u ||
+                        operand.memory.displacement < 0x20) {
+                        continue;
+                    }
+                    const uint16_t widthBits = operand.width != 0u
+                        ? operand.width : operand.memory.width;
+                    const uint8_t width = WidthBytes(widthBits);
+                    if (width == 0u) continue;
+                    const uint64_t start =
+                        static_cast<uint64_t>(operand.memory.displacement) - 0x20u;
+                    const uint64_t end = start + width;
+                    if (end > (std::numeric_limits<uint32_t>::max)()) {
+                        stackArgumentBytes = VM_NATIVE_MAX_STACK_ARGUMENT_BYTES + 8u;
+                    } else {
+                        stackArgumentBytes = std::max(stackArgumentBytes,
+                            AlignUp32(static_cast<uint32_t>(end), 8u));
+                    }
+                }
+            }
+            if (instruction.IsCall()) {
+                m_nativeCallStackBytes[instruction.address] = stackArgumentBytes;
+                m_nativeCallStackBytes[instruction.rva] = stackArgumentBytes;
+                stackArgumentBytes = 0;
+            }
+            if (instruction.IsBranch() || instruction.IsReturn() ||
+                instruction.IsInterrupt()) {
+                stackArgumentBytes = 0;
+            }
+        }
+    }
+}
+
 bool Translator::LowerCall(const InstructionIR& instruction, TranslationResult& result) {
+    uint32_t importThunkRVA = 0;
+    if (ResolveX64ImportSlotCall(instruction, importThunkRVA)) {
+        uint32_t stackBytes = 0;
+        const auto foundStackBytes = m_nativeCallStackBytes.find(instruction.address);
+        if (foundStackBytes != m_nativeCallStackBytes.end()) {
+            stackBytes = foundStackBytes->second;
+        }
+        if (stackBytes > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES ||
+            (stackBytes & 7u) != 0u) {
+            return FailInstruction(instruction,
+                "x64 import CALL stack-argument window exceeds CALL_HOST contract");
+        }
+        Emit(result, VM_UOP_FLAGS_UPDATE,
+            {VM_FLAG_UPDATE_CLEAR, 0u}, instruction.rva);
+        Emit(result, VM_UOP_PUSH_IMM, {importThunkRVA, 8u}, instruction.rva);
+        Emit(result, VM_UOP_CALL_HOST,
+            {VM_MICRO_CALL_IMPORT_SLOT, VM_ABI_WIN64, stackBytes},
+            instruction.rva);
+        return true;
+    }
     if (instruction.isIndirectBranch || !instruction.hasBranchTarget) {
         return FailInstruction(instruction, "indirect/unresolved CALL has no provable VM target");
     }
@@ -1344,6 +1447,7 @@ TranslationResult Translator::TranslateFunction(const Function& function) {
     result.density = m_config.density;
     m_lastFailures.clear();
     m_branchFixups.clear();
+    m_nativeCallStackBytes.clear();
     if (!m_initialized || function.blocks.empty() || function.size == 0 ||
         m_opcodeMap.empty() || m_registerMap.size() < 16) {
         result.failures = m_lastFailures;
@@ -1404,6 +1508,7 @@ TranslationResult Translator::TranslateFunction(const Function& function) {
     m_functionStart = function.entryAddress;
     m_functionEnd = function.entryAddress + function.size;
     m_currentFunctionRva = static_cast<uint32_t>(function.entryAddress);
+    AnalyzeNativeCallStackArguments(function);
     result.operandCodec = VMSchema::DeriveOperandCodec(m_config.buildSeed, m_currentFunctionRva);
     if (!ValidateFlagDataflow(function, result.returnStackCleanup,
             result.observableRflagsMask)) {
@@ -1890,6 +1995,20 @@ bool PrepareOracleMemoryRegisters(
     return true;
 }
 
+bool IsOracleX64ImportSlotCall(const InstructionIR& instruction) {
+    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
+        instruction.machineMode != MachineMode::X64) {
+        return false;
+    }
+    const OperandIR* memoryOperand = nullptr;
+    for (const auto& operand : instruction.operands) {
+        if (operand.type != OperandType::Memory) continue;
+        if (memoryOperand) return false;
+        memoryOperand = &operand;
+    }
+    return memoryOperand && IsX64RipRelativeImageMemoryOperand(*memoryOperand);
+}
+
 bool ExecuteOracle(
     const Function& function,
     OracleState& state,
@@ -2184,6 +2303,10 @@ bool ExecuteOracle(
                 break;
             }
             case InstructionMnemonic::Call:
+                if (IsOracleX64ImportSlotCall(instruction)) {
+                    state.gpr[0] = VM_MICRO_HOST_CALL_MODEL_RESULT;
+                    break;
+                }
                 if (instruction.isIndirectBranch || !instruction.hasBranchTarget ||
                     byAddress.find(instruction.branchTargetRVA) == byAddress.end() ||
                     state.callDepth >= state.callStack.size()) goto unsupported;
@@ -2546,6 +2669,11 @@ VMIRModelPreflightResult VMIRModelPreflightVerifier::Verify(
         options.maxSteps = config.maxSteps;
         options.addressWidth = function.blocks.front().instructions.front().machineMode ==
             MachineMode::X64 ? 8u : 4u;
+        options.allowDeterministicHostCalls = true;
+        options.nativeFamilyToVregSlot.fill(VM_REG_INVALID);
+        for (uint8_t family = 0; family < 16; ++family) {
+            options.nativeFamilyToVregSlot[family] = registerMap.at(family);
+        }
 
         const bool oracleOk = ExecuteOracle(function, oracle, corpusMemoryBase, corpusMemoryBase,
             oracleMemory, config.maxSteps, oracleError);

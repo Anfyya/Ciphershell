@@ -709,6 +709,31 @@ bool VMMicroSemanticExecutor::ExecuteOne(
             state.callStack[state.callDepth++] = fallthroughIp;
             state.ip = static_cast<uint32_t>(instruction.operands[0]);
             return true;
+        case VM_UOP_CALL_HOST:
+            if (!options.allowDeterministicHostCalls) {
+                return SetError(state, VMMicroFault::UnsupportedSemantic,
+                    "micro semantic requires an external runtime effect", error);
+            }
+            if (!pop(a)) return stackFault();
+            if (instruction.operands[0] != VM_MICRO_CALL_IMPORT_SLOT ||
+                instruction.operands[1] != VM_ABI_WIN64 ||
+                instruction.operands[2] > VM_NATIVE_MAX_STACK_ARGUMENT_BYTES ||
+                (instruction.operands[2] & 7u) != 0u ||
+                options.addressWidth != 8u) {
+                return SetError(state, VMMicroFault::UnsupportedSemantic,
+                    "deterministic host-call model only supports x64 import slots", error);
+            }
+            {
+                const uint8_t raxSlot = options.nativeFamilyToVregSlot[0];
+                if (raxSlot >= options.registerCount) {
+                    return SetError(state, VMMicroFault::Decode,
+                        "deterministic host-call model has no mapped RAX slot", error);
+                }
+                (void)a;
+                MaterializeFlags(state, VM_FLAG_ARCHITECTURAL_MASK);
+                state.gpr[raxSlot] = VM_MICRO_HOST_CALL_MODEL_RESULT;
+            }
+            return true;
         case VM_UOP_RET:
             if (state.callDepth != 0) state.ip = state.callStack[--state.callDepth];
             else state.finished = true;
@@ -716,7 +741,6 @@ bool VMMicroSemanticExecutor::ExecuteOne(
         case VM_UOP_EXIT:
             state.finished = true;
             return true;
-        case VM_UOP_CALL_HOST:
         case VM_UOP_BRIDGE_EXTENDED:
         case VM_UOP_RDTSC:
         case VM_UOP_CPUID:

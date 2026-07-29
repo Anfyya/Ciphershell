@@ -183,7 +183,14 @@ bool BuildNativeCodeFixups(
             fixup.fieldOffset = static_cast<uint32_t>(fieldOffset);
             fixup.nextInstructionOffset = static_cast<uint32_t>(nextOffset);
             fixup.targetRVA = ripOperand->memory.resolvedRVA;
-            fixup.kind = VM_NATIVE_CODE_FIXUP_RIP_REL32;
+            const bool importSlotCall =
+                instruction.machineMode == MachineMode::X64 &&
+                instruction.IsCall() &&
+                instruction.isIndirectBranch &&
+                ripOperand->memory.isImageAddress;
+            fixup.kind = importSlotCall
+                ? VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL
+                : VM_NATIVE_CODE_FIXUP_RIP_REL32;
             fixup.fieldSize = 4u;
             fixups.push_back(fixup);
         }

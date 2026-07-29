@@ -46,10 +46,14 @@ struct VMMicroMachineState {
     uint64_t faultAddress = 0;
 };
 
+constexpr uint64_t VM_MICRO_HOST_CALL_MODEL_RESULT = 0x4353484F53544341ULL;
+
 struct VMMicroExecutionOptions {
     uint32_t registerCount = 32;
     uint32_t maxSteps = 1000000;
     uint8_t addressWidth = 8;
+    bool allowDeterministicHostCalls = false;
+    std::array<uint8_t, 16> nativeFamilyToVregSlot{};
 };
 
 struct VMMicroSemanticPlan {

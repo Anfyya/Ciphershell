@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -843,6 +844,41 @@ void TestMicroExecutorRegisterCountClamp() {
         "registerCount 超过 gpr 容量(32)未被 executor 钳制拒绝");
 }
 
+void TestMicroExecutorDeterministicHostCallModel() {
+    EncodedEnvironment environment = MakeEnvironment(0x86, 0x8600);
+    const std::vector<MicroInstruction> program = {
+        Uop(VM_UOP_PUSH_IMM, {0x7000, 8}),
+        Uop(VM_UOP_CALL_HOST, {VM_MICRO_CALL_IMPORT_SLOT, VM_ABI_WIN64, 0}),
+        Uop(VM_UOP_EXIT, {0})
+    };
+    std::vector<uint8_t> memory;
+    std::string error;
+
+    VMMicroMachineState rejected{};
+    rejected.rflags = 0x202u | VM_FLAG_CF;
+    Require(!ExecuteEncoded(program, environment, rejected, memory, 0x1000, error) &&
+            rejected.fault == VMMicroFault::UnsupportedSemantic,
+        "未显式启用 deterministic host-call model 时 CALL_HOST 被执行");
+
+    environment.options.allowDeterministicHostCalls = true;
+    environment.options.nativeFamilyToVregSlot.fill(VM_REGISTER_INVALID);
+    for (uint8_t family = 0; family < 16; ++family) {
+        environment.options.nativeFamilyToVregSlot[family] = family;
+    }
+
+    VMMicroMachineState accepted{};
+    accepted.rflags = 0x202u | VM_FLAG_CF;
+    error.clear();
+    Require(ExecuteEncoded(program, environment, accepted, memory, 0x1000, error),
+        "deterministic host-call model 未接受 x64 import CALL_HOST: " + error);
+    Require(accepted.gpr[0] == CipherShell::VM_MICRO_HOST_CALL_MODEL_RESULT,
+        "deterministic host-call model 未写入约定的 RAX 返回值");
+    Require(accepted.operandStackDepth == 0,
+        "deterministic host-call model 返回后操作数栈未清空");
+    Require(accepted.rflags == (0x202u | VM_FLAG_CF),
+        "deterministic host-call model 意外破坏了已物化的 RFLAGS");
+}
+
 void TestDifferentialArchitectureState() {
     const EncodedEnvironment environment = MakeEnvironment(0x95, 0x9500);
     constexpr uint64_t memoryBase = 0x0000000140000000ULL;
@@ -1622,12 +1658,122 @@ CipherShell::Function MakeMemoryAddFunction() {
     return function;
 }
 
+CipherShell::Function MakeImportCallFunction() {
+    CipherShell::OperandIR stackSlot{};
+    stackSlot.type = CipherShell::OperandType::Memory;
+    stackSlot.action = CipherShell::OperandAction::Write;
+    stackSlot.visibility = CipherShell::OperandVisibility::Explicit;
+    stackSlot.width = 64;
+    stackSlot.memory.segment = CipherShell::RegisterId::SS;
+    stackSlot.memory.base = CipherShell::RegisterId::RSP;
+    stackSlot.memory.baseInfo = CipherShell::DescribeRegister(CipherShell::RegisterId::RSP);
+    stackSlot.memory.displacement = 0x20;
+    stackSlot.memory.width = 64;
+    stackSlot.memory.hasBase = true;
+    stackSlot.memory.hasDisplacement = true;
+
+    CipherShell::InstructionIR storeArg{};
+    storeArg.address = 0x4000;
+    storeArg.rva = 0x4000;
+    storeArg.length = 5;
+    storeArg.rawBytes[0] = 0x48;
+    storeArg.rawBytes[1] = 0x89;
+    storeArg.rawBytes[2] = 0x44;
+    storeArg.rawBytes[3] = 0x24;
+    storeArg.rawBytes[4] = 0x20;
+    storeArg.mnemonic = CipherShell::InstructionMnemonic::Mov;
+    storeArg.category = CipherShell::InstructionCategory::DataTransfer;
+    storeArg.machineMode = CipherShell::MachineMode::X64;
+    storeArg.encoding = CipherShell::InstructionEncoding::Legacy;
+    storeArg.instructionSet = CipherShell::InstructionSetClass::Scalar;
+    storeArg.addressWidth = 64;
+    storeArg.operandWidth = 64;
+    storeArg.stackWidth = 64;
+    storeArg.mnemonicText = "mov";
+    storeArg.operands.push_back(stackSlot);
+    storeArg.operands.push_back(RegisterOperand(
+        CipherShell::RegisterId::RAX, CipherShell::OperandAction::Read));
+
+    CipherShell::OperandIR importSlot{};
+    importSlot.type = CipherShell::OperandType::Memory;
+    importSlot.action = CipherShell::OperandAction::Read;
+    importSlot.visibility = CipherShell::OperandVisibility::Explicit;
+    importSlot.width = 64;
+    importSlot.memory.segment = CipherShell::RegisterId::DS;
+    importSlot.memory.base = CipherShell::RegisterId::RIP;
+    importSlot.memory.baseInfo = CipherShell::DescribeRegister(CipherShell::RegisterId::RIP);
+    importSlot.memory.displacement = 0x2000;
+    importSlot.memory.width = 64;
+    importSlot.memory.hasBase = true;
+    importSlot.memory.hasDisplacement = true;
+    importSlot.memory.isRipRelative = true;
+    importSlot.memory.isImageAddress = true;
+    importSlot.memory.resolvedVA = 0x7000;
+    importSlot.memory.resolvedRVA = 0x7000;
+
+    CipherShell::InstructionIR call{};
+    call.address = 0x4005;
+    call.rva = 0x4005;
+    call.length = 6;
+    call.rawBytes[0] = 0xFF;
+    call.rawBytes[1] = 0x15;
+    call.rawBytes[2] = 0x00;
+    call.rawBytes[3] = 0x20;
+    call.rawBytes[4] = 0x00;
+    call.rawBytes[5] = 0x00;
+    call.mnemonic = CipherShell::InstructionMnemonic::Call;
+    call.category = CipherShell::InstructionCategory::Call;
+    call.branchKind = CipherShell::BranchKind::Call;
+    call.machineMode = CipherShell::MachineMode::X64;
+    call.encoding = CipherShell::InstructionEncoding::Legacy;
+    call.instructionSet = CipherShell::InstructionSetClass::Scalar;
+    call.addressWidth = 64;
+    call.operandWidth = 64;
+    call.stackWidth = 64;
+    call.displacementOffset = 2;
+    call.displacementSize = 4;
+    call.isIndirectBranch = true;
+    call.mnemonicText = "call";
+    call.operands.push_back(importSlot);
+
+    CipherShell::InstructionIR ret{};
+    ret.address = 0x400B;
+    ret.rva = 0x400B;
+    ret.length = 1;
+    ret.rawBytes[0] = 0xC3;
+    ret.mnemonic = CipherShell::InstructionMnemonic::Ret;
+    ret.category = CipherShell::InstructionCategory::Return;
+    ret.branchKind = CipherShell::BranchKind::Return;
+    ret.machineMode = CipherShell::MachineMode::X64;
+    ret.encoding = CipherShell::InstructionEncoding::Legacy;
+    ret.instructionSet = CipherShell::InstructionSetClass::Scalar;
+    ret.mnemonicText = "ret";
+
+    CipherShell::BasicBlock block{};
+    block.startAddress = 0x4000;
+    block.endAddress = 0x400C;
+    block.instructionCount = 3;
+    block.instructions = {storeArg, call, ret};
+    block.isFunctionEntry = true;
+
+    CipherShell::Function function{};
+    function.entryAddress = 0x4000;
+    function.size = 0x0C;
+    function.name = "micro_gate_import_call";
+    function.blocks.push_back(std::move(block));
+    function.isLeaf = true;
+    function.boundaryTrusted = true;
+    function.decodedBytes = 0x0C;
+    return function;
+}
+
 TranslationResult TranslateForGate(
     const CipherShell::Function& function,
     uint64_t buildSeed,
     VMMicroDensity density,
     uint32_t minimumRatio,
-    const OpcodeMaps& maps)
+    const OpcodeMaps& maps,
+    const std::unordered_set<uint32_t>* importThunkRVAs = nullptr)
 {
     TranslationConfig config{};
     config.virtualRegisterCount = 32;
@@ -1637,6 +1783,9 @@ TranslationResult TranslateForGate(
     config.heavyMinimumRatio = minimumRatio;
     config.enableSimdBridge = true;
     config.enableX87Bridge = true;
+    if (importThunkRVAs) {
+        config.importThunkRVAs = *importThunkRVAs;
+    }
     Translator translator;
     Require(translator.Initialize(config), "Translator 拒绝合法微操作配置");
     translator.SetOpcodeMap(maps.forward);
@@ -2503,6 +2652,68 @@ void TestTranslatorInternalCallAndAddressSizeDifferential() {
     RequireIRModelPreflight(address32, addressTranslation, maps, 0xADD232ULL);
 }
 
+void TestTranslatorX64ImportCallHostModel() {
+    const CipherShell::Function function = MakeImportCallFunction();
+    OpcodeMaps maps = MakeOpcodeMaps(MakeSeed(0xC9));
+    KeepRuntimeSupportedOpcodes(maps, true);
+
+    const TranslationResult rejected = TranslateForGate(
+        function, 0xC911223344556677ULL, VMMicroDensity::Heavy,
+        VM_MICRO_HEAVY_MIN_RATIO, maps);
+    bool sawIndirectReject = false;
+    for (const auto& failure : rejected.failures) {
+        if (failure.reason.find("indirect/unresolved CALL") != std::string::npos) {
+            sawIndirectReject = true;
+            break;
+        }
+    }
+    Require(!rejected.success && sawIndirectReject,
+        "未声明 import thunk 时 x64 IAT CALL 未保持 fail-closed");
+
+    const std::unordered_set<uint32_t> importThunkRVAs = {0x7000};
+    const TranslationResult translation = TranslateForGate(
+        function, 0xC911223344556677ULL, VMMicroDensity::Heavy,
+        VM_MICRO_HEAVY_MIN_RATIO, maps, &importThunkRVAs);
+    Require(translation.success,
+        "x64 import CALL_HOST lowering failed");
+
+    bool sawImportThunkPush = false;
+    bool sawCallHost = false;
+    for (const auto& instruction : translation.instructions) {
+        if (instruction.opcode == VM_UOP_PUSH_IMM &&
+            instruction.operandCount >= 2 &&
+            instruction.operands[0] == 0x7000 &&
+            instruction.operands[1] == 8u) {
+            sawImportThunkPush = true;
+        }
+        if (instruction.opcode == VM_UOP_CALL_HOST) {
+            sawCallHost = true;
+            Require(instruction.operandCount == 3,
+                "CALL_HOST operand arity changed unexpectedly");
+            Require(instruction.operands[0] == VM_MICRO_CALL_IMPORT_SLOT,
+                "CALL_HOST callKind is not import-slot");
+            Require(instruction.operands[1] == VM_ABI_WIN64,
+                "CALL_HOST ABI is not Win64");
+            Require(instruction.operands[2] == 8u,
+                "CALL_HOST stack-argument window did not capture [rsp+20h] write");
+        }
+    }
+    Require(sawImportThunkPush,
+        "x64 import CALL_HOST lowering未推入 thunk RVA");
+    Require(sawCallHost,
+        "x64 import CALL 未降到 CALL_HOST");
+
+    CipherShell::VMIRModelPreflightConfig config{};
+    config.corpusSeed = 0xC9D1FF22ULL;
+    config.corpusCount = 64;
+    config.memorySize = 0x10000;
+    config.maxSteps = 100000;
+    const auto verified = CipherShell::VMIRModelPreflightVerifier::Verify(
+        function, translation, maps.forward, IdentityRegisterMap(), config);
+    Require(verified.success && verified.casesExecuted == config.corpusCount,
+        "x64 import CALL_HOST preflight failed: " + verified.error);
+}
+
 void TestTranslatorRejectsImplicitAtomicMemoryXchg() {
     CipherShell::Function function = MakeMemoryAddFunction();
     auto& xchg = function.blocks[0].instructions[0];
@@ -3326,6 +3537,8 @@ int main() {
     Run("per-instruction K variant selector", &TestPerInstructionVariantSelector, failures);
     Run("变长流 verifier fail-closed", &TestStreamVerifierFailClosed, failures);
     Run("micro executor registerCount 边界钳制", &TestMicroExecutorRegisterCountClamp, failures);
+    Run("micro executor deterministic CALL_HOST model",
+        &TestMicroExecutorDeterministicHostCallModel, failures);
     Run("完整架构状态差分模糊语料", &TestDifferentialArchitectureState, failures);
     Run("lazy flags 全消费者路径", &TestLazyFlagsAndConsumers, failures);
     Run("lazy flags overwrite/update preservation",
@@ -3341,6 +3554,8 @@ int main() {
         &TestTranslatorWideDivideDifferentialAndZeroExtend, failures);
     Run("Translator internal CALL/address-size differential",
         &TestTranslatorInternalCallAndAddressSizeDifferential, failures);
+    Run("Translator x64 import CALL_HOST model",
+        &TestTranslatorX64ImportCallHostModel, failures);
     Run("Translator implicit atomic XCHG fail-closed",
         &TestTranslatorRejectsImplicitAtomicMemoryXchg, failures);
     Run("Translator stack/implicit flags differential",
