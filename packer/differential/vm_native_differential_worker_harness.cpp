@@ -297,6 +297,7 @@ bool RunNativeHalf(
     const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* originalCorpusMemory,
     uint8_t* corpusMemory,
+    std::vector<NativeTargetStubPatch>& nativeTargetPatches,
     VMNativeDifferentialWorkerOutcome& outcome,
     std::string& error)
 {
@@ -416,6 +417,7 @@ bool RunNativeHalf(
 
     NormalizeImportCallReturnArtifacts(header, nativeCodeFixups,
         static_cast<const uint8_t*>(codeBuffer), originalCorpusMemory, corpusMemory);
+    RestoreNativeCallTargetStubs(corpusMemory, nativeTargetPatches);
 
     const bool faulted = VMNativeExecTrampolineFaulted() != 0;
 
@@ -762,7 +764,8 @@ bool RunNativeDifferentialWorkerCase(
         return false;
     }
     if (!RunNativeHalf(header, nativeCode, nativeCodeFixups, corpusMemory,
-            static_cast<uint8_t*>(nativeMemory), outcome, error)) {
+            static_cast<uint8_t*>(nativeMemory), nativeTargetPatches,
+            outcome, error)) {
         RestoreNativeCallTargetStubs(static_cast<uint8_t*>(nativeMemory),
             nativeTargetPatches);
         VirtualFree(nativeMemory, 0, MEM_RELEASE);
