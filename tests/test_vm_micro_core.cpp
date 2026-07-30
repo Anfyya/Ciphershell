@@ -1719,9 +1719,12 @@ CipherShell::Function MakeImportCallFunction() {
     importSlot.memory.hasBase = true;
     importSlot.memory.hasDisplacement = true;
     importSlot.memory.isRipRelative = true;
-    importSlot.memory.isImageAddress = true;
-    importSlot.memory.resolvedVA = 0x7000;
-    importSlot.memory.resolvedRVA = 0x7000;
+    // Deliberately leave the derived RIP target absent: production must still
+    // recognize the exact FF 15 disp32 encoding and validate its raw slot RVA
+    // against the parsed IAT set.
+    importSlot.memory.isImageAddress = false;
+    importSlot.memory.resolvedVA = 0;
+    importSlot.memory.resolvedRVA = 0;
 
     CipherShell::InstructionIR call{};
     call.address = 0x4005;
@@ -1729,8 +1732,9 @@ CipherShell::Function MakeImportCallFunction() {
     call.length = 6;
     call.rawBytes[0] = 0xFF;
     call.rawBytes[1] = 0x15;
-    call.rawBytes[2] = 0x00;
-    call.rawBytes[3] = 0x20;
+    // 0x4005 + 6 + 0x2FF5 = 0x7000 (the trusted IAT slot below).
+    call.rawBytes[2] = 0xF5;
+    call.rawBytes[3] = 0x2F;
     call.rawBytes[4] = 0x00;
     call.rawBytes[5] = 0x00;
     call.mnemonic = CipherShell::InstructionMnemonic::Call;

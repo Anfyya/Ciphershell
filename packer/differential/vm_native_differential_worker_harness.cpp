@@ -297,7 +297,6 @@ bool RunNativeHalf(
     const VMNativeDifferentialCodeFixup* nativeCodeFixups,
     const uint8_t* originalCorpusMemory,
     uint8_t* corpusMemory,
-    uintptr_t hostCallTarget,
     VMNativeDifferentialWorkerOutcome& outcome,
     std::string& error)
 {
@@ -350,9 +349,11 @@ bool RunNativeHalf(
             error = "native differential code fixup is malformed";
             return false;
         }
-        const uint64_t target = fixup.kind == VM_NATIVE_CODE_FIXUP_REL32_NATIVE_CALL
-            ? static_cast<uint64_t>(hostCallTarget)
-            : header.memoryBase + fixup.targetRVA;
+        // A rel32 direct call must stay close to the copied native body.  Point
+        // it at the corpus-native target RVA, whose temporary entry stub uses
+        // an absolute jump to the surrogate.  Writing the surrogate address
+        // directly here can exceed the signed rel32 range.
+        const uint64_t target = header.memoryBase + fixup.targetRVA;
         const uint64_t next = reinterpret_cast<uintptr_t>(codeBuffer) +
             fixup.nextInstructionOffset;
         const int64_t displacement = static_cast<int64_t>(target) -
@@ -753,11 +754,22 @@ bool RunNativeDifferentialWorkerCase(
         VirtualFree(nativeMemory, 0, MEM_RELEASE);
         return false;
     }
-    if (!RunNativeHalf(header, nativeCode, nativeCodeFixups, corpusMemory,
-            static_cast<uint8_t*>(nativeMemory), hostCallTarget, outcome, error)) {
+    std::vector<NativeTargetStubPatch> nativeTargetPatches;
+    if (!PatchNativeCallTargetStubs(header, nativeCodeFixups,
+            static_cast<uint8_t*>(nativeMemory), hostCallTarget,
+            nativeTargetPatches, error)) {
         VirtualFree(nativeMemory, 0, MEM_RELEASE);
         return false;
     }
+    if (!RunNativeHalf(header, nativeCode, nativeCodeFixups, corpusMemory,
+            static_cast<uint8_t*>(nativeMemory), outcome, error)) {
+        RestoreNativeCallTargetStubs(static_cast<uint8_t*>(nativeMemory),
+            nativeTargetPatches);
+        VirtualFree(nativeMemory, 0, MEM_RELEASE);
+        return false;
+    }
+    RestoreNativeCallTargetStubs(static_cast<uint8_t*>(nativeMemory),
+        nativeTargetPatches);
     VirtualFree(nativeMemory, 0, MEM_RELEASE);
 
     // +16: scratch for the VirtualProtect/FlushInstructionCache pointers the

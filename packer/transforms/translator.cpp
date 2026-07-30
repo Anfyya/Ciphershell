@@ -124,10 +124,35 @@ uint32_t AlignUp32(uint32_t value, uint32_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-bool IsX64RipRelativeImageMemoryOperand(const OperandIR& operand) {
-    return operand.type == OperandType::Memory &&
-        operand.memory.isRipRelative &&
-        operand.memory.isImageAddress;
+// Decode the exact x64 FF /2 RIP-relative form from its bytes instead of
+// trusting only the derived OperandIR target.  The import call is still
+// admitted solely when that decoded slot belongs to the parsed IAT set.
+// This keeps an incomplete/stale derived RIP target from turning a known IAT
+// call into an opaque indirect branch.
+bool ResolveX64FF15ImportSlotRVA(
+    const InstructionIR& instruction,
+    uint32_t& slotRVA)
+{
+    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
+        instruction.machineMode != MachineMode::X64 || instruction.length < 6u ||
+        instruction.rawBytes[0] != 0xFFu || instruction.rawBytes[1] != 0x15u ||
+        instruction.displacementOffset != 2u || instruction.displacementSize != 4u ||
+        instruction.displacementOffset + instruction.displacementSize > instruction.length) {
+        return false;
+    }
+    const uint32_t encoded =
+        static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset]) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 1u]) << 8u) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 2u]) << 16u) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 3u]) << 24u);
+    const int64_t target = static_cast<int64_t>(instruction.rva) +
+        static_cast<int64_t>(instruction.length) +
+        static_cast<int64_t>(static_cast<int32_t>(encoded));
+    if (target < 0 || target > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    slotRVA = static_cast<uint32_t>(target);
+    return true;
 }
 
 uint32_t DefinedFlagsFor(InstructionMnemonic mnemonic) {
@@ -739,21 +764,10 @@ bool Translator::ResolveX64ImportSlotCall(
     const InstructionIR& instruction,
     uint32_t& thunkRVA) const
 {
-    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
-        instruction.machineMode != MachineMode::X64) {
+    uint32_t candidate = 0;
+    if (!ResolveX64FF15ImportSlotRVA(instruction, candidate)) {
         return false;
     }
-    const OperandIR* memoryOperand = nullptr;
-    for (const auto& operand : instruction.operands) {
-        if (operand.type != OperandType::Memory) continue;
-        if (memoryOperand) return false;
-        memoryOperand = &operand;
-    }
-    if (!memoryOperand ||
-        !IsX64RipRelativeImageMemoryOperand(*memoryOperand)) {
-        return false;
-    }
-    const uint32_t candidate = memoryOperand->memory.resolvedRVA;
     if (m_config.importThunkRVAs.find(candidate) ==
             m_config.importThunkRVAs.end()) {
         return false;
@@ -2042,17 +2056,8 @@ bool PrepareOracleMemoryRegisters(
 }
 
 bool IsOracleX64ImportSlotCall(const InstructionIR& instruction) {
-    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
-        instruction.machineMode != MachineMode::X64) {
-        return false;
-    }
-    const OperandIR* memoryOperand = nullptr;
-    for (const auto& operand : instruction.operands) {
-        if (operand.type != OperandType::Memory) continue;
-        if (memoryOperand) return false;
-        memoryOperand = &operand;
-    }
-    return memoryOperand && IsX64RipRelativeImageMemoryOperand(*memoryOperand);
+    uint32_t ignoredSlotRVA = 0;
+    return ResolveX64FF15ImportSlotRVA(instruction, ignoredSlotRVA);
 }
 
 bool IsOracleX64NativeRvaCall(

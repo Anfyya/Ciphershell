@@ -36,7 +36,7 @@ namespace CipherShell {
 
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_REQUEST_MAGIC = 0x43534E44u;  /* "CSND" */
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_RESPONSE_MAGIC = 0x43534E52u; /* "CSNR" */
-constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 4u;
+constexpr uint32_t VM_NATIVE_DIFFERENTIAL_PROTOCOL_VERSION = 5u;
 constexpr uint32_t VM_NATIVE_DIFFERENTIAL_MAX_MEMORY_SIZE = 64u * 1024u * 1024u;
 
 #pragma pack(push, 1)

@@ -12,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -92,13 +93,17 @@ Function DecodeStandaloneFunction(
 TranslationResult TranslateStandaloneFunction(
     const Function& standaloneFunction,
     const HarnessBuild& build,
-    Translator& translator)
+    Translator& translator,
+    const std::unordered_set<uint32_t>* nativeCallTargetRVAs = nullptr)
 {
     TranslationConfig transConfig{};
     transConfig.virtualRegisterCount = 24;
     transConfig.buildSeed = build.translatorSeed;
     transConfig.density = VMMicroDensity::Light;
     transConfig.handlerVariantCount = VM_HANDLER_VARIANT_COUNT;
+    if (nativeCallTargetRVAs) {
+        transConfig.nativeCallTargetRVAs = *nativeCallTargetRVAs;
+    }
     Require(translator.Initialize(transConfig), "Translator 初始化失败");
     translator.SetOpcodeMap(build.isa.opcodeMap);
     translator.SetRegisterMap(build.isa.registerMap);
@@ -249,6 +254,66 @@ void TestRealDifferentialPassAndCatchesRealMismatch() {
     RunDifferentialCase(subFunction, addTranslation, build, 8, false,
         "native=SUB vs VM-bytecode=ADD 必须被判定语义分歧");
 }
+
+#if defined(_M_X64)
+void TestX64DirectNativeCallHostDifferential() {
+    const auto seed = MakeSeed(0xB4u);
+    const HarnessBuild build = SetUpMutatedIsa(seed);
+
+    Disassembler disassembler;
+    Require(disassembler.Initialize(kIs64),
+        "x64 direct native CALL disassembler initialization failed");
+
+    constexpr uint64_t kEntry = 0x1000u;
+    constexpr uint32_t kNativeTargetRVA = 0x2000u;
+    const std::vector<uint8_t> bytes = {
+        0xE8,0xFB,0x0F,0x00,0x00, // call 0x2000
+        0xC3                         // ret
+    };
+    const Function function =
+        DecodeStandaloneFunction(disassembler, bytes, kEntry);
+    const auto& instructions = function.blocks.front().instructions;
+    const auto callIt = std::find_if(instructions.begin(), instructions.end(),
+        [](const InstructionIR& instruction) { return instruction.IsCall(); });
+    Require(callIt != instructions.end() && callIt->hasBranchTarget &&
+            callIt->branchTargetRVA == kNativeTargetRVA,
+        "x64 direct native CALL fixture did not decode the expected rel32 target");
+
+    const std::unordered_set<uint32_t> nativeCallTargetRVAs = {
+        kNativeTargetRVA
+    };
+    Translator translator;
+    const TranslationResult translation = TranslateStandaloneFunction(
+        function, build, translator, &nativeCallTargetRVAs);
+
+    bool sawTargetPush = false;
+    bool sawNativeCallHost = false;
+    for (const MicroInstruction& instruction : translation.instructions) {
+        if (instruction.opcode == VM_UOP_PUSH_IMM &&
+                instruction.operandCount >= 2u &&
+                instruction.operands[0] == kNativeTargetRVA &&
+                instruction.operands[1] == 8u) {
+            sawTargetPush = true;
+        }
+        if (instruction.opcode != VM_UOP_CALL_HOST) continue;
+        sawNativeCallHost = true;
+        Require(instruction.operandCount >= 3u,
+            "x64 direct native CALL_HOST operand contract shrank");
+        Require(instruction.operands[0] == VM_MICRO_CALL_NATIVE_RVA,
+            "x64 direct CALL did not lower as native-RVA CALL_HOST");
+        Require(instruction.operands[1] == VM_ABI_WIN64,
+            "x64 direct native CALL_HOST ABI is not Win64");
+    }
+    Require(sawTargetPush,
+        "x64 direct native CALL_HOST did not push the native target RVA");
+    Require(sawNativeCallHost,
+        "x64 direct native CALL was not lowered to CALL_HOST");
+
+    RunDifferentialCase(function, translation, build, 4, true,
+        "x64 direct native CALL_HOST worker rel32 stub differential",
+        false, 0xB5u);
+}
+#endif
 
 void TestZydisAluPilotNativeDifferential() {
     const auto seed = MakeSeed(0xB0u);
@@ -2236,6 +2301,8 @@ int main(int argc, char** argv) {
     Run("undefined flags consumed later fail closed",
         &TestUndefinedFlagsReadFailsClosed, failures);
 #if defined(_M_X64)
+    Run("x64 direct native CALL_HOST worker rel32 stub differential",
+        &TestX64DirectNativeCallHostDifferential, failures);
     Run("x64 CMOV r32 upper-half semantics",
         &TestCmovR32PreservesOrClearsUpperHalf, failures);
 #endif

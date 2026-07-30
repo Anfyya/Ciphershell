@@ -56,6 +56,32 @@ uint64_t ComputeSemanticDigest(
     return digest == 0 ? 1u : digest;
 }
 
+bool ResolveX64FF15ImportSlotRVA(
+    const InstructionIR& instruction,
+    uint32_t& slotRVA)
+{
+    if (!instruction.IsCall() || !instruction.isIndirectBranch ||
+        instruction.machineMode != MachineMode::X64 || instruction.length < 6u ||
+        instruction.rawBytes[0] != 0xFFu || instruction.rawBytes[1] != 0x15u ||
+        instruction.displacementOffset != 2u || instruction.displacementSize != 4u ||
+        instruction.displacementOffset + instruction.displacementSize > instruction.length) {
+        return false;
+    }
+    const uint32_t encoded =
+        static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset]) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 1u]) << 8u) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 2u]) << 16u) |
+        (static_cast<uint32_t>(instruction.rawBytes[instruction.displacementOffset + 3u]) << 24u);
+    const int64_t target = static_cast<int64_t>(instruction.rva) +
+        static_cast<int64_t>(instruction.length) +
+        static_cast<int64_t>(static_cast<int32_t>(encoded));
+    if (target < 0 || target > (std::numeric_limits<uint32_t>::max)()) {
+        return false;
+    }
+    slotRVA = static_cast<uint32_t>(target);
+    return true;
+}
+
 bool BuildContiguousNativeCode(
     const Function& function,
     std::vector<uint8_t>& code,
@@ -151,6 +177,32 @@ bool BuildNativeCodeFixups(
     fixups.clear();
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
+            uint32_t importSlotRVA = 0;
+            if (ResolveX64FF15ImportSlotRVA(instruction, importSlotRVA)) {
+                if (instruction.rva < function.entryAddress ||
+                    instruction.displacementOffset + 4u > instruction.length) {
+                    error = "native differential import CALL is not an exact RIP-relative disp32";
+                    return false;
+                }
+                const uint64_t instructionOffset =
+                    instruction.rva - function.entryAddress;
+                const uint64_t fieldOffset = instructionOffset +
+                    instruction.displacementOffset;
+                const uint64_t nextOffset = instructionOffset + instruction.length;
+                if (fieldOffset > code.size() || 4u > code.size() -
+                        static_cast<size_t>(fieldOffset) || nextOffset > code.size()) {
+                    error = "native differential import CALL fixup escapes copied code";
+                    return false;
+                }
+                VMNativeDifferentialCodeFixup fixup{};
+                fixup.fieldOffset = static_cast<uint32_t>(fieldOffset);
+                fixup.nextInstructionOffset = static_cast<uint32_t>(nextOffset);
+                fixup.targetRVA = importSlotRVA;
+                fixup.kind = VM_NATIVE_CODE_FIXUP_RIP_REL32_IMPORT_CALL;
+                fixup.fieldSize = 4u;
+                fixups.push_back(fixup);
+                continue;
+            }
             if (instruction.machineMode == MachineMode::X64 &&
                 instruction.IsCall() && !instruction.isIndirectBranch &&
                 instruction.hasBranchTarget &&
