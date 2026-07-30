@@ -275,11 +275,20 @@ void TestX64DirectNativeCallHostDifferential() {
     };
     const Function function =
         DecodeStandaloneFunction(disassembler, bytes, kEntry);
-    const auto& instructions = function.blocks.front().instructions;
-    const auto callIt = std::find_if(instructions.begin(), instructions.end(),
-        [](const InstructionIR& instruction) { return instruction.IsCall(); });
-    Require(callIt != instructions.end() && callIt->hasBranchTarget &&
-            callIt->branchTargetRVA == kNativeTargetRVA,
+    const InstructionIR* callInstruction = nullptr;
+    for (const BasicBlock& block : function.blocks) {
+        const auto callIt = std::find_if(block.instructions.begin(),
+            block.instructions.end(),
+            [](const InstructionIR& instruction) {
+                return instruction.IsCall();
+            });
+        if (callIt != block.instructions.end()) {
+            callInstruction = &*callIt;
+            break;
+        }
+    }
+    Require(callInstruction != nullptr && callInstruction->hasBranchTarget &&
+            callInstruction->branchTargetRVA == kNativeTargetRVA,
         "x64 direct native CALL fixture did not decode the expected rel32 target");
 
     const std::unordered_set<uint32_t> nativeCallTargetRVAs = {
