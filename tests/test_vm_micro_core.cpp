@@ -2746,6 +2746,8 @@ void TestTranslatorX64NativeRvaCallHostModel() {
     call.length = 5;
     call.displacementOffset = 1;
     call.displacementSize = 4;
+    call.immediateOffset = 1;
+    call.immediateSize = 4;
     call.isIndirectBranch = false;
     call.hasBranchTarget = true;
     call.branchTargetRVA = 0x5000;

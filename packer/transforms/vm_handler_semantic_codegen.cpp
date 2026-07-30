@@ -3197,8 +3197,15 @@ void EmitX64MemoryVariant(CodeBuffer& c, bool store, uint8_t strategy) {
         if (strategy == 0u) {
             if (!store) EmitZydisLoad(c, true, 0u, address,
                 static_cast<int32_t>(displacement), bytes);
-            else EmitZydisStore(c, true, address,
-                static_cast<int32_t>(displacement), 2u, bytes);
+            else {
+                // Make K=0 STORE consume the published value register too, so
+                // the seed-selected liveness plan remains structurally visible
+                // in the emitted core instead of collapsing to a fixed RDX ->
+                // [mem] tail across builds.
+                EmitZydisMove(c, true, value, 2u);
+                EmitZydisStore(c, true, address,
+                    static_cast<int32_t>(displacement), value, bytes);
+            }
         } else if (!store) {
             EmitZydisLoad(c, true, value, address,
                 static_cast<int32_t>(displacement), bytes);

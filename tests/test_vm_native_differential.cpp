@@ -267,8 +267,11 @@ void TestX64DirectNativeCallHostDifferential() {
     constexpr uint64_t kEntry = 0x1000u;
     constexpr uint32_t kNativeTargetRVA = 0x2000u;
     const std::vector<uint8_t> bytes = {
-        0xE8,0xFB,0x0F,0x00,0x00, // call 0x2000
-        0xC3                         // ret
+        0x39,0xC0,                 // cmp eax,eax (ZF=1)
+        0x74,0x05,                 // jz 0x1009; the direct CALL is decoded
+                                   // and fixed up, but not executed.
+        0xE8,0xF7,0x0F,0x00,0x00,  // call 0x2000
+        0xC3                       // ret
     };
     const Function function =
         DecodeStandaloneFunction(disassembler, bytes, kEntry);
